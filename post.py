@@ -154,8 +154,8 @@ for file in files:
         #         cv.line(cl1,(x1,y1),(x2,y2),(0,0,255),2)
         
         # Pretty decent spot detector
-        circles = cv.HoughCircles(cl2,cv.HOUGH_GRADIENT,1,30,
-        param1=150,param2=0.6,minRadius=4,maxRadius=10)
+        circles = cv.HoughCircles(cl1,cv.HOUGH_GRADIENT,12,70,
+        param1=300,param2=0.85,minRadius=2,maxRadius=8)
         
         if circles is not None:
             circles = np.uint16(np.around(circles))

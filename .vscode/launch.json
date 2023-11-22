@@ -1,0 +1,37 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Post",
+            "type": "python",
+            "request": "launch",
+            "program": "post.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\2023-09-18_04_04_22Z"]
+            //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_1496"],
+            "args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK-4056"] // finder
+            //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_4056"] // main
+
+        },
+        {
+            "name": "Vis",
+            "type": "python",
+            "request": "launch",
+            "program": "vis.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Current File",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

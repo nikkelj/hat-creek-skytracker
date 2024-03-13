@@ -13,7 +13,7 @@
             "justMyCode": true,
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\2023-09-18_04_04_22Z"]
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_1496"],
-            "args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK-4056"] // finder
+            //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK-4056"] // finder
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_4056"] // main
 
         },
@@ -29,7 +29,16 @@
             "name": "Auxstar",
             "type": "python",
             "request": "launch",
-            "program": "lib/auxstar.py",
+            "program": "cli/auxstar.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": ["--test", "--port", "COM3"]
+        },
+        {
+            "name": "Joystick",
+            "type": "python",
+            "request": "launch",
+            "program": "cli/joystick.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": ["--port", "COM3"]

@@ -212,7 +212,7 @@ class NexstarHandController:
             int: firmware version
         """
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_VER'][1], target, COMMANDS['MC_GET_VER'][0], COMMANDS['MC_GET_VER'][2])
+        request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_VER'][1], target.value, COMMANDS['MC_GET_VER'][0], COMMANDS['MC_GET_VER'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_GET_VER'][2]+1)
@@ -229,7 +229,7 @@ class NexstarHandController:
             int: position
         """
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_POSITION'][1], target, COMMANDS['MC_GET_POSITION'][0], COMMANDS['MC_GET_POSITION'][2])
+        request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_POSITION'][1], target.value, COMMANDS['MC_GET_POSITION'][0], COMMANDS['MC_GET_POSITION'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_GET_POSITION'][2]+1)
@@ -254,7 +254,7 @@ class NexstarHandController:
         """
         fofr = pack_int3(dms2f(dd,mm,ss))
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target, COMMANDS['MC_GOTO_FAST'][0], fofr, COMMANDS['MC_GOTO_FAST'][2])
+        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0], fofr, COMMANDS['MC_GOTO_FAST'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_GOTO_FAST'][2]+1)
@@ -275,7 +275,7 @@ class NexstarHandController:
         """
         fofr = pack_int3(dms2f(dd,mm,ss))
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target, COMMANDS['MC_SET_POSITION'][0], fofr, COMMANDS['MC_SET_POSITION'][2])
+        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0], fofr, COMMANDS['MC_SET_POSITION'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_SET_POSITION'][2]+1)
@@ -295,14 +295,14 @@ class NexstarHandController:
         cmd = 'MC_SET_POS_GUIDERATE' if rate > 0 else 'MC_SET_NEG_GUIDERATE'
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
         if sidereal:
-            request = '50{:02x}{:02x}{:02x}ffff00{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], COMMANDS[cmd][2])
+            request = '50{:02x}{:02x}{:02x}ffff00{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], COMMANDS[cmd][2])
         elif solar:
-            request = '50{:02x}{:02x}{:02x}fffe00{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], COMMANDS[cmd][2])
+            request = '50{:02x}{:02x}{:02x}fffe00{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], COMMANDS[cmd][2])
         elif lunar:
-            request = '50{:02x}{:02x}{:02x}fffd00{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], COMMANDS[cmd][2])
+            request = '50{:02x}{:02x}{:02x}fffd00{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], COMMANDS[cmd][2])
         else:
             packed_rate = pack_int3(rate)
-            request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], packed_rate, COMMANDS[cmd][2])
+            request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], packed_rate, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
@@ -320,7 +320,7 @@ class NexstarHandController:
             int: ack
         """
         cmd = 'MC_MOVE_POS' if rate >= 0 else 'MC_MOVE_NEG'
-        request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], rate, COMMANDS[cmd][2])
+        request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], abs(rate), COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
@@ -338,7 +338,7 @@ class NexstarHandController:
             int: ack
         """
         cmd = 'MC_SET_POS_BACKLASH' if backlash >= 0 else 'MC_SET_NEG_BACKLASH'
-        request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target, COMMANDS[cmd][0], backlash, COMMANDS[cmd][2])
+        request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], backlash, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
@@ -350,7 +350,7 @@ def status_report(controller):
     tz = pytz.timezone('US/Pacific')
 
     alt_version = controller.hc_get_version(target=Targets.ALT)
-    azm_version = controller.hc_get_version(target=Targets.AZM])
+    azm_version = controller.hc_get_version(target=Targets.AZM)
     hc_version = controller.hc_get_version(target=Targets.HC)
     print("ALT version ............................. : {}".format(alt_version))
     print("AZM version ............................. : {}".format(azm_version))

@@ -4,10 +4,23 @@ and handles joystick input. It provides a tare functionality, and allows
 us to map the telescope rate commands proportionally onto each joystick axis.
 """
 import argparse
-import pygame
+import ctypes
+import cv2 #opencv library
+import h5py
 import math as m
+import numpy as np #numpy math library
+import pygame
+import time 
+
+from config import CAM1_XSIZE, CAM1_YSIZE, CAM2_XSIZE, CAM2_YSIZE
 
 from auxstar import NexstarHandController, status_report, RATES, Targets
+from asi_python import ASI_CAMERA_INFO, ASI_CONTROL_CAPS, _errorcodes, _exposurecodes, _imgtypes
+
+libasi = ctypes.cdll["ASICamera2"]
+
+numberOfCameras = libasi.ASIGetNumOfConnectedCameras()
+print("Num Connected Cameras:" + str(numberOfCameras))
 
 pygame.init()
 
@@ -211,8 +224,9 @@ def main():
     status_report(controller)
         
     # Set the width and height of the screen (width, height), and name the window.
-    screen = pygame.display.set_mode((500, 700))
+    joystick_screen = pygame.display.set_mode((500, 700))
     pygame.display.set_caption("AuxStar Joystick CLI")
+    camera1_screen = pygame.display.set_mode((1548/2.5, 1040/2.5))
 
     # Used to manage how fast the screen updates.
     clock = pygame.time.Clock()
@@ -239,19 +253,19 @@ def main():
         # Drawing step
         # First, clear the screen to white. Don't put other drawing commands
         # above this, or they will be erased with this command.
-        screen.fill((255, 255, 255))
+        joystick_screen.fill((255, 255, 255))
         text_print.reset()
 
         # Get count of joysticks.
         joystick_count = pygame.joystick.get_count()
 
-        text_print.tprint(screen, f"Number of joysticks: {joystick_count}")
+        text_print.tprint(joystick_screen, f"Number of joysticks: {joystick_count}")
         text_print.indent()
 
         # For each joystick, render the status of all joystick buttons onto the display
         for joystick in joysticks.values():
-            render_joystick_status(joystick, text_print, screen, joystick_config)
-            rate_control(joystick, controller, screen, joystick_config)
+            render_joystick_status(joystick, text_print, joystick_screen, joystick_config)
+            rate_control(joystick, controller, joystick_screen, joystick_config)
 
         # Go ahead and update the screen with what we've drawn.
         pygame.display.flip()

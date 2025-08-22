@@ -70,7 +70,7 @@ def on_gamma_correction_trackbar(val):
 ##################################### MAIN #############################################
 files = os.listdir(args.directory)
 for file in files:
-    if ".PNG" in file and '.txt' not in file.lower():
+    if (".PNG" in file or ".png" in file) and '.txt' not in file.lower():
         logging.info(f'Processing {file}')
         #imgC = cv.imread(os.path.join(args.directory, file), cv.IMREAD_COLOR) #cv.IMREAD_GRAYSCALE)
         img = cv.imread(os.path.join(args.directory, file), cv.IMREAD_GRAYSCALE)
@@ -94,6 +94,7 @@ for file in files:
         
         # Gamma correction
         img_gamma = gammaCorrection(imS)
+        cl1 = img_gamma
         
         # Custom interpolated stretch function - works but not amazing
         #original = imS.copy()
@@ -115,9 +116,9 @@ for file in files:
         
         # Contrast Limited Adaptive Histogram Equalization (tiled)
         # Color CLAHE: https://stackoverflow.com/questions/25008458/how-to-apply-clahe-on-rgb-color-images
-        clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        cl1 = clahe.apply(imS)
-        cl2 = cl1.copy()
+        #clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        #cl1 = clahe.apply(imS)
+        #cl2 = cl1.copy()
         
         # Denoise
         #cv.fastNlMeansDenoisingMulti(cl1, 2, 5, cl2, 4, 7, 99) # meh
@@ -128,8 +129,8 @@ for file in files:
         #bg=cv.morphologyEx(dilation, cv.MORPH_OPEN, kernel)
         #cl2=cv.divide(cl1, bg, scale=255)
         #cl2=cv.threshold(cl2, 0, 255,  cv.THRESH_BINARY+cv.THRESH_OTSU )[1] 
-        cl2 = cv.GaussianBlur(cl1, (13, 13), 0)
-        cl2 = cv.Laplacian(cl2,cv.CV_8S, ksize=5)
+        #cl2 = cv.GaussianBlur(cl1, (13, 13), 0)
+        #cl2 = cv.Laplacian(cl2,cv.CV_8S, ksize=5)
         
         # Threshold
         #ret,th1 = cv.threshold(cl1,30,255,cv.THRESH_BINARY)
@@ -175,8 +176,8 @@ for file in files:
         # Todo: implement a sequential spot tracker
 
         cv.imshow("original", cl1)
-        cv.imshow("processed", cl2)
-        cv.moveWindow("processed", x=int(xsize*1.125), y=int(ysize*0.1875))
+        #cv.imshow("processed", cl2)
+        # cv.moveWindow("processed", x=int(xsize*1.125), y=int(ysize*0.1875))
         cv.imshow("gamma", img_gamma)
         cv.moveWindow("gamma", x=int(xsize*0.125), y=ysize+int(ysize*0.25))
         

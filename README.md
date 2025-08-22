@@ -55,7 +55,8 @@ A list of libraries utlilized, to give some sense of the foundation in use.
     - Provide a simple UI to assist with co-boresighting a guide scope to the main scope against a guide star
     - Provide a simple two-axis calibration against the star to determine sensor rotations with respect to RA/DEC axes, with guidance to co-align both sensors if desired.
     - Output sensor rotations, angular step-change calibrations, and sensor details into main and guide config files.
-- CLI #3: Program Track or Moving Object Search, Acquisition, Tracking, and Auto-labeled Capture
+- CLI #3: Joystick Loop with Manual Track, Program Track, Moving Object Search, Acquisition, Tracking, and Auto-labeled Capture
+    - Provide a manual joystick loop with rich controls that branches to sub-modes
     - Provide simple programmed following of a TLE trajectory via available hardware interfaces
     - Provide, alternately, a programmed following of an ephemeris trajectory via available hardware interfaces
     - Provide object search while following a programmed trajectory

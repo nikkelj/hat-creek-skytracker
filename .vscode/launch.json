@@ -15,6 +15,7 @@
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_1496"],
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK-4056"] // finder
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_4056"] // main
+            "args": ["--directory", "C:\\Users\\nikke\\OneDrive\\Desktop\\SharpCap Captures\\2024-03-18\\Capture\\pipp_20240318_195751\\19_27_56"]
 
         },
         {
@@ -42,6 +43,22 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": ["--port", "COM3"]
+        },
+        {
+            "name": "Main",
+            "type": "python",
+            "request": "launch",
+            "program": "cli/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+        },
+        {
+            "name": "Main2",
+            "type": "python",
+            "request": "launch",
+            "program": "cli/main2.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
         },
         {
             "name": "Python: Current File",

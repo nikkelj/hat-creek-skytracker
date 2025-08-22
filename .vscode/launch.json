@@ -10,6 +10,7 @@
             "request": "launch",
             "program": "cli/post.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\2023-09-18_04_04_22Z"]
             //"args": ["--directory", "C:\\Users\\nikke\\ASICAP\\CapObj\\STARLINK_1496"],
@@ -24,6 +25,7 @@
             "request": "launch",
             "program": "cli/vis.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true
         },
         {
@@ -32,6 +34,7 @@
             "request": "launch",
             "program": "cli/auxstar.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,
             "args": ["--test", "--port", "COM3"]
         },
@@ -41,6 +44,7 @@
             "request": "launch",
             "program": "cli/joystick.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,
             "args": ["--port", "COM3"]
         },
@@ -50,6 +54,7 @@
             "request": "launch",
             "program": "cli/main.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,
         },
         {
@@ -58,6 +63,7 @@
             "request": "launch",
             "program": "cli/main2.py",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,
         },
         {
@@ -66,6 +72,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true
         }
     ]

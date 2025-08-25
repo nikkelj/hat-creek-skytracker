@@ -67,6 +67,15 @@
             "justMyCode": true,
         },
         {
+            "name": "Grok4 Multifile",
+            "type": "python",
+            "request": "launch",
+            "program": "grok4/main.py",
+            "console": "integratedTerminal",
+            "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
+            "justMyCode": true,
+        },
+        {
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",

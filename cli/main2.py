@@ -336,7 +336,7 @@ if __name__ == "__main__":
     last_update_time = 0
     update_interval = 0.1  # Target 10 Hz
     last_trajectory_update = 0
-    trajectory_interval = 900  # 15 minutes in seconds
+    trajectory_interval = 900  # 15 minutes
     satellite_trajectories = {}
     satellite_arc_segments = {}
     hovered_satellite = None
@@ -737,6 +737,10 @@ if __name__ == "__main__":
             ts = load.timescale()
             t = ts.now()
             current_tt = t.tt
+            # Debug: Check current_tt against trajectory time range
+            if satellites and satellite_trajectories:
+                first_sat_trajectory, first_sat_times = satellite_trajectories[satellites[0]]
+                print(f"Current TT: {current_tt}, Trajectory Time Range: [{min(first_sat_times)}, {max(first_sat_times)}]")
             satellite_positions = {}
             lat = float(lat_str)
             lon = float(lon_str)
@@ -901,6 +905,11 @@ if __name__ == "__main__":
             time_text = f"UTC: {utc_time_str}  Local: {local_time_str}"
             time_surface = small_font.render(time_text, True, (255, 255, 255))
             menu_screen.blit(time_surface, (sub_x + 10, sub_y + sub_height - 30))
+            # Draw satellite count display below filters
+            sat_count = len(satellite_positions)
+            count_text = f"Satellites in view: {sat_count}"
+            count_surface = small_font.render(count_text, True, (255, 255, 255))
+            menu_screen.blit(count_surface, (sub_x + 20, sub_y + 320))
         elif current_mode == "sensor_calib":
             sub_rect = (sub_x, sub_y, sub_width, sub_height)
             menu_screen.fill((50, 50, 50), sub_rect)

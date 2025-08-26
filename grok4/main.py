@@ -6,12 +6,13 @@ import requests
 import math
 from tkinter import Tk
 from tkinter import filedialog
-from skyfield.api import wgs84, load
+from skyfield.api import wgs84, load, utc
+from datetime import datetime, timedelta
 import numpy as np
 from utils import draw_button, create_negative_image
 from trajectory import precompute_trajectories, interpolate_position
 from config import load_config, save_config, handle_input
-from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count
+from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display
 
 # Initialize Pygame and set up the display
 os.environ['SDL_VIDEO_WINDOW_POS'] = "0,0"
@@ -47,6 +48,7 @@ sub_x = menu_width
 sub_y = 0
 sub_width = total_width - menu_width
 sub_height = total_height
+radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
 
 input_rects = {
     'lat': pygame.Rect(sub_x + 20, sub_y + 60, 200, 30),
@@ -58,8 +60,12 @@ save_button = pygame.Rect(sub_x + 20, sub_y + sub_height - 50, 100, 30)
 load_button = pygame.Rect(sub_x + 130, sub_y + sub_height - 50, 100, 30)
 clear_filters_button = pygame.Rect(sub_x + 250, sub_y + 30, 100, 30)  # Aligned with Name Filter
 filter_rect = pygame.Rect(sub_x + 10, sub_y + 30, 200, 30)  # Name Filter
-filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt, +20 pixels
-filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt, +30 pixels
+filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt
+filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt
+scroll_bar_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 50, 2 * radius, 20)  # Scroll bar below polar plot
+slider_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 50, 20, 20)  # Slider
+pause_button = pygame.Rect(sub_x + sub_width // 2 + radius + 10, sub_y + sub_height - 50, 60, 30)  # Pause button
+play_button = pygame.Rect(sub_x + sub_width // 2 + radius + 80, sub_y + sub_height - 50, 60, 30)  # Play button
 legend_x = sub_x + sub_width - 170
 legend_y = sub_y + sub_height - 160
 
@@ -95,12 +101,20 @@ selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None
 filter_text = ""
 filter_above_alt_text = ""
 filter_below_alt_text = ""
+paused = False
+paused_tt = None
+scroll_start = None
+dragging_slider = False
+t0 = None
+t1 = None
 
 # Button states for embossment
 button_states = {btn["mode"]: {"hover": False, "clicked": False} for btn in buttons}
 button_states["save"] = {"hover": False, "clicked": False}
 button_states["load"] = {"hover": False, "clicked": False}
 button_states["clear_filters"] = {"hover": False, "clicked": False}
+button_states["pause"] = {"hover": False, "clicked": False}
+button_states["play"] = {"hover": False, "clicked": False}
 
 # Initial render of main menu
 menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
@@ -268,14 +282,13 @@ def update_status_callback(message):
 running = True
 while running:
     current_time = time.time()
-    current_tt = ts.now().tt
     mouse_pos = pygame.mouse.get_pos()
     # Check if mouse is over the background image
     image_rect = pygame.Rect((menu_width - 160) // 2, image_y, 160, 160) if bg_image_menu else None
     # Define filter rectangles inside the loop to ensure they are always current
     filter_rect = pygame.Rect(sub_x + 10, sub_y + 30, 200, 30)  # Name Filter
-    filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt, +20 pixels
-    filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt, +30 pixels
+    filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt
+    filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt
 
     # Precompute trajectories and arc segments every 15 minutes
     if current_time - last_trajectory_update >= trajectory_interval:
@@ -284,13 +297,29 @@ while running:
         lon = float(lon_str or 0)
         alt_m = float(alt_str or 0)
         observer = wgs84.latlon(lat, lon, elevation_m=alt_m)
+        t0 = ts.utc((datetime.utcnow() - timedelta(minutes=15)).replace(tzinfo=utc))
+        t1 = ts.utc((datetime.utcnow() + timedelta(minutes=15)).replace(tzinfo=utc))
         satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback)
         last_trajectory_update = current_time
         update_status_callback("Trajectories updated")
+        # Initialize slider to current time
+        fraction = (ts.now().tt - t0.tt) / (t1.tt - t0.tt)
+        slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
 
     # Compute satellite positions at 10 Hz
     if current_time - last_update_time >= update_interval:
         satellite_positions = {}
+        if dragging_slider:
+            fraction = (slider_rect.x - scroll_bar_rect.x) / (scroll_bar_rect.width - slider_rect.width)
+            current_tt = t0.tt + fraction * (t1.tt - t0.tt)
+        elif paused:
+            current_tt = paused_tt
+        else:
+            current_tt = ts.now().tt
+            # Update slider position to reflect real-time
+            if t0 is not None and t1 is not None:
+                fraction = (current_tt - t0.tt) / (t1.tt - t0.tt)
+                slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
         if selected_satellite:
             if selected_satellite in satellite_trajectories:
                 px, py, alt = interpolate_position(satellite_trajectories[selected_satellite], current_tt)
@@ -322,287 +351,314 @@ while running:
         last_update_time = current_time
 
     # Handle events
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        elif event.type == pygame.MOUSEBUTTONDOWN:
-            pos = pygame.mouse.get_pos()
-            for btn in buttons:
-                if btn["rect"].collidepoint(pos):
-                    if btn["mode"] == "exit":
-                        running = False
-                    else:
-                        for b in buttons:
-                            button_states[b["mode"]]["clicked"] = False
-                        current_mode = btn["mode"]
-                        button_states[current_mode]["clicked"] = True
-                        focused_field = None
-                        cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0}
-                        selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None}
-            if current_mode == "config_options":
-                if save_button.collidepoint(pos):
-                    button_states["save"]["clicked"] = True
-                    config = {"lat": lat_str, "lon": lon_str, "alt": alt_str, "elevation_mask": elevation_mask_str}
-                    save_config(config)
-                    status_messages.append("Configuration saved")
-                    print("Debug: Configuration saved")
-                elif load_button.collidepoint(pos):
-                    button_states["load"]["clicked"] = True
-                    root = Tk()
-                    root.withdraw()
-                    file_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-                    if file_path:
-                        config = load_config(file_path)
-                        lat_str, lon_str, alt_str, elevation_mask_str = config["lat"], config["lon"], config["alt"], config["elevation_mask"]
-                        status_messages.append(f"Configuration loaded from {file_path}")
-                        print(f"Debug: Configuration loaded from {file_path}")
-                elif input_rects['lat'].collidepoint(pos):
-                    focused_field = 'lat'
-                    cursor_pos['lat'] = len(lat_str)
-                    selection_start['lat'] = None
-                elif input_rects['lon'].collidepoint(pos):
-                    focused_field = 'lon'
-                    cursor_pos['lon'] = len(lon_str)
-                    selection_start['lon'] = None
-                elif input_rects['alt'].collidepoint(pos):
-                    focused_field = 'alt'
-                    cursor_pos['alt'] = len(alt_str)
-                    selection_start['alt'] = None
-                elif input_rects['elevation_mask'].collidepoint(pos):
-                    focused_field = 'elevation_mask'
-                    cursor_pos['elevation_mask'] = len(elevation_mask_str)
-                    selection_start['elevation_mask'] = None
-            elif current_mode == "tracking_vis" and clear_filters_button.collidepoint(pos):
-                button_states["clear_filters"]["clicked"] = True
-                filter_text = ""
-                filter_above_alt_text = ""
-                filter_below_alt_text = ""
-                cursor_pos["filter"] = 0
-                cursor_pos["filter_above_alt"] = 0
-                cursor_pos["filter_below_alt"] = 0
-                selection_start["filter"] = None
-                selection_start["filter_above_alt"] = None
-                selection_start["filter_below_alt"] = None
-                selected_satellite = None
-            elif current_mode == "tracking_vis":
-                if filter_rect.collidepoint(pos):
-                    focused_field = 'filter'
-                    cursor_pos['filter'] = len(filter_text)
-                    selection_start['filter'] = None
-                elif filter_above_alt_rect.collidepoint(pos):
-                    focused_field = 'filter_above_alt'
-                    cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
-                    selection_start['filter_above_alt'] = None
-                elif filter_below_alt_rect.collidepoint(pos):
-                    focused_field = 'filter_below_alt'
-                    cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
-                    selection_start['filter_below_alt'] = None
-                else:
-                    deselected = False
-                    if selected_satellite:
-                        px, py, _ = satellite_positions.get(selected_satellite, (0, 0, 0))
-                        if math.hypot(px - pos[0], py - pos[1]) < 10:
-                            selected_satellite = None
-                            deselected = True
-                    if not deselected:
-                        for sat, (px, py, _) in satellite_positions.items():
-                            if math.hypot(px - pos[0], py - pos[1]) < 10:
-                                selected_satellite = sat
-                                break
-        elif event.type == pygame.MOUSEMOTION:
-            for btn in buttons:
-                button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
-            if current_mode == "config_options":
-                button_states["save"]["hover"] = save_button.collidepoint(event.pos)
-                button_states["load"]["hover"] = load_button.collidepoint(event.pos)
-            elif current_mode == "tracking_vis":
-                button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
-                hovered_satellite = None
-                for sat, (px, py, _) in satellite_positions.items():
-                    if math.hypot(px - event.pos[0], py - pos[1]) < 10:
-                        hovered_satellite = sat
-                        break
-        elif event.type == pygame.MOUSEBUTTONUP:
-            for btn in buttons:
-                button_states[btn["mode"]]["clicked"] = False
-            button_states["save"]["clicked"] = False
-            button_states["load"]["clicked"] = False
-            button_states["clear_filters"]["clicked"] = False
-        elif event.type == pygame.KEYDOWN:
-            if current_mode == "config_options" and focused_field:
-                lat_str, lon_str, alt_str, elevation_mask_str = handle_input(event, focused_field, lat_str, lon_str, alt_str, elevation_mask_str, cursor_pos, selection_start)
-            elif current_mode == "tracking_vis":
-                if filter_rect.collidepoint(mouse_pos):
-                    if event.key != pygame.K_TAB:
-                        focused_field = "filter"
+    try:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                pos = pygame.mouse.get_pos()
+                for btn in buttons:
+                    if btn["rect"].collidepoint(pos):
+                        if btn["mode"] == "exit":
+                            running = False
+                        else:
+                            for b in buttons:
+                                button_states[b["mode"]]["clicked"] = False
+                            current_mode = btn["mode"]
+                            button_states[current_mode]["clicked"] = True
+                            focused_field = None
+                            cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0}
+                            selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None}
+                if current_mode == "config_options":
+                    if save_button.collidepoint(pos):
+                        button_states["save"]["clicked"] = True
+                        config = {"lat": lat_str, "lon": lon_str, "alt": alt_str, "elevation_mask": elevation_mask_str}
+                        save_config(config)
+                        status_messages.append("Configuration saved")
+                        print("Debug: Configuration saved")
+                    elif load_button.collidepoint(pos):
+                        button_states["load"]["clicked"] = True
+                        root = Tk()
+                        root.withdraw()
+                        file_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+                        if file_path:
+                            config = load_config(file_path)
+                            lat_str, lon_str, alt_str, elevation_mask_str = config["lat"], config["lon"], config["alt"], config["elevation_mask"]
+                            status_messages.append(f"Configuration loaded from {file_path}")
+                            print(f"Debug: Configuration loaded from {file_path}")
+                    elif input_rects['lat'].collidepoint(pos):
+                        focused_field = 'lat'
+                        cursor_pos['lat'] = len(lat_str)
+                        selection_start['lat'] = None
+                    elif input_rects['lon'].collidepoint(pos):
+                        focused_field = 'lon'
+                        cursor_pos['lon'] = len(lon_str)
+                        selection_start['lon'] = None
+                    elif input_rects['alt'].collidepoint(pos):
+                        focused_field = 'alt'
+                        cursor_pos['alt'] = len(alt_str)
+                        selection_start['alt'] = None
+                    elif input_rects['elevation_mask'].collidepoint(pos):
+                        focused_field = 'elevation_mask'
+                        cursor_pos['elevation_mask'] = len(elevation_mask_str)
+                        selection_start['elevation_mask'] = None
+                elif current_mode == "tracking_vis":
+                    if clear_filters_button.collidepoint(pos):
+                        button_states["clear_filters"]["clicked"] = True
+                        filter_text = ""
+                        filter_above_alt_text = ""
+                        filter_below_alt_text = ""
+                        cursor_pos["filter"] = 0
+                        cursor_pos["filter_above_alt"] = 0
+                        cursor_pos["filter_below_alt"] = 0
+                        selection_start["filter"] = None
+                        selection_start["filter_above_alt"] = None
+                        selection_start["filter_below_alt"] = None
+                        selected_satellite = None
+                    elif pause_button.collidepoint(pos):
+                        button_states["pause"]["clicked"] = True
+                        paused = True
+                        paused_tt = ts.now().tt
+                    elif play_button.collidepoint(pos):
+                        button_states["play"]["clicked"] = True
+                        paused = False
+                        paused_tt = None
+                    elif scroll_bar_rect.collidepoint(pos):
+                        dragging_slider = True
+                        scroll_start = pos[0]
+                        slider_rect.x = max(scroll_bar_rect.x, min(pos[0] - slider_rect.width // 2, scroll_bar_rect.x + scroll_bar_rect.width - slider_rect.width))
+                    elif filter_rect.collidepoint(pos):
+                        focused_field = 'filter'
                         cursor_pos['filter'] = len(filter_text)
                         selection_start['filter'] = None
-                elif filter_above_alt_rect.collidepoint(mouse_pos):
-                    if event.key != pygame.K_TAB:
-                        focused_field = "filter_above_alt"
+                    elif filter_above_alt_rect.collidepoint(pos):
+                        focused_field = 'filter_above_alt'
                         cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
                         selection_start['filter_above_alt'] = None
-                elif filter_below_alt_rect.collidepoint(mouse_pos):
-                    if event.key != pygame.K_TAB:
-                        focused_field = "filter_below_alt"
+                    elif filter_below_alt_rect.collidepoint(pos):
+                        focused_field = 'filter_below_alt'
                         cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
                         selection_start['filter_below_alt'] = None
-                if focused_field == "filter":
-                    field_str = filter_text
-                    mods = pygame.key.get_mods()
-                    if event.key == pygame.K_LEFT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
-                            cursor_pos["filter"] = max(0, cursor_pos["filter"] - 1)
-                        else:
-                            cursor_pos["filter"] = max(0, cursor_pos["filter"] - 1)
-                            selection_start["filter"] = None
-                    elif event.key == pygame.K_RIGHT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
-                            cursor_pos["filter"] = min(len(field_str), cursor_pos["filter"] + 1)
-                        else:
-                            cursor_pos["filter"] = min(len(field_str), cursor_pos["filter"] + 1)
-                            selection_start["filter"] = None
-                    elif event.key == pygame.K_HOME:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
-                        cursor_pos["filter"] = 0
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = None
-                    elif event.key == pygame.K_END:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
-                        cursor_pos["filter"] = len(field_str)
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter"] = None
-                    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
-                        start = min(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"]
-                        end = max(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter"]
-                        if start < end:
-                            field_str = field_str[:start] + field_str[end:]
-                            cursor_pos["filter"] = start
-                            selection_start["filter"] = None
-                        elif event.key == pygame.K_BACKSPACE and cursor_pos["filter"] > 0:
-                            field_str = field_str[:cursor_pos["filter"] - 1] + field_str[cursor_pos["filter"]:]
-                            cursor_pos["filter"] -= 1
-                            selection_start["filter"] = None
-                    elif event.key == pygame.K_RETURN:
-                        focused_field = None
-                        selection_start["filter"] = None
                     else:
-                        char = event.unicode
-                        if char.isalnum() or char in [' ', '-', '_']:
+                        deselected = False
+                        if selected_satellite:
+                            px, py, _ = satellite_positions.get(selected_satellite, (0, 0, 0))
+                            if math.hypot(px - pos[0], py - pos[1]) < 10:
+                                selected_satellite = None
+                                deselected = True
+                        if not deselected:
+                            for sat, (px, py, _) in satellite_positions.items():
+                                if math.hypot(px - pos[0], py - pos[1]) < 10:
+                                    selected_satellite = sat
+                                    break
+            elif event.type == pygame.MOUSEMOTION:
+                for btn in buttons:
+                    button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
+                if current_mode == "config_options":
+                    button_states["save"]["hover"] = save_button.collidepoint(event.pos)
+                    button_states["load"]["hover"] = load_button.collidepoint(event.pos)
+                elif current_mode == "tracking_vis":
+                    button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
+                    button_states["pause"]["hover"] = pause_button.collidepoint(event.pos)
+                    button_states["play"]["hover"] = play_button.collidepoint(event.pos)
+                    if dragging_slider:
+                        slider_rect.x = max(scroll_bar_rect.x, min(event.pos[0] - slider_rect.width // 2, scroll_bar_rect.x + scroll_bar_rect.width - slider_rect.width))
+                    hovered_satellite = None
+                    for sat, (px, py, _) in satellite_positions.items():
+                        if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
+                            hovered_satellite = sat
+                            break
+            elif event.type == pygame.MOUSEBUTTONUP:
+                for btn in buttons:
+                    button_states[btn["mode"]]["clicked"] = False
+                button_states["save"]["clicked"] = False
+                button_states["load"]["clicked"] = False
+                button_states["clear_filters"]["clicked"] = False
+                button_states["pause"]["clicked"] = False
+                button_states["play"]["clicked"] = False
+                if dragging_slider and paused:
+                    fraction = (slider_rect.x - scroll_bar_rect.x) / (scroll_bar_rect.width - slider_rect.width)
+                    paused_tt = t0.tt + fraction * (t1.tt - t0.tt)
+                dragging_slider = False
+                scroll_start = None
+            elif event.type == pygame.KEYDOWN:
+                if current_mode == "config_options" and focused_field:
+                    lat_str, lon_str, alt_str, elevation_mask_str = handle_input(event, focused_field, lat_str, lon_str, alt_str, elevation_mask_str, cursor_pos, selection_start)
+                elif current_mode == "tracking_vis":
+                    if filter_rect.collidepoint(mouse_pos):
+                        if event.key != pygame.K_TAB:
+                            focused_field = "filter"
+                            cursor_pos['filter'] = len(filter_text)
+                            selection_start['filter'] = None
+                    elif filter_above_alt_rect.collidepoint(mouse_pos):
+                        if event.key != pygame.K_TAB:
+                            focused_field = "filter_above_alt"
+                            cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
+                            selection_start['filter_above_alt'] = None
+                    elif filter_below_alt_rect.collidepoint(mouse_pos):
+                        if event.key != pygame.K_TAB:
+                            focused_field = "filter_below_alt"
+                            cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
+                            selection_start['filter_below_alt'] = None
+                    if focused_field == "filter":
+                        field_str = filter_text
+                        mods = pygame.key.get_mods()
+                        if event.key == pygame.K_LEFT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
+                                cursor_pos["filter"] = max(0, cursor_pos["filter"] - 1)
+                            else:
+                                cursor_pos["filter"] = max(0, cursor_pos["filter"] - 1)
+                                selection_start["filter"] = None
+                        elif event.key == pygame.K_RIGHT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
+                                cursor_pos["filter"] = min(len(field_str), cursor_pos["filter"] + 1)
+                            else:
+                                cursor_pos["filter"] = min(len(field_str), cursor_pos["filter"] + 1)
+                                selection_start["filter"] = None
+                        elif event.key == pygame.K_HOME:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
+                            cursor_pos["filter"] = 0
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = None
+                        elif event.key == pygame.K_END:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = cursor_pos["filter"] if selection_start["filter"] is None else selection_start["filter"]
+                            cursor_pos["filter"] = len(field_str)
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter"] = None
+                        elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
                             start = min(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"]
-                            end = max(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"]
-                            field_str = field_str[:start] + char + field_str[end:]
-                            cursor_pos["filter"] += 1
+                            end = max(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter"]
+                            if start < end:
+                                field_str = field_str[:start] + field_str[end:]
+                                cursor_pos["filter"] = start
+                                selection_start["filter"] = None
+                            elif event.key == pygame.K_BACKSPACE and cursor_pos["filter"] > 0:
+                                field_str = field_str[:cursor_pos["filter"] - 1] + field_str[cursor_pos["filter"]:]
+                                cursor_pos["filter"] = 1
+                                selection_start["filter"] = None
+                        elif event.key == pygame.K_RETURN:
+                            focused_field = None
                             selection_start["filter"] = None
-                    filter_text = field_str
-                elif focused_field == "filter_above_alt":
-                    field_str = filter_above_alt_text
-                    mods = pygame.key.get_mods()
-                    if event.key == pygame.K_LEFT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
-                            cursor_pos["filter_above_alt"] = max(0, cursor_pos["filter_above_alt"] - 1)
                         else:
-                            cursor_pos["filter_above_alt"] = max(0, cursor_pos["filter_above_alt"] - 1)
-                            selection_start["filter_above_alt"] = None
-                    elif event.key == pygame.K_RIGHT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
-                            cursor_pos["filter_above_alt"] = min(len(field_str), cursor_pos["filter_above_alt"] + 1)
-                        else:
-                            cursor_pos["filter_above_alt"] = min(len(field_str), cursor_pos["filter_above_alt"] + 1)
-                            selection_start["filter_above_alt"] = None
-                    elif event.key == pygame.K_HOME:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
-                        cursor_pos["filter_above_alt"] = 0
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = None
-                    elif event.key == pygame.K_END:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
-                        cursor_pos["filter_above_alt"] = len(field_str)
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_above_alt"] = None
-                    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
-                        start = min(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"]
-                        end = max(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter_above_alt"]
-                        if start < end:
-                            field_str = field_str[:start] + field_str[end:]
-                            cursor_pos["filter_above_alt"] = start
-                            selection_start["filter_above_alt"] = None
-                        elif event.key == pygame.K_BACKSPACE and cursor_pos["filter_above_alt"] > 0:
-                            field_str = field_str[:cursor_pos["filter_above_alt"] - 1] + field_str[cursor_pos["filter_above_alt"]:]
-                            cursor_pos["filter_above_alt"] -= 1
-                            selection_start["filter_above_alt"] = None
-                    elif event.key == pygame.K_RETURN:
-                        focused_field = None
-                        selection_start["filter_above_alt"] = None
-                    else:
-                        char = event.unicode
-                        if char.isdigit() or char in ['.', '-']:
+                            char = event.unicode
+                            if char.isalnum() or char in [' ', '-', '_']:
+                                start = min(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"]
+                                end = max(cursor_pos["filter"], selection_start["filter"]) if selection_start["filter"] is not None else cursor_pos["filter"]
+                                field_str = field_str[:start] + char + field_str[end:]
+                                cursor_pos["filter"] += 1
+                                selection_start["filter"] = None
+                        filter_text = field_str
+                    elif focused_field == "filter_above_alt":
+                        field_str = filter_above_alt_text
+                        mods = pygame.key.get_mods()
+                        if event.key == pygame.K_LEFT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
+                                cursor_pos["filter_above_alt"] = max(0, cursor_pos["filter_above_alt"] - 1)
+                            else:
+                                cursor_pos["filter_above_alt"] = max(0, cursor_pos["filter_above_alt"] - 1)
+                                selection_start["filter_above_alt"] = None
+                        elif event.key == pygame.K_RIGHT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
+                                cursor_pos["filter_above_alt"] = min(len(field_str), cursor_pos["filter_above_alt"] + 1)
+                            else:
+                                cursor_pos["filter_above_alt"] = min(len(field_str), cursor_pos["filter_above_alt"] + 1)
+                                selection_start["filter_above_alt"] = None
+                        elif event.key == pygame.K_HOME:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
+                            cursor_pos["filter_above_alt"] = 0
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = None
+                        elif event.key == pygame.K_END:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = cursor_pos["filter_above_alt"] if selection_start["filter_above_alt"] is None else selection_start["filter_above_alt"]
+                            cursor_pos["filter_above_alt"] = len(field_str)
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_above_alt"] = None
+                        elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
                             start = min(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"]
-                            end = max(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"]
-                            field_str = field_str[:start] + char + field_str[end:]
-                            cursor_pos["filter_above_alt"] += 1
+                            end = max(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter_above_alt"]
+                            if start < end:
+                                field_str = field_str[:start] + field_str[end:]
+                                cursor_pos["filter_above_alt"] = start
+                                selection_start["filter_above_alt"] = None
+                            elif event.key == pygame.K_BACKSPACE and cursor_pos["filter_above_alt"] > 0:
+                                field_str = field_str[:cursor_pos["filter_above_alt"] - 1] + field_str[cursor_pos["filter_above_alt"]:]
+                                cursor_pos["filter_above_alt"] = 1
+                                selection_start["filter_above_alt"] = None
+                        elif event.key == pygame.K_RETURN:
+                            focused_field = None
                             selection_start["filter_above_alt"] = None
-                    filter_above_alt_text = field_str
-                elif focused_field == "filter_below_alt":
-                    field_str = filter_below_alt_text
-                    mods = pygame.key.get_mods()
-                    if event.key == pygame.K_LEFT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
-                            cursor_pos["filter_below_alt"] = max(0, cursor_pos["filter_below_alt"] - 1)
                         else:
-                            cursor_pos["filter_below_alt"] = max(0, cursor_pos["filter_below_alt"] - 1)
-                            selection_start["filter_below_alt"] = None
-                    elif event.key == pygame.K_RIGHT:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
-                            cursor_pos["filter_below_alt"] = min(len(field_str), cursor_pos["filter_below_alt"] + 1)
-                        else:
-                            cursor_pos["filter_below_alt"] = min(len(field_str), cursor_pos["filter_below_alt"] + 1)
-                            selection_start["filter_below_alt"] = None
-                    elif event.key == pygame.K_HOME:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
-                        cursor_pos["filter_below_alt"] = 0
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = None
-                    elif event.key == pygame.K_END:
-                        if mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
-                        cursor_pos["filter_below_alt"] = len(field_str)
-                        if not mods & pygame.KMOD_SHIFT:
-                            selection_start["filter_below_alt"] = None
-                    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
-                        start = min(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"]
-                        end = max(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter_below_alt"]
-                        if start < end:
-                            field_str = field_str[:start] + field_str[end:]
-                            cursor_pos["filter_below_alt"] = start
-                            selection_start["filter_below_alt"] = None
-                        elif event.key == pygame.K_BACKSPACE and cursor_pos["filter_below_alt"] > 0:
-                            field_str = field_str[:cursor_pos["filter_below_alt"] - 1] + field_str[cursor_pos["filter_below_alt"]:]
-                            cursor_pos["filter_below_alt"] -= 1
-                            selection_start["filter_below_alt"] = None
-                    elif event.key == pygame.K_RETURN:
-                        focused_field = None
-                        selection_start["filter_below_alt"] = None
-                    else:
-                        char = event.unicode
-                        if char.isdigit() or char in ['.', '-']:
+                            char = event.unicode
+                            if char.isdigit() or char in ['.', '-']:
+                                start = min(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"]
+                                end = max(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"]) if selection_start["filter_above_alt"] is not None else cursor_pos["filter_above_alt"]
+                                field_str = field_str[:start] + char + field_str[end:]
+                                cursor_pos["filter_above_alt"] = 1
+                                selection_start["filter_above_alt"] = None
+                        filter_above_alt_text = field_str
+                    elif focused_field == "filter_below_alt":
+                        field_str = filter_below_alt_text
+                        mods = pygame.key.get_mods()
+                        if event.key == pygame.K_LEFT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
+                                cursor_pos["filter_below_alt"] = max(0, cursor_pos["filter_below_alt"] - 1)
+                            else:
+                                cursor_pos["filter_below_alt"] = max(0, cursor_pos["filter_below_alt"] - 1)
+                                selection_start["filter_below_alt"] = None
+                        elif event.key == pygame.K_RIGHT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
+                                cursor_pos["filter_below_alt"] = min(len(field_str), cursor_pos["filter_below_alt"] + 1)
+                            else:
+                                cursor_pos["filter_below_alt"] = min(len(field_str), cursor_pos["filter_below_alt"] + 1)
+                                selection_start["filter_below_alt"] = None
+                        elif event.key == pygame.K_HOME:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
+                            cursor_pos["filter_below_alt"] = 0
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = None
+                        elif event.key == pygame.K_END:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = cursor_pos["filter_below_alt"] if selection_start["filter_below_alt"] is None else selection_start["filter_below_alt"]
+                            cursor_pos["filter_below_alt"] = len(field_str)
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["filter_below_alt"] = None
+                        elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
                             start = min(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"]
-                            end = max(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"]
-                            field_str = field_str[:start] + char + field_str[end:]
-                            cursor_pos["filter_below_alt"] += 1
+                            end = max(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"] + 1 if event.key == pygame.K_DELETE else cursor_pos["filter_below_alt"]
+                            if start < end:
+                                field_str = field_str[:start] + field_str[end:]
+                                cursor_pos["filter_below_alt"] = start
+                                selection_start["filter_below_alt"] = None
+                            elif event.key == pygame.K_BACKSPACE and cursor_pos["filter_below_alt"] > 0:
+                                field_str = field_str[:cursor_pos["filter_below_alt"] - 1] + field_str[cursor_pos["filter_below_alt"]:]
+                                cursor_pos["filter_below_alt"] -= 1
+                                selection_start["filter_below_alt"] = None
+                        elif event.key == pygame.K_RETURN:
+                            focused_field = None
                             selection_start["filter_below_alt"] = None
-                    filter_below_alt_text = field_str
+                        else:
+                            char = event.unicode
+                            if char.isdigit() or char in ['.', '-']:
+                                start = min(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"]
+                                end = max(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"]) if selection_start["filter_below_alt"] is not None else cursor_pos["filter_below_alt"]
+                                field_str = field_str[:start] + char + field_str[end:]
+                                cursor_pos["filter_below_alt"] += 1
+                                selection_start["filter_below_alt"] = None
+                        filter_below_alt_text = field_str
+    except Exception as e:
+        status_messages.append(f"Event error: {str(e)}")
+        print(f"Debug: Event error - {str(e)}")
 
     # Render continuously
     menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
@@ -640,6 +696,10 @@ while running:
         draw_time_display(menu_screen, sub_x, sub_y, sub_height, small_font)
         draw_satellite_count(menu_screen, sub_x, sub_y, satellite_positions, small_font)
         draw_button(menu_screen, clear_filters_button, "Clear Filters", button_states["clear_filters"])
+        draw_button(menu_screen, pause_button, "Pause", button_states["pause"])
+        draw_button(menu_screen, play_button, "Play", button_states["play"])
+        draw_scroll_bar(menu_screen, scroll_bar_rect, slider_rect, small_font)
+        draw_scroll_time_display(menu_screen, sub_x, sub_y, sub_width, sub_height, current_tt, ts, small_font)
     elif current_mode == "sensor_calib":
         sub_rect = (sub_x, sub_y, sub_width, sub_height)
         menu_screen.fill((50, 50, 50), sub_rect)

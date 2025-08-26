@@ -249,18 +249,25 @@ def draw_legend(surface, legend_x, legend_y, small_font):
 def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font):
     if (hovered_satellite or selected_satellite):
         sat = selected_satellite if selected_satellite else hovered_satellite
+        epoch_dt = sat.epoch.utc_datetime().strftime("%Y-%m-%d %H:%M:%S")
         details = [
             f"NORAD ID: {sat.model.satnum_str}",
             f"Name: {sat.name.strip()}",
-            f"Mean Altitude (km): {satellite_mean_altitudes.get(sat, 0.0):.1f}",
-            f"Eccentricity: {sat.model.ecco:.4f}"
+            f"Int. Designator: {sat.model.intldesg}",
+            f"Epoch: {epoch_dt}",
+            f"Inclination (deg): {math.degrees(sat.model.inclo):.2f}",
+            f"RAAN (deg): {math.degrees(sat.model.nodeo):.2f}",
+            f"Arg. of Perigee (deg): {math.degrees(sat.model.argpo):.2f}",
+            f"Mean Anomaly (deg): {math.degrees(sat.model.mo):.2f}",
+            f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
+            f"Rev Number: {sat.model.revnum}"
         ]
         details_rect = pygame.Rect(sub_x + sub_width - 250, sub_y + 20, 230, 200)
         pygame.draw.rect(surface, (50, 50, 50), details_rect)  # Dark grey background
         pygame.draw.rect(surface, (0, 0, 0), details_rect, 2)  # Black border
         for i, line in enumerate(details):
             text_surface = small_font.render(line, True, (255, 255, 255))
-            surface.blit(text_surface, (details_rect.x + 5, details_rect.y + 5 + i * 20))
+            surface.blit(text_surface, (details_rect.x + 5, details_rect.y + 5 + i * 15))
 
 def draw_time_display(surface, sub_x, sub_y, sub_height, small_font):
     current_utc = datetime.utcnow()
@@ -276,3 +283,25 @@ def draw_satellite_count(surface, sub_x, sub_y, satellite_positions, small_font)
     count_text = f"Satellites in view: {sat_count}"
     count_surface = small_font.render(count_text, True, (255, 255, 255))
     surface.blit(count_surface, (sub_x + 10, sub_y + 200))  # Moved below filter boxes
+
+def draw_scroll_bar(surface, scroll_bar_rect, slider_rect, small_font):
+    # Draw scroll bar track
+    pygame.draw.rect(surface, (100, 100, 100), scroll_bar_rect)
+    # Draw slider
+    pygame.draw.rect(surface, (255, 255, 255), slider_rect)
+    # Draw time labels
+    start_label = small_font.render("-15 min", True, (255, 255, 255))
+    end_label = small_font.render("+15 min", True, (255, 255, 255))
+    surface.blit(start_label, (scroll_bar_rect.x, scroll_bar_rect.y + scroll_bar_rect.height + 5))
+    surface.blit(end_label, (scroll_bar_rect.x + scroll_bar_rect.width - end_label.get_width(), scroll_bar_rect.y + scroll_bar_rect.height + 5))
+
+def draw_scroll_time_display(surface, sub_x, sub_y, sub_width, sub_height, current_tt, ts, small_font):
+    radius = min(sub_width, sub_height) // 2 - 50
+    current_utc = ts.tt(jd=current_tt).utc_datetime()
+    current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
+    utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]
+    local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]
+    time_text = f"Scroll UTC: {utc_time_str}  Local: {local_time_str}"
+    time_surface = small_font.render(time_text, True, (255, 255, 255))
+    text_width, _ = small_font.size(time_text)
+    surface.blit(time_surface, (sub_x + sub_width // 2 - text_width // 2, sub_y + sub_height - 25))

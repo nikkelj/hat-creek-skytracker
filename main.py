@@ -24,9 +24,9 @@ total_height = display_info.current_h
 menu_screen = pygame.display.set_mode((total_width, total_height))
 pygame.display.set_caption("Main Menu")
 
-# Load background image for menu and icon (assume 'cli/lucky.jpg' exists)
+# Load background image for menu and icon (assume 'lucky.jpg' exists)
 try:
-    bg_image = pygame.image.load('cli/lucky.jpg')
+    bg_image = pygame.image.load('lucky.jpg')
     bg_image_menu = pygame.transform.scale(bg_image, (160, 160))  # For menu background
     bg_image_icon = pygame.transform.scale(bg_image, (32, 32))  # For icon
     pygame.display.set_icon(bg_image_icon)  # Set as program icon
@@ -37,7 +37,7 @@ except pygame.error:
     bg_image_icon = None
     negative_image = None
     rotation_angle = 0
-    print("Warning: 'cli/lucky.jpg' not found. Using fallback color and no icon.")
+    print("Warning: 'lucky.jpg' not found. Using fallback color and no icon.")
 
 font = pygame.font.Font(None, 24)
 large_font = pygame.font.Font(None, 36)
@@ -88,7 +88,7 @@ clock = pygame.time.Clock()
 # For author info
 author_bg = None
 try:
-    author_bg = pygame.image.load('cli/lucky.jpg')
+    author_bg = pygame.image.load('lucky.jpg')
 except pygame.error:
     pass
 

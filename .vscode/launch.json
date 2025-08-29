@@ -70,7 +70,7 @@
             "name": "Grok4 Multifile",
             "type": "python",
             "request": "launch",
-            "program": "grok4/main.py",
+            "program": "main.py",
             "console": "integratedTerminal",
             "python": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python",
             "justMyCode": true,

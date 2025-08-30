@@ -58,24 +58,25 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
 
 def interpolate_position(trajectory_data, current_tt):
     if not trajectory_data[0]:  # Check if trajectory is empty
-        return None, None, None
+        return None, None, None, None
     trajectory, times_array = trajectory_data
     # Find the insertion point for current_tt
     idx = np.searchsorted(times_array, current_tt) - 1
     if idx < 0:
         # Before the first point, use the first point
-        return trajectory[0][4], trajectory[0][5], trajectory[0][1]
+        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3]
     elif idx >= len(times_array) - 1:
         # After the last point, use the last point
-        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1]
+        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3]
     else:
         # Linear interpolation between idx and idx+1
         t0 = times_array[idx]
         t1 = times_array[idx + 1]
         fraction = (current_tt - t0) / (t1 - t0)
-        px0, py0, alt0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1]
-        px1, py1, alt1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1]
+        px0, py0, alt0, dist0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3]
+        px1, py1, alt1, dist1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3]
         px = px0 + fraction * (px1 - px0)
         py = py0 + fraction * (py1 - py0)
         alt = alt0 + fraction * (alt1 - alt0)
-        return px, py, alt
+        dist = dist0 + fraction * (dist1 - dist0)
+        return px, py, alt, dist

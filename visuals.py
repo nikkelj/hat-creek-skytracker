@@ -139,7 +139,7 @@ def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, l
                 pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
 
 def draw_satellites(surface, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy):
-    for sat, (px, py, alt) in satellite_positions.items():
+    for sat, (px, py, alt, _) in satellite_positions.items():
         mean_altitude = satellite_mean_altitudes.get(sat, 0.0)
         eccentricity = sat.model.ecco
         if 2000 < mean_altitude <= 35786:  # MEO
@@ -246,7 +246,7 @@ def draw_legend(surface, legend_x, legend_y, small_font):
     geo_label = small_font.render("GEO (Purple)", True, (255, 255, 255))
     surface.blit(geo_label, (legend_x + 40, legend_y + 105))
 
-def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font):
+def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font, satellite_perigee=None, satellite_apogee=None, satellite_positions=None):
     if (hovered_satellite or selected_satellite):
         sat = selected_satellite if selected_satellite else hovered_satellite
         epoch_dt = sat.epoch.utc_datetime().strftime("%Y-%m-%d %H:%M:%S")
@@ -262,7 +262,15 @@ def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_
             f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
             f"Rev Number: {sat.model.revnum}"
         ]
-        details_rect = pygame.Rect(sub_x + sub_width - 250, sub_y + 20, 230, 200)
+        dist = satellite_positions[sat][3] if satellite_positions and sat in satellite_positions else None
+        if ((selected_satellite or hovered_satellite) and satellite_perigee and satellite_apogee):
+            details.extend([
+                f"Apogee Altitude (km): {satellite_apogee[sat]:.1f}",
+                f"Perigee Altitude (km): {satellite_perigee[sat]:.1f}"
+            ])
+        if ((selected_satellite or hovered_satellite) and dist is not None):
+            details.append(f"Slant Range (km): {dist:.1f}")
+        details_rect = pygame.Rect(sub_x + sub_width - 250, sub_y + 20, 230, 250)
         pygame.draw.rect(surface, (50, 50, 50), details_rect)  # Dark grey background
         pygame.draw.rect(surface, (0, 0, 0), details_rect, 2)  # Black border
         for i, line in enumerate(details):

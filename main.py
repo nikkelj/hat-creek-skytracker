@@ -237,6 +237,8 @@ except Exception as e:
 # Pre-compute satellite labels and mean altitudes
 satellite_labels = {}
 satellite_mean_altitudes = {}
+satellite_perigee = {}
+satellite_apogee = {}
 MU = 3.986004418e14  # Earth's gravitational parameter in m^3/s^2
 R_EARTH = 6371  # Earth radius in km
 for sat in satellites:
@@ -252,7 +254,9 @@ for sat in satellites:
     apogee = a * (1 + e) - R_EARTH  # Apogee altitude in km
     mean_altitude = (perigee + apogee) / 2
     satellite_mean_altitudes[sat] = mean_altitude
-    print(f"Debug: Satellite {label_text} mean altitude: {mean_altitude:.1f} km")
+    satellite_perigee[sat] = perigee
+    satellite_apogee[sat] = apogee
+    print(f"Debug: Satellite {label_text} mean altitude: {mean_altitude:.1f} km perigee: {perigee:.1f} km apogee: {apogee:.1f} km")
 
 last_update_time = 0
 update_interval = 0.1  # Target 10 Hz
@@ -322,13 +326,13 @@ while running:
                 slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
         if selected_satellite:
             if selected_satellite in satellite_trajectories:
-                px, py, alt = interpolate_position(satellite_trajectories[selected_satellite], current_tt)
+                px, py, alt, dist = interpolate_position(satellite_trajectories[selected_satellite], current_tt)
                 if px is not None and alt > float(elevation_mask_str or 0):
-                    satellite_positions[selected_satellite] = (px, py, alt)
+                    satellite_positions[selected_satellite] = (px, py, alt, dist)
         else:
             for sat in satellites:
                 if sat in satellite_trajectories:
-                    px, py, alt = interpolate_position(satellite_trajectories[sat], current_tt)
+                    px, py, alt, dist = interpolate_position(satellite_trajectories[sat], current_tt)
                     if px is not None and alt > float(elevation_mask_str or 0):
                         # Apply filters
                         include_sat = True
@@ -347,7 +351,7 @@ while running:
                             except ValueError:
                                 include_sat = False
                         if include_sat:
-                            satellite_positions[sat] = (px, py, alt)
+                            satellite_positions[sat] = (px, py, alt, dist)
         last_update_time = current_time
 
     # Handle events
@@ -442,12 +446,12 @@ while running:
                     else:
                         deselected = False
                         if selected_satellite:
-                            px, py, _ = satellite_positions.get(selected_satellite, (0, 0, 0))
+                            px, py, _, _ = satellite_positions.get(selected_satellite, (0, 0, 0, 0))
                             if math.hypot(px - pos[0], py - pos[1]) < 10:
                                 selected_satellite = None
                                 deselected = True
                         if not deselected:
-                            for sat, (px, py, _) in satellite_positions.items():
+                            for sat, (px, py, _, _) in satellite_positions.items():
                                 if math.hypot(px - pos[0], py - pos[1]) < 10:
                                     selected_satellite = sat
                                     break
@@ -464,7 +468,7 @@ while running:
                     if dragging_slider:
                         slider_rect.x = max(scroll_bar_rect.x, min(event.pos[0] - slider_rect.width // 2, scroll_bar_rect.x + scroll_bar_rect.width - slider_rect.width))
                     hovered_satellite = None
-                    for sat, (px, py, _) in satellite_positions.items():
+                    for sat, (px, py, _, _) in satellite_positions.items():
                         if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
                             hovered_satellite = sat
                             break
@@ -692,7 +696,7 @@ while running:
         draw_satellites(menu_screen, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy)
         draw_filters(menu_screen, filter_rect, filter_above_alt_rect, filter_below_alt_rect, filter_text, filter_above_alt_text, filter_below_alt_text, focused_field, cursor_pos, selection_start, small_font)
         draw_legend(menu_screen, legend_x, legend_y, small_font)
-        draw_details(menu_screen, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font)
+        draw_details(menu_screen, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font, satellite_perigee, satellite_apogee, satellite_positions)
         draw_time_display(menu_screen, sub_x, sub_y, sub_height, small_font)
         draw_satellite_count(menu_screen, sub_x, sub_y, satellite_positions, small_font)
         draw_button(menu_screen, clear_filters_button, "Clear Filters", button_states["clear_filters"])

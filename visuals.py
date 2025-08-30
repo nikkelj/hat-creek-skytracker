@@ -1,7 +1,9 @@
 import math
 import pygame
+import numpy as np
 from datetime import datetime, timedelta
 from utils import get_altitude_color, draw_button
+from skyfield.api import wgs84, load
 
 def draw_hexagon(surface, x, y, color, size=5):
     points = [(x + size * math.cos(math.radians(60 * i)), y + size * math.sin(math.radians(60 * i))) for i in range(6)]
@@ -11,7 +13,7 @@ def draw_triangle(surface, x, y, color, size=5):
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
 
-def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts=None, current_tt=None, satellite_trajectories=None, satellite_positions=None, satellite_labels=None, satellite_mean_altitudes=None, selected_satellite=None, satellite_arc_segments=None, filter_text="", filter_above_alt_text="", legend_x=None, legend_y=None, clear_filters_button=None, tle_loaded=False):
+def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts=None, current_tt=None, satellite_trajectories=None, satellite_positions=None, satellite_labels=None, satellite_mean_altitudes=None, selected_satellite=None, satellite_arc_segments=None, filter_text="", filter_above_alt_text="", legend_x=None, legend_y=None, clear_filters_button=None, tle_loaded=False, obs_lat=0, obs_lon=0, obs_alt=0, obs_elevation_mask=0):
     # Draw gradient background for config options
     if ts is None:
         for y in range(sub_height):
@@ -135,8 +137,80 @@ def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, l
                     surface.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
         # Draw precomputed arc segments for selected satellite
         if selected_satellite and tle_loaded and selected_satellite in satellite_arc_segments:
-            for x0, y0, x1, y1, color in satellite_arc_segments[selected_satellite]:
-                pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+            # Redraw selected satellite's arc segments with sunlit detection
+            if selected_satellite in satellite_arc_segments and satellite_trajectories and selected_satellite in satellite_trajectories:
+                trajectory_data, times_array = satellite_trajectories[selected_satellite]
+
+                # Set up observer and sun for sunlit calculation
+                try:
+                    observer = wgs84.latlon(obs_lat or 0, obs_lon or 0, elevation_m=obs_alt or 0)
+
+                    # Load sun ephemeris
+                    sun_ephemeris = load('de421.bsp')['sun']
+
+                    # Create Skyfield Time objects for current trajectory times
+                    skyfield_times = []
+                    for tt_time in times_array:
+                        skyfield_times.append(ts.tt(jd=tt_time))
+
+                    # Calculate sunlit status for each trajectory point
+                    sunlit_status = []
+                    for st in skyfield_times:
+                        try:
+                            # Get satellite position and sun position
+                            sat_pos = selected_satellite.at(st)
+                            sun_pos = sun_ephemeris.at(st)
+
+                            # Calculate vectors
+                            sat_to_sun = (sun_pos.position.km - sat_pos.position.km)
+                            sat_to_center = -sat_pos.position.km  # Vector from satellite to Earth center
+
+                            # Calculate angle between sun vector and Earth center vector
+                            dot_product = np.dot(sat_to_sun, sat_to_center)
+                            mag_sat_sun = np.linalg.norm(sat_to_sun)
+                            mag_sat_center = np.linalg.norm(sat_to_center)
+
+                            if mag_sat_sun > 0 and mag_sat_center > 0:
+                                cos_angle = dot_product / (mag_sat_sun * mag_sat_center)
+                                angle = math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
+                                # If the satellite is closer to the sun-side relative to Earth, it's sunlit
+                                # Invert the logic: if angle > 90°, then the sun is on the same side as the horizon
+                                is_sunlit = angle > 90.0
+                            else:
+                                is_sunlit = False
+
+                        except Exception:
+                            is_sunlit = False
+
+                        sunlit_status.append(is_sunlit)
+
+                    # Redraw segments with sunlit-aware colors
+                    segments = []
+                    current_start_time = times_array[0] if len(times_array) > 0 else 0
+
+                    for i in range(len(trajectory_data) - 1):
+                        x0, y0, x1, y1 = trajectory_data[i][4], trajectory_data[i][5], trajectory_data[i + 1][4], trajectory_data[i + 1][5]
+                        alt = trajectory_data[i][1]
+
+                        if alt > 0:  # Above horizon
+                            is_future = times_array[i] > current_tt if current_tt else False
+                            is_sunlit = sunlit_status[i] if i < len(sunlit_status) else False
+
+                            if is_future:
+                                color = (255, 255, 0) if is_sunlit else (255, 0, 0)  # Yellow for sunlit future, red for shadowed
+                            else:
+                                color = (128, 128, 128)  # Grey for past
+
+                            pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+
+                except Exception as e:
+                    # Fallback to default arc segments if sunlit calculation fails
+                    for x0, y0, x1, y1, color in satellite_arc_segments[selected_satellite]:
+                        pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+            else:
+                # Default drawing if no trajectory data available
+                for x0, y0, x1, y1, color in satellite_arc_segments[selected_satellite]:
+                    pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
 
 def draw_satellites(surface, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy):
     for sat, (px, py, alt, _) in satellite_positions.items():
@@ -313,3 +387,96 @@ def draw_scroll_time_display(surface, sub_x, sub_y, sub_width, sub_height, curre
     time_surface = small_font.render(time_text, True, (255, 255, 255))
     text_width, _ = small_font.size(time_text)
     surface.blit(time_surface, (sub_x + sub_width // 2 - text_width // 2, sub_y + sub_height - 15))
+
+def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data, selected_satellite, small_font, sort_keys=None, sort_reverse_flags=None, elevation_mask_deg=10.0):
+    """
+    Draw the satellite pass table in the lower left corner.
+    Returns a list of rectangles representing clickable areas for sorting and selection.
+    """
+    if not pass_table_data:
+        return []
+
+    # Table positioning and dimensions
+    table_x = sub_x + 10
+    table_y = sub_y + sub_height - 370  # Position above the status messages and controls, moved up 50 pixels
+    table_width = 350
+    table_height = 316  # Increased by ~2 rows to accommodate taller border
+    row_height = 18
+    header_height = 25
+
+    # Background
+    pygame.draw.rect(surface, (40, 40, 40), (table_x, table_y, table_width, table_height))
+    pygame.draw.rect(surface, (200, 200, 200), (table_x, table_y, table_width, table_height), 2)
+
+    # Column widths (Name, NORAD ID, Azimuth, Max Elevation)
+    col_widths = [120, 60, 70, 85]
+    col_x_positions = [table_x + 5, table_x + col_widths[0] + 5, table_x + col_widths[0] + col_widths[1] + 5,
+                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + 5]
+
+    # Table title
+    title_text = "Satellite Passes"
+    title_surface = small_font.render(title_text, True, (255, 255, 255))
+    surface.blit(title_surface, (table_x + 5, table_y + 5))
+
+    # Column headers
+    column_headers = ["Name", "NORAD", "Azimuth", "Max Elev"]
+    clickable_areas = []
+
+    header_y = table_y + 25
+    for i, header in enumerate(column_headers):
+        # Draw header background
+        header_bg_color = (60, 60, 60) if sort_keys and i < len(sort_keys) and sort_keys[i] else (50, 50, 50)
+        pygame.draw.rect(surface, header_bg_color, (col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5))
+
+        # Draw header text
+        header_surface = small_font.render(header, True, (255, 255, 255))
+        surface.blit(header_surface, (col_x_positions[i], header_y + 3))
+
+        # Add clickable border and area
+        header_rect = pygame.Rect(col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5)
+        pygame.draw.rect(surface, (150, 150, 150), header_rect, 1)
+        clickable_areas.append(('header', i, header_rect))
+
+    # Draw table rows
+    row_y = header_y + header_height - 5
+    for row_idx, pass_entry in enumerate(pass_table_data[:15]):  # Limit to 15 rows maximum
+        # Alternate row colors
+        if row_idx % 2 == 0:
+            row_bg_color = (45, 45, 45)
+        else:
+            row_bg_color = (35, 35, 35)
+
+        # Highlight selected satellite's row
+        if selected_satellite and pass_entry['satellite'] == selected_satellite:
+            row_bg_color = (80, 100, 120)  # Blue highlight for selected
+
+        # Draw row background
+        pygame.draw.rect(surface, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
+
+        # Draw cell contents
+        cell_values = [
+            pass_entry['name'][:20],  # Truncate long names
+            pass_entry['norad_id'],
+            f"{pass_entry['azimuth_at_max']:.0f}°",
+            f"{pass_entry['max_elevation']:.1f}°"
+        ]
+
+        for col_idx, value in enumerate(cell_values):
+            # Draw cell text
+            value_surface = small_font.render(value, True, (255, 255, 255))
+            surface.blit(value_surface, (col_x_positions[col_idx], row_y + 2))
+
+        # Add row clickable area for selection
+        row_rect = pygame.Rect(table_x + 3, row_y, table_width - 6, row_height)
+        pygame.draw.rect(surface, (100, 100, 100), row_rect, 1)
+        clickable_areas.append(('row', row_idx, row_rect))
+
+        row_y += row_height
+
+    # Add info text about sorting in title row, right-justified
+    info_text = f"Sorted by: {['Name', 'NORAD', 'Azimuth', 'Max Elev'][sort_keys.index(True) if sort_keys and True in sort_keys else 3]} ({'Desc' if sort_reverse_flags and sort_reverse_flags[sort_keys.index(True) if sort_keys and True in sort_keys else 3] else 'Asc'})"
+    info_surface = small_font.render(info_text, True, (180, 180, 180))
+    info_x = table_x + table_width - info_surface.get_width() - 5  # Right-justified
+    surface.blit(info_surface, (info_x, table_y + 5))  # Same Y as title
+
+    return clickable_areas

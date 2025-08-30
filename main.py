@@ -10,9 +10,9 @@ from skyfield.api import wgs84, load, utc
 from datetime import datetime, timedelta, timezone
 import numpy as np
 from utils import draw_button, create_negative_image
-from trajectory import precompute_trajectories, interpolate_position
+from trajectory import precompute_trajectories, interpolate_position, clear_trajectory_cache, build_satellite_pass_table, sort_pass_table
 from config import load_config, save_config, handle_input
-from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display
+from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table
 
 # Initialize Pygame and set up the display
 os.environ['SDL_VIDEO_WINDOW_POS'] = "0,0"
@@ -280,6 +280,12 @@ satellite_arc_segments = {}
 hovered_satellite = None
 selected_satellite = None
 
+# Satellite pass table variables
+satellite_pass_table = []
+table_sort_keys = [False, False, False, True]  # Default: sort by max elevation (index 3)
+table_sort_reverse = [True, True, True, True]  # Default: descending for all
+pass_table_clickable_areas = []
+
 # Callback function for status updates during trajectory precomputation
 def update_status_callback(message):
     status_messages.append(message)
@@ -327,6 +333,45 @@ while running:
 
             update_status_callback("Recomputing trajectories...")
             satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback, center_time, duration_minutes)
+
+            # Build satellite pass table
+            satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+            # Apply filters to pass table
+            filtered_pass_table = []
+            for pass_entry in satellite_pass_table:
+                sat = pass_entry['satellite']
+                include_sat = True
+
+                # Apply name/NORAD filter
+                if filter_text:
+                    include_sat = include_sat and (
+                        filter_text.lower() in sat.name.lower() or
+                        filter_text in sat.model.satnum_str
+                    )
+
+                # Apply altitude above filter
+                if filter_above_alt_text and include_sat:
+                    try:
+                        alt_filter = float(filter_above_alt_text)
+                        sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                        include_sat = include_sat and sat_alt >= alt_filter
+                    except ValueError:
+                        include_sat = False
+
+                # Apply altitude below filter
+                if filter_below_alt_text and include_sat:
+                    try:
+                        alt_filter = float(filter_below_alt_text)
+                        sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                        include_sat = include_sat and sat_alt <= alt_filter
+                    except ValueError:
+                        include_sat = False
+
+                if include_sat:
+                    filtered_pass_table.append(pass_entry)
+
+            satellite_pass_table = sort_pass_table(filtered_pass_table, table_sort_keys, table_sort_reverse)
+
             last_trajectory_update = current_time
             update_status_callback("Trajectories recomputed")
             selected_satellite = None
@@ -356,6 +401,45 @@ while running:
         scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"
 
         satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback)
+
+        # Build satellite pass table
+        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+        # Apply filters to pass table
+        filtered_pass_table = []
+        for pass_entry in satellite_pass_table:
+            sat = pass_entry['satellite']
+            include_sat = True
+
+            # Apply name/NORAD filter
+            if filter_text:
+                include_sat = include_sat and (
+                    filter_text.lower() in sat.name.lower() or
+                    filter_text in sat.model.satnum_str
+                )
+
+            # Apply altitude above filter
+            if filter_above_alt_text and include_sat:
+                try:
+                    alt_filter = float(filter_above_alt_text)
+                    sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                    include_sat = include_sat and sat_alt >= alt_filter
+                except ValueError:
+                    include_sat = False
+
+            # Apply altitude below filter
+            if filter_below_alt_text and include_sat:
+                try:
+                    alt_filter = float(filter_below_alt_text)
+                    sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                    include_sat = include_sat and sat_alt <= alt_filter
+                except ValueError:
+                    include_sat = False
+
+            if include_sat:
+                filtered_pass_table.append(pass_entry)
+
+        satellite_pass_table = sort_pass_table(filtered_pass_table, table_sort_keys, table_sort_reverse)
+
         last_trajectory_update = current_time
         update_status_callback("Trajectories updated")
         # Initialize slider to current time
@@ -471,6 +555,9 @@ while running:
                         selection_start["filter_above_alt"] = None
                         selection_start["filter_below_alt"] = None
                         selected_satellite = None
+                        # Re-build satellite pass table to remove filters
+                        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+                        satellite_pass_table = sort_pass_table(satellite_pass_table, table_sort_keys, table_sort_reverse)
                     elif pause_button.collidepoint(pos):
                         button_states["pause"]["clicked"] = True
                         paused = True
@@ -517,17 +604,44 @@ while running:
                         selection_start["duration"] = None
                         status_messages.append("Reset to current time (30 min duration)")
                     else:
-                        deselected = False
-                        if selected_satellite:
-                            px, py, _, _ = satellite_positions.get(selected_satellite, (0, 0, 0, 0))
-                            if math.hypot(px - pos[0], py - pos[1]) < 10:
-                                selected_satellite = None
-                                deselected = True
-                        if not deselected:
-                            for sat, (px, py, _, _) in satellite_positions.items():
+                        # Check pass table clicks
+                        table_clicked = False
+                        if hasattr(pass_table_clickable_areas, '__iter__'):
+                            for area_type, index, rect in pass_table_clickable_areas:
+                                if rect.collidepoint(pos):
+                                    table_clicked = True
+                                    if area_type == 'row' and satellite_pass_table and index < len(satellite_pass_table):
+                                        # Select satellite from pass table
+                                        selected_satellite = satellite_pass_table[index]['satellite']
+                                        status_messages.append(f"Selected: {satellite_pass_table[index]['name']}")
+                                    elif area_type == 'header':
+                                        # Sort by column
+                                        if sort_keys and index < len(sort_keys):
+                                            # Toggle sort direction if same column, otherwise set new sort
+                                            if sort_keys[index]:
+                                                table_sort_reverse[index] = not table_sort_reverse[index]
+                                            else:
+                                                # Reset all sort keys
+                                                table_sort_keys = [False] * len(table_sort_keys)
+                                                table_sort_keys[index] = True
+                                                table_sort_reverse = [False] * len(table_sort_reverse)
+                                                table_sort_reverse[index] = True
+                                            # Re-sort the table
+                                            satellite_pass_table = sort_pass_table(satellite_pass_table, table_sort_keys, table_sort_reverse)
+                                        break
+
+                        if not table_clicked:
+                            deselected = False
+                            if selected_satellite:
+                                px, py, _, _ = satellite_positions.get(selected_satellite, (0, 0, 0, 0))
                                 if math.hypot(px - pos[0], py - pos[1]) < 10:
-                                    selected_satellite = sat
-                                    break
+                                    selected_satellite = None
+                                    deselected = True
+                            if not deselected:
+                                for sat, (px, py, _, _) in satellite_positions.items():
+                                    if math.hypot(px - pos[0], py - pos[1]) < 10:
+                                        selected_satellite = sat
+                                        break
             elif event.type == pygame.MOUSEMOTION:
                 for btn in buttons:
                     button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
@@ -882,13 +996,52 @@ while running:
         draw_polar_plot(menu_screen, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states)
     elif current_mode == "tracking_vis" and tle_loaded:
         menu_screen.fill((0, 0, 0), (sub_x, sub_y, sub_width, sub_height))  # Clear the subplot area with black
-        draw_polar_plot(menu_screen, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts, current_tt, satellite_trajectories, satellite_positions, satellite_labels, satellite_mean_altitudes, selected_satellite, satellite_arc_segments, filter_text, filter_above_alt_text, legend_x, legend_y, clear_filters_button, tle_loaded=tle_loaded)
+        draw_polar_plot(menu_screen, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts, current_tt, satellite_trajectories, satellite_positions, satellite_labels, satellite_mean_altitudes, selected_satellite, satellite_arc_segments, filter_text, filter_above_alt_text, legend_x, legend_y, clear_filters_button, tle_loaded=tle_loaded, obs_lat=float(lat_str or 0), obs_lon=float(lon_str or 0), obs_alt=float(alt_str or 0))
         draw_satellites(menu_screen, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy)
         draw_filters(menu_screen, filter_rect, filter_above_alt_rect, filter_below_alt_rect, filter_text, filter_above_alt_text, filter_below_alt_text, focused_field, cursor_pos, selection_start, small_font)
         draw_legend(menu_screen, legend_x, legend_y, small_font)
         draw_details(menu_screen, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font, satellite_perigee, satellite_apogee, satellite_positions)
         draw_time_display(menu_screen, sub_x, sub_y, sub_height, small_font)
-        draw_satellite_count(menu_screen, sub_x, sub_y, satellite_positions, small_font)
+        draw_satellite_count(menu_screen, sub_x, sub_y + 240, satellite_positions, small_font)
+        # Filter pass table in realtime based on current filter settings
+        filtered_pass_table = []
+        for pass_entry in satellite_pass_table:
+            sat = pass_entry['satellite']
+            include_sat = True
+
+            # Apply name/NORAD filter
+            if filter_text:
+                include_sat = include_sat and (
+                    filter_text.lower() in sat.name.lower() or
+                    filter_text in sat.model.satnum_str
+                )
+
+            # Apply altitude above filter
+            if filter_above_alt_text and include_sat:
+                try:
+                    alt_filter = float(filter_above_alt_text)
+                    sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                    include_sat = include_sat and sat_alt >= alt_filter
+                except ValueError:
+                    include_sat = False
+
+            # Apply altitude below filter
+            if filter_below_alt_text and include_sat:
+                try:
+                    alt_filter = float(filter_below_alt_text)
+                    sat_alt = satellite_mean_altitudes.get(sat, 0.0)
+                    include_sat = include_sat and sat_alt <= alt_filter
+                except ValueError:
+                    include_sat = False
+
+            if include_sat:
+                filtered_pass_table.append(pass_entry)
+
+        # Apply sorting to filtered data
+        sorted_filtered_pass_table = sort_pass_table(filtered_pass_table, table_sort_keys, table_sort_reverse)
+
+        # Draw satellite pass table
+        pass_table_clickable_areas = draw_satellite_pass_table(menu_screen, sub_x, sub_y, sub_height, sorted_filtered_pass_table, selected_satellite, small_font, table_sort_keys, table_sort_reverse)
         draw_button(menu_screen, clear_filters_button, "Clear Filters", button_states["clear_filters"])
         draw_button(menu_screen, pause_button, "Pause", button_states["pause"])
         draw_button(menu_screen, play_button, "Play", button_states["play"])

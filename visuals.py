@@ -130,7 +130,7 @@ def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, l
                 elif az_deg == 90:  # East
                     surface.blit(direction_label, (cx + radius + 10, cy - direction_label.get_height() // 2))
                 elif az_deg == 180:  # South
-                    surface.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 10))
+                    surface.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 5))
                 elif az_deg == 270:  # West
                     surface.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
         # Draw precomputed arc segments for selected satellite
@@ -260,7 +260,7 @@ def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_
             f"Arg. of Perigee (deg): {math.degrees(sat.model.argpo):.2f}",
             f"Mean Anomaly (deg): {math.degrees(sat.model.mo):.2f}",
             f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
-            f"Rev Number: {sat.model.revnum}"
+            f"Rev Number: {sat.model.revnum}",
         ]
         dist = satellite_positions[sat][3] if satellite_positions and sat in satellite_positions else None
         if ((selected_satellite or hovered_satellite) and satellite_perigee and satellite_apogee):
@@ -290,16 +290,16 @@ def draw_satellite_count(surface, sub_x, sub_y, satellite_positions, small_font)
     sat_count = len(satellite_positions)
     count_text = f"Satellites in view: {sat_count}"
     count_surface = small_font.render(count_text, True, (255, 255, 255))
-    surface.blit(count_surface, (sub_x + 10, sub_y + 200))  # Moved below filter boxes
+    surface.blit(count_surface, (sub_x + 10, sub_y + 240))  # Moved below filter boxes
 
-def draw_scroll_bar(surface, scroll_bar_rect, slider_rect, small_font):
+def draw_scroll_bar(surface, scroll_bar_rect, slider_rect, small_font, start_label_text="-15 min", end_label_text="+15 min"):
     # Draw scroll bar track
     pygame.draw.rect(surface, (100, 100, 100), scroll_bar_rect)
     # Draw slider
     pygame.draw.rect(surface, (255, 255, 255), slider_rect)
     # Draw time labels
-    start_label = small_font.render("-15 min", True, (255, 255, 255))
-    end_label = small_font.render("+15 min", True, (255, 255, 255))
+    start_label = small_font.render(start_label_text, True, (255, 255, 255))
+    end_label = small_font.render(end_label_text, True, (255, 255, 255))
     surface.blit(start_label, (scroll_bar_rect.x, scroll_bar_rect.y + scroll_bar_rect.height + 5))
     surface.blit(end_label, (scroll_bar_rect.x + scroll_bar_rect.width - end_label.get_width(), scroll_bar_rect.y + scroll_bar_rect.height + 5))
 
@@ -312,4 +312,4 @@ def draw_scroll_time_display(surface, sub_x, sub_y, sub_width, sub_height, curre
     time_text = f"Scroll UTC: {utc_time_str}  Local: {local_time_str}"
     time_surface = small_font.render(time_text, True, (255, 255, 255))
     text_width, _ = small_font.size(time_text)
-    surface.blit(time_surface, (sub_x + sub_width // 2 - text_width // 2, sub_y + sub_height - 25))
+    surface.blit(time_surface, (sub_x + sub_width // 2 - text_width // 2, sub_y + sub_height - 15))

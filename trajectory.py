@@ -3,10 +3,16 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import math
 
-def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback=None):
-    current_utc = datetime.now(timezone.utc)
-    t0 = ts.utc(current_utc - timedelta(minutes=15))
-    t1 = ts.utc(current_utc + timedelta(minutes=15))
+def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback=None, center_time=None, duration_minutes=15):
+    if center_time is not None:
+        # Use the provided center time and duration
+        t0 = ts.utc(center_time - timedelta(minutes=duration_minutes/2))
+        t1 = ts.utc(center_time + timedelta(minutes=duration_minutes/2))
+    else:
+        # Default behavior: current time with 15 minutes on each side
+        current_utc = datetime.now(timezone.utc)
+        t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes/2))
+        t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes/2))
     times = ts.linspace(t0, t1, 1801)  # 1-second intervals over 30 minutes (1800 intervals + 1)
     trajectories = {}
     arc_segments = {}
@@ -17,7 +23,7 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
     for i, sat in enumerate(satellites):
         if sat in satellite_labels:
             if update_status_callback and (i + 1) % 1000 == 0:
-                update_status_callback(f"Computed trajectories for {i+1}/{total_sats} satellites...")
+                update_status_callback(f"Computed traj for {i+1}/{total_sats} sats...")
             difference = sat - observer
             topocentrics = difference.at(times)
             alts, azs, distances = topocentrics.altaz()

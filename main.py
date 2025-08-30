@@ -7,7 +7,7 @@ import math
 from tkinter import Tk
 from tkinter import filedialog
 from skyfield.api import wgs84, load, utc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 from utils import draw_button, create_negative_image
 from trajectory import precompute_trajectories, interpolate_position
@@ -58,14 +58,18 @@ input_rects = {
 }
 save_button = pygame.Rect(sub_x + 20, sub_y + sub_height - 50, 100, 30)
 load_button = pygame.Rect(sub_x + 130, sub_y + sub_height - 50, 100, 30)
-clear_filters_button = pygame.Rect(sub_x + 250, sub_y + 30, 100, 30)  # Aligned with Name Filter
-filter_rect = pygame.Rect(sub_x + 10, sub_y + 30, 200, 30)  # Name Filter
-filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt
-filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt
-scroll_bar_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 50, 2 * radius, 20)  # Scroll bar below polar plot
-slider_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 50, 20, 20)  # Slider
-pause_button = pygame.Rect(sub_x + sub_width // 2 + radius + 10, sub_y + sub_height - 50, 60, 30)  # Pause button
-play_button = pygame.Rect(sub_x + sub_width // 2 + radius + 80, sub_y + sub_height - 50, 60, 30)  # Play button
+clear_filters_button = pygame.Rect(sub_x + 10, sub_y + 30, 100, 30)  # Aligned with Name Filter
+recompute_button = pygame.Rect(sub_x + 120, sub_y + 30, 100, 30)  # Recompute Trajectories
+reset_button = pygame.Rect(sub_x + 230, sub_y + 30, 80, 30)  # Reset
+center_time_rect = pygame.Rect(sub_x + 140, sub_y + 90, 130, 30)  # Center Time ISO
+duration_rect = pygame.Rect(sub_x + 140, sub_y + 140, 130, 30)  # Duration Minutes
+filter_rect = pygame.Rect(sub_x + 10, sub_y + 70, 100, 30)  # Name Filter
+filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 130, 100, 30)  # Filter Above Alt
+filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 185, 100, 30)  # Filter Below Alt
+scroll_bar_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 35, 2 * radius, 10)  # Scroll bar below polar plot
+slider_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 35, 20, 10)  # Slider
+pause_button = pygame.Rect(sub_x + sub_width // 2 + radius + 10, sub_y + sub_height - 45, 60, 30)  # Pause button
+play_button = pygame.Rect(sub_x + sub_width // 2 + radius + 80, sub_y + sub_height - 45, 60, 30)  # Play button
 legend_x = sub_x + sub_width - 170
 legend_y = sub_y + sub_height - 160
 
@@ -96,8 +100,10 @@ except pygame.error:
 config = load_config()
 lat_str, lon_str, alt_str, elevation_mask_str = config["lat"], config["lon"], config["alt"], config["elevation_mask"]
 focused_field = None
-cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0}
-selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None}
+cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0, "center_time": 0, "duration": 0}
+selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None, "center_time": None, "duration": None}
+center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # Initial to current UTC ISO
+duration_str = "30"  # 30 minutes
 filter_text = ""
 filter_above_alt_text = ""
 filter_below_alt_text = ""
@@ -107,12 +113,19 @@ scroll_start = None
 dragging_slider = False
 t0 = None
 t1 = None
+recompute_triggered = False
+
+# Scroll bar labels (global variables to persist between updates)
+scroll_bar_start_label = "-15.0 min"
+scroll_bar_end_label = "+15.0 min"
 
 # Button states for embossment
 button_states = {btn["mode"]: {"hover": False, "clicked": False} for btn in buttons}
 button_states["save"] = {"hover": False, "clicked": False}
 button_states["load"] = {"hover": False, "clicked": False}
 button_states["clear_filters"] = {"hover": False, "clicked": False}
+button_states["recompute"] = {"hover": False, "clicked": False}
+button_states["reset"] = {"hover": False, "clicked": False}
 button_states["pause"] = {"hover": False, "clicked": False}
 button_states["play"] = {"hover": False, "clicked": False}
 
@@ -289,10 +302,41 @@ while running:
     mouse_pos = pygame.mouse.get_pos()
     # Check if mouse is over the background image
     image_rect = pygame.Rect((menu_width - 160) // 2, image_y, 160, 160) if bg_image_menu else None
-    # Define filter rectangles inside the loop to ensure they are always current
-    filter_rect = pygame.Rect(sub_x + 10, sub_y + 30, 200, 30)  # Name Filter
-    filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 90, 200, 30)  # Filter Above Alt
-    filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 200, 30)  # Filter Below Alt
+    # Define rectangles inside the loop to ensure they are always current
+    filter_rect = pygame.Rect(sub_x + 10, sub_y + 90, 100, 30)  # Name Filter
+    filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 100, 30)  # Filter Above Alt
+    filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 195, 100, 30)  # Filter Below Alt
+    center_time_rect = pygame.Rect(sub_x + 140, sub_y + 90, 130, 30)  # Center Time ISO
+    duration_rect = pygame.Rect(sub_x + 140, sub_y + 140, 130, 30)  # Duration Minutes
+
+    if recompute_triggered and tle_loaded:
+        try:
+            center_time_obj = datetime.fromisoformat(center_time_str.replace('Z', '+00:00'))
+            center_time = center_time_obj.replace(tzinfo=timezone.utc)
+            duration_minutes = float(duration_str)
+            lat = float(lat_str or 0)
+            lon = float(lon_str or 0)
+            alt_m = float(alt_str or 0)
+            observer = wgs84.latlon(lat, lon, elevation_m=alt_m)
+            t0 = ts.utc((center_time - timedelta(minutes=duration_minutes / 2)))
+            t1 = ts.utc((center_time + timedelta(minutes=duration_minutes / 2)))
+
+            # Update scroll bar time range labels
+            scroll_bar_start_label = "-" + str(duration_minutes/2) + " min"
+            scroll_bar_end_label = "+" + str(duration_minutes/2) + " min"
+
+            update_status_callback("Recomputing trajectories...")
+            satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback, center_time, duration_minutes)
+            last_trajectory_update = current_time
+            update_status_callback("Trajectories recomputed")
+            selected_satellite = None
+            paused = False
+            paused_tt = None
+            fraction = max(0.0, min(1.0, (ts.now().tt - t0.tt) / (t1.tt - t0.tt)))
+            slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
+        except Exception as e:
+            update_status_callback(f"Error recomputing: {str(e)}")
+        recompute_triggered = False
 
     # Precompute trajectories and arc segments every 15 minutes
     if current_time - last_trajectory_update >= trajectory_interval:
@@ -301,8 +345,16 @@ while running:
         lon = float(lon_str or 0)
         alt_m = float(alt_str or 0)
         observer = wgs84.latlon(lat, lon, elevation_m=alt_m)
-        t0 = ts.utc((datetime.utcnow() - timedelta(minutes=15)).replace(tzinfo=utc))
-        t1 = ts.utc((datetime.utcnow() + timedelta(minutes=15)).replace(tzinfo=utc))
+        # Use current time as center and user-specified duration
+        duration_minutes_auto = float(duration_str) if duration_str else 30.0
+        current_utc = datetime.now(timezone.utc)
+        t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes_auto/2))
+        t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes_auto/2))
+
+        # Update scroll bar time range labels based on the duration being used
+        scroll_bar_start_label = "-" + str(duration_minutes_auto/2) + " min"
+        scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"
+
         satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback)
         last_trajectory_update = current_time
         update_status_callback("Trajectories updated")
@@ -371,8 +423,8 @@ while running:
                             current_mode = btn["mode"]
                             button_states[current_mode]["clicked"] = True
                             focused_field = None
-                            cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0}
-                            selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None}
+                            cursor_pos = {"lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0, "filter": 0, "filter_above_alt": 0, "filter_below_alt": 0, "center_time": 0, "duration": 0}
+                            selection_start = {"lat": None, "lon": None, "alt": None, "elevation_mask": None, "filter": None, "filter_above_alt": None, "filter_below_alt": None, "center_time": None, "duration": None}
                 if current_mode == "config_options":
                     if save_button.collidepoint(pos):
                         button_states["save"]["clicked"] = True
@@ -443,6 +495,27 @@ while running:
                         focused_field = 'filter_below_alt'
                         cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
                         selection_start['filter_below_alt'] = None
+                    elif center_time_rect.collidepoint(pos):
+                        focused_field = 'center_time'
+                        cursor_pos['center_time'] = len(center_time_str)
+                        selection_start['center_time'] = None
+                    elif duration_rect.collidepoint(pos):
+                        focused_field = 'duration'
+                        cursor_pos['duration'] = len(duration_str)
+                        selection_start['duration'] = None
+                    elif recompute_button.collidepoint(pos):
+                        recompute_triggered = True
+                        button_states["recompute"]["clicked"] = True
+                    elif reset_button.collidepoint(pos):
+                        button_states["reset"]["clicked"] = True
+                        # Reset to current UTC time and default 30 minute duration
+                        center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        duration_str = "30"
+                        cursor_pos["center_time"] = len(center_time_str)
+                        cursor_pos["duration"] = len(duration_str)
+                        selection_start["center_time"] = None
+                        selection_start["duration"] = None
+                        status_messages.append("Reset to current time (30 min duration)")
                     else:
                         deselected = False
                         if selected_satellite:
@@ -463,6 +536,8 @@ while running:
                     button_states["load"]["hover"] = load_button.collidepoint(event.pos)
                 elif current_mode == "tracking_vis":
                     button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
+                    button_states["recompute"]["hover"] = recompute_button.collidepoint(event.pos)
+                    button_states["reset"]["hover"] = reset_button.collidepoint(event.pos)
                     button_states["pause"]["hover"] = pause_button.collidepoint(event.pos)
                     button_states["play"]["hover"] = play_button.collidepoint(event.pos)
                     if dragging_slider:
@@ -478,6 +553,7 @@ while running:
                 button_states["save"]["clicked"] = False
                 button_states["load"]["clicked"] = False
                 button_states["clear_filters"]["clicked"] = False
+                button_states["reset"]["clicked"] = False
                 button_states["pause"]["clicked"] = False
                 button_states["play"]["clicked"] = False
                 if dragging_slider and paused:
@@ -504,6 +580,16 @@ while running:
                             focused_field = "filter_below_alt"
                             cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
                             selection_start['filter_below_alt'] = None
+                    elif center_time_rect.collidepoint(mouse_pos):
+                        if event.key != pygame.K_TAB:
+                            focused_field = "center_time"
+                            cursor_pos['center_time'] = len(center_time_str)
+                            selection_start['center_time'] = None
+                    elif duration_rect.collidepoint(mouse_pos):
+                        if event.key != pygame.K_TAB:
+                            focused_field = "duration"
+                            cursor_pos['duration'] = len(duration_str)
+                            selection_start['duration'] = None
                     if focused_field == "filter":
                         field_str = filter_text
                         mods = pygame.key.get_mods()
@@ -556,6 +642,110 @@ while running:
                                 cursor_pos["filter"] += 1
                                 selection_start["filter"] = None
                         filter_text = field_str
+                    elif focused_field == "center_time":
+                        field_str = center_time_str
+                        mods = pygame.key.get_mods()
+                        if event.key == pygame.K_LEFT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = cursor_pos["center_time"] if selection_start["center_time"] is None else selection_start["center_time"]
+                                cursor_pos["center_time"] = max(0, cursor_pos["center_time"] - 1)
+                            else:
+                                cursor_pos["center_time"] = max(0, cursor_pos["center_time"] - 1)
+                                selection_start["center_time"] = None
+                        elif event.key == pygame.K_RIGHT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = cursor_pos["center_time"] if selection_start["center_time"] is None else selection_start["center_time"]
+                                cursor_pos["center_time"] = min(len(field_str), cursor_pos["center_time"] + 1)
+                            else:
+                                cursor_pos["center_time"] = min(len(field_str), cursor_pos["center_time"] + 1)
+                                selection_start["center_time"] = None
+                        elif event.key == pygame.K_HOME:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = cursor_pos["center_time"] if selection_start["center_time"] is None else selection_start["center_time"]
+                            cursor_pos["center_time"] = 0
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = None
+                        elif event.key == pygame.K_END:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = cursor_pos["center_time"] if selection_start["center_time"] is None else selection_start["center_time"]
+                            cursor_pos["center_time"] = len(field_str)
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["center_time"] = None
+                        elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
+                            start = min(cursor_pos["center_time"], selection_start["center_time"]) if selection_start["center_time"] is not None else cursor_pos["center_time"]
+                            end = max(cursor_pos["center_time"], selection_start["center_time"]) if selection_start["center_time"] is not None else cursor_pos["center_time"] + 1 if event.key == pygame.K_DELETE else cursor_pos["center_time"]
+                            if start < end:
+                                field_str = field_str[:start] + field_str[end:]
+                                cursor_pos["center_time"] = start
+                                selection_start["center_time"] = None
+                            elif event.key == pygame.K_BACKSPACE and cursor_pos["center_time"] > 0:
+                                field_str = field_str[:cursor_pos["center_time"] - 1] + field_str[cursor_pos["center_time"]:]
+                                cursor_pos["center_time"] -= 1
+                                selection_start["center_time"] = None
+                        elif event.key == pygame.K_RETURN:
+                            focused_field = None
+                            selection_start["center_time"] = None
+                        else:
+                            char = event.unicode
+                            if char.isalnum() or char in ['-', ':', 'T', 'Z', '.']:
+                                start = min(cursor_pos["center_time"], selection_start["center_time"]) if selection_start["center_time"] is not None else cursor_pos["center_time"]
+                                end = max(cursor_pos["center_time"], selection_start["center_time"]) if selection_start["center_time"] is not None else cursor_pos["center_time"]
+                                field_str = field_str[:start] + char + field_str[end:]
+                                cursor_pos["center_time"] += 1
+                                selection_start["center_time"] = None
+                        center_time_str = field_str
+                    elif focused_field == "duration":
+                        field_str = duration_str
+                        mods = pygame.key.get_mods()
+                        if event.key == pygame.K_LEFT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = cursor_pos["duration"] if selection_start["duration"] is None else selection_start["duration"]
+                                cursor_pos["duration"] = max(0, cursor_pos["duration"] - 1)
+                            else:
+                                cursor_pos["duration"] = max(0, cursor_pos["duration"] - 1)
+                                selection_start["duration"] = None
+                        elif event.key == pygame.K_RIGHT:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = cursor_pos["duration"] if selection_start["duration"] is None else selection_start["duration"]
+                                cursor_pos["duration"] = min(len(field_str), cursor_pos["duration"] + 1)
+                            else:
+                                cursor_pos["duration"] = min(len(field_str), cursor_pos["duration"] + 1)
+                                selection_start["duration"] = None
+                        elif event.key == pygame.K_HOME:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = cursor_pos["duration"] if selection_start["duration"] is None else selection_start["duration"]
+                            cursor_pos["duration"] = 0
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = None
+                        elif event.key == pygame.K_END:
+                            if mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = cursor_pos["duration"] if selection_start["duration"] is None else selection_start["duration"]
+                            cursor_pos["duration"] = len(field_str)
+                            if not mods & pygame.KMOD_SHIFT:
+                                selection_start["duration"] = None
+                        elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
+                            start = min(cursor_pos["duration"], selection_start["duration"]) if selection_start["duration"] is not None else cursor_pos["duration"]
+                            end = max(cursor_pos["duration"], selection_start["duration"]) if selection_start["duration"] is not None else cursor_pos["duration"] + 1 if event.key == pygame.K_DELETE else cursor_pos["duration"]
+                            if start < end:
+                                field_str = field_str[:start] + field_str[end:]
+                                cursor_pos["duration"] = start
+                                selection_start["duration"] = None
+                            elif event.key == pygame.K_BACKSPACE and cursor_pos["duration"] > 0:
+                                field_str = field_str[:cursor_pos["duration"] - 1] + field_str[cursor_pos["duration"]:]
+                                cursor_pos["duration"] -= 1
+                                selection_start["duration"] = None
+                        elif event.key == pygame.K_RETURN:
+                            focused_field = None
+                            selection_start["duration"] = None
+                        else:
+                            char = event.unicode
+                            if char.isdigit():
+                                start = min(cursor_pos["duration"], selection_start["duration"]) if selection_start["duration"] is not None else cursor_pos["duration"]
+                                end = max(cursor_pos["duration"], selection_start["duration"]) if selection_start["duration"] is not None else cursor_pos["duration"]
+                                field_str = field_str[:start] + char + field_str[end:]
+                                cursor_pos["duration"] += 1
+                                selection_start["duration"] = None
+                        duration_str = field_str
                     elif focused_field == "filter_above_alt":
                         field_str = filter_above_alt_text
                         mods = pygame.key.get_mods()
@@ -704,6 +894,34 @@ while running:
         draw_button(menu_screen, play_button, "Play", button_states["play"])
         draw_scroll_bar(menu_screen, scroll_bar_rect, slider_rect, small_font)
         draw_scroll_time_display(menu_screen, sub_x, sub_y, sub_width, sub_height, current_tt, ts, small_font)
+        # Draw Recompute Button
+        draw_button(menu_screen, recompute_button, "Update Traj", button_states["recompute"])
+        # Draw Reset Button
+        draw_button(menu_screen, reset_button, "Reset", button_states["reset"])
+        # Draw Center Time Input
+        pygame.draw.rect(menu_screen, (255, 255, 255), center_time_rect)
+        if focused_field == 'center_time':
+            pygame.draw.rect(menu_screen, (0, 0, 255), center_time_rect, 2)
+        text_surface = small_font.render(center_time_str, True, (0, 0, 0))
+        menu_screen.blit(text_surface, (center_time_rect.x + 5, center_time_rect.y + 5))
+        if focused_field == 'center_time':
+            text_width, _ = small_font.size(center_time_str[:cursor_pos['center_time']])
+            pygame.draw.line(menu_screen, (0, 0, 255), (center_time_rect.x + 5 + text_width, center_time_rect.y + 5), (center_time_rect.x + 5 + text_width, center_time_rect.y + 25), 2)
+        # Label for Center Time
+        label = small_font.render("Center Time:", True, (255, 255, 255))
+        menu_screen.blit(label, (center_time_rect.x, center_time_rect.y - 15))
+        # Draw Duration Input
+        pygame.draw.rect(menu_screen, (255, 255, 255), duration_rect)
+        if focused_field == 'duration':
+            pygame.draw.rect(menu_screen, (0, 0, 255), duration_rect, 2)
+        text_surface = small_font.render(duration_str, True, (0, 0, 0))
+        menu_screen.blit(text_surface, (duration_rect.x + 5, duration_rect.y + 5))
+        if focused_field == 'duration':
+            text_width, _ = small_font.size(duration_str[:cursor_pos['duration']])
+            pygame.draw.line(menu_screen, (0, 0, 255), (duration_rect.x + 5 + text_width, duration_rect.y + 5), (duration_rect.x + 5 + text_width, duration_rect.y + 25), 2)
+        # Label for Duration
+        label = small_font.render("Duration (min.):", True, (255, 255, 255))
+        menu_screen.blit(label, (duration_rect.x, duration_rect.y - 15))
     elif current_mode == "sensor_calib":
         sub_rect = (sub_x, sub_y, sub_width, sub_height)
         menu_screen.fill((50, 50, 50), sub_rect)

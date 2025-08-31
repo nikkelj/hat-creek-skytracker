@@ -248,7 +248,7 @@ def interpolate_position(trajectory_data, current_tt):
         dist = dist0 + fraction * (dist1 - dist0)
         return px, py, alt, dist
 
-def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0):
+def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """
     Extract pass information from a single satellite's trajectory.
     Returns pass data or None if no significant pass exists.
@@ -278,27 +278,91 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
     name = satellite.name.strip() if satellite and hasattr(satellite, 'name') else "Unknown"
     norad_id = satellite.model.satnum_str if satellite and hasattr(satellite, 'model') else "Unknown"
 
+    # Find closest approach (minimum distance) time
+    closest_time = None
+    if np.any(visible_points):
+        visible_distances = trajectory_array[visible_points, 3]  # distances for visible points
+        visible_times = trajectory_array[visible_points, 0]       # times for visible points
+
+        if len(visible_distances) > 0:
+            min_dist_idx = np.argmin(visible_distances)
+            closest_time = visible_times[min_dist_idx]
+
+    # Format closest approach time as local time string
+    closest_approach_time = "--:--"
+    if closest_time is not None:
+        try:
+            # Convert TT (Terrestrial Time) to UTC datetime
+            closest_datetime = ts.tt(jd=closest_time).utc_datetime()
+            # Convert to local time (PDT/PDT)
+            closest_datetime = closest_datetime.replace(tzinfo=timezone.utc)
+            closest_datetime = closest_datetime.astimezone()
+            closest_approach_time = closest_datetime.strftime("%H:%M")
+        except Exception:
+            closest_approach_time = "--:--"
+
     return {
         'satellite': satellite,
         'name': name,
         'norad_id': norad_id,
         'max_elevation': max_elevation,
         'azimuth_at_max': azimuth_at_max,
+        'closest_approach_time': closest_approach_time,
         'is_visible': np.any(visible_points)
     }
 
-def build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=10.0, max_rows=20):
+def build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=10.0, max_rows=20, ts=None, current_satellite_positions=None):
     """
     Build pass table data from all satellite trajectories.
+    Only includes satellites that are currently in view OR will be in view soon (future closest approach).
     Returns sorted list of pass data (default: max elevation descending).
     """
     pass_entries = []
 
+    # Get current time in local timezone for comparison
+    current_datetime = datetime.now(timezone.utc)
+    current_local = current_datetime.astimezone()
+
     for sat in satellites:
         if sat in satellite_trajectories and sat in satellite_labels:
-            pass_data = extract_pass_data_from_trajectory(satellite_trajectories[sat], sat, satellite_labels, elevation_mask_deg)
+            pass_data = extract_pass_data_from_trajectory(satellite_trajectories[sat], sat, satellite_labels, elevation_mask_deg, ts)
             if pass_data and pass_data['is_visible']:
-                pass_entries.append(pass_data)
+                # Filter for satellites that are either:
+                # 1. Currently in view (checked against satellite_positions)
+                # 2. Will be in view soon (future closest approach time)
+                include_in_table = False
+
+                # Check if satellite is currently in view
+                if current_satellite_positions and sat in current_satellite_positions:
+                    include_in_table = True
+                else:
+                    # Check if the closest approach time is in the future
+                    closest_time_str = pass_data.get('closest_approach_time', '--:--')
+                    if closest_time_str != '--:--':
+                        try:
+                            # Convert time string back to local time for comparison
+                            h, m = map(int, closest_time_str.split(':'))
+                            closest_datetime = current_local.replace(hour=h, minute=m, second=0, microsecond=0)
+
+                            # Handle case where closest time is before current time (next day)
+                            if closest_datetime < current_local:
+                                closest_datetime = closest_datetime.replace(
+                                    day=current_local.day + 1,
+                                    month=current_local.month if current_local.day < 31 else current_local.month + 1,
+                                    year=current_local.year
+                                )
+
+                            # If closest approach is within 2 hours from now, include it
+                            time_diff = closest_datetime - current_local
+                            if time_diff.total_seconds() >= 0 and time_diff.total_seconds() <= 7200:  # 7200 seconds = 2 hours
+                                include_in_table = True
+                        except (ValueError, IndexError):
+                            # If time parsing fails, check if satellite has any visibility points
+                            # This is a fallback for cases where the time format is unexpected
+                            pass
+
+                if include_in_table:
+                    pass_entries.append(pass_data)
 
     # Sort by max elevation descending by default
     pass_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
@@ -306,11 +370,63 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
     # Limit to max_rows
     return pass_entries[:max_rows]
 
-def sort_pass_table(pass_table, sort_key, reverse=False):
+def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
     """
-    Sort pass table by specified key.
-    sort_key can be: 'name', 'norad_id', 'azimuth_at_max', 'max_elevation'
+    Sort pass table by specified keys.
+    sort_keys: array of booleans indicating active columns (True = active sort column)
+    reverse_flags: array of booleans indicating sort direction for each column
+    Legacy support: single sort_key string if arrays not provided
     """
+
+    # Handle legacy single key sorting
+    if sort_keys is None or not hasattr(sort_keys, '__iter__'):
+        # Legacy mode - sort_key should be passed as second positional argument
+        sort_key = sort_keys if sort_keys else 'max_elevation'
+        reverse = reverse_flags if isinstance(reverse_flags, bool) else False
+
+        if sort_key == 'name':
+            return sorted(pass_table, key=lambda x: x['name'], reverse=reverse)
+        elif sort_key == 'norad_id':
+            return sorted(pass_table, key=lambda x: x['norad_id'], reverse=reverse)
+        elif sort_key == 'azimuth_at_max':
+            return sorted(pass_table, key=lambda x: x['azimuth_at_max'], reverse=reverse)
+        elif sort_key == 'max_elevation':
+            return sorted(pass_table, key=lambda x: x['max_elevation'], reverse=reverse)
+        elif sort_key == 'closest_approach_time':
+            # Custom sorter for time strings (handle "--:--" cases)
+            def time_sort_key(x):
+                time_str = x['closest_approach_time']
+                if time_str == '--:--':
+                    return '23:59'  # Put unknown times at the end
+                return time_str
+            return sorted(pass_table, key=time_sort_key, reverse=reverse)
+        else:
+            return pass_table
+
+    # Handle array-based sorting (column header clicks)
+    # Find the active sort column
+    active_column = None
+    for i, is_active in enumerate(sort_keys):
+        if is_active:
+            active_column = i
+            break
+
+    if active_column is None:
+        # No active column, sort by max elevation by default
+        active_column = 3  # max_elevation column
+
+    # Map column index to sort key
+    column_mapping = {
+        0: 'name',
+        1: 'norad_id',
+        2: 'azimuth_at_max',
+        3: 'max_elevation',
+        4: 'closest_approach_time'
+    }
+
+    sort_key = column_mapping.get(active_column, 'max_elevation')
+    reverse = reverse_flags[active_column] if reverse_flags and len(reverse_flags) > active_column else False
+
     if sort_key == 'name':
         return sorted(pass_table, key=lambda x: x['name'], reverse=reverse)
     elif sort_key == 'norad_id':
@@ -319,5 +435,13 @@ def sort_pass_table(pass_table, sort_key, reverse=False):
         return sorted(pass_table, key=lambda x: x['azimuth_at_max'], reverse=reverse)
     elif sort_key == 'max_elevation':
         return sorted(pass_table, key=lambda x: x['max_elevation'], reverse=reverse)
+    elif sort_key == 'closest_approach_time':
+        # Custom sorter for time strings (handle "--:--" cases)
+        def time_sort_key(x):
+            time_str = x['closest_approach_time']
+            if time_str == '--:--':
+                return '23:59'  # Put unknown times at the end
+            return time_str
+        return sorted(pass_table, key=time_sort_key, reverse=reverse)
     else:
         return pass_table

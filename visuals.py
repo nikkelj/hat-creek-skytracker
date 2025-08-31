@@ -399,7 +399,7 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
     # Table positioning and dimensions
     table_x = sub_x + 10
     table_y = sub_y + sub_height - 370  # Position above the status messages and controls, moved up 50 pixels
-    table_width = 350
+    table_width = 374  # Sum of column widths (354px) + margin (20px)
     table_height = 316  # Increased by ~2 rows to accommodate taller border
     row_height = 18
     header_height = 25
@@ -408,10 +408,11 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
     pygame.draw.rect(surface, (40, 40, 40), (table_x, table_y, table_width, table_height))
     pygame.draw.rect(surface, (200, 200, 200), (table_x, table_y, table_width, table_height), 2)
 
-    # Column widths (Name, NORAD ID, Azimuth, Max Elevation)
-    col_widths = [120, 60, 70, 85]
+    # Column widths (Name, NORAD ID, Az, Max El, Closest Time)
+    col_widths = [120, 55, 42, 57, 80]
     col_x_positions = [table_x + 5, table_x + col_widths[0] + 5, table_x + col_widths[0] + col_widths[1] + 5,
-                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + 5]
+                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + 5,
+                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + col_widths[3] + 5]
 
     # Table title
     title_text = "Satellite Passes"
@@ -419,7 +420,7 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
     surface.blit(title_surface, (table_x + 5, table_y + 5))
 
     # Column headers
-    column_headers = ["Name", "NORAD", "Azimuth", "Max Elev"]
+    column_headers = ["Name", "NORAD", "Az", "Max El", "Closest"]
     clickable_areas = []
 
     header_y = table_y + 25
@@ -458,7 +459,8 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
             pass_entry['name'][:20],  # Truncate long names
             pass_entry['norad_id'],
             f"{pass_entry['azimuth_at_max']:.0f}°",
-            f"{pass_entry['max_elevation']:.1f}°"
+            f"{pass_entry['max_elevation']:.1f}°",
+            pass_entry.get('closest_approach_time', '--:--')  # Local time of minimum slant range
         ]
 
         for col_idx, value in enumerate(cell_values):
@@ -474,7 +476,7 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
         row_y += row_height
 
     # Add info text about sorting in title row, right-justified
-    info_text = f"Sorted by: {['Name', 'NORAD', 'Azimuth', 'Max Elev'][sort_keys.index(True) if sort_keys and True in sort_keys else 3]} ({'Desc' if sort_reverse_flags and sort_reverse_flags[sort_keys.index(True) if sort_keys and True in sort_keys else 3] else 'Asc'})"
+    info_text = f"Sorted by: {['Name', 'NORAD', 'Az', 'Max El', 'Closest'][sort_keys.index(True) if sort_keys and True in sort_keys else 3]} ({'Desc' if sort_reverse_flags and sort_reverse_flags[sort_keys.index(True) if sort_keys and True in sort_keys else 3] else 'Asc'})"
     info_surface = small_font.render(info_text, True, (180, 180, 180))
     info_x = table_x + table_width - info_surface.get_width() - 5  # Right-justified
     surface.blit(info_surface, (info_x, table_y + 5))  # Same Y as title

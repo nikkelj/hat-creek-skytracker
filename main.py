@@ -59,8 +59,8 @@ input_rects = {
 save_button = pygame.Rect(sub_x + 20, sub_y + sub_height - 50, 100, 30)
 load_button = pygame.Rect(sub_x + 130, sub_y + sub_height - 50, 100, 30)
 clear_filters_button = pygame.Rect(sub_x + 10, sub_y + 30, 100, 30)  # Aligned with Name Filter
-recompute_button = pygame.Rect(sub_x + 120, sub_y + 30, 100, 30)  # Recompute Trajectories
-reset_button = pygame.Rect(sub_x + 230, sub_y + 30, 80, 30)  # Reset
+recompute_button = pygame.Rect(sub_x + 230, sub_y + 30, 100, 30)  # Recompute Trajectories
+reset_button = pygame.Rect(sub_x + 140, sub_y + 30, 80, 30)  # Reset
 center_time_rect = pygame.Rect(sub_x + 140, sub_y + 90, 130, 30)  # Center Time ISO
 duration_rect = pygame.Rect(sub_x + 140, sub_y + 140, 130, 30)  # Duration Minutes
 filter_rect = pygame.Rect(sub_x + 10, sub_y + 70, 100, 30)  # Name Filter
@@ -74,13 +74,13 @@ legend_x = sub_x + sub_width - 170
 legend_y = sub_y + sub_height - 160
 
 buttons = [
-    {"rect": pygame.Rect(10, 10, 180, 80), "text": "Tracking Vis", "mode": "tracking_vis"},
-    {"rect": pygame.Rect(10, 100, 180, 80), "text": "Sensor Calib", "mode": "sensor_calib"},
-    {"rect": pygame.Rect(10, 190, 180, 80), "text": "Joystick Loop", "mode": "joystick_loop"},
-    {"rect": pygame.Rect(10, 280, 180, 80), "text": "Post Process", "mode": "post_process"},
-    {"rect": pygame.Rect(10, 370, 180, 80), "text": "Config Options", "mode": "config_options"},
-    {"rect": pygame.Rect(10, 460, 180, 80), "text": "Author Info", "mode": "author_info"},
-    {"rect": pygame.Rect(10, 550, 180, 80), "text": "Exit", "mode": "exit"},
+    {"rect": pygame.Rect(10, 10, 180, 40), "text": "Tracking Vis", "mode": "tracking_vis"},
+    {"rect": pygame.Rect(10, 60, 180, 40), "text": "Sensor Calib", "mode": "sensor_calib"},
+    {"rect": pygame.Rect(10, 110, 180, 40), "text": "Joystick Loop", "mode": "joystick_loop"},
+    {"rect": pygame.Rect(10, 160, 180, 40), "text": "Post Process", "mode": "post_process"},
+    {"rect": pygame.Rect(10, 210, 180, 40), "text": "Config Options", "mode": "config_options"},
+    {"rect": pygame.Rect(10, 260, 180, 40), "text": "Author Info", "mode": "author_info"},
+    {"rect": pygame.Rect(10, 310, 180, 40), "text": "Exit", "mode": "exit"},
 ]
 
 image_y = 550 + 80 + 10  # Position underneath the buttons
@@ -279,11 +279,12 @@ satellite_trajectories = {}
 satellite_arc_segments = {}
 hovered_satellite = None
 selected_satellite = None
+satellite_positions = {}
 
 # Satellite pass table variables
 satellite_pass_table = []
-table_sort_keys = [False, False, False, True]  # Default: sort by max elevation (index 3)
-table_sort_reverse = [True, True, True, True]  # Default: descending for all
+table_sort_keys = [False, False, False, True, False]  # Default: sort by max elevation (index 3), 5 columns total
+table_sort_reverse = [True, True, True, True, True]  # Default: descending for all, 5 columns total
 pass_table_clickable_areas = []
 
 # Callback function for status updates during trajectory precomputation
@@ -334,8 +335,8 @@ while running:
             update_status_callback("Recomputing trajectories...")
             satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback, center_time, duration_minutes)
 
-            # Build satellite pass table
-            satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+            # Build satellite pass table (filtered for current visibility + upcoming passes)
+            satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts)
             # Apply filters to pass table
             filtered_pass_table = []
             for pass_entry in satellite_pass_table:
@@ -402,8 +403,8 @@ while running:
 
         satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback)
 
-        # Build satellite pass table
-        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+        # Build satellite pass table (filtered for current visibility + upcoming passes)
+        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts, current_satellite_positions=satellite_positions)
         # Apply filters to pass table
         filtered_pass_table = []
         for pass_entry in satellite_pass_table:
@@ -555,8 +556,8 @@ while running:
                         selection_start["filter_above_alt"] = None
                         selection_start["filter_below_alt"] = None
                         selected_satellite = None
-                        # Re-build satellite pass table to remove filters
-                        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels)
+                        # Re-build satellite pass table to remove filters (filtered for current visibility + upcoming passes)
+                        satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts, current_satellite_positions=satellite_positions)
                         satellite_pass_table = sort_pass_table(satellite_pass_table, table_sort_keys, table_sort_reverse)
                     elif pause_button.collidepoint(pos):
                         button_states["pause"]["clicked"] = True
@@ -616,9 +617,9 @@ while running:
                                         status_messages.append(f"Selected: {satellite_pass_table[index]['name']}")
                                     elif area_type == 'header':
                                         # Sort by column
-                                        if sort_keys and index < len(sort_keys):
+                                        if table_sort_keys and index < len(table_sort_keys):
                                             # Toggle sort direction if same column, otherwise set new sort
-                                            if sort_keys[index]:
+                                            if table_sort_keys[index]:
                                                 table_sort_reverse[index] = not table_sort_reverse[index]
                                             else:
                                                 # Reset all sort keys

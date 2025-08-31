@@ -5,6 +5,138 @@ from datetime import datetime, timedelta
 from utils import get_altitude_color, draw_button
 from skyfield.api import wgs84, load
 
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+# UI Dimensions and Layout
+UI_MARGIN = 5                    # Standard margin for UI elements
+UI_PADDING = 5                   # Standard padding for text inside elements
+UI_SMALL_PADDING = 2             # Smaller padding for tight layouts
+UI_TEXT_LABEL_OFFSET = 15        # Y offset for text labels above inputs
+UI_DOUBLE_CLICK_THRESHOLD = 10   # Threshold for satellite selection/clicking
+UI_LINE_THICKNESS = 1            # Default line thickness for drawing
+UI_FOCUSED_BORDER_WIDTH = 2      # Width of focus border
+UI_RECTANGLE_BORDER_WIDTH = 2    # Width of group rectangles
+UI_RECTANGLE_BORDER_RADIUS = 5   # Border radius for rounded rectangles
+
+# Shape and Satellite Drawing
+SATELLITE_SHAPE_SIZE_DEFAULT = 5     # Default size for hexagon/triangle shapes
+SATELLITE_CIRCLE_RADIUS = 3         # Radius of default satellite circles
+SATELLITE_HIGHLIGHT_RADIUS = 5      # Radius of highlight circle for hovered/selected
+SATELLITE_ELLIPSE_WIDTH = 6         # Width of elliptical marker for eccentric orbits
+SATELLITE_ELLIPSE_HEIGHT = 3        # Height of elliptical marker for eccentric orbits
+ECCENTRICITY_THRESHOLD = 0.01       # Threshold to determine if orbit is eccentric
+
+# Altitude Ranges (km)
+LEO_ALTITUDE_MAX = 2000            # Maximum LEO altitude
+GEO_ALTITUDE_NOMINAL = 35786       # Nominal GEO altitude
+GEO_ALTITUDE_TOLERANCE = 1000      # Tolerance for GEO altitude classification
+
+# Orbit Classification Colors (RGB)
+COLOR_MEO_ORBIT = (255, 165, 0)    # Orange for Medium Earth Orbit
+COLOR_GEO_ORBIT = (128, 0, 128)    # Purple for Geostationary Earth Orbit
+COLOR_LEO_DEFAULT = (0, 255, 0)    # Green default for Low Earth Orbit
+COLOR_SATELLITE_HIGHLIGHT = (255, 255, 0)  # Yellow highlight for selected/hovered
+
+# Drawing Colors
+COLOR_WHITE = (255, 255, 255)
+COLOR_BLACK = (0, 0, 0)
+COLOR_RED = (255, 0, 0)
+COLOR_GRAY_MEDIUM = (100, 100, 100)
+COLOR_GRAY_DARK = (50, 50, 50)
+COLOR_GRAY_DARK_BACKGROUND = (30, 30, 30)
+COLOR_FOCUS_BLUE = (0, 0, 255)
+COLOR_SELECTION = (0, 120, 215)
+
+# Gradient Parameters
+GRADIENT_BRIGHTNESS_FACTOR = 5     # Brightness adjustment factor for gradients
+GRADIENT_BOTTOM_COLOR = (160, 160, 160)  # Base color for config background gradient
+
+# Polar Plot Parameters
+POLAR_RADIUS_OFFSET = 50           # Offset from display edge for polar plot radius
+POLAR_SCREEN_OFFSET_X = 50         # X offset for polar plot from screen edge
+POLAR_SCREEN_OFFSET_Y = 5          # Y offset for polar plot from screen edge
+ELEVATION_CIRCLE_DEGREES = [30, 60]  # Elevation circles to draw
+AZIMUTH_LINE_INTERVAL_DEGREES = 30  # Degrees between azimuth lines
+
+# Elevation Mask and Horizon Parameters
+HORIZON_ELEVATION_DEGREES = 90      # Elevation angle for horizon
+
+# Arc Segment Drawing
+ARC_SEGMENT_WIDTH = 1              # Line width for trajectory arcs
+
+# Font Sizes
+FONT_SIZE_ELEVATION_LABEL = 14     # Font size for elevation labels
+FONT_SIZE_DIRECTION_LABEL = 14     # Font size for compass direction labels
+
+# Legend Parameters
+LEGEND_WIDTH = 150                # Width of orbit legend
+LEGEND_HEIGHT = 140               # Height of orbit legend
+LEGEND_TITLE_OFFSET_Y = 20         # Y offset for legend title line
+LEGEND_CONTENT_OFFSET_Y = 40       # Y offset for legend content
+LEGEND_ITEM_SPACING_Y = 20         # Y spacing between legend items
+LEGEND_ALTITUDE_BAR_WIDTH = 150    # Width of altitude color bar
+LEGEND_ALTITUDE_BAR_HEIGHT = 25    # Height of altitude color bar
+LEGEND_ALTITUDE_HEATMAP_SCALE = 1000  # Max altitude for color bar (km)
+LEGEND_ALTITUDE_LABELS = [0, 1000]    # Altitude labels (km)
+
+# Table/Display Parameters
+DETAILS_PANEL_WIDTH = 230          # Width of satellite details panel
+DETAILS_PANEL_HEIGHT = 250         # Height of satellite details panel
+DETAILS_PANEL_OFFSET_X = 250       # X offset for details panel from right edge
+DETAILS_PANEL_OFFSET_Y = 20        # Y offset for details panel from top
+DETAILS_LINE_HEIGHT = 15           # Line height for details text
+
+# Satellite Count Display
+SATELLITE_COUNT_OFFSET_Y = 240     # Y offset for satellite count from top
+
+# Time Display
+TIME_DISPLAY_OFFSET_Y_FROM_BOTTOM = 30  # Y offset for time from bottom
+TIME_DISPLAY_OFFSET_X = 10          # X offset for time display
+
+# Scroll Bar and Slider
+SCROLL_BAR_HEIGHT = 10             # Height of scroll bar background
+SLIDER_HEIGHT = 10                 # Height of scroll bar slider
+SCROLL_BAR_OFFSET_Y = 35           # Y offset for scroll bar from visualization bottom
+SLIDER_OFFSET_Y = 35               # Y offset for slider from visualization bottom
+SCROLL_TIME_DISPLAY_OFFSET_Y = 15  # Y offset for scroll time display
+
+# Pass Table Parameters
+PASS_TABLE_OFFSET_Y = 370          # Y offset for pass table from visualization bottom
+PASS_TABLE_WIDTH = 374             # Total width of pass table
+PASS_TABLE_HEIGHT = 316            # Total height of pass table
+PASS_TABLE_MAX_ROWS = 15           # Maximum number of rows to display
+PASS_TABLE_ROW_HEIGHT = 18         # Height of each table row
+PASS_TABLE_HEADER_HEIGHT = 25      # Height of table header
+PASS_TABLE_MARGIN = 5              # Internal margin for table content
+PASS_TABLE_BACKGROUND_COLOR = (40, 40, 40)   # Background color
+PASS_TABLE_BORDER_COLOR = (200, 200, 200)   # Border color
+
+# Pass Table Column Widths
+PASS_TABLE_COLUMN_NAME = 120       # Name column width
+PASS_TABLE_COLUMN_NORAD = 55       # NORAD ID column width
+PASS_TABLE_COLUMN_AZIMUTH = 42     # Azimuth column width
+PASS_TABLE_COLUMN_ELEVATION = 57   # Max elevation column width
+PASS_TABLE_COLUMN_TIME = 80        # Time column width
+
+# Pass Table Row Colors
+PASS_TABLE_ROW_ODD_COLOR = (45, 45, 45)      # Odd row background
+PASS_TABLE_ROW_EVEN_COLOR = (35, 35, 35)     # Even row background
+PASS_TABLE_ROW_SELECTED_COLOR = (80, 100, 120)  # Selected row highlight
+PASS_TABLE_HEADER_DEFAULT_COLOR = (50, 50, 50) # Default header background
+PASS_TABLE_HEADER_SORTED_COLOR = (60, 60, 60)   # Sorted header background
+
+# Text Shortening and Formatting
+SATELLITE_NAME_MAX_LENGTH = 20     # Max length for displayed satellite names
+TIME_STRING_MILLISECONDS_PRECISION = 3   # Precision for time string milliseconds
+DEFAULT_ELEVATION_MASK_DEG = 10.0        # Default elevation mask (degrees)
+HOUR_OFFSET_PDT = 7                     # PDT offset from UTC (hours)
+
+# ==============================================================================
+# VISUALIZATION FUNCTIONS
+# ==============================================================================
+
 def draw_hexagon(surface, x, y, color, size=5):
     points = [(x + size * math.cos(math.radians(60 * i)), y + size * math.sin(math.radians(60 * i))) for i in range(6)]
     pygame.draw.polygon(surface, color, points)

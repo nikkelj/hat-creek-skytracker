@@ -1,7 +1,49 @@
-from skyfield.api import wgs84, load
-from datetime import datetime, timedelta, timezone
 import numpy as np
 import math
+from datetime import datetime, timedelta, timezone
+from skyfield.api import wgs84, load
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+# Simulation and Trajectory Parameters
+TRAJECTORY_DURATION_MINUTES_DEFAULT = 15  # Default duration for trajectory computation
+TIME_SAMPLES_COUNT = 301  # Number of time samples for trajectory (every ~6 seconds)
+MIN_VISIBLE_ALTITUDE_DEGREES = 15.0  # Minimum altitude considered visible (degrees)
+DEFAULT_ELEVATION_MASK_DEGREES = 10.0  # Default elevation mask
+FRUSTUM_UNCERTAINTY_MARGIN_DEGREES = 15.0  # Extra margin for visibility checking
+VISIBILITY_SEED_SAMPLES_MIN = 5  # Minimum number of time samples for visibility checking
+VISIBILITY_SEED_INTERVAL_MINUTES = 2  # Minutes between visibility check samples
+
+# Future Pass Window
+FUTURE_PASS_WINDOW_HOURS = 2.0  # Hours of future passes to display in table
+FUTURE_PASS_WINDOW_SECONDS = FUTURE_PASS_WINDOW_HOURS * 3600  # Convert to seconds
+
+# Table and Display Limits
+PASS_TABLE_MAX_ROWS_DEFAULT = 20  # Maximum rows to display in pass table
+SATELLITE_NAME_MAX_LENGTH_TABLE = 20  # Max satellite name length in table display
+
+# Progress Reporting
+VISIBILITY_FILTER_BATCH_SIZE = 500  # Batch size for visibility filter progress reporting
+TRAJECTORY_COMPUTE_BATCH_SIZE = 100  # Batch size for trajectory computation progress reporting
+
+# Trajectory Rendering
+TRAJECTORY_FUTURE_COLOR = (255, 0, 0)  # Red color for future trajectory segments
+TRAJECTORY_PAST_COLOR = (128, 128, 128)  # Gray color for past trajectory segments
+TRAJECTORY_START_TIME_BUFFER = 0.0  # Additional buffer for trajectory start time
+
+# Cache Configuration
+CACHE_PRECISION_DIGITS = 6  # Decimal precision for cache keys
+TIME_RANGE_BUFFER_MINUTES = 0.0  # Buffer added to time ranges
+
+# Horizon and Elevation Thresholds
+ELEVATION_THRESHOLD_DEGREES = 0.0  # Minimum elevation above horizon
+MINIMUM_VISIBLE_ALTITUDE_DEGREES = 0.0  # Minimum altitude to consider for visibility
+
+# ==============================================================================
+# FUNCTIONS
+# ==============================================================================
 
 # Global cache for trajectories to avoid recomputation
 TRAJECTORY_CACHE = {}
@@ -27,8 +69,8 @@ def _is_satellite_potentially_visible(satellite, observer, time_samples, elevati
         alts = topocentrics.altaz()[0]
         alt_deg = np.array(alts.degrees)
 
-        # If any altitude is above the elevation mask + some margin, consider it potentially visible
-        min_visible_alt = max(elevation_mask_deg, 15.0)  # At least 15 degrees to account for sample sparsity
+        # If any altitude is above the elevation mask + margin, consider it potentially visible
+        min_visible_alt = max(elevation_mask_deg, FRUSTUM_UNCERTAINTY_MARGIN_DEGREES)
         return np.any(alt_deg > min_visible_alt)
 
     except Exception:
@@ -49,8 +91,9 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
         t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes/2))
         t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes/2))
 
-    # Create coarse time samples for visibility checking (every 2 minutes for speed)
-    num_samples = max(5, int(duration_minutes / 2))  # At least 5 samples
+    # Create coarse time samples for visibility checking
+    num_samples = max(VISIBILITY_SEED_SAMPLES_MIN,
+                     int(duration_minutes / VISIBILITY_SEED_INTERVAL_MINUTES))
     visibility_times = ts.linspace(t0, t1, num_samples)
 
     visible_satellites = []
@@ -62,7 +105,7 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
             visible_satellites.append(sat)
 
         # Progress update for filtering
-        if update_status_callback and total_checked % 500 == 0 and total_checked > 0:
+        if update_status_callback and total_checked % VISIBILITY_FILTER_BATCH_SIZE == 0 and total_checked > 0:
             update_status_callback(f"Visibility filtered {len(visible_satellites)}/{total_checked} satellites...")
 
     if visible_satellites:
@@ -169,7 +212,7 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
         arc_segments[sat] = segments
 
         # Progress update
-        if update_status_callback and processed_count % 100 == 0 and processed_count > 0:
+        if update_status_callback and processed_count % TRAJECTORY_COMPUTE_BATCH_SIZE == 0 and processed_count > 0:
             update_status_callback(f"Computed traj {processed_count}/{total_sats} sats...")
 
     # Load cached trajectories for satellites that don't need recomputation

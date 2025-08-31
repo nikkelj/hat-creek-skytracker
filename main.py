@@ -14,35 +14,100 @@ from trajectory import precompute_trajectories, interpolate_position, clear_traj
 from config import load_config, save_config, handle_input
 from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table
 
+# ==============================================================================
+# CONSTANTS AND CONFIGURATION
+# ==============================================================================
+
+# UI Dimensions
+MENU_WIDTH = 200
+BUTTON_WIDTH = 180
+BUTTON_HEIGHT = 40
+INPUT_WIDTH = 200
+INPUT_HEIGHT = 30
+CENTER_TIME_WIDTH = 130
+DURATION_WIDTH = 130
+FILTER_WIDTH = 100
+
+# UI Spacing and Layout
+BUTTON_GAP = 20
+INPUT_GAP = 70
+FILTER_GAP = 50
+UI_MARGIN = 10
+UI_HEIGHT_OFFSET = 5
+
+# Background and Icon Images
+BG_IMAGE_SIZE = (160, 160)
+ICON_SIZE = (32, 32)
+BACKGROUND_FILENAME = 'lucky.jpg'
+
+# Font Sizes
+LARGE_FONT_SIZE = 36
+NORMAL_FONT_SIZE = 24
+SMALL_FONT_SIZE = 14
+
+# Default Values
+DEFAULT_DURATION_MINUTES = "30"
+DEFAULT_ELEVATION_MASK_DEG = 10.0
+
+# Update Intervals (seconds)
+POSITION_UPDATE_INTERVAL = 0.1  # 10 Hz
+TRAJECTORY_UPDATE_INTERVAL = 900  # 15 minutes
+FPS_TARGET = 60
+
+# Cache Settings
+CACHE_FILENAME = 'tle_cache.tle'
+CACHE_AGE_LIMIT_HOURS = 24
+CACHE_AGE_LIMIT_SECONDS = CACHE_AGE_LIMIT_HOURS * 3600
+
+# Colors (RGB tuples)
+COLOR_BACKGROUND_DARK = (30, 30, 30)
+COLOR_TEXT_WHITE = (255, 255, 255)
+COLOR_INPUT_BACKGROUND = (255, 255, 255)
+COLOR_INPUT_TEXT = (0, 0, 0)
+COLOR_FOCUS_BLUE = (0, 0, 255)
+COLOR_SELECTION = (0, 120, 215)
+
+# TLE API Configuration
+TLE_API_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle'
+
+# Astrodynamics Constants
+EARTH_GRAVITATIONAL_PARAMETER = 3.986004418e14  # m^3/s^2
+EARTH_RADIUS_KM = 6371
+SECONDS_PER_HOUR = 3600
+WINDOW_POSITION = "0,0"
+
+# ==============================================================================
+# END CONSTANTS
+# ==============================================================================
+
 # Initialize Pygame and set up the display
-os.environ['SDL_VIDEO_WINDOW_POS'] = "0,0"
 pygame.init()
 display_info = pygame.display.Info()
-menu_width = 200
+menu_width = MENU_WIDTH
 total_width = display_info.current_w
 total_height = display_info.current_h
 menu_screen = pygame.display.set_mode((total_width, total_height))
 pygame.display.set_caption("Main Menu")
 
-# Load background image for menu and icon (assume 'lucky.jpg' exists)
+# Load background image for menu and icon
 try:
-    bg_image = pygame.image.load('lucky.jpg')
-    bg_image_menu = pygame.transform.scale(bg_image, (160, 160))  # For menu background
-    bg_image_icon = pygame.transform.scale(bg_image, (32, 32))  # For icon
-    pygame.display.set_icon(bg_image_icon)  # Set as program icon
-    negative_image = create_negative_image(bg_image_menu)  # Create negative version
-    rotation_angle = 0  # Initialize rotation angle
+    bg_image = pygame.image.load(BACKGROUND_FILENAME)
+    bg_image_menu = pygame.transform.scale(bg_image, BG_IMAGE_SIZE)
+    bg_image_icon = pygame.transform.scale(bg_image, ICON_SIZE)
+    pygame.display.set_icon(bg_image_icon)
+    negative_image = create_negative_image(bg_image_menu)
+    rotation_angle = 0
 except pygame.error:
-    bg_image_menu = None  # Fallback to solid color if image not found
+    bg_image_menu = None
     bg_image_icon = None
     negative_image = None
     rotation_angle = 0
-    print("Warning: 'lucky.jpg' not found. Using fallback color and no icon.")
+    print(f"Warning: '{BACKGROUND_FILENAME}' not found. Using fallback color and no icon.")
 
-font = pygame.font.Font(None, 24)
-large_font = pygame.font.Font(None, 36)
-small_font = pygame.font.Font(None, 14)  # Smaller font for labels to save space
-status_font = pygame.font.Font(None, 14)  # Increased from 12 to 14 for status messages
+font = pygame.font.Font(None, NORMAL_FONT_SIZE)
+large_font = pygame.font.Font(None, LARGE_FONT_SIZE)
+small_font = pygame.font.Font(None, SMALL_FONT_SIZE)
+status_font = pygame.font.Font(None, SMALL_FONT_SIZE)
 
 sub_x = menu_width
 sub_y = 0
@@ -51,10 +116,10 @@ sub_height = total_height
 radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
 
 input_rects = {
-    'lat': pygame.Rect(sub_x + 20, sub_y + 60, 200, 30),
-    'lon': pygame.Rect(sub_x + 20, sub_y + 150, 200, 30),
-    'alt': pygame.Rect(sub_x + 20, sub_y + 240, 200, 30),
-    'elevation_mask': pygame.Rect(sub_x + 20, sub_y + 330, 200, 30),
+    'lat': pygame.Rect(sub_x + UI_MARGIN, sub_y + 60, INPUT_WIDTH, INPUT_HEIGHT),
+    'lon': pygame.Rect(sub_x + UI_MARGIN, sub_y + 150, INPUT_WIDTH, INPUT_HEIGHT),
+    'alt': pygame.Rect(sub_x + UI_MARGIN, sub_y + 240, INPUT_WIDTH, INPUT_HEIGHT),
+    'elevation_mask': pygame.Rect(sub_x + UI_MARGIN, sub_y + 330, INPUT_WIDTH, INPUT_HEIGHT),
 }
 save_button = pygame.Rect(sub_x + 20, sub_y + sub_height - 50, 100, 30)
 load_button = pygame.Rect(sub_x + 130, sub_y + sub_height - 50, 100, 30)

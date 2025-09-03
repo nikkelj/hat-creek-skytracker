@@ -107,8 +107,8 @@ CAMERA2_HEIGHT = 1216
 # Camera connection buttons (shrunk to 50% size and arranged horizontally)
 CAMERA1_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_OFFSET + 0, 60, 20)
 CAMERA1_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 265, UI_HEIGHT_OFFSET + 0, 60, 20)
-CAMERA2_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1050, UI_HEIGHT_OFFSET + 0, 60, 20)
-CAMERA2_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1115, UI_HEIGHT_OFFSET + 0, 60, 20)
+CAMERA2_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 0, 60, 20)
+CAMERA2_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1135, UI_HEIGHT_OFFSET + 0, 60, 20)
 
 # Camera connection variables
 camera1_connected = False
@@ -1320,9 +1320,9 @@ while running:
                     if camera1_frame is not None:
                         # ASI returns numpy array, convert to pygame surface
                         if camera1_prop['IsColorCam']:
-                            B, G, R = camera1_frame.T
-                            rgb_image_array1 = np.array((R, G, B)).T
-                            pil_img1 = Image.fromarray(rgb_image_array1, mode="RGB")
+                            #B, G, R = camera1_frame.T
+                            #rgb_image_array1 = np.array((R, G, B)).T
+                            pil_img1 = Image.fromarray(camera1_frame, mode="RGB")
                         else:
                             pil_img1 = Image.fromarray(camera1_frame, mode="L").convert("RGB")
                         camera1_surface = pygame.image.frombytes(pil_img1.tobytes(), pil_img1.size, pil_img1.mode)
@@ -1340,7 +1340,9 @@ while running:
                     if camera2_frame is not None:
                         # ASI returns numpy array, convert to pygame surface
                         if camera2_prop['IsColorCam']:
-                            pil_img2 = Image.fromarray(camera2_frame, mode="RGB")
+                            B, G, R = camera2_frame.T
+                            rgb_image_array2 = np.array((R, G, B)).T
+                            pil_img2 = Image.fromarray(rgb_image_array2, mode="RGB")
                         else:
                             pil_img2 = Image.fromarray(camera2_frame, mode="L").convert("RGB")
                             #size2 = camera2_frame.shape[1::-1]

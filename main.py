@@ -1895,6 +1895,18 @@ while running:
 
                 menu_screen.blit(combined_surface, (combined_x, combined_y))
 
+                # Draw targeting crosshairs at center of combined image
+                center_x = combined_x + combined_width // 2
+                center_y = combined_y + combined_height // 2
+
+                # Draw horizontal line of crosshairs
+                pygame.draw.line(menu_screen, (255, 0, 0), (center_x - 50, center_y), (center_x + 50, center_y), 1)
+                # Draw vertical line of crosshairs
+                pygame.draw.line(menu_screen, (255, 0, 0), (center_x, center_y - 50), (center_x, center_y + 50), 1)
+
+                # Draw center dot
+                pygame.draw.circle(menu_screen, (255, 0, 0), (center_x, center_y), 2)
+
                 # Display combined view info
                 combined_status = f"Combined View - Camera 1: {camera1_opacity:.1f}, Camera 2: {1-camera1_opacity:.1f}"
                 status_surface = small_font.render(combined_status, True, (255, 255, 255))

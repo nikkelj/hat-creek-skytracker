@@ -169,6 +169,14 @@ camera1_gain_max = 300  # Conservative range, can be adjusted based on camera ca
 camera2_gain_min = 0
 camera2_gain_max = 300
 
+# Combined view UI controls (bottom center of screen) - defined after pygame initialization
+
+# Combined camera view variables (for sensor calibration mode)
+combined_view_toggle = False  # Toggle between split screen and combined view
+camera1_opacity = 0.5  # Opacity for camera 1 (0.0-1.0), camera 2 gets (1.0 - opacity)
+camera1_opacity_min = 0.0
+camera1_opacity_max = 1.0
+
 # Camera exposure variables (ASI cameras typically in microseconds, 100us to 2000s range)
 camera1_exposure = 10000  # 10ms default
 camera2_exposure = 10000
@@ -254,6 +262,11 @@ sub_y = 0
 sub_width = total_width - MENU_WIDTH
 sub_height = total_height
 radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
+
+# Combined view UI controls (bottom center of screen) - defined after pygame initialization
+COMBINED_VIEW_BUTTON_RECT = pygame.Rect(total_width // 2 + 50, total_height - 60, 100, 20)  # Toggle button beneath the two images at center (shrunk height)
+CAMERA_OPACITY_SLIDER_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 300, 20)  # Opacity slider
+CAMERA_OPACITY_SLIDER_HANDLE_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 20, 20)  # Slider handle
 
 input_rects = {
     'lat': pygame.Rect(sub_x + UI_MARGIN, sub_y + 60, INPUT_WIDTH, INPUT_HEIGHT),
@@ -925,6 +938,26 @@ while running:
                                 update_status_callback(f"Camera 2 exposure set to {camera2_exposure} µs")
                             except Exception as e:
                                 update_status_callback(f"Failed to set Camera 2 exposure: {str(e)}")
+
+                    # Handle combined view toggle button
+                    elif COMBINED_VIEW_BUTTON_RECT.collidepoint(pos):
+                        if camera1_connected and camera2_connected:
+                            combined_view_toggle = not combined_view_toggle
+                            if combined_view_toggle:
+                                update_status_callback("Combined view enabled")
+                            else:
+                                update_status_callback("Split screen view restored")
+                        else:
+                            update_status_callback("Both cameras must be connected to use combined view")
+
+                    # Handle opacity slider
+                    elif CAMERA_OPACITY_SLIDER_RECT.collidepoint(pos):
+                        if combined_view_toggle and camera1_connected and camera2_connected:
+                            # Calculate new opacity value based on click position
+                            slider_fraction = (pos[0] - CAMERA_OPACITY_SLIDER_RECT.x) / CAMERA_OPACITY_SLIDER_RECT.width
+                            slider_fraction = max(0.0, min(1.0, slider_fraction))  # Clamp to 0-1
+                            camera1_opacity = camera1_opacity_min + slider_fraction * (camera1_opacity_max - camera1_opacity_min)
+                            update_status_callback(f"Camera opacity set to {camera1_opacity:.1f}")
 
                     # Handle ROI controls for Camera 1
                     elif camera1_connected:
@@ -1816,86 +1849,134 @@ while running:
         # Draw camera feeds if available
         display_width = sub_width // 2
         display_height = sub_height
-        
+
         # Camera 1 display area (left half)
         cam1_left = sub_x
         cam1_top = sub_y
         cam1_width = sub_width // 2
         cam1_height = sub_height
-        
+
         # Camera 2 display area (right half)
         cam2_left = sub_x + sub_width // 2
         cam2_top = sub_y
         cam2_width = sub_width // 2
         cam2_height = sub_height
 
-        # Draw camera 1 feed
-        if camera1_connected:
-            camera1_status = f"Camera 1 ({camera1_name}): Connected"
-            status_color = (0, 255, 0)
-        else:
-            camera1_status = f"Camera 1 ({camera1_name}): Disconnected"
-            status_color = (255, 0, 0)
-
-        # Draw status text for camera 1
-        status_surface = small_font.render(camera1_status, True, status_color)
-        menu_screen.blit(status_surface, (cam1_left + 10, cam1_top + 10))
-
-        # Display camera 1 image if connected
-        cam1_img_x = 0
-        cam1_img_y = 0
-        cam1_scaled_frame = None
-        if camera1_frame and camera1_connected:
+        # Handle combined view mode
+        if combined_view_toggle and camera1_connected and camera2_connected and camera1_frame and camera2_frame:
+            # Combined view: Blend both cameras into a single full-screen image
             try:
-                # Scale image to fit display area
-                cam1_scaled_frame = pygame.transform.scale(camera1_frame, (cam1_width - 20, cam1_height - 80))
-                # Center the scaled image
-                cam1_img_x = cam1_left + (cam1_width - cam1_scaled_frame.get_width()) // 2
-                cam1_img_y = cam1_top + 50
-                menu_screen.blit(cam1_scaled_frame, (cam1_img_x, cam1_img_y))
+                # Use full available area for combined view
+                combined_width = sub_width - 20
+                combined_height = sub_height - 100  # Leave space for controls at bottom
 
-                # Display FPS, UTC and Local time below the image
-                info_text = f"FPS: {camera1_fps:.1f}  UTC: {camera1_utc_ts}  Local: {camera1_local_ts}"
-                info_surface = small_font.render(info_text, True, (255, 255, 255))
-                text_y = cam1_img_y + cam1_scaled_frame.get_height() + 10
-                menu_screen.blit(info_surface, (cam1_img_x, text_y))
+                # Scale both images to the same size for blending
+                cam1_combined = pygame.transform.scale(camera1_frame, (combined_width, combined_height))
+                cam2_combined = pygame.transform.scale(camera2_frame, (combined_width, combined_height))
+
+                # Create a combined surface for blending
+                combined_surface = pygame.Surface((combined_width, combined_height))
+
+                # Copy cam1 to combined surface with its opacity
+                cmap1_array = pygame.surfarray.array3d(cam1_combined)
+                cam2_array = pygame.surfarray.array3d(cam2_combined)
+
+                # Blend the arrays using weighted sum
+                # camera1_opacity for cam1, (1 - camera1_opacity) for cam2
+                blended_array = (cmap1_array.astype(np.float32) * camera1_opacity +
+                               cam2_array.astype(np.float32) * (1.0 - camera1_opacity)).astype(np.uint8)
+
+                # Create surface from blended array
+                combined_surface = pygame.surfarray.make_surface(blended_array)
+
+                # Center the combined image on screen
+                combined_x = sub_x + (sub_width - combined_width) // 2
+                combined_y = sub_y + 40
+
+                menu_screen.blit(combined_surface, (combined_x, combined_y))
+
+                # Display combined view info
+                combined_status = f"Combined View - Camera 1: {camera1_opacity:.1f}, Camera 2: {1-camera1_opacity:.1f}"
+                status_surface = small_font.render(combined_status, True, (255, 255, 255))
+                menu_screen.blit(status_surface, (combined_x, combined_y + combined_height))
+
+                # FPS info for both cameras
+                fps_text = f"Cam1 FPS: {camera1_fps:.1f}  Cam2 FPS: {camera2_fps:.1f}"
+                fps_surface = small_font.render(fps_text, True, (255, 255, 255))
+                menu_screen.blit(fps_surface, (combined_x, combined_y + combined_height + 25))
+
             except Exception as e:
-                error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
-                menu_screen.blit(error_msg, (cam1_left + 10, cam1_top + 40))
-
-        # Draw camera 2 feed
-        if camera2_connected:
-            camera2_status = f"Camera 2 ({camera2_name}): Connected"
-            status_color = (0, 255, 0)
+                error_msg = small_font.render(f"Combined view error: {str(e)}", True, (255, 0, 0))
+                menu_screen.blit(error_msg, (sub_x + 10, sub_y + sub_height // 2))
         else:
-            camera2_status = f"Camera 2 ({camera2_name}): Disconnected"
-            status_color = (255, 0, 0)
+            # Split screen view
+            # Draw camera 1 feed
+            if camera1_connected:
+                camera1_status = f"Camera 1 ({camera1_name}): Connected"
+                status_color = (0, 255, 0)
+            else:
+                camera1_status = f"Camera 1 ({camera1_name}): Disconnected"
+                status_color = (255, 0, 0)
 
-        # Draw status text for camera 2
-        status_surface = small_font.render(camera2_status, True, status_color)
-        menu_screen.blit(status_surface, (cam2_left + 10, cam2_top + 10))
+            # Draw status text for camera 1
+            status_surface = small_font.render(camera1_status, True, status_color)
+            menu_screen.blit(status_surface, (cam1_left + 10, cam1_top + 10))
 
-        # Display camera 2 image if connected
-        cam2_img_x = 0
-        cam2_img_y = 0
-        cam2_scaled_frame = None
-        if camera2_frame and camera2_connected:
-            try:
-                # Scale image to fit display area
-                cam2_scaled_frame = pygame.transform.scale(camera2_frame, (cam2_width - 20, cam2_height - 80))
-                # Center the scaled image
-                cam2_img_x = cam2_left + (cam2_width - cam2_scaled_frame.get_width()) // 2
-                cam2_img_y = cam2_top + 50
-                menu_screen.blit(cam2_scaled_frame, (cam2_img_x, cam2_img_y))
+            # Display camera 1 image if connected
+            cam1_img_x = 0
+            cam1_img_y = 0
+            cam1_scaled_frame = None
+            if camera1_frame and camera1_connected:
+                try:
+                    # Scale image to fit display area
+                    cam1_scaled_frame = pygame.transform.scale(camera1_frame, (cam1_width - 20, cam1_height - 80))
+                    # Center the scaled image
+                    cam1_img_x = cam1_left + (cam1_width - cam1_scaled_frame.get_width()) // 2
+                    cam1_img_y = cam1_top + 50
+                    menu_screen.blit(cam1_scaled_frame, (cam1_img_x, cam1_img_y))
 
-                # Display FPS, UTC and Local time below the image
-                info_text = f"FPS: {camera2_fps:.1f}  UTC: {camera2_utc_ts}  Local: {camera2_local_ts}"
-                info_surface = small_font.render(info_text, True, (255, 255, 255))
-                text_y = cam2_img_y + cam2_scaled_frame.get_height() + 10
-                menu_screen.blit(info_surface, (cam2_img_x, text_y))
-            except Exception as e:
-                error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
-                menu_screen.blit(error_msg, (cam2_left + 10, cam2_top + 40))
+                    # Display FPS, UTC and Local time below the image
+                    info_text = f"FPS: {camera1_fps:.1f}  UTC: {camera1_utc_ts}  Local: {camera1_local_ts}"
+                    info_surface = small_font.render(info_text, True, (255, 255, 255))
+                    text_y = cam1_img_y + cam1_scaled_frame.get_height() + 10
+                    menu_screen.blit(info_surface, (cam1_img_x, text_y))
+                except Exception as e:
+                    error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
+                    menu_screen.blit(error_msg, (cam1_left + 10, cam1_top + 40))
+
+            # Draw camera 2 feed
+            if camera2_connected:
+                camera2_status = f"Camera 2 ({camera2_name}): Connected"
+                status_color = (0, 255, 0)
+            else:
+                camera2_status = f"Camera 2 ({camera2_name}): Disconnected"
+                status_color = (255, 0, 0)
+
+            # Draw status text for camera 2
+            status_surface = small_font.render(camera2_status, True, status_color)
+            menu_screen.blit(status_surface, (cam2_left + 10, cam2_top + 10))
+
+            # Display camera 2 image if connected
+            cam2_img_x = 0
+            cam2_img_y = 0
+            cam2_scaled_frame = None
+            if camera2_frame and camera2_connected:
+                try:
+                    # Scale image to fit display area
+                    cam2_scaled_frame = pygame.transform.scale(camera2_frame, (cam2_width - 20, cam2_height - 80))
+                    # Center the scaled image
+                    cam2_img_x = cam2_left + (cam2_width - cam2_scaled_frame.get_width()) // 2
+                    cam2_img_y = cam2_top + 50
+                    menu_screen.blit(cam2_scaled_frame, (cam2_img_x, cam2_img_y))
+
+                    # Display FPS, UTC and Local time below the image
+                    info_text = f"FPS: {camera2_fps:.1f}  UTC: {camera2_utc_ts}  Local: {camera2_local_ts}"
+                    info_surface = small_font.render(info_text, True, (255, 255, 255))
+                    text_y = cam2_img_y + cam2_scaled_frame.get_height() + 10
+                    menu_screen.blit(info_surface, (cam2_img_x, text_y))
+                except Exception as e:
+                    error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
+                    menu_screen.blit(error_msg, (cam2_left + 10, cam2_top + 40))
 
         # Draw connect buttons with smaller font
         # Camera 1 buttons
@@ -2132,6 +2213,43 @@ while running:
         if not ASI_AVAILABLE:
             asi_msg = small_font.render("WARNING: ZWO ASI SDK not available", True, (255, 255, 0))
             menu_screen.blit(asi_msg, (sub_x + 10, sub_y + sub_height - 30))
+
+        # Draw combined view toggle button and opacity slider at bottom center
+        # Only show if both cameras are connected
+        if camera1_connected and camera2_connected:
+
+            # Calculate positions to center the controls
+            combined_controls_y = total_height - 70  # Position above the slider
+            slider_y = total_height - 30
+
+            # Draw toggle button
+            button_color = (0, 128, 255) if combined_view_toggle else (128, 128, 128)
+            pygame.draw.rect(menu_screen, button_color, COMBINED_VIEW_BUTTON_RECT)
+            pygame.draw.rect(menu_screen, (255, 255, 255), COMBINED_VIEW_BUTTON_RECT, 2)  # Border
+
+            # Button text
+            button_text = "Combined View: ON" if combined_view_toggle else "Combined View: OFF"
+            button_surface = small_font.render(button_text, True, (255, 255, 255))
+            button_rect = button_surface.get_rect(center=COMBINED_VIEW_BUTTON_RECT.center)
+            menu_screen.blit(button_surface, button_rect)
+
+            # Draw opacity slider (only when combined view is on)
+            if combined_view_toggle:
+                # Draw slider track
+                pygame.draw.rect(menu_screen, (120, 120, 120), CAMERA_OPACITY_SLIDER_RECT)
+
+                # Calculate handle position based on current opacity value
+                opacity_fraction = (camera1_opacity - camera1_opacity_min) / (camera1_opacity_max - camera1_opacity_min)
+                handle_x = CAMERA_OPACITY_SLIDER_RECT.x + int(opacity_fraction * CAMERA_OPACITY_SLIDER_RECT.width)
+                CAMERA_OPACITY_SLIDER_HANDLE_RECT.x = handle_x - CAMERA_OPACITY_SLIDER_HANDLE_RECT.width // 2
+
+                # Draw active part of the track (gray fill from left)
+                active_width = handle_x - CAMERA_OPACITY_SLIDER_RECT.x
+                pygame.draw.rect(menu_screen, (150, 150, 150), pygame.Rect(CAMERA_OPACITY_SLIDER_RECT.x, CAMERA_OPACITY_SLIDER_RECT.y, active_width, CAMERA_OPACITY_SLIDER_RECT.height))
+
+                # Draw handle
+                handle_color = (0, 255, 255)
+                pygame.draw.rect(menu_screen, handle_color, CAMERA_OPACITY_SLIDER_HANDLE_RECT)
 
         # Display camera error message if any
         if camera_error_message:

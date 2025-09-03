@@ -4,11 +4,28 @@ import sys
 import time
 import requests
 import math
+from PIL import Image
 from tkinter import Tk
 from tkinter import filedialog
 from skyfield.api import wgs84, load, utc
 from datetime import datetime, timedelta, timezone
 import numpy as np
+
+# Camera imports (for ASI cameras)
+try:
+    import zwoasi as asi
+    import numpy as np
+    asi.init('lib/ASICamera2.dll')
+    print("ZWO ASI SDK available for camera integration")
+    ASI_AVAILABLE = True
+except ImportError:
+    print("Warning: ZWO ASI SDK not available - camera functionality will be disabled")
+    ASI_AVAILABLE = False
+    asi = None
+except Exception as e:
+    print(f"Error initializing ASI SDK: {e}")
+    ASI_AVAILABLE = False
+    asi = None
 from utils import draw_button, create_negative_image
 from trajectory import precompute_trajectories, interpolate_position, clear_trajectory_cache, build_satellite_pass_table, sort_pass_table
 from config import load_config, save_config, handle_input
@@ -76,6 +93,47 @@ EARTH_RADIUS_KM = 6371
 SECONDS_PER_HOUR = 3600
 WINDOW_POSITION = "0,0"
 
+# Camera Constants and Settings
+CAMERA_UPDATE_INTERVAL = 0.1  # Update camera images every 1 second (30 FPS typical)
+CAMERA_WIDTH = 1920  # ASI462MM resolution (adjust based on actual camera)
+CAMERA_HEIGHT = 1280
+CAMERA2_WIDTH = 1936  # ASI178MC resolution
+CAMERA2_HEIGHT = 1216
+
+# ==============================================================================
+# CAMERA VARIABLES (sensor calibration) - defined after pygame initialization
+# ==============================================================================
+
+# Camera connection buttons (shrunk to 50% size and arranged horizontally)
+CAMERA1_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_OFFSET + 0, 60, 20)
+CAMERA1_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 265, UI_HEIGHT_OFFSET + 0, 60, 20)
+CAMERA2_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1050, UI_HEIGHT_OFFSET + 0, 60, 20)
+CAMERA2_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1115, UI_HEIGHT_OFFSET + 0, 60, 20)
+
+# Camera connection variables
+camera1_connected = False
+camera2_connected = False
+camera1_cap = None
+camera2_cap = None
+camera1_prop = None
+camera2_prop = None
+camera1_index = 0  # ASI462MM camera index
+camera2_index = 1  # ASI178MC camera index
+camera1_last_update = 0
+camera2_last_update = 0
+
+# Camera state variables
+camera_error_message = ""
+camera1_frame = None
+camera2_frame = None
+
+# Camera UI buttons state
+camera_button_states = {}
+camera_button_states["camera1_connect"] = {"hover": False, "clicked": False}
+camera_button_states["camera2_connect"] = {"hover": False, "clicked": False}
+camera_button_states["camera1_disconnect"] = {"hover": False, "clicked": False}
+camera_button_states["camera2_disconnect"] = {"hover": False, "clicked": False}
+
 # ==============================================================================
 # END CONSTANTS
 # ==============================================================================
@@ -83,11 +141,15 @@ WINDOW_POSITION = "0,0"
 # Initialize Pygame and set up the display
 pygame.init()
 display_info = pygame.display.Info()
-menu_width = MENU_WIDTH
 total_width = display_info.current_w
 total_height = display_info.current_h
 menu_screen = pygame.display.set_mode((total_width, total_height))
 pygame.display.set_caption("Main Menu")
+
+# Enumerate cameras if available
+camera_infos = []
+camera1_name = "Camera 1"
+camera2_name = "Camera 2"
 
 # Load background image for menu and icon
 try:
@@ -107,11 +169,12 @@ except pygame.error:
 font = pygame.font.Font(None, NORMAL_FONT_SIZE)
 large_font = pygame.font.Font(None, LARGE_FONT_SIZE)
 small_font = pygame.font.Font(None, SMALL_FONT_SIZE)
+tiny_font = pygame.font.Font(None, 12)  # Smaller font for compact camera buttons
 status_font = pygame.font.Font(None, SMALL_FONT_SIZE)
 
-sub_x = menu_width
+sub_x = MENU_WIDTH
 sub_y = 0
-sub_width = total_width - menu_width
+sub_width = total_width - MENU_WIDTH
 sub_height = total_height
 radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
 
@@ -195,9 +258,9 @@ button_states["pause"] = {"hover": False, "clicked": False}
 button_states["play"] = {"hover": False, "clicked": False}
 
 # Initial render of main menu
-menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
 if bg_image_menu:
-    menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))  # Center horizontally, adjusted for 160px width
+    menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))  # Center horizontally, adjusted for 160px width
 for btn in buttons:
     draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
 status_messages = ["Starting TLE process..."]
@@ -222,11 +285,11 @@ try:
         if current_time - cache_time > cache_age_limit:
             status_messages.append("Downloading TLEs from Celestrak...")
             status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-            menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+            menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
             for btn in buttons:
                 draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
             if bg_image_menu:
-                menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+                menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
             for i, msg in enumerate(status_messages[-4:]):
                 status_render = status_font.render(msg, True, (255, 255, 255))
                 menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -243,11 +306,11 @@ try:
         else:
             status_messages.append("Loading TLEs from cache...")
             status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-            menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+            menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
             for btn in buttons:
                 draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
             if bg_image_menu:
-                menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+                menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
             for i, msg in enumerate(status_messages[-4:]):
                 status_render = status_font.render(msg, True, (255, 255, 255))
                 menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -260,11 +323,11 @@ try:
     else:
         status_messages.append("Downloading TLEs from Celestrak...")
         status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-        menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+        menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
         for btn in buttons:
             draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
         if bg_image_menu:
-            menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+            menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
         for i, msg in enumerate(status_messages[-4:]):
             status_render = status_font.render(msg, True, (255, 255, 255))
             menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -281,11 +344,11 @@ try:
 
     status_messages.append("Creating satellite objects...")
     status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-    menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
     for btn in buttons:
         draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
     if bg_image_menu:
-        menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+        menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
     for i, msg in enumerate(status_messages[-4:]):
         status_render = status_font.render(msg, True, (255, 255, 255))
         menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -297,11 +360,11 @@ try:
     satellites = load.tle_file(cache_file)
     status_messages.append("TLEs ready")
     status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-    menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
     for btn in buttons:
         draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
     if bg_image_menu:
-        menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+        menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
     for i, msg in enumerate(status_messages[-4:]):
         status_render = status_font.render(msg, True, (255, 255, 255))
         menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -334,7 +397,7 @@ for sat in satellites:
     satellite_mean_altitudes[sat] = mean_altitude
     satellite_perigee[sat] = perigee
     satellite_apogee[sat] = apogee
-    print(f"Debug: Satellite {label_text} mean altitude: {mean_altitude:.1f} km perigee: {perigee:.1f} km apogee: {apogee:.1f} km")
+    #print(f"Debug: Satellite {label_text} mean altitude: {mean_altitude:.1f} km perigee: {perigee:.1f} km apogee: {apogee:.1f} km")
 
 last_update_time = 0
 update_interval = 0.1  # Target 10 Hz
@@ -356,11 +419,11 @@ pass_table_clickable_areas = []
 def update_status_callback(message):
     status_messages.append(message)
     status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-    menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
     for btn in buttons:
         draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
     if bg_image_menu:
-        menu_screen.blit(bg_image_menu, ((menu_width - 160) // 2, image_y))
+        menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
     for i, msg in enumerate(status_messages[-4:]):
         status_render = status_font.render(msg, True, (255, 255, 255))
         menu_screen.blit(status_render, (10, status_y_start + i * 14))
@@ -373,7 +436,7 @@ while running:
     current_time = time.time()
     mouse_pos = pygame.mouse.get_pos()
     # Check if mouse is over the background image
-    image_rect = pygame.Rect((menu_width - 160) // 2, image_y, 160, 160) if bg_image_menu else None
+    image_rect = pygame.Rect((MENU_WIDTH - 160) // 2, image_y, 160, 160) if bg_image_menu else None
     # Define rectangles inside the loop to ensure they are always current
     filter_rect = pygame.Rect(sub_x + 10, sub_y + 90, 100, 30)  # Name Filter
     filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 100, 30)  # Filter Above Alt
@@ -608,6 +671,104 @@ while running:
                         focused_field = 'elevation_mask'
                         cursor_pos['elevation_mask'] = len(elevation_mask_str)
                         selection_start['elevation_mask'] = None
+                elif current_mode == "sensor_calib":
+                    # Detect number of cameras connected
+                    num_cameras = asi.get_num_cameras()
+                    update_status_callback(f"Detected {num_cameras} cameras")
+                    camera_infos = asi.list_cameras() 
+                    update_status_callback(f"Camera names: {camera_infos}")
+                    if len(camera_infos) > 0:
+                        camera1_name = camera_infos[0]
+                    if len(camera_infos) > 1:
+                        camera2_name = camera_infos[1]
+                    
+                    # Handle camera connection/disconnection buttons
+                    if CAMERA1_CONNECT_BUTTON.collidepoint(pos):
+                        camera_button_states["camera1_connect"]["clicked"] = True
+                        if ASI_AVAILABLE and camera1_index is not None:
+                            try:
+                                if camera1_connected:
+                                    update_status_callback("Camera 1 already connected")
+                                else:
+                                    camera1_cap = asi.Camera(camera1_index)
+                                    camera1_prop = camera1_cap.get_camera_property()
+                                    if camera1_cap:
+                                        # Set video format
+                                        if camera1_prop['IsColorCam']:
+                                            camera1_cap.set_image_type(asi.ASI_IMG_RGB24)
+                                        else:
+                                            camera1_cap.set_image_type(asi.ASI_IMG_RAW8)
+                                        
+                                        # Set camera controls
+                                        camera1_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
+                                        camera1_cap.set_control_value(asi.ASI_GAIN, 1)  # Min gain
+                                        camera1_connected = True
+                                        camera1_last_update = current_time
+                                        update_status_callback("Camera 1 connected successfully")
+                                        camera_error_message = ""
+                                    else:
+                                        update_status_callback("Failed to connect Camera 1")
+                                        camera1_cap = None
+                            except Exception as e:
+                                update_status_callback(f"Camera 1 connection error: {str(e)}")
+                                camera1_cap = None
+                        elif not ASI_AVAILABLE:
+                            update_status_callback("ZWO ASI SDK not available")
+                        else:
+                            update_status_callback(f"Camera 1 not found at index {camera1_index}")
+                    elif CAMERA1_DISCONNECT_BUTTON.collidepoint(pos):
+                        camera_button_states["camera1_disconnect"]["clicked"] = True
+                        try:
+                            if camera1_cap is not None:
+                                camera1_cap = None
+                            camera1_connected = False
+                            camera1_frame = None
+                            update_status_callback("Camera 1 disconnected")
+                        except Exception as e:
+                            update_status_callback(f"Camera 1 disconnection error: {str(e)}")
+                    elif CAMERA2_CONNECT_BUTTON.collidepoint(pos):
+                        camera_button_states["camera2_connect"]["clicked"] = True
+                        if ASI_AVAILABLE and camera2_index is not None:
+                            try:
+                                if camera2_connected:
+                                    update_status_callback("Camera 2 already connected")
+                                else:
+                                    camera2_cap = asi.Camera(camera2_index)
+                                    camera2_prop = camera2_cap.get_camera_property()
+                                    if camera2_cap:
+                                        # Set video format
+                                        if camera2_prop['IsColorCam']:
+                                            camera2_cap.set_image_type(asi.ASI_IMG_RGB24)
+                                        else:
+                                            camera2_cap.set_image_type(asi.ASI_IMG_RAW8)
+                                            
+                                        # Set camera controls
+                                        camera2_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
+                                        camera2_cap.set_control_value(asi.ASI_GAIN, 1)  # Min gain
+                                        camera2_connected = True
+                                        camera2_last_update = current_time
+                                        update_status_callback("Camera 2 connected successfully")
+                                        camera_error_message = ""
+                                    else:
+                                        update_status_callback("Failed to connect Camera 2")
+                                        camera2_cap = None
+                            except Exception as e:
+                                update_status_callback(f"Camera 2 connection error: {str(e)}")
+                                camera2_cap = None
+                        elif not ASI_AVAILABLE:
+                            update_status_callback("ZWO ASI SDK not available")
+                        else:
+                            update_status_callback("Camera 2 camera not found")
+                    elif CAMERA2_DISCONNECT_BUTTON.collidepoint(pos):
+                        camera_button_states["camera2_disconnect"]["clicked"] = True
+                        try:
+                            if camera2_cap is not None:
+                                camera2_cap = None
+                            camera2_connected = False
+                            camera2_frame = None
+                            update_status_callback("Camera 2 disconnected")
+                        except Exception as e:
+                            update_status_callback(f"Camera 2 disconnection error: {str(e)}")
                 elif current_mode == "tracking_vis":
                     if clear_filters_button.collidepoint(pos):
                         button_states["clear_filters"]["clicked"] = True
@@ -736,6 +897,10 @@ while running:
                 button_states["reset"]["clicked"] = False
                 button_states["pause"]["clicked"] = False
                 button_states["play"]["clicked"] = False
+                camera_button_states["camera1_connect"]["clicked"] = False
+                camera_button_states["camera2_connect"]["clicked"] = False
+                camera_button_states["camera1_disconnect"]["clicked"] = False
+                camera_button_states["camera2_disconnect"]["clicked"] = False
                 if dragging_slider and paused:
                     fraction = (slider_rect.x - scroll_bar_rect.x) / (scroll_bar_rect.width - slider_rect.width)
                     paused_tt = t0.tt + fraction * (t1.tt - t0.tt)
@@ -1035,7 +1200,7 @@ while running:
         print(f"Debug: Event error - {str(e)}")
 
     # Render continuously
-    menu_screen.fill((30, 30, 30), (0, 0, menu_width, total_height))  # Dark theme menu background
+    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
     if bg_image_menu:
         # Blit rotated negative image if mouse is over the image area, normal otherwise
         if image_rect and image_rect.collidepoint(mouse_pos):
@@ -1142,9 +1307,156 @@ while running:
         label = small_font.render("Duration (min.):", True, (255, 255, 255))
         menu_screen.blit(label, (duration_rect.x, duration_rect.y - 15))
     elif current_mode == "sensor_calib":
+        # Sensor calibration mode - display dual ASI camera feeds
         sub_rect = (sub_x, sub_y, sub_width, sub_height)
-        menu_screen.fill((50, 50, 50), sub_rect)
-        # Add sensor-mount calibration code here later
+        menu_screen.fill((20, 20, 20), sub_rect)  # Darker background
+
+        # Update camera images if ASI SDK is available and 1 second has elapsed
+        if ASI_AVAILABLE:
+            # Update camera 1
+            if camera1_connected and (current_time - camera1_last_update >= CAMERA_UPDATE_INTERVAL):
+                try:
+                    camera1_frame = camera1_cap.capture()
+                    if camera1_frame is not None:
+                        # ASI returns numpy array, convert to pygame surface
+                        if camera1_prop['IsColorCam']:
+                            B, G, R = camera1_frame.T
+                            rgb_image_array1 = np.array((R, G, B)).T
+                            pil_img1 = Image.fromarray(rgb_image_array1, mode="RGB")
+                        else:
+                            pil_img1 = Image.fromarray(camera1_frame, mode="L").convert("RGB")
+                        camera1_surface = pygame.image.frombytes(pil_img1.tobytes(), pil_img1.size, pil_img1.mode)
+                        camera1_frame = camera1_surface
+                        camera_error_message = ""
+                    camera1_last_update = current_time
+                except Exception as e:
+                    camera_error_message = f"Camera 1 error: {str(e)}"
+                    camera1_frame = None
+
+            # Update camera 2
+            if camera2_connected and (current_time - camera2_last_update >= CAMERA_UPDATE_INTERVAL):
+                try:
+                    camera2_frame = camera2_cap.capture()
+                    if camera2_frame is not None:
+                        # ASI returns numpy array, convert to pygame surface
+                        if camera2_prop['IsColorCam']:
+                            pil_img2 = Image.fromarray(camera2_frame, mode="RGB")
+                        else:
+                            pil_img2 = Image.fromarray(camera2_frame, mode="L").convert("RGB")
+                            #size2 = camera2_frame.shape[1::-1]
+                            #camera2_frame = np.repeat(camera2_frame.reshape(size2[1], size2[0], 1), 3, axis = 2)
+                            #pil_img2 = Image.fromarray(camera2_frame, mode="RGB") 
+                            #camera2_surface = pygame.image.frombytes(camera2_frame.tobytes(), size2, 'RGB')
+                        camera2_surface = pygame.image.frombytes(pil_img2.tobytes(), pil_img2.size, pil_img2.mode)
+                        camera2_frame = camera2_surface
+                        camera_error_message = ""
+                    camera2_last_update = current_time
+                except Exception as e:
+                    camera_error_message = f"Camera 2 error: {str(e)}"
+                    camera2_frame = None
+
+        # Draw camera feeds if available
+        display_width = sub_width // 2
+        display_height = sub_height
+        
+        # Camera 1 display area (left half)
+        cam1_left = sub_x
+        cam1_top = sub_y
+        cam1_width = sub_width // 2
+        cam1_height = sub_height
+        
+        # Camera 2 display area (right half)
+        cam2_left = sub_x + sub_width // 2
+        cam2_top = sub_y
+        cam2_width = sub_width // 2
+        cam2_height = sub_height
+
+        # Draw camera 1 feed
+        if camera1_connected:
+            camera1_status = f"Camera 1 ({camera1_name}): Connected"
+            status_color = (0, 255, 0)
+        else:
+            camera1_status = f"Camera 1 ({camera1_name}): Disconnected"
+            status_color = (255, 0, 0)
+        
+        # Draw status text for camera 1
+        status_surface = small_font.render(camera1_status, True, status_color)
+        menu_screen.blit(status_surface, (cam1_left + 10, cam1_top + 10))
+        
+        # Display camera 1 image if connected
+        if camera1_frame and camera1_connected:
+            try:
+                # Scale image to fit display area
+                scaled_frame = pygame.transform.scale(camera1_frame, (cam1_width - 20, cam1_height - 80))
+                # Center the scaled image
+                img_x = cam1_left + (cam1_width - scaled_frame.get_width()) // 2
+                img_y = cam1_top + 50
+                menu_screen.blit(scaled_frame, (img_x, img_y))
+            except Exception as e:
+                error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
+                menu_screen.blit(error_msg, (cam1_left + 10, cam1_top + 40))
+
+        # Draw camera 2 feed
+        if camera2_connected:
+            camera2_status = f"Camera 2 ({camera2_name}): Connected"
+            status_color = (0, 255, 0)
+        else:
+            camera2_status = f"Camera 2 ({camera2_name}): Disconnected"
+            status_color = (255, 0, 0)
+        
+        # Draw status text for camera 2
+        status_surface = small_font.render(camera2_status, True, status_color)
+        menu_screen.blit(status_surface, (cam2_left + 10, cam2_top + 10))
+        
+        # Display camera 2 image if connected
+        if camera2_frame and camera2_connected:
+            try:
+                # Scale image to fit display area
+                scaled_frame = pygame.transform.scale(camera2_frame, (cam2_width - 20, cam2_height - 80))
+                # Center the scaled image
+                img_x = cam2_left + (cam2_width - scaled_frame.get_width()) // 2
+                img_y = cam2_top + 50
+                menu_screen.blit(scaled_frame, (img_x, img_y))
+            except Exception as e:
+                error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
+                menu_screen.blit(error_msg, (cam2_left + 10, cam2_top + 40))
+
+        # Draw connect buttons with smaller font
+        # Camera 1 buttons
+        camera1_connect_text = tiny_font.render("Connect 1", True, (255, 255, 255) if not camera_button_states["camera1_connect"]["clicked"] else (0, 0, 255))
+        camera1_disconnect_text = tiny_font.render("Disconnect 1", True, (255, 255, 255) if not camera_button_states["camera1_disconnect"]["clicked"] else (0, 0, 255))
+
+        # Camera 2 buttons
+        camera2_connect_text = tiny_font.render("Connect 2", True, (255, 255, 255) if not camera_button_states["camera2_connect"]["clicked"] else (0, 0, 255))
+        camera2_disconnect_text = tiny_font.render("Disconnect 2", True, (255, 255, 255) if not camera_button_states["camera2_disconnect"]["clicked"] else (0, 0, 255))
+
+        # Draw button backgrounds
+        pygame.draw.rect(menu_screen, (100, 100, 100) if camera_button_states["camera1_connect"]["clicked"] else (150, 150, 150), CAMERA1_CONNECT_BUTTON)
+        pygame.draw.rect(menu_screen, (100, 100, 100) if camera_button_states["camera1_disconnect"]["clicked"] else (150, 150, 150), CAMERA1_DISCONNECT_BUTTON)
+        pygame.draw.rect(menu_screen, (100, 100, 100) if camera_button_states["camera2_connect"]["clicked"] else (150, 150, 150), CAMERA2_CONNECT_BUTTON)
+        pygame.draw.rect(menu_screen, (100, 100, 100) if camera_button_states["camera2_disconnect"]["clicked"] else (150, 150, 150), CAMERA2_DISCONNECT_BUTTON)
+
+        # Center text in buttons
+        camera1_connect_rect = camera1_connect_text.get_rect(center=CAMERA1_CONNECT_BUTTON.center)
+        camera1_disconnect_rect = camera1_disconnect_text.get_rect(center=CAMERA1_DISCONNECT_BUTTON.center)
+        camera2_connect_rect = camera2_connect_text.get_rect(center=CAMERA2_CONNECT_BUTTON.center)
+        camera2_disconnect_rect = camera2_disconnect_text.get_rect(center=CAMERA2_DISCONNECT_BUTTON.center)
+
+        # Draw text
+        menu_screen.blit(camera1_connect_text, camera1_connect_rect)
+        menu_screen.blit(camera1_disconnect_text, camera1_disconnect_rect)
+        menu_screen.blit(camera2_connect_text, camera2_connect_rect)
+        menu_screen.blit(camera2_disconnect_text, camera2_disconnect_rect)
+        
+        # Display ASI SDK status
+        if not ASI_AVAILABLE:
+            asi_msg = small_font.render("WARNING: ZWO ASI SDK not available", True, (255, 255, 0))
+            menu_screen.blit(asi_msg, (sub_x + 10, sub_y + sub_height - 30))
+        
+        # Display camera error message if any
+        if camera_error_message:
+            error_surface = small_font.render(camera_error_message, True, (255, 0, 0))
+            menu_screen.blit(error_surface, (sub_x + 10, sub_y + sub_height - 50))
     elif current_mode == "joystick_loop":
         sub_rect = (sub_x, sub_y, sub_width, sub_height)
         menu_screen.fill((100, 100, 100), sub_rect)

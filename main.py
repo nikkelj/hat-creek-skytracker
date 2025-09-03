@@ -137,6 +137,12 @@ camera1_prop = None
 camera2_prop = None
 camera1_index = 0  # ASI462MM camera index
 camera2_index = 1  # ASI178MC camera index
+
+# Dynamic camera resolution variables (set at connection time)
+camera1_width_res = CAMERA_WIDTH  # Default fallback, updated on connection
+camera1_height_res = CAMERA_HEIGHT
+camera2_width_res = CAMERA2_WIDTH
+camera2_height_res = CAMERA_HEIGHT
 camera1_last_update = 0
 camera2_last_update = 0
 camera1_last_frame_time = 0
@@ -170,6 +176,25 @@ camera1_exposure_min = 10  # 10 us minimum
 camera1_exposure_max = 500000  # 0.5 maximum (conservative range)
 camera2_exposure_min = 10
 camera2_exposure_max = 500000
+
+# ROI selection variables
+camera1_roi_size = 0  # Index into roi_sizes list (0 = no ROI, 1+ = roi_sizes[i-1])
+camera2_roi_size = 0
+camera1_roi_x = 0.5  # Fraction of frame width (0.0-1.0)
+camera2_roi_x = 0.5
+camera1_roi_y = 0.5  # Fraction of frame height (0.0-1.0)
+camera2_roi_y = 0.5
+
+# ROI size presets (as fraction of full frame, diminishing sizes)
+# Note: These should be conservative to avoid exceeding binned sensor resolutions
+roi_sizes = [
+    (0.03125, 0.03125),  # Smallest: 3.125% size
+    (0.0625, 0.0625),    # Small: 6.25% size (index 1)
+    (0.125, 0.125),      # 12.5% size (index 2)
+    (0.25, 0.25),        # 25% size (index 3)
+    (0.5, 0.5),          # 50% size (index 4)
+    (1.0, 1.0),          # Full frame (index 5)
+]
 
 # Camera UI buttons state
 camera_button_states = {}
@@ -750,7 +775,7 @@ while running:
                                             camera1_cap.set_image_type(asi.ASI_IMG_RGB24)
                                         else:
                                             camera1_cap.set_image_type(asi.ASI_IMG_RAW8)
-                                        
+
                                         # Set camera controls - optimized for higher framerate
                                         camera1_cap.set_control_value(asi.ASI_EXPOSURE, camera1_exposure)  # Use exposure variable
                                         camera1_cap.set_control_value(asi.ASI_GAIN, camera1_gain)  # Set initial gain
@@ -758,6 +783,11 @@ while running:
                                         camera1_last_update = current_time
                                         update_status_callback("Camera 1 connected successfully")
                                         camera_error_message = ""
+
+                                        # Set dynamic camera resolution from camera properties
+                                        camera1_width_res = camera1_prop.get('MaxWidth', CAMERA_WIDTH)
+                                        camera1_height_res = camera1_prop.get('MaxHeight', CAMERA_HEIGHT)
+                                        update_status_callback(f"Camera 1 resolution: {camera1_width_res}x{camera1_height_res}")
                                     else:
                                         update_status_callback("Failed to connect Camera 1")
                                         camera1_cap = None
@@ -895,6 +925,268 @@ while running:
                                 update_status_callback(f"Camera 2 exposure set to {camera2_exposure} µs")
                             except Exception as e:
                                 update_status_callback(f"Failed to set Camera 2 exposure: {str(e)}")
+
+                    # Handle ROI controls for Camera 1
+                    elif camera1_connected:
+                        roi1_controls_x = cam1_left + cam1_width - 200
+                        roi1_controls_y = cam1_top + 30
+
+                        # Check ROI size selection buttons for Camera 1
+                        roi_button_clicked = False
+                        for i, size in enumerate(roi_sizes):
+                            button_rect = pygame.Rect(roi1_controls_x + (i % 3) * 55, roi1_controls_y + (i // 3) * 25, 50, 20)
+                            if button_rect.collidepoint(pos):
+                                camera1_roi_size = i + 1 if camera1_roi_size != i + 1 else 0  # Toggle
+                                roi_button_clicked = True
+
+                                            # Apply ROI to camera 1 hardware if connected
+                                if camera1_connected and camera1_cap and ASI_AVAILABLE and camera1_roi_size > 0:
+                                    try:
+                                        # Get current ROI format to preserve bins and image_type
+                                        try:
+                                            current_roi_format = camera1_cap.get_roi_format()
+                                        except:
+                                            # Fallback if get_roi_format fails
+                                            current_roi_format = (CAMERA_WIDTH, CAMERA_HEIGHT, 1, camera1_prop.get('ImgType', 0))
+
+                                        bins = current_roi_format[2] if len(current_roi_format) > 2 else 1
+                                        image_type = current_roi_format[3] if len(current_roi_format) > 3 else camera1_prop.get('ImgType', 0)
+
+                                        size_fraction = roi_sizes[camera1_roi_size - 1]
+                                        cam1_width_res = camera1_prop.get('MaxWidth', CAMERA_WIDTH)
+                                        cam1_height_res = camera1_prop.get('MaxHeight', CAMERA_HEIGHT)
+                                        roi_width = int(cam1_width_res * size_fraction[0])
+                                        roi_height = int(cam1_height_res * size_fraction[1])
+
+                                        # Ensure dimensions meet camera requirements - adjusted for different camera models
+                                        roi_width = roi_width - (roi_width % 8)  # Width must be multiple of 8
+                                        roi_height = roi_height - (roi_height % 2)  # Height must be multiple of 2
+                                        roi_width = max(roi_width, 32)  # Minimum width
+                                        roi_height = max(roi_height, 4)  # Minimum height
+
+                                        roi_center_x = int(camera1_roi_x * cam1_width_res)
+                                        roi_center_y = int(camera1_roi_y * cam1_height_res)
+
+                                        roi_start_x = roi_center_x - roi_width // 2
+                                        roi_start_y = roi_center_y - roi_height // 2
+
+                                        # Ensure ROI stays within frame bounds
+                                        roi_start_x = max(0, min(roi_start_x, cam1_width_res - roi_width))
+                                        roi_start_y = max(0, min(roi_start_y, cam1_height_res - roi_height))
+
+                                        # Set ROI format first (dimensions and type, preserving current bins)
+                                        camera1_cap.set_roi_format(roi_width, roi_height, bins, image_type)
+
+                                        # Then set ROI start position
+                                        camera1_cap.set_roi_start_position(roi_start_x, roi_start_y)
+
+                                        update_status_callback(f"Camera 1 ROI applied: {roi_width}x{roi_height} at ({roi_start_x}, {roi_start_y})")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to set Camera 1 ROI: {str(e)}")
+                                elif camera1_roi_size == 0 and camera1_connected and camera1_cap and ASI_AVAILABLE:
+                                    # Reset to full frame
+                                    try:
+                                        try:
+                                            current_roi_format = camera1_cap.get_roi_format()
+                                        except:
+                                            # Fallback if get_roi_format fails
+                                            current_roi_format = (CAMERA_WIDTH, CAMERA_HEIGHT, 1, camera1_prop.get('ImgType', 0))
+
+                                        bins = current_roi_format[2] if len(current_roi_format) > 2 else 1
+                                        image_type = current_roi_format[3] if len(current_roi_format) > 3 else camera1_prop.get('ImgType', 0)
+                                        cam1_width_res = camera1_prop.get('MaxWidth', CAMERA_WIDTH)
+                                        cam1_height_res = camera1_prop.get('MaxHeight', CAMERA_HEIGHT)
+                                        # Set to full frame with proper parameters: width, height, bins, image_type
+                                        camera1_cap.set_roi_format(cam1_width_res, cam1_height_res, bins, image_type)
+                                        # Also reset the ROI start position to (0, 0) and center variables
+                                        camera1_cap.set_roi_start_position(0, 0)
+                                        camera1_roi_x = 0.5
+                                        camera1_roi_y = 0.5
+                                        update_status_callback("Camera 1 ROI reset to full frame")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to reset Camera 1 ROI: {str(e)}")
+
+                                roi_status = "Disabled" if camera1_roi_size == 0 else f"Size {roi_sizes[i][0]:.1f}"
+                                update_status_callback(f"Camera 1 ROI: {roi_status}")
+                                break
+
+                        # Check for ROI position setting by clicking on Camera 1 image
+                        if not roi_button_clicked and camera1_frame:
+                            cam1_image_rect = pygame.Rect(cam1_img_x, cam1_img_y, cam1_scaled_frame.get_width(), cam1_scaled_frame.get_height())
+                            if cam1_image_rect.collidepoint(pos):
+                                # Convert click position to ROI coordinates (normalized 0-1)
+                                camera1_roi_x = (pos[0] - cam1_img_x) / cam1_scaled_frame.get_width()
+                                camera1_roi_y = (pos[1] - cam1_img_y) / cam1_scaled_frame.get_height()
+                                camera1_roi_x = max(0.0, min(1.0, camera1_roi_x))  # Clamp to 0-1
+                                camera1_roi_y = max(0.0, min(1.0, camera1_roi_y))
+                                update_status_callback(f"Camera 1 ROI center: ({camera1_roi_x:.2f}, {camera1_roi_y:.2f})")
+
+                                # Apply new position to camera 1 hardware
+                                if camera1_connected and camera1_cap and ASI_AVAILABLE and camera1_roi_size > 0:
+                                    try:
+                                        # Get current ROI format to preserve bins and image_type
+                                        current_roi_format = camera1_cap.get_roi_format()
+                                        bins = current_roi_format[2]
+                                        image_type = current_roi_format[3]
+
+                                        cam1_width_res = camera1_prop.get('MaxWidth', CAMERA_WIDTH)
+                                        cam1_height_res = camera1_prop.get('MaxHeight', CAMERA_HEIGHT)
+
+                                        size_fraction = roi_sizes[camera1_roi_size - 1]
+                                        roi_width = int(cam1_width_res * size_fraction[0])
+                                        roi_height = int(cam1_height_res * size_fraction[1])
+                                        
+                                        # Ensure dimensions meet camera requirements - adjusted for different camera models
+                                        roi_width = roi_width - (roi_width % 8)  # Width must be multiple of 8
+                                        roi_height = roi_height - (roi_height % 2)  # Height must be multiple of 2
+                                        roi_width = max(roi_width, 32)  # Minimum width
+                                        roi_height = max(roi_height, 4)  # Minimum height
+
+                                        roi_center_x = int(camera1_roi_x * cam1_width_res)
+                                        roi_center_y = int(camera1_roi_y * cam1_height_res)
+
+                                        roi_start_x = roi_center_x - roi_width // 2
+                                        roi_start_y = roi_center_y - roi_height // 2
+
+                                        # Ensure ROI stays within frame bounds
+                                        roi_start_x = max(0, min(roi_start_x, cam1_width_res - roi_width))
+                                        roi_start_y = max(0, min(roi_start_y, cam1_height_res - roi_height))
+
+                                        # Set ROI format first (dimensions and type, preserving current bins)
+                                        camera1_cap.set_roi_format(roi_width, roi_height, bins, image_type)
+
+                                        # Then set ROI start position
+                                        camera1_cap.set_roi_start_position(roi_start_x, roi_start_y)
+
+                                        update_status_callback("Camera 1 ROI position updated")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to update Camera 1 ROI: {str(e)}")
+
+                    # Handle ROI controls for Camera 2
+                    if camera2_connected:
+                        roi2_controls_x = cam2_left + cam2_width - 200
+                        roi2_controls_y = cam2_top + 30
+
+                        # Check ROI size selection buttons for Camera 2
+                        roi_button_clicked = False
+                        for i, size in enumerate(roi_sizes):
+                            button_rect = pygame.Rect(roi2_controls_x + (i % 3) * 55, roi2_controls_y + (i // 3) * 25, 50, 20)
+                            if button_rect.collidepoint(pos):
+                                camera2_roi_size = i + 1 if camera2_roi_size != i + 1 else 0  # Toggle
+                                roi_button_clicked = True
+
+                                # Apply ROI to camera 2 hardware if connected
+                                if camera2_connected and camera2_cap and ASI_AVAILABLE and camera2_roi_size > 0:
+                                    try:
+                                        # Get current ROI format to preserve bins and image_type
+                                        try:
+                                            current_roi_format = camera2_cap.get_roi_format()
+                                        except:
+                                            # Fallback if get_roi_format fails
+                                            current_roi_format = (CAMERA2_WIDTH, CAMERA_HEIGHT, 1, camera2_prop.get('ImgType', 0))
+
+                                        bins = current_roi_format[2] if len(current_roi_format) > 2 else 1
+                                        image_type = current_roi_format[3] if len(current_roi_format) > 3 else camera2_prop.get('ImgType', 0)
+
+                                        cam2_width_res = camera2_prop.get('MaxWidth', CAMERA2_WIDTH)
+                                        cam2_height_res = camera2_prop.get('MaxHeight', CAMERA_HEIGHT)
+
+                                        size_fraction = roi_sizes[camera2_roi_size - 1]
+                                        roi_width = int(cam2_width_res * size_fraction[0])
+                                        roi_height = int(cam2_height_res * size_fraction[1])
+
+                                        # Ensure dimensions meet camera requirements for different models
+                                        roi_width = roi_width - (roi_width % 8)  # Width must be multiple of 8
+                                        roi_height = roi_height - (roi_height % 2)  # Height must be multiple of 2
+                                        roi_width = max(roi_width, 32)  # Minimum width
+                                        roi_height = max(roi_height, 4)  # Minimum height
+
+                                        roi_center_x = int(camera2_roi_x * cam2_width_res)
+                                        roi_center_y = int(camera2_roi_y * cam2_height_res)
+
+                                        roi_start_x = roi_center_x - roi_width // 2
+                                        roi_start_y = roi_center_y - roi_height // 2
+
+                                        # Ensure ROI stays within frame bounds
+                                        roi_start_x = max(0, min(roi_start_x, cam2_width_res - roi_width))
+                                        roi_start_y = max(0, min(roi_start_y, cam2_height_res - roi_height))
+
+                                        # Set ROI format first (dimensions and type, preserving current bins)
+                                        camera2_cap.set_roi_format(roi_width, roi_height, bins, image_type)
+
+                                        # Then set ROI start position
+                                        camera2_cap.set_roi_start_position(roi_start_x, roi_start_y)
+
+                                        update_status_callback(f"Camera 2 ROI applied: {roi_width}x{roi_height} at ({roi_start_x}, {roi_start_y})")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to set Camera 2 ROI: {str(e)}")
+                                elif camera2_roi_size == 0 and camera2_connected and camera2_cap and ASI_AVAILABLE:
+                                    # Reset to full frame
+                                    try:
+                                        current_roi_format = camera2_cap.get_roi_format()
+                                        bins = current_roi_format[2]
+                                        image_type = current_roi_format[3]
+                                        cam2_width_res = camera2_prop.get('MaxWidth', CAMERA2_WIDTH)
+                                        cam2_height_res = camera2_prop.get('MaxHeight', CAMERA_HEIGHT)
+                                        # Set to full frame with proper parameters: width, height, bins, image_type
+                                        camera2_cap.set_roi_format(cam2_width_res, cam2_height_res, bins, image_type)
+                                        # Also reset the ROI start position to (0, 0) and center variables
+                                        camera2_cap.set_roi_start_position(0, 0)
+                                        camera2_roi_x = 0.5
+                                        camera2_roi_y = 0.5
+                                        update_status_callback("Camera 2 ROI reset to full frame")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to reset Camera 2 ROI: {str(e)}")
+
+                                update_status_callback(f"Camera 2 ROI: {'Disabled' if camera2_roi_size == 0 else f'{roi_sizes[i][0]:.1f}'}")
+                                break
+
+                        # Check for ROI position setting by clicking on Camera 2 image
+                        if not roi_button_clicked and camera2_frame:
+                            cam2_image_rect = pygame.Rect(cam2_img_x, cam2_img_y, cam2_scaled_frame.get_width(), cam2_scaled_frame.get_height())
+                            if cam2_image_rect.collidepoint(pos):
+                                # Convert click position to ROI coordinates (normalized 0-1)
+                                camera2_roi_x = (pos[0] - cam2_img_x) / cam2_scaled_frame.get_width()
+                                camera2_roi_y = (pos[1] - cam2_img_y) / cam2_scaled_frame.get_height()
+                                camera2_roi_x = max(0.0, min(1.0, camera2_roi_x))  # Clamp to 0-1
+                                camera2_roi_y = max(0.0, min(1.0, camera2_roi_y))
+                                update_status_callback(f"Camera 2 ROI center: ({camera2_roi_x:.2f}, {camera2_roi_y:.2f})")
+
+                                # Apply new position to camera 2 hardware
+                                if camera2_connected and camera2_cap and ASI_AVAILABLE and camera2_roi_size > 0:
+                                    try:
+                                        cam2_width_res = camera2_prop.get('MaxWidth', CAMERA2_WIDTH)
+                                        cam2_height_res = camera2_prop.get('MaxHeight', CAMERA_HEIGHT)
+
+                                        size_fraction = roi_sizes[camera2_roi_size - 1]
+                                        roi_width = int(cam2_width_res * size_fraction[0])
+                                        roi_height = int(cam2_height_res * size_fraction[1])
+                                        
+                                        # Ensure dimensions meet camera requirements - adjusted for different camera models
+                                        roi_width = roi_width - (roi_width % 8)  # Width must be multiple of 8
+                                        roi_height = roi_height - (roi_height % 2)  # Height must be multiple of 2
+                                        roi_width = max(roi_width, 32)  # Minimum width
+                                        roi_height = max(roi_height, 4)  # Minimum height
+
+                                        roi_center_x = int(camera2_roi_x * cam2_width_res)
+                                        roi_center_y = int(camera2_roi_y * cam2_height_res)
+
+                                        roi_start_x = roi_center_x - roi_width // 2
+                                        roi_start_y = roi_center_y - roi_height // 2
+
+                                        # Ensure ROI stays within frame bounds
+                                        roi_start_x = max(0, min(roi_start_x, cam2_width_res - roi_width))
+                                        roi_start_y = max(0, min(roi_start_y, cam2_height_res - roi_height))
+
+                                        # Set ROI format first (dimensions and type, preserving current bins)
+                                        camera2_cap.set_roi_format(roi_width, roi_height, bins, image_type)
+
+                                        # Then set ROI start position
+                                        camera2_cap.set_roi_start_position(roi_start_x, roi_start_y)
+
+                                        update_status_callback("Camera 2 ROI position updated")
+                                    except Exception as e:
+                                        update_status_callback(f"Failed to update Camera 2 ROI: {str(e)}")
                 elif current_mode == "tracking_vis":
                     if clear_filters_button.collidepoint(pos):
                         button_states["clear_filters"]["clicked"] = True
@@ -1454,11 +1746,13 @@ while running:
                     if camera1_raw is not None:
                         # Optimized image processing - direct numpy array to pygame conversion
                         if camera1_prop['IsColorCam']:
-                            # For color cameras, convert BGR to RGB if needed and create surface directly
-                            if camera1_raw.shape[-1] == 3:  # RGB image
-                                camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
+                            # For color cameras - ZWO ASI provides BGR format, convert to RGB
+                            if camera1_raw.shape[-1] == 3:  # BGR image
+                                # Convert BGR to RGB by reversing the last dimension
+                                rgb_array = camera1_raw[..., ::-1].astype(np.uint8)
+                                camera1_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
                             else:
-                                # Assume it's raw format, create RGB surface directly
+                                # Fallback for unexpected format
                                 camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
                         else:
                             # For mono cameras, create RGB surface directly
@@ -1486,11 +1780,13 @@ while running:
                     if camera2_raw is not None:
                         # Optimized image processing - direct numpy array to pygame conversion
                         if camera2_prop['IsColorCam']:
-                            # For color cameras, convert BGR to RGB if needed and create surface directly
-                            if camera2_raw.shape[-1] == 3:  # RGB image
-                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
+                            # For color cameras - ZWO ASI provides BGR format, convert to RGB
+                            if camera2_raw.shape[-1] == 3:  # BGR image
+                                # Convert BGR to RGB by reversing the last dimension
+                                rgb_array = camera2_raw[..., ::-1].astype(np.uint8)
+                                camera2_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
                             else:
-                                # Assume it's raw format, create RGB surface directly
+                                # Fallback for unexpected format
                                 camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
                         else:
                             # For monochrome cameras - replicate single channel to RGB (optimized numpy version)
@@ -1540,26 +1836,29 @@ while running:
         else:
             camera1_status = f"Camera 1 ({camera1_name}): Disconnected"
             status_color = (255, 0, 0)
-        
+
         # Draw status text for camera 1
         status_surface = small_font.render(camera1_status, True, status_color)
         menu_screen.blit(status_surface, (cam1_left + 10, cam1_top + 10))
-        
+
         # Display camera 1 image if connected
+        cam1_img_x = 0
+        cam1_img_y = 0
+        cam1_scaled_frame = None
         if camera1_frame and camera1_connected:
             try:
                 # Scale image to fit display area
-                scaled_frame = pygame.transform.scale(camera1_frame, (cam1_width - 20, cam1_height - 80))
+                cam1_scaled_frame = pygame.transform.scale(camera1_frame, (cam1_width - 20, cam1_height - 80))
                 # Center the scaled image
-                img_x = cam1_left + (cam1_width - scaled_frame.get_width()) // 2
-                img_y = cam1_top + 50
-                menu_screen.blit(scaled_frame, (img_x, img_y))
+                cam1_img_x = cam1_left + (cam1_width - cam1_scaled_frame.get_width()) // 2
+                cam1_img_y = cam1_top + 50
+                menu_screen.blit(cam1_scaled_frame, (cam1_img_x, cam1_img_y))
 
                 # Display FPS, UTC and Local time below the image
                 info_text = f"FPS: {camera1_fps:.1f}  UTC: {camera1_utc_ts}  Local: {camera1_local_ts}"
                 info_surface = small_font.render(info_text, True, (255, 255, 255))
-                text_y = img_y + scaled_frame.get_height() + 10
-                menu_screen.blit(info_surface, (img_x, text_y))
+                text_y = cam1_img_y + cam1_scaled_frame.get_height() + 10
+                menu_screen.blit(info_surface, (cam1_img_x, text_y))
             except Exception as e:
                 error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
                 menu_screen.blit(error_msg, (cam1_left + 10, cam1_top + 40))
@@ -1571,26 +1870,29 @@ while running:
         else:
             camera2_status = f"Camera 2 ({camera2_name}): Disconnected"
             status_color = (255, 0, 0)
-        
+
         # Draw status text for camera 2
         status_surface = small_font.render(camera2_status, True, status_color)
         menu_screen.blit(status_surface, (cam2_left + 10, cam2_top + 10))
-        
+
         # Display camera 2 image if connected
+        cam2_img_x = 0
+        cam2_img_y = 0
+        cam2_scaled_frame = None
         if camera2_frame and camera2_connected:
             try:
                 # Scale image to fit display area
-                scaled_frame = pygame.transform.scale(camera2_frame, (cam2_width - 20, cam2_height - 80))
+                cam2_scaled_frame = pygame.transform.scale(camera2_frame, (cam2_width - 20, cam2_height - 80))
                 # Center the scaled image
-                img_x = cam2_left + (cam2_width - scaled_frame.get_width()) // 2
-                img_y = cam2_top + 50
-                menu_screen.blit(scaled_frame, (img_x, img_y))
+                cam2_img_x = cam2_left + (cam2_width - cam2_scaled_frame.get_width()) // 2
+                cam2_img_y = cam2_top + 50
+                menu_screen.blit(cam2_scaled_frame, (cam2_img_x, cam2_img_y))
 
                 # Display FPS, UTC and Local time below the image
                 info_text = f"FPS: {camera2_fps:.1f}  UTC: {camera2_utc_ts}  Local: {camera2_local_ts}"
                 info_surface = small_font.render(info_text, True, (255, 255, 255))
-                text_y = img_y + scaled_frame.get_height() + 10
-                menu_screen.blit(info_surface, (img_x, text_y))
+                text_y = cam2_img_y + cam2_scaled_frame.get_height() + 10
+                menu_screen.blit(info_surface, (cam2_img_x, text_y))
             except Exception as e:
                 error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
                 menu_screen.blit(error_msg, (cam2_left + 10, cam2_top + 40))
@@ -1723,6 +2025,108 @@ while running:
             # Draw handle
             handle_color = (0, 255, 255) if camera_button_states["camera2_exposure_slider"]["hover"] else (255, 255, 255)
             pygame.draw.rect(menu_screen, handle_color, CAMERA2_EXPOSURE_SLIDER_HANDLE_RECT)
+
+        # Draw ROI controls for Camera 1 (if connected)
+        if camera1_connected:
+            # ROI controls positioned at upper right of camera 1 display area
+            roi1_controls_x = cam1_left + cam1_width - 200
+            roi1_controls_y = cam1_top + 30
+
+            # ROI size selection buttons
+            for i, size in enumerate(roi_sizes):
+                button_rect = pygame.Rect(roi1_controls_x + (i % 3) * 55, roi1_controls_y + (i // 3) * 25, 50, 20)
+                size_text = f"{size[0]:.1f}"
+                if size == (1.0, 1.0):
+                    size_text = "1:1"
+                button_color = (0, 255, 0) if camera1_roi_size == i + 1 else (100, 100, 100)
+                pygame.draw.rect(menu_screen, button_color, button_rect)
+                text = tiny_font.render(size_text, True, (255, 255, 255))
+                text_rect = text.get_rect(center=button_rect.center)
+                menu_screen.blit(text, text_rect)
+
+            # ROI position label and current values
+            roi1_pos_label = tiny_font.render(f"ROI Pos: ({camera1_roi_x:.2f}, {camera1_roi_y:.2f})", True, (255, 255, 255))
+            menu_screen.blit(roi1_pos_label, (roi1_controls_x, roi1_controls_y + 80))
+
+            # Instructional text
+            roi_help = tiny_font.render("Click image to set ROI center", True, (200, 200, 200))
+            menu_screen.blit(roi_help, (roi1_controls_x, roi1_controls_y + 95))
+
+            # Draw ROI overlay on camera 1 image if ROI is active
+            if camera1_roi_size > 0 and camera1_frame and cam1_scaled_frame:
+                size_fraction = roi_sizes[camera1_roi_size - 1]
+                roi_width = camera1_frame.get_width() * size_fraction[0]
+                roi_height = camera1_frame.get_height() * size_fraction[1]
+                roi_center_x = camera1_roi_x * camera1_frame.get_width()
+                roi_center_y = camera1_roi_y * camera1_frame.get_height()
+                roi_left = roi_center_x - roi_width / 2
+                roi_top = roi_center_y - roi_height / 2
+
+                # Convert to display coordinates (scaled and positioned)
+                scaled_roi_x = cam1_img_x + (roi_left / camera1_frame.get_width()) * cam1_scaled_frame.get_width()
+                scaled_roi_y = cam1_img_y + (roi_top / camera1_frame.get_height()) * cam1_scaled_frame.get_height()
+                scaled_roi_w = (roi_width / camera1_frame.get_width()) * cam1_scaled_frame.get_width()
+                scaled_roi_h = (roi_height / camera1_frame.get_height()) * cam1_scaled_frame.get_height()
+
+                # Draw ROI rectangle
+                pygame.draw.rect(menu_screen, (0, 255, 0), pygame.Rect(scaled_roi_x, scaled_roi_y, scaled_roi_w, scaled_roi_h), 2)
+
+                # Draw center cross
+                center_x = scaled_roi_x + scaled_roi_w / 2
+                center_y = scaled_roi_y + scaled_roi_h / 2
+                pygame.draw.line(menu_screen, (0, 255, 0), (center_x - 10, center_y), (center_x + 10, center_y), 1)
+                pygame.draw.line(menu_screen, (0, 255, 0), (center_x, center_y - 10), (center_x, center_y + 10), 1)
+
+        # Draw ROI controls for Camera 2 (if connected)
+        if camera2_connected:
+            # ROI controls positioned at upper right of camera 2 display area
+            roi2_controls_x = cam2_left + cam2_width - 200
+            roi2_controls_y = cam2_top + 30
+
+            # ROI size selection buttons
+            for i, size in enumerate(roi_sizes):
+                button_rect = pygame.Rect(roi2_controls_x + (i % 3) * 55, roi2_controls_y + (i // 3) * 25, 50, 20)
+                size_text = f"{size[0]:.1f}"
+                if size == (1.0, 1.0):
+                    size_text = "1:1"
+                button_color = (0, 255, 0) if camera2_roi_size == i + 1 else (100, 100, 100)
+                pygame.draw.rect(menu_screen, button_color, button_rect)
+                text = tiny_font.render(size_text, True, (255, 255, 255))
+                text_rect = text.get_rect(center=button_rect.center)
+                menu_screen.blit(text, text_rect)
+
+            # ROI position label and current values
+            roi2_pos_label = tiny_font.render(f"ROI Pos: ({camera2_roi_x:.2f}, {camera2_roi_y:.2f})", True, (255, 255, 255))
+            menu_screen.blit(roi2_pos_label, (roi2_controls_x, roi2_controls_y + 80))
+
+            # Instructional text
+            roi_help = tiny_font.render("Click image to set ROI center", True, (200, 200, 200))
+            menu_screen.blit(roi_help, (roi2_controls_x, roi2_controls_y + 95))
+
+            # Draw ROI overlay on camera 2 image if ROI is active
+            if camera2_roi_size > 0 and camera2_frame and cam2_scaled_frame:
+                size_fraction = roi_sizes[camera2_roi_size - 1]
+                roi_width = camera2_frame.get_width() * size_fraction[0]
+                roi_height = camera2_frame.get_height() * size_fraction[1]
+                roi_center_x = camera2_roi_x * camera2_frame.get_width()
+                roi_center_y = camera2_roi_y * camera2_frame.get_height()
+                roi_left = roi_center_x - roi_width / 2
+                roi_top = roi_center_y - roi_height / 2
+
+                # Convert to display coordinates (scaled and positioned)
+                scaled_roi_x = cam2_img_x + (roi_left / camera2_frame.get_width()) * cam2_scaled_frame.get_width()
+                scaled_roi_y = cam2_img_y + (roi_top / camera2_frame.get_height()) * cam2_scaled_frame.get_height()
+                scaled_roi_w = (roi_width / camera2_frame.get_width()) * cam2_scaled_frame.get_width()
+                scaled_roi_h = (roi_height / camera2_frame.get_height()) * cam2_scaled_frame.get_height()
+
+                # Draw ROI rectangle
+                pygame.draw.rect(menu_screen, (0, 255, 0), pygame.Rect(scaled_roi_x, scaled_roi_y, scaled_roi_w, scaled_roi_h), 2)
+
+                # Draw center cross
+                center_x = scaled_roi_x + scaled_roi_w / 2
+                center_y = scaled_roi_y + scaled_roi_h / 2
+                pygame.draw.line(menu_screen, (0, 255, 0), (center_x - 10, center_y), (center_x + 10, center_y), 1)
+                pygame.draw.line(menu_screen, (0, 255, 0), (center_x, center_y - 10), (center_x, center_y + 10), 1)
 
         # Display ASI SDK status
         if not ASI_AVAILABLE:

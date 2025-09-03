@@ -110,6 +110,18 @@ CAMERA1_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 265, UI_HEIGHT_
 CAMERA2_CONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 0, 60, 20)
 CAMERA2_DISCONNECT_BUTTON = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1135, UI_HEIGHT_OFFSET + 0, 60, 20)
 
+# Gain control UI rectangles
+CAMERA1_GAIN_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_OFFSET + 30, 150, 20)  # Track for slider
+CAMERA1_GAIN_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
+CAMERA2_GAIN_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 30, 150, 20)  # Track for slider
+CAMERA2_GAIN_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
+
+# Gain slider segments (for visual feedback)
+CAMERA1_GAIN_TRACK_COLOR = (139, 139, 139)  # Dark grey for track
+CAMERA1_GAIN_ACTIVE_COLOR = (100, 100, 100)  # Grey for active portion
+CAMERA2_GAIN_TRACK_COLOR = CAMERA1_GAIN_TRACK_COLOR
+CAMERA2_GAIN_ACTIVE_COLOR = CAMERA1_GAIN_ACTIVE_COLOR
+
 # Camera connection variables
 camera1_connected = False
 camera2_connected = False
@@ -121,11 +133,29 @@ camera1_index = 0  # ASI462MM camera index
 camera2_index = 1  # ASI178MC camera index
 camera1_last_update = 0
 camera2_last_update = 0
+camera1_last_frame_time = 0
+camera2_last_frame_time = 0
+
+# Camera FPS and timestamp variables
+camera1_fps = 0.0
+camera2_fps = 0.0
+camera1_utc_ts = ""
+camera2_utc_ts = ""
+camera1_local_ts = ""
+camera2_local_ts = ""
 
 # Camera state variables
 camera_error_message = ""
 camera1_frame = None
 camera2_frame = None
+
+# Camera gain variables (ASI cameras typically range from 0-300 or similar, adjust as needed)
+camera1_gain = 1
+camera2_gain = 1
+camera1_gain_min = 0
+camera1_gain_max = 300  # Conservative range, can be adjusted based on camera capabilities
+camera2_gain_min = 0
+camera2_gain_max = 300
 
 # Camera UI buttons state
 camera_button_states = {}
@@ -133,6 +163,10 @@ camera_button_states["camera1_connect"] = {"hover": False, "clicked": False}
 camera_button_states["camera2_connect"] = {"hover": False, "clicked": False}
 camera_button_states["camera1_disconnect"] = {"hover": False, "clicked": False}
 camera_button_states["camera2_disconnect"] = {"hover": False, "clicked": False}
+
+# Gain control UI button states
+camera_button_states["camera1_gain_slider"] = {"hover": False, "dragging": False}
+camera_button_states["camera2_gain_slider"] = {"hover": False, "dragging": False}
 
 # ==============================================================================
 # END CONSTANTS
@@ -701,7 +735,7 @@ while running:
                                         
                                         # Set camera controls
                                         camera1_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
-                                        camera1_cap.set_control_value(asi.ASI_GAIN, 1)  # Min gain
+                                        camera1_cap.set_control_value(asi.ASI_GAIN, camera1_gain)  # Set initial gain
                                         camera1_connected = True
                                         camera1_last_update = current_time
                                         update_status_callback("Camera 1 connected successfully")
@@ -744,7 +778,7 @@ while running:
                                             
                                         # Set camera controls
                                         camera2_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
-                                        camera2_cap.set_control_value(asi.ASI_GAIN, 1)  # Min gain
+                                        camera2_cap.set_control_value(asi.ASI_GAIN, camera2_gain)  # Set initial gain
                                         camera2_connected = True
                                         camera2_last_update = current_time
                                         update_status_callback("Camera 2 connected successfully")
@@ -769,6 +803,39 @@ while running:
                             update_status_callback("Camera 2 disconnected")
                         except Exception as e:
                             update_status_callback(f"Camera 2 disconnection error: {str(e)}")
+
+                    # Handle gain slider clicks
+                    elif CAMERA1_GAIN_SLIDER_RECT.collidepoint(pos):
+                        camera_button_states["camera1_gain_slider"]["hover"] = True
+                        # Calculate new gain value based on click position
+                        slider_fraction = (pos[0] - CAMERA1_GAIN_SLIDER_RECT.x) / CAMERA1_GAIN_SLIDER_RECT.width
+                        slider_fraction = max(0.0, min(1.0, slider_fraction))  # Clamp to 0-1
+                        new_gain = int(camera1_gain_min + slider_fraction * (camera1_gain_max - camera1_gain_min))
+                        camera1_gain = new_gain
+
+                        # Update camera gain if connected
+                        if camera1_connected and camera1_cap and ASI_AVAILABLE:
+                            try:
+                                camera1_cap.set_control_value(asi.ASI_GAIN, camera1_gain)
+                                update_status_callback(f"Camera 1 gain set to {camera1_gain}")
+                            except Exception as e:
+                                update_status_callback(f"Failed to set Camera 1 gain: {str(e)}")
+
+                    elif CAMERA2_GAIN_SLIDER_RECT.collidepoint(pos):
+                        camera_button_states["camera2_gain_slider"]["hover"] = True
+                        # Calculate new gain value based on click position
+                        slider_fraction = (pos[0] - CAMERA2_GAIN_SLIDER_RECT.x) / CAMERA2_GAIN_SLIDER_RECT.width
+                        slider_fraction = max(0.0, min(1.0, slider_fraction))  # Clamp to 0-1
+                        new_gain = int(camera2_gain_min + slider_fraction * (camera2_gain_max - camera2_gain_min))
+                        camera2_gain = new_gain
+
+                        # Update camera gain if connected
+                        if camera2_connected and camera2_cap and ASI_AVAILABLE:
+                            try:
+                                camera2_cap.set_control_value(asi.ASI_GAIN, camera2_gain)
+                                update_status_callback(f"Camera 2 gain set to {camera2_gain}")
+                            except Exception as e:
+                                update_status_callback(f"Failed to set Camera 2 gain: {str(e)}")
                 elif current_mode == "tracking_vis":
                     if clear_filters_button.collidepoint(pos):
                         button_states["clear_filters"]["clicked"] = True
@@ -875,6 +942,10 @@ while running:
                 if current_mode == "config_options":
                     button_states["save"]["hover"] = save_button.collidepoint(event.pos)
                     button_states["load"]["hover"] = load_button.collidepoint(event.pos)
+                elif current_mode == "sensor_calib":
+                    # Update gain slider hover states
+                    camera_button_states["camera1_gain_slider"]["hover"] = CAMERA1_GAIN_SLIDER_RECT.collidepoint(event.pos)
+                    camera_button_states["camera2_gain_slider"]["hover"] = CAMERA2_GAIN_SLIDER_RECT.collidepoint(event.pos)
                 elif current_mode == "tracking_vis":
                     button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
                     button_states["recompute"]["hover"] = recompute_button.collidepoint(event.pos)
@@ -1328,6 +1399,15 @@ while running:
                         camera1_surface = pygame.image.frombytes(pil_img1.tobytes(), pil_img1.size, pil_img1.mode)
                         camera1_frame = camera1_surface
                         camera_error_message = ""
+
+                        # Calculate FPS and set timestamps
+                        if camera1_last_frame_time > 0:
+                            delta_time = current_time - camera1_last_frame_time
+                            if delta_time > 0:
+                                camera1_fps = 1.0 / delta_time
+                        camera1_last_frame_time = current_time
+                        camera1_utc_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                        camera1_local_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     camera1_last_update = current_time
                 except Exception as e:
                     camera_error_message = f"Camera 1 error: {str(e)}"
@@ -1352,6 +1432,15 @@ while running:
                         camera2_surface = pygame.image.frombytes(pil_img2.tobytes(), pil_img2.size, pil_img2.mode)
                         camera2_frame = camera2_surface
                         camera_error_message = ""
+
+                        # Calculate FPS and set timestamps
+                        if camera2_last_frame_time > 0:
+                            delta_time = current_time - camera2_last_frame_time
+                            if delta_time > 0:
+                                camera2_fps = 1.0 / delta_time
+                        camera2_last_frame_time = current_time
+                        camera2_utc_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                        camera2_local_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     camera2_last_update = current_time
                 except Exception as e:
                     camera_error_message = f"Camera 2 error: {str(e)}"
@@ -1394,6 +1483,12 @@ while running:
                 img_x = cam1_left + (cam1_width - scaled_frame.get_width()) // 2
                 img_y = cam1_top + 50
                 menu_screen.blit(scaled_frame, (img_x, img_y))
+
+                # Display FPS, UTC and Local time below the image
+                info_text = f"FPS: {camera1_fps:.1f}  UTC: {camera1_utc_ts}  Local: {camera1_local_ts}"
+                info_surface = small_font.render(info_text, True, (255, 255, 255))
+                text_y = img_y + scaled_frame.get_height() + 10
+                menu_screen.blit(info_surface, (img_x, text_y))
             except Exception as e:
                 error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
                 menu_screen.blit(error_msg, (cam1_left + 10, cam1_top + 40))
@@ -1419,6 +1514,12 @@ while running:
                 img_x = cam2_left + (cam2_width - scaled_frame.get_width()) // 2
                 img_y = cam2_top + 50
                 menu_screen.blit(scaled_frame, (img_x, img_y))
+
+                # Display FPS, UTC and Local time below the image
+                info_text = f"FPS: {camera2_fps:.1f}  UTC: {camera2_utc_ts}  Local: {camera2_local_ts}"
+                info_surface = small_font.render(info_text, True, (255, 255, 255))
+                text_y = img_y + scaled_frame.get_height() + 10
+                menu_screen.blit(info_surface, (img_x, text_y))
             except Exception as e:
                 error_msg = small_font.render(f"Display error: {str(e)}", True, (255, 255, 0))
                 menu_screen.blit(error_msg, (cam2_left + 10, cam2_top + 40))
@@ -1449,12 +1550,60 @@ while running:
         menu_screen.blit(camera1_disconnect_text, camera1_disconnect_rect)
         menu_screen.blit(camera2_connect_text, camera2_connect_rect)
         menu_screen.blit(camera2_disconnect_text, camera2_disconnect_rect)
-        
+
+        # Draw gain controls for Camera 1 (left side)
+        if camera1_connected:
+            # Camera 1 gain label and value
+            camera1_gain_label = tiny_font.render(f"Cam 1 Gain:", True, (255, 255, 255))
+            camera1_gain_value = tiny_font.render(f"{camera1_gain}", True, (255, 255, 0) if camera_button_states["camera1_gain_slider"]["hover"] else (255, 255, 255))
+            menu_screen.blit(camera1_gain_label, (cam1_left + 10, cam1_top + 32))
+            menu_screen.blit(camera1_gain_value, (cam1_left + 10, cam1_top + 45))
+
+            # Draw Camera 1 gain slider track
+            pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_GAIN_SLIDER_RECT)
+
+            # Calculate handle position based on current gain value
+            gain_fraction = (camera1_gain - camera1_gain_min) / (camera1_gain_max - camera1_gain_min)
+            handle_x = CAMERA1_GAIN_SLIDER_RECT.x + int(gain_fraction * CAMERA1_GAIN_SLIDER_RECT.width)
+            CAMERA1_GAIN_SLIDER_HANDLE_RECT.x = handle_x - CAMERA1_GAIN_SLIDER_HANDLE_RECT.width // 2
+
+            # Draw active part of the track (filled portion)
+            active_width = handle_x - CAMERA1_GAIN_SLIDER_RECT.x
+            pygame.draw.rect(menu_screen, CAMERA1_GAIN_ACTIVE_COLOR, pygame.Rect(CAMERA1_GAIN_SLIDER_RECT.x, CAMERA1_GAIN_SLIDER_RECT.y, active_width, CAMERA1_GAIN_SLIDER_RECT.height))
+
+            # Draw handle
+            handle_color = (0, 255, 255) if camera_button_states["camera1_gain_slider"]["hover"] else (255, 255, 255)
+            pygame.draw.rect(menu_screen, handle_color, CAMERA1_GAIN_SLIDER_HANDLE_RECT)
+
+        # Draw gain controls for Camera 2 (right side)
+        if camera2_connected:
+            # Camera 2 gain label and value
+            camera2_gain_label = tiny_font.render(f"Cam 2 Gain:", True, (255, 255, 255))
+            camera2_gain_value = tiny_font.render(f"{camera2_gain}", True, (255, 255, 0) if camera_button_states["camera2_gain_slider"]["hover"] else (255, 255, 255))
+            menu_screen.blit(camera2_gain_label, (cam2_left + 10, cam2_top + 32))
+            menu_screen.blit(camera2_gain_value, (cam2_left + 10, cam2_top + 45))
+
+            # Draw Camera 2 gain slider track
+            pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_GAIN_SLIDER_RECT)
+
+            # Calculate handle position based on current gain value
+            gain_fraction = (camera2_gain - camera2_gain_min) / (camera2_gain_max - camera2_gain_min)
+            handle_x = CAMERA2_GAIN_SLIDER_RECT.x + int(gain_fraction * CAMERA2_GAIN_SLIDER_RECT.width)
+            CAMERA2_GAIN_SLIDER_HANDLE_RECT.x = handle_x - CAMERA2_GAIN_SLIDER_HANDLE_RECT.width // 2
+
+            # Draw active part of the track (filled portion)
+            active_width = handle_x - CAMERA2_GAIN_SLIDER_RECT.x
+            pygame.draw.rect(menu_screen, CAMERA2_GAIN_ACTIVE_COLOR, pygame.Rect(CAMERA2_GAIN_SLIDER_RECT.x, CAMERA2_GAIN_SLIDER_RECT.y, active_width, CAMERA2_GAIN_SLIDER_RECT.height))
+
+            # Draw handle
+            handle_color = (0, 255, 255) if camera_button_states["camera2_gain_slider"]["hover"] else (255, 255, 255)
+            pygame.draw.rect(menu_screen, handle_color, CAMERA2_GAIN_SLIDER_HANDLE_RECT)
+
         # Display ASI SDK status
         if not ASI_AVAILABLE:
             asi_msg = small_font.render("WARNING: ZWO ASI SDK not available", True, (255, 255, 0))
             menu_screen.blit(asi_msg, (sub_x + 10, sub_y + sub_height - 30))
-        
+
         # Display camera error message if any
         if camera_error_message:
             error_surface = small_font.render(camera_error_message, True, (255, 0, 0))

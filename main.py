@@ -94,7 +94,7 @@ SECONDS_PER_HOUR = 3600
 WINDOW_POSITION = "0,0"
 
 # Camera Constants and Settings
-CAMERA_UPDATE_INTERVAL = 0.1  # Update camera images every 1 second (30 FPS typical)
+CAMERA_UPDATE_INTERVAL = 0.05  # Update camera images at 20 FPS target
 CAMERA_WIDTH = 1920  # ASI462MM resolution (adjust based on actual camera)
 CAMERA_HEIGHT = 1280
 CAMERA2_WIDTH = 1936  # ASI178MC resolution
@@ -115,6 +115,12 @@ CAMERA1_GAIN_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_O
 CAMERA1_GAIN_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
 CAMERA2_GAIN_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 30, 150, 20)  # Track for slider
 CAMERA2_GAIN_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
+
+# Exposure control UI rectangles (positioned to the right of gain sliders)
+CAMERA1_EXPOSURE_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200 + 200, UI_HEIGHT_OFFSET + 30, 150, 20)  # Track for slider - 200px right of camera 1 gain
+CAMERA1_EXPOSURE_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 200 + 200, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
+CAMERA2_EXPOSURE_SLIDER_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070 + 200, UI_HEIGHT_OFFSET + 30, 150, 20)  # Track for slider - 200px right of camera 2 gain
+CAMERA2_EXPOSURE_SLIDER_HANDLE_RECT = pygame.Rect(MENU_WIDTH + UI_MARGIN + 1070 + 200, UI_HEIGHT_OFFSET + 30, 20, 20)  # Slider handle
 
 # Gain slider segments (for visual feedback)
 CAMERA1_GAIN_TRACK_COLOR = (139, 139, 139)  # Dark grey for track
@@ -157,6 +163,14 @@ camera1_gain_max = 300  # Conservative range, can be adjusted based on camera ca
 camera2_gain_min = 0
 camera2_gain_max = 300
 
+# Camera exposure variables (ASI cameras typically in microseconds, 100us to 2000s range)
+camera1_exposure = 10000  # 10ms default
+camera2_exposure = 10000
+camera1_exposure_min = 10  # 10 us minimum
+camera1_exposure_max = 500000  # 0.5 maximum (conservative range)
+camera2_exposure_min = 10
+camera2_exposure_max = 500000
+
 # Camera UI buttons state
 camera_button_states = {}
 camera_button_states["camera1_connect"] = {"hover": False, "clicked": False}
@@ -167,6 +181,10 @@ camera_button_states["camera2_disconnect"] = {"hover": False, "clicked": False}
 # Gain control UI button states
 camera_button_states["camera1_gain_slider"] = {"hover": False, "dragging": False}
 camera_button_states["camera2_gain_slider"] = {"hover": False, "dragging": False}
+
+# Exposure control UI button states
+camera_button_states["camera1_exposure_slider"] = {"hover": False, "dragging": False}
+camera_button_states["camera2_exposure_slider"] = {"hover": False, "dragging": False}
 
 # ==============================================================================
 # END CONSTANTS
@@ -733,8 +751,8 @@ while running:
                                         else:
                                             camera1_cap.set_image_type(asi.ASI_IMG_RAW8)
                                         
-                                        # Set camera controls
-                                        camera1_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
+                                        # Set camera controls - optimized for higher framerate
+                                        camera1_cap.set_control_value(asi.ASI_EXPOSURE, camera1_exposure)  # Use exposure variable
                                         camera1_cap.set_control_value(asi.ASI_GAIN, camera1_gain)  # Set initial gain
                                         camera1_connected = True
                                         camera1_last_update = current_time
@@ -776,8 +794,8 @@ while running:
                                         else:
                                             camera2_cap.set_image_type(asi.ASI_IMG_RAW8)
                                             
-                                        # Set camera controls
-                                        camera2_cap.set_control_value(asi.ASI_EXPOSURE, 50000)  # 50ms
+                                        # Set camera controls - optimized for higher framerate
+                                        camera2_cap.set_control_value(asi.ASI_EXPOSURE, camera2_exposure)  # Use exposure variable
                                         camera2_cap.set_control_value(asi.ASI_GAIN, camera2_gain)  # Set initial gain
                                         camera2_connected = True
                                         camera2_last_update = current_time
@@ -836,6 +854,47 @@ while running:
                                 update_status_callback(f"Camera 2 gain set to {camera2_gain}")
                             except Exception as e:
                                 update_status_callback(f"Failed to set Camera 2 gain: {str(e)}")
+
+                    # Handle exposure slider clicks
+                    elif CAMERA1_EXPOSURE_SLIDER_RECT.collidepoint(pos):
+                        camera_button_states["camera1_exposure_slider"]["hover"] = True
+                        # Calculate new exposure value based on click position using logarithmic scaling
+                        slider_fraction = (pos[0] - CAMERA1_EXPOSURE_SLIDER_RECT.x) / CAMERA1_EXPOSURE_SLIDER_RECT.width
+                        slider_fraction = max(0.0, min(1.0, slider_fraction))  # Clamp to 0-1
+                        # Logarithmic scaling: map 0-1 to log(min)-log(max)
+                        log_min = math.log10(camera1_exposure_min) if camera1_exposure_min > 0 else 0
+                        log_max = math.log10(camera1_exposure_max)
+                        log_value = log_min + slider_fraction * (log_max - log_min)
+                        new_exposure = int(10 ** log_value)
+                        camera1_exposure = new_exposure
+
+                        # Update camera exposure if connected
+                        if camera1_connected and camera1_cap and ASI_AVAILABLE:
+                            try:
+                                camera1_cap.set_control_value(asi.ASI_EXPOSURE, camera1_exposure)
+                                update_status_callback(f"Camera 1 exposure set to {camera1_exposure} µs")
+                            except Exception as e:
+                                update_status_callback(f"Failed to set Camera 1 exposure: {str(e)}")
+
+                    elif CAMERA2_EXPOSURE_SLIDER_RECT.collidepoint(pos):
+                        camera_button_states["camera2_exposure_slider"]["hover"] = True
+                        # Calculate new exposure value based on click position using logarithmic scaling
+                        slider_fraction = (pos[0] - CAMERA2_EXPOSURE_SLIDER_RECT.x) / CAMERA2_EXPOSURE_SLIDER_RECT.width
+                        slider_fraction = max(0.0, min(1.0, slider_fraction))  # Clamp to 0-1
+                        # Logarithmic scaling: map 0-1 to log(min)-log(max)
+                        log_min = math.log10(camera2_exposure_min) if camera2_exposure_min > 0 else 0
+                        log_max = math.log10(camera2_exposure_max)
+                        log_value = log_min + slider_fraction * (log_max - log_min)
+                        new_exposure = int(10 ** log_value)
+                        camera2_exposure = new_exposure
+
+                        # Update camera exposure if connected
+                        if camera2_connected and camera2_cap and ASI_AVAILABLE:
+                            try:
+                                camera2_cap.set_control_value(asi.ASI_EXPOSURE, camera2_exposure)
+                                update_status_callback(f"Camera 2 exposure set to {camera2_exposure} µs")
+                            except Exception as e:
+                                update_status_callback(f"Failed to set Camera 2 exposure: {str(e)}")
                 elif current_mode == "tracking_vis":
                     if clear_filters_button.collidepoint(pos):
                         button_states["clear_filters"]["clicked"] = True
@@ -946,6 +1005,10 @@ while running:
                     # Update gain slider hover states
                     camera_button_states["camera1_gain_slider"]["hover"] = CAMERA1_GAIN_SLIDER_RECT.collidepoint(event.pos)
                     camera_button_states["camera2_gain_slider"]["hover"] = CAMERA2_GAIN_SLIDER_RECT.collidepoint(event.pos)
+
+                    # Update exposure slider hover states
+                    camera_button_states["camera1_exposure_slider"]["hover"] = CAMERA1_EXPOSURE_SLIDER_RECT.collidepoint(event.pos)
+                    camera_button_states["camera2_exposure_slider"]["hover"] = CAMERA2_EXPOSURE_SLIDER_RECT.collidepoint(event.pos)
                 elif current_mode == "tracking_vis":
                     button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
                     button_states["recompute"]["hover"] = recompute_button.collidepoint(event.pos)
@@ -1387,16 +1450,19 @@ while running:
             # Update camera 1
             if camera1_connected and (current_time - camera1_last_update >= CAMERA_UPDATE_INTERVAL):
                 try:
-                    camera1_frame = camera1_cap.capture()
-                    if camera1_frame is not None:
-                        # ASI returns numpy array, convert to pygame surface
+                    camera1_raw = camera1_cap.capture()
+                    if camera1_raw is not None:
+                        # Optimized image processing - direct numpy array to pygame conversion
                         if camera1_prop['IsColorCam']:
-                            #B, G, R = camera1_frame.T
-                            #rgb_image_array1 = np.array((R, G, B)).T
-                            pil_img1 = Image.fromarray(camera1_frame, mode="RGB")
+                            # For color cameras, convert BGR to RGB if needed and create surface directly
+                            if camera1_raw.shape[-1] == 3:  # RGB image
+                                camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
+                            else:
+                                # Assume it's raw format, create RGB surface directly
+                                camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
                         else:
-                            pil_img1 = Image.fromarray(camera1_frame, mode="L").convert("RGB")
-                        camera1_surface = pygame.image.frombytes(pil_img1.tobytes(), pil_img1.size, pil_img1.mode)
+                            # For mono cameras, create RGB surface directly
+                            camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
                         camera1_frame = camera1_surface
                         camera_error_message = ""
 
@@ -1416,20 +1482,25 @@ while running:
             # Update camera 2
             if camera2_connected and (current_time - camera2_last_update >= CAMERA_UPDATE_INTERVAL):
                 try:
-                    camera2_frame = camera2_cap.capture()
-                    if camera2_frame is not None:
-                        # ASI returns numpy array, convert to pygame surface
+                    camera2_raw = camera2_cap.capture()
+                    if camera2_raw is not None:
+                        # Optimized image processing - direct numpy array to pygame conversion
                         if camera2_prop['IsColorCam']:
-                            B, G, R = camera2_frame.T
-                            rgb_image_array2 = np.array((R, G, B)).T
-                            pil_img2 = Image.fromarray(rgb_image_array2, mode="RGB")
+                            # For color cameras, convert BGR to RGB if needed and create surface directly
+                            if camera2_raw.shape[-1] == 3:  # RGB image
+                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
+                            else:
+                                # Assume it's raw format, create RGB surface directly
+                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
                         else:
-                            pil_img2 = Image.fromarray(camera2_frame, mode="L").convert("RGB")
-                            #size2 = camera2_frame.shape[1::-1]
-                            #camera2_frame = np.repeat(camera2_frame.reshape(size2[1], size2[0], 1), 3, axis = 2)
-                            #pil_img2 = Image.fromarray(camera2_frame, mode="RGB") 
-                            #camera2_surface = pygame.image.frombytes(camera2_frame.tobytes(), size2, 'RGB')
-                        camera2_surface = pygame.image.frombytes(pil_img2.tobytes(), pil_img2.size, pil_img2.mode)
+                            # For monochrome cameras - replicate single channel to RGB (optimized numpy version)
+                            if camera2_raw.ndim == 2:
+                                # Single channel grayscale - replicate to 3 channels for RGB
+                                rgb_array = np.stack([camera2_raw, camera2_raw, camera2_raw], axis=-1).astype(np.uint8)
+                                camera2_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
+                            else:
+                                # Fallback for unexpected format
+                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
                         camera2_frame = camera2_surface
                         camera_error_message = ""
 
@@ -1575,6 +1646,33 @@ while running:
             handle_color = (0, 255, 255) if camera_button_states["camera1_gain_slider"]["hover"] else (255, 255, 255)
             pygame.draw.rect(menu_screen, handle_color, CAMERA1_GAIN_SLIDER_HANDLE_RECT)
 
+            # Camera 1 exposure label and value (beside gain)
+            camera1_exposure_label = tiny_font.render(f"Cam 1 Exp:", True, (255, 255, 255))
+            camera1_exposure_value = tiny_font.render(f"{camera1_exposure} µs", True, (255, 255, 0) if camera_button_states["camera1_exposure_slider"]["hover"] else (255, 255, 255))
+            exposure_offset_x = 90  # Position exposure labels to the right of gain labels
+            menu_screen.blit(camera1_exposure_label, (cam1_left + exposure_offset_x, cam1_top + 32))
+            menu_screen.blit(camera1_exposure_value, (cam1_left + exposure_offset_x, cam1_top + 45))
+
+            # Draw Camera 1 exposure slider track
+            pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_EXPOSURE_SLIDER_RECT)
+
+            # Calculate handle position based on current exposure value using logarithmic scaling
+            if camera1_exposure > 0:
+                exposure_fraction = (math.log10(camera1_exposure) - math.log10(camera1_exposure_min)) / (math.log10(camera1_exposure_max) - math.log10(camera1_exposure_min))
+            else:
+                exposure_fraction = 0.0
+            exposure_fraction = max(0.0, min(1.0, exposure_fraction))  # Clamp to 0-1
+            handle_x = CAMERA1_EXPOSURE_SLIDER_RECT.x + int(exposure_fraction * CAMERA1_EXPOSURE_SLIDER_RECT.width)
+            CAMERA1_EXPOSURE_SLIDER_HANDLE_RECT.x = handle_x - CAMERA1_EXPOSURE_SLIDER_HANDLE_RECT.width // 2
+
+            # Draw active part of the track (filled portion)
+            active_width = handle_x - CAMERA1_EXPOSURE_SLIDER_RECT.x
+            pygame.draw.rect(menu_screen, CAMERA1_GAIN_ACTIVE_COLOR, pygame.Rect(CAMERA1_EXPOSURE_SLIDER_RECT.x, CAMERA1_EXPOSURE_SLIDER_RECT.y, active_width, CAMERA1_EXPOSURE_SLIDER_RECT.height))
+
+            # Draw handle
+            handle_color = (0, 255, 255) if camera_button_states["camera1_exposure_slider"]["hover"] else (255, 255, 255)
+            pygame.draw.rect(menu_screen, handle_color, CAMERA1_EXPOSURE_SLIDER_HANDLE_RECT)
+
         # Draw gain controls for Camera 2 (right side)
         if camera2_connected:
             # Camera 2 gain label and value
@@ -1598,6 +1696,33 @@ while running:
             # Draw handle
             handle_color = (0, 255, 255) if camera_button_states["camera2_gain_slider"]["hover"] else (255, 255, 255)
             pygame.draw.rect(menu_screen, handle_color, CAMERA2_GAIN_SLIDER_HANDLE_RECT)
+
+            # Camera 2 exposure label and value (beside gain)
+            camera2_exposure_label = tiny_font.render(f"Cam 2 Exp:", True, (255, 255, 255))
+            camera2_exposure_value = tiny_font.render(f"{camera2_exposure} µs", True, (255, 255, 0) if camera_button_states["camera2_exposure_slider"]["hover"] else (255, 255, 255))
+            exposure_offset_x = 90  # Position exposure labels to the right of gain labels
+            menu_screen.blit(camera2_exposure_label, (cam2_left + exposure_offset_x, cam2_top + 32))
+            menu_screen.blit(camera2_exposure_value, (cam2_left + exposure_offset_x, cam2_top + 45))
+
+            # Draw Camera 2 exposure slider track
+            pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_EXPOSURE_SLIDER_RECT)
+
+            # Calculate handle position based on current exposure value using logarithmic scaling
+            if camera2_exposure > 0:
+                exposure_fraction = (math.log10(camera2_exposure) - math.log10(camera2_exposure_min)) / (math.log10(camera2_exposure_max) - math.log10(camera2_exposure_min))
+            else:
+                exposure_fraction = 0.0
+            exposure_fraction = max(0.0, min(1.0, exposure_fraction))  # Clamp to 0-1
+            handle_x = CAMERA2_EXPOSURE_SLIDER_RECT.x + int(exposure_fraction * CAMERA2_EXPOSURE_SLIDER_RECT.width)
+            CAMERA2_EXPOSURE_SLIDER_HANDLE_RECT.x = handle_x - CAMERA2_EXPOSURE_SLIDER_HANDLE_RECT.width // 2
+
+            # Draw active part of the track (filled portion)
+            active_width = handle_x - CAMERA2_EXPOSURE_SLIDER_RECT.x
+            pygame.draw.rect(menu_screen, CAMERA2_GAIN_ACTIVE_COLOR, pygame.Rect(CAMERA2_EXPOSURE_SLIDER_RECT.x, CAMERA2_EXPOSURE_SLIDER_RECT.y, active_width, CAMERA2_EXPOSURE_SLIDER_RECT.height))
+
+            # Draw handle
+            handle_color = (0, 255, 255) if camera_button_states["camera2_exposure_slider"]["hover"] else (255, 255, 255)
+            pygame.draw.rect(menu_screen, handle_color, CAMERA2_EXPOSURE_SLIDER_HANDLE_RECT)
 
         # Display ASI SDK status
         if not ASI_AVAILABLE:

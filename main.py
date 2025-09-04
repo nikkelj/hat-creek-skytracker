@@ -96,8 +96,8 @@ SECONDS_PER_HOUR = 3600
 WINDOW_POSITION = "0,0"
 
 # Camera Constants and Settings
-CAMERA_UPDATE_INTERVAL = 0.1  # Update camera images at 10 FPS target (reduced for stability)
-CAMERA_TARGET_FPS = 10  # Reduced from 20 to prevent timeouts with exposure settings
+CAMERA_UPDATE_INTERVAL = 0.1  # Update camera images at 15 FPS target (optimized timing)
+CAMERA_TARGET_FPS = 15  # Increased from 10 for better frame rate while maintaining stability
 CAMERA_WIDTH = 1920  # ASI462MM resolution (adjust based on actual camera)
 CAMERA_HEIGHT = 1280
 CAMERA2_WIDTH = 1936  # ASI178MC resolution
@@ -230,8 +230,8 @@ camera_button_states["camera2_exposure_slider"] = {"hover": False, "dragging": F
 camera1_thread = None
 camera2_thread = None
 
-# Buffer size for circular buffers (30 frames = ~1 second at 30 FPS)
-BUFFER_SIZE = 30
+# Buffer size for circular buffers (60 frames = ~2 seconds at 30 FPS for smoother playback)
+BUFFER_SIZE = 60
 
 # Thread-safe flags for thread lifecycle management
 camera_threads_running = False
@@ -1924,17 +1924,18 @@ while running:
                 # Create a combined surface for blending
                 combined_surface = pygame.Surface((combined_width, combined_height))
 
-                # Copy cam1 to combined surface with its opacity
-                cmap1_array = pygame.surfarray.array3d(cam1_combined)
-                cam2_array = pygame.surfarray.array3d(cam2_combined)
+                # Optimized blended rendering using pygame surface blending
+                # Set alpha values for both cameras
+                cam1_combined.set_alpha(int(camera1_opacity * 255))
+                cam2_combined.set_alpha(int((1.0 - camera1_opacity) * 255))
 
-                # Blend the arrays using weighted sum
-                # camera1_opacity for cam1, (1 - camera1_opacity) for cam2
-                blended_array = (cmap1_array.astype(np.float32) * camera1_opacity +
-                               cam2_array.astype(np.float32) * (1.0 - camera1_opacity)).astype(np.uint8)
+                # Blend both cameras with alpha
+                combined_surface.blit(cam1_combined, (0, 0))
+                combined_surface.blit(cam2_combined, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
 
-                # Create surface from blended array
-                combined_surface = pygame.surfarray.make_surface(blended_array)
+                # Reset alpha for future use
+                cam1_combined.set_alpha(255)
+                cam2_combined.set_alpha(255)
 
                 # Center the combined image on screen
                 combined_x = sub_x + (sub_width - combined_width) // 2

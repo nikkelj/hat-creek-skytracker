@@ -1080,7 +1080,7 @@ while running:
                     # Handle ROI controls for Camera 1
                     elif camera1_connected:
                         roi1_controls_x = cam1_left + cam1_width - 200
-                        roi1_controls_y = cam1_top + 30
+                        roi1_controls_y = cam1_top + 0
 
                         # Check ROI size selection buttons for Camera 1
                         roi_button_clicked = False
@@ -1216,7 +1216,7 @@ while running:
                     # Handle ROI controls for Camera 2
                     if camera2_connected:
                         roi2_controls_x = cam2_left + cam2_width - 200
-                        roi2_controls_y = cam2_top + 30
+                        roi2_controls_y = cam2_top + 0
 
                         # Check ROI size selection buttons for Camera 2
                         roi_button_clicked = False
@@ -2070,8 +2070,8 @@ while running:
             # Camera 1 gain label and value
             camera1_gain_label = tiny_font.render(f"Cam 1 Gain:", True, (255, 255, 255))
             camera1_gain_value = tiny_font.render(f"{camera1_gain}", True, (255, 255, 0) if camera_button_states["camera1_gain_slider"]["hover"] else (255, 255, 255))
-            menu_screen.blit(camera1_gain_label, (cam1_left + 10, cam1_top + 32))
-            menu_screen.blit(camera1_gain_value, (cam1_left + 10, cam1_top + 45))
+            menu_screen.blit(camera1_gain_label, (cam1_left + 10, cam1_top + 27))
+            menu_screen.blit(camera1_gain_value, (cam1_left + 10, cam1_top + 40))
 
             # Draw Camera 1 gain slider track
             pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_GAIN_SLIDER_RECT)
@@ -2093,8 +2093,8 @@ while running:
             camera1_exposure_label = tiny_font.render(f"Cam 1 Exp:", True, (255, 255, 255))
             camera1_exposure_value = tiny_font.render(f"{camera1_exposure} µs", True, (255, 255, 0) if camera_button_states["camera1_exposure_slider"]["hover"] else (255, 255, 255))
             exposure_offset_x = 90  # Position exposure labels to the right of gain labels
-            menu_screen.blit(camera1_exposure_label, (cam1_left + exposure_offset_x, cam1_top + 32))
-            menu_screen.blit(camera1_exposure_value, (cam1_left + exposure_offset_x, cam1_top + 45))
+            menu_screen.blit(camera1_exposure_label, (cam1_left + exposure_offset_x, cam1_top + 27))
+            menu_screen.blit(camera1_exposure_value, (cam1_left + exposure_offset_x, cam1_top + 40))
 
             # Draw Camera 1 exposure slider track
             pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_EXPOSURE_SLIDER_RECT)
@@ -2121,8 +2121,8 @@ while running:
             # Camera 2 gain label and value
             camera2_gain_label = tiny_font.render(f"Cam 2 Gain:", True, (255, 255, 255))
             camera2_gain_value = tiny_font.render(f"{camera2_gain}", True, (255, 255, 0) if camera_button_states["camera2_gain_slider"]["hover"] else (255, 255, 255))
-            menu_screen.blit(camera2_gain_label, (cam2_left + 10, cam2_top + 32))
-            menu_screen.blit(camera2_gain_value, (cam2_left + 10, cam2_top + 45))
+            menu_screen.blit(camera2_gain_label, (cam2_left + 10, cam2_top + 27))
+            menu_screen.blit(camera2_gain_value, (cam2_left + 10, cam2_top + 40))
 
             # Draw Camera 2 gain slider track
             pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_GAIN_SLIDER_RECT)
@@ -2144,8 +2144,8 @@ while running:
             camera2_exposure_label = tiny_font.render(f"Cam 2 Exp:", True, (255, 255, 255))
             camera2_exposure_value = tiny_font.render(f"{camera2_exposure} µs", True, (255, 255, 0) if camera_button_states["camera2_exposure_slider"]["hover"] else (255, 255, 255))
             exposure_offset_x = 90  # Position exposure labels to the right of gain labels
-            menu_screen.blit(camera2_exposure_label, (cam2_left + exposure_offset_x, cam2_top + 32))
-            menu_screen.blit(camera2_exposure_value, (cam2_left + exposure_offset_x, cam2_top + 45))
+            menu_screen.blit(camera2_exposure_label, (cam2_left + exposure_offset_x, cam2_top + 27))
+            menu_screen.blit(camera2_exposure_value, (cam2_left + exposure_offset_x, cam2_top + 40))
 
             # Draw Camera 2 exposure slider track
             pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_EXPOSURE_SLIDER_RECT)
@@ -2171,7 +2171,7 @@ while running:
         if camera1_connected:
             # ROI controls positioned at upper right of camera 1 display area
             roi1_controls_x = cam1_left + cam1_width - 200
-            roi1_controls_y = cam1_top + 30
+            roi1_controls_y = cam1_top + 0
 
             # ROI size selection buttons
             for i, size in enumerate(roi_sizes):
@@ -2222,7 +2222,7 @@ while running:
         if camera2_connected:
             # ROI controls positioned at upper right of camera 2 display area
             roi2_controls_x = cam2_left + cam2_width - 200
-            roi2_controls_y = cam2_top + 30
+            roi2_controls_y = cam2_top + 0
 
             # ROI size selection buttons
             for i, size in enumerate(roi_sizes):

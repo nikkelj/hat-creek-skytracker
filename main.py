@@ -4,12 +4,14 @@ import sys
 import time
 import requests
 import math
+import threading
 from PIL import Image
 from tkinter import Tk
 from tkinter import filedialog
 from skyfield.api import wgs84, load, utc
 from datetime import datetime, timedelta, timezone
 import numpy as np
+from camera_buffer import CircularBuffer, CameraThread
 
 # Camera imports (for ASI cameras)
 try:
@@ -94,7 +96,8 @@ SECONDS_PER_HOUR = 3600
 WINDOW_POSITION = "0,0"
 
 # Camera Constants and Settings
-CAMERA_UPDATE_INTERVAL = 0.05  # Update camera images at 20 FPS target
+CAMERA_UPDATE_INTERVAL = 0.1  # Update camera images at 15 FPS target (optimized timing)
+CAMERA_TARGET_FPS = 15  # Increased from 10 for better frame rate while maintaining stability
 CAMERA_WIDTH = 1920  # ASI462MM resolution (adjust based on actual camera)
 CAMERA_HEIGHT = 1280
 CAMERA2_WIDTH = 1936  # ASI178MC resolution
@@ -218,6 +221,26 @@ camera_button_states["camera2_gain_slider"] = {"hover": False, "dragging": False
 # Exposure control UI button states
 camera_button_states["camera1_exposure_slider"] = {"hover": False, "dragging": False}
 camera_button_states["camera2_exposure_slider"] = {"hover": False, "dragging": False}
+
+# ==============================================================================
+# CAMERA THREADING VARIABLES (new threaded system)
+# ==============================================================================
+
+# Camera thread objects
+camera1_thread = None
+camera2_thread = None
+
+# Buffer size for circular buffers (60 frames = ~2 seconds at 30 FPS for smoother playback)
+BUFFER_SIZE = 60
+
+# Thread-safe flags for thread lifecycle management
+camera_threads_running = False
+camera1_threads_running = False
+camera2_threads_running = False
+
+# Initialize camera threads
+camera1_thread = None
+camera2_thread = None
 
 # ==============================================================================
 # END CONSTANTS
@@ -521,6 +544,93 @@ def update_status_callback(message):
     pygame.time.wait(50)  # Brief pause to ensure display update
     print(f"Debug: Status - {message}")
 
+# ==============================================================================
+# CAMERA THREAD MANAGEMENT FUNCTIONS
+# ==============================================================================
+
+def start_camera1_thread():
+    """Start camera 1 capture thread if not already running"""
+    global camera1_thread, camera1_threads_running
+
+    if camera1_threads_running or not camera1_connected or camera1_cap is None:
+        return
+
+    camera1_threads_running = True
+    camera1_thread = CameraThread(camera1_index, camera1_cap, BUFFER_SIZE, CAMERA_TARGET_FPS)
+    camera1_thread.start()
+    update_status_callback("Camera 1 thread started")
+
+def start_camera2_thread():
+    """Start camera 2 capture thread if not already running"""
+    global camera2_thread, camera2_threads_running
+
+    if camera2_threads_running or not camera2_connected or camera2_cap is None:
+        return
+
+    camera2_threads_running = True
+    camera2_thread = CameraThread(camera2_index, camera2_cap, BUFFER_SIZE, CAMERA_TARGET_FPS)
+    camera2_thread.start()
+    update_status_callback("Camera 2 thread started")
+
+def stop_camera1_thread():
+    """Stop camera 1 capture thread"""
+    global camera1_thread, camera1_threads_running
+
+    camera1_threads_running = False
+
+    if camera1_thread is not None:
+        camera1_thread.stop()
+        camera1_thread = None
+        update_status_callback("Camera 1 thread stopped")
+
+def stop_camera2_thread():
+    """Stop camera 2 capture thread"""
+    global camera2_thread, camera2_threads_running
+
+    camera2_threads_running = False
+
+    if camera2_thread is not None:
+        camera2_thread.stop()
+        camera2_thread = None
+        update_status_callback("Camera 2 thread stopped")
+
+def stop_camera_threads():
+    """Stop all camera capture threads"""
+    stop_camera1_thread()
+    stop_camera2_thread()
+
+def update_camera_frames_from_buffers():
+    """Update camera frames from thread buffers"""
+    global camera1_frame, camera2_frame, camera1_fps, camera2_fps
+    global camera1_utc_ts, camera2_utc_ts, camera1_local_ts, camera2_local_ts
+
+    # Update camera 1 frame from buffer
+    if camera1_thread is not None:
+        latest_frame = camera1_thread.buffer.get_latest_frame()
+        if latest_frame is not None:
+            camera1_frame = latest_frame['frame']
+            camera1_fps = camera1_thread.get_buffer_fps()
+            camera1_utc_ts = camera1_thread.get_utc_timestamp()
+            camera1_local_ts = camera1_thread.get_local_timestamp()
+
+    # Update camera 2 frame from buffer
+    if camera2_thread is not None:
+        latest_frame = camera2_thread.buffer.get_latest_frame()
+        if latest_frame is not None:
+            camera2_frame = latest_frame['frame']
+            camera2_fps = camera2_thread.get_buffer_fps()
+            camera2_utc_ts = camera2_thread.get_utc_timestamp()
+            camera2_local_ts = camera2_thread.get_local_timestamp()
+
+def update_todo_progress():
+    """Update task progress checklist"""
+    # This would be called periodically to mark tasks as complete
+    pass
+
+# ==============================================================================
+# MAIN PROGRAM LOOP
+# ==============================================================================
+
 running = True
 while running:
     current_time = time.time()
@@ -801,6 +911,9 @@ while running:
                                         camera1_width_res = camera1_prop.get('MaxWidth', CAMERA_WIDTH)
                                         camera1_height_res = camera1_prop.get('MaxHeight', CAMERA_HEIGHT)
                                         update_status_callback(f"Camera 1 resolution: {camera1_width_res}x{camera1_height_res}")
+
+                                        # Start threaded capture for camera 1
+                                        start_camera1_thread()
                                     else:
                                         update_status_callback("Failed to connect Camera 1")
                                         camera1_cap = None
@@ -813,57 +926,62 @@ while running:
                             update_status_callback(f"Camera 1 not found at index {camera1_index}")
                     elif CAMERA1_DISCONNECT_BUTTON.collidepoint(pos):
                         camera_button_states["camera1_disconnect"]["clicked"] = True
-                        try:
-                            if camera1_cap is not None:
-                                camera1_cap = None
-                            camera1_connected = False
-                            camera1_frame = None
-                            update_status_callback("Camera 1 disconnected")
-                        except Exception as e:
-                            update_status_callback(f"Camera 1 disconnection error: {str(e)}")
+                        stop_camera1_thread()
+                        if camera1_cap is not None:
+                            camera1_cap = None
+                        camera1_connected = False
+                        camera1_frame = None
+                        update_status_callback("Camera 1 disconnected")
                     elif CAMERA2_CONNECT_BUTTON.collidepoint(pos):
                         camera_button_states["camera2_connect"]["clicked"] = True
-                        if ASI_AVAILABLE and camera2_index is not None:
+                        if ASI_AVAILABLE:
                             try:
                                 if camera2_connected:
                                     update_status_callback("Camera 2 already connected")
                                 else:
-                                    camera2_cap = asi.Camera(camera2_index)
-                                    camera2_prop = camera2_cap.get_camera_property()
-                                    if camera2_cap:
-                                        # Set video format
-                                        if camera2_prop['IsColorCam']:
-                                            camera2_cap.set_image_type(asi.ASI_IMG_RGB24)
-                                        else:
-                                            camera2_cap.set_image_type(asi.ASI_IMG_RAW8)
-                                            
-                                        # Set camera controls - optimized for higher framerate
-                                        camera2_cap.set_control_value(asi.ASI_EXPOSURE, camera2_exposure)  # Use exposure variable
-                                        camera2_cap.set_control_value(asi.ASI_GAIN, camera2_gain)  # Set initial gain
-                                        camera2_connected = True
-                                        camera2_last_update = current_time
-                                        update_status_callback("Camera 2 connected successfully")
-                                        camera_error_message = ""
-                                    else:
-                                        update_status_callback("Failed to connect Camera 2")
+                                    # Check how many cameras are actually available
+                                    num_cameras = asi.get_num_cameras()
+                                    if num_cameras <= camera2_index:
+                                        update_status_callback(f"Camera 2 (index {camera2_index}) not found. Only {num_cameras} camera(s) detected.")
                                         camera2_cap = None
+                                    else:
+                                        camera2_cap = asi.Camera(camera2_index)
+                                        camera2_prop = camera2_cap.get_camera_property()
+                                        if camera2_cap:
+                                            # Set video format
+                                            if camera2_prop['IsColorCam']:
+                                                camera2_cap.set_image_type(asi.ASI_IMG_RGB24)
+                                            else:
+                                                camera2_cap.set_image_type(asi.ASI_IMG_RAW8)
+
+                                            # Set camera controls - optimized for higher framerate
+                                            camera2_cap.set_control_value(asi.ASI_EXPOSURE, camera2_exposure)  # Use exposure variable
+                                            camera2_cap.set_control_value(asi.ASI_GAIN, camera2_gain)  # Set initial gain
+                                            camera2_connected = True
+                                            camera2_last_update = current_time
+                                            update_status_callback("Camera 2 connected successfully")
+                                            camera_error_message = ""
+
+                                            # Start threaded capture for camera 2
+                                            start_camera2_thread()
+                                        else:
+                                            update_status_callback("Failed to connect Camera 2")
+                                            camera2_cap = None
                             except Exception as e:
                                 update_status_callback(f"Camera 2 connection error: {str(e)}")
                                 camera2_cap = None
                         elif not ASI_AVAILABLE:
                             update_status_callback("ZWO ASI SDK not available")
                         else:
-                            update_status_callback("Camera 2 camera not found")
+                            update_status_callback("ASI library not available")
                     elif CAMERA2_DISCONNECT_BUTTON.collidepoint(pos):
                         camera_button_states["camera2_disconnect"]["clicked"] = True
-                        try:
-                            if camera2_cap is not None:
-                                camera2_cap = None
-                            camera2_connected = False
-                            camera2_frame = None
-                            update_status_callback("Camera 2 disconnected")
-                        except Exception as e:
-                            update_status_callback(f"Camera 2 disconnection error: {str(e)}")
+                        stop_camera2_thread()
+                        if camera2_cap is not None:
+                            camera2_cap = None
+                        camera2_connected = False
+                        camera2_frame = None
+                        update_status_callback("Camera 2 disconnected")
 
                     # Handle gain slider clicks
                     elif CAMERA1_GAIN_SLIDER_RECT.collidepoint(pos):
@@ -962,7 +1080,7 @@ while running:
                     # Handle ROI controls for Camera 1
                     elif camera1_connected:
                         roi1_controls_x = cam1_left + cam1_width - 200
-                        roi1_controls_y = cam1_top + 30
+                        roi1_controls_y = cam1_top + 0
 
                         # Check ROI size selection buttons for Camera 1
                         roi_button_clicked = False
@@ -1098,7 +1216,7 @@ while running:
                     # Handle ROI controls for Camera 2
                     if camera2_connected:
                         roi2_controls_x = cam2_left + cam2_width - 200
-                        roi2_controls_y = cam2_top + 30
+                        roi2_controls_y = cam2_top + 0
 
                         # Check ROI size selection buttons for Camera 2
                         roi_button_clicked = False
@@ -1770,81 +1888,10 @@ while running:
         sub_rect = (sub_x, sub_y, sub_width, sub_height)
         menu_screen.fill((20, 20, 20), sub_rect)  # Darker background
 
-        # Update camera images if ASI SDK is available and 1 second has elapsed
-        if ASI_AVAILABLE:
-            # Update camera 1
-            if camera1_connected and (current_time - camera1_last_update >= CAMERA_UPDATE_INTERVAL):
-                try:
-                    camera1_raw = camera1_cap.capture()
-                    if camera1_raw is not None:
-                        # Optimized image processing - direct numpy array to pygame conversion
-                        if camera1_prop['IsColorCam']:
-                            # For color cameras - ZWO ASI provides BGR format, convert to RGB
-                            if camera1_raw.shape[-1] == 3:  # BGR image
-                                # Convert BGR to RGB by reversing the last dimension
-                                rgb_array = camera1_raw[..., ::-1].astype(np.uint8)
-                                camera1_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
-                            else:
-                                # Fallback for unexpected format
-                                camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
-                        else:
-                            # For mono cameras, create RGB surface directly
-                            camera1_surface = pygame.image.frombuffer(camera1_raw.tobytes(), camera1_raw.shape[1::-1], 'RGB')
-                        camera1_frame = camera1_surface
-                        camera_error_message = ""
+        # Update camera frames from thread buffers
+        update_camera_frames_from_buffers()
 
-                        # Calculate FPS and set timestamps
-                        if camera1_last_frame_time > 0:
-                            delta_time = current_time - camera1_last_frame_time
-                            if delta_time > 0:
-                                camera1_fps = 1.0 / delta_time
-                        camera1_last_frame_time = current_time
-                        camera1_utc_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                        camera1_local_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    camera1_last_update = current_time
-                except Exception as e:
-                    camera_error_message = f"Camera 1 error: {str(e)}"
-                    camera1_frame = None
-
-            # Update camera 2
-            if camera2_connected and (current_time - camera2_last_update >= CAMERA_UPDATE_INTERVAL):
-                try:
-                    camera2_raw = camera2_cap.capture()
-                    if camera2_raw is not None:
-                        # Optimized image processing - direct numpy array to pygame conversion
-                        if camera2_prop['IsColorCam']:
-                            # For color cameras - ZWO ASI provides BGR format, convert to RGB
-                            if camera2_raw.shape[-1] == 3:  # BGR image
-                                # Convert BGR to RGB by reversing the last dimension
-                                rgb_array = camera2_raw[..., ::-1].astype(np.uint8)
-                                camera2_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
-                            else:
-                                # Fallback for unexpected format
-                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
-                        else:
-                            # For monochrome cameras - replicate single channel to RGB (optimized numpy version)
-                            if camera2_raw.ndim == 2:
-                                # Single channel grayscale - replicate to 3 channels for RGB
-                                rgb_array = np.stack([camera2_raw, camera2_raw, camera2_raw], axis=-1).astype(np.uint8)
-                                camera2_surface = pygame.image.frombuffer(rgb_array.tobytes(), rgb_array.shape[1::-1], 'RGB')
-                            else:
-                                # Fallback for unexpected format
-                                camera2_surface = pygame.image.frombuffer(camera2_raw.tobytes(), camera2_raw.shape[1::-1], 'RGB')
-                        camera2_frame = camera2_surface
-                        camera_error_message = ""
-
-                        # Calculate FPS and set timestamps
-                        if camera2_last_frame_time > 0:
-                            delta_time = current_time - camera2_last_frame_time
-                            if delta_time > 0:
-                                camera2_fps = 1.0 / delta_time
-                        camera2_last_frame_time = current_time
-                        camera2_utc_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                        camera2_local_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    camera2_last_update = current_time
-                except Exception as e:
-                    camera_error_message = f"Camera 2 error: {str(e)}"
-                    camera2_frame = None
+        # Camera frames are now updated automatically by the CameraThread - no blocking capture in main thread
 
         # Draw camera feeds if available
         display_width = sub_width // 2
@@ -1877,17 +1924,18 @@ while running:
                 # Create a combined surface for blending
                 combined_surface = pygame.Surface((combined_width, combined_height))
 
-                # Copy cam1 to combined surface with its opacity
-                cmap1_array = pygame.surfarray.array3d(cam1_combined)
-                cam2_array = pygame.surfarray.array3d(cam2_combined)
+                # Optimized blended rendering using pygame surface blending
+                # Set alpha values for both cameras
+                cam1_combined.set_alpha(int(camera1_opacity * 255))
+                cam2_combined.set_alpha(int((1.0 - camera1_opacity) * 255))
 
-                # Blend the arrays using weighted sum
-                # camera1_opacity for cam1, (1 - camera1_opacity) for cam2
-                blended_array = (cmap1_array.astype(np.float32) * camera1_opacity +
-                               cam2_array.astype(np.float32) * (1.0 - camera1_opacity)).astype(np.uint8)
+                # Blend both cameras with alpha
+                combined_surface.blit(cam1_combined, (0, 0))
+                combined_surface.blit(cam2_combined, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
 
-                # Create surface from blended array
-                combined_surface = pygame.surfarray.make_surface(blended_array)
+                # Reset alpha for future use
+                cam1_combined.set_alpha(255)
+                cam2_combined.set_alpha(255)
 
                 # Center the combined image on screen
                 combined_x = sub_x + (sub_width - combined_width) // 2
@@ -2022,8 +2070,8 @@ while running:
             # Camera 1 gain label and value
             camera1_gain_label = tiny_font.render(f"Cam 1 Gain:", True, (255, 255, 255))
             camera1_gain_value = tiny_font.render(f"{camera1_gain}", True, (255, 255, 0) if camera_button_states["camera1_gain_slider"]["hover"] else (255, 255, 255))
-            menu_screen.blit(camera1_gain_label, (cam1_left + 10, cam1_top + 32))
-            menu_screen.blit(camera1_gain_value, (cam1_left + 10, cam1_top + 45))
+            menu_screen.blit(camera1_gain_label, (cam1_left + 10, cam1_top + 27))
+            menu_screen.blit(camera1_gain_value, (cam1_left + 10, cam1_top + 40))
 
             # Draw Camera 1 gain slider track
             pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_GAIN_SLIDER_RECT)
@@ -2045,8 +2093,8 @@ while running:
             camera1_exposure_label = tiny_font.render(f"Cam 1 Exp:", True, (255, 255, 255))
             camera1_exposure_value = tiny_font.render(f"{camera1_exposure} µs", True, (255, 255, 0) if camera_button_states["camera1_exposure_slider"]["hover"] else (255, 255, 255))
             exposure_offset_x = 90  # Position exposure labels to the right of gain labels
-            menu_screen.blit(camera1_exposure_label, (cam1_left + exposure_offset_x, cam1_top + 32))
-            menu_screen.blit(camera1_exposure_value, (cam1_left + exposure_offset_x, cam1_top + 45))
+            menu_screen.blit(camera1_exposure_label, (cam1_left + exposure_offset_x, cam1_top + 27))
+            menu_screen.blit(camera1_exposure_value, (cam1_left + exposure_offset_x, cam1_top + 40))
 
             # Draw Camera 1 exposure slider track
             pygame.draw.rect(menu_screen, CAMERA1_GAIN_TRACK_COLOR, CAMERA1_EXPOSURE_SLIDER_RECT)
@@ -2073,8 +2121,8 @@ while running:
             # Camera 2 gain label and value
             camera2_gain_label = tiny_font.render(f"Cam 2 Gain:", True, (255, 255, 255))
             camera2_gain_value = tiny_font.render(f"{camera2_gain}", True, (255, 255, 0) if camera_button_states["camera2_gain_slider"]["hover"] else (255, 255, 255))
-            menu_screen.blit(camera2_gain_label, (cam2_left + 10, cam2_top + 32))
-            menu_screen.blit(camera2_gain_value, (cam2_left + 10, cam2_top + 45))
+            menu_screen.blit(camera2_gain_label, (cam2_left + 10, cam2_top + 27))
+            menu_screen.blit(camera2_gain_value, (cam2_left + 10, cam2_top + 40))
 
             # Draw Camera 2 gain slider track
             pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_GAIN_SLIDER_RECT)
@@ -2096,8 +2144,8 @@ while running:
             camera2_exposure_label = tiny_font.render(f"Cam 2 Exp:", True, (255, 255, 255))
             camera2_exposure_value = tiny_font.render(f"{camera2_exposure} µs", True, (255, 255, 0) if camera_button_states["camera2_exposure_slider"]["hover"] else (255, 255, 255))
             exposure_offset_x = 90  # Position exposure labels to the right of gain labels
-            menu_screen.blit(camera2_exposure_label, (cam2_left + exposure_offset_x, cam2_top + 32))
-            menu_screen.blit(camera2_exposure_value, (cam2_left + exposure_offset_x, cam2_top + 45))
+            menu_screen.blit(camera2_exposure_label, (cam2_left + exposure_offset_x, cam2_top + 27))
+            menu_screen.blit(camera2_exposure_value, (cam2_left + exposure_offset_x, cam2_top + 40))
 
             # Draw Camera 2 exposure slider track
             pygame.draw.rect(menu_screen, CAMERA2_GAIN_TRACK_COLOR, CAMERA2_EXPOSURE_SLIDER_RECT)
@@ -2123,7 +2171,7 @@ while running:
         if camera1_connected:
             # ROI controls positioned at upper right of camera 1 display area
             roi1_controls_x = cam1_left + cam1_width - 200
-            roi1_controls_y = cam1_top + 30
+            roi1_controls_y = cam1_top + 0
 
             # ROI size selection buttons
             for i, size in enumerate(roi_sizes):
@@ -2174,7 +2222,7 @@ while running:
         if camera2_connected:
             # ROI controls positioned at upper right of camera 2 display area
             roi2_controls_x = cam2_left + cam2_width - 200
-            roi2_controls_y = cam2_top + 30
+            roi2_controls_y = cam2_top + 0
 
             # ROI size selection buttons
             for i, size in enumerate(roi_sizes):

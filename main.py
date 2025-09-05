@@ -167,10 +167,7 @@ sub_width = total_width - MENU_WIDTH
 sub_height = total_height
 radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
 
-# Combined view UI controls (bottom center of screen) - defined after pygame initialization
-COMBINED_VIEW_BUTTON_RECT = pygame.Rect(total_width // 2 + 50, total_height - 60, 100, 20)  # Toggle button beneath the two images at center (shrunk height)
-CAMERA_OPACITY_SLIDER_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 300, 20)  # Opacity slider
-CAMERA_OPACITY_SLIDER_HANDLE_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 20, 20)  # Slider handle
+# Combined view UI controls are now in camera_manager
 
 input_rects = {
     'lat': pygame.Rect(sub_x + UI_MARGIN, sub_y + 60, INPUT_WIDTH, INPUT_HEIGHT),
@@ -837,8 +834,12 @@ while running:
             elif current_mode == "sensor_calib":
                 # Handle sensor calibration events using modular handler
                 from camera_manager import handle_sensor_calib_events
-                sensor_result = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
-                                                         camera1_connected, camera2_connected)
+                from camera_manager import camera1_roi_size, camera2_roi_size, camera1_roi_x, camera1_roi_y, camera2_roi_x, camera2_roi_y
+                sensor_result, updated_roi_state = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                                                         camera1_connected, camera2_connected,
+                                                         camera1_roi_size, camera2_roi_size,
+                                                         camera1_roi_x, camera1_roi_y,
+                                                         camera2_roi_x, camera2_roi_y, update_status_callback)
                 if sensor_result:
                     # Update camera connection states based on result
                     if "action" in sensor_result:
@@ -855,6 +856,32 @@ while running:
                     if "status" in sensor_result:
                         status_messages.append(sensor_result["status"])
                         status_messages[:] = status_messages[-4:]  # Keep last 4 messages
+
+                    # Update global ROI state variables from event handler results
+                    if updated_roi_state:
+                        # Update camera_manager module variables by importing and assigning
+                        import camera_manager
+                        camera_manager.camera1_roi_size = updated_roi_state.get('camera1_roi_size', camera1_roi_size)
+                        camera_manager.camera2_roi_size = updated_roi_state.get('camera2_roi_size', camera2_roi_size)
+                        camera_manager.camera1_roi_x = updated_roi_state.get('camera1_roi_x', camera1_roi_x)
+                        camera_manager.camera1_roi_y = updated_roi_state.get('camera1_roi_y', camera1_roi_y)
+                        camera_manager.camera2_roi_x = updated_roi_state.get('camera2_roi_x', camera2_roi_x)
+                        camera_manager.camera2_roi_y = updated_roi_state.get('camera2_roi_y', camera2_roi_y)
+
+                        # Also update local variables immediately for immediate UI feedback
+                        camera1_roi_size = updated_roi_state.get('camera1_roi_size', camera1_roi_size)
+                        camera2_roi_size = updated_roi_state.get('camera2_roi_size', camera2_roi_size)
+                        camera1_roi_x = updated_roi_state.get('camera1_roi_x', camera1_roi_x)
+                        camera1_roi_y = updated_roi_state.get('camera1_roi_y', camera1_roi_y)
+                        camera2_roi_x = updated_roi_state.get('camera2_roi_x', camera2_roi_x)
+                        camera2_roi_y = updated_roi_state.get('camera2_roi_y', camera2_roi_y)
+
+                        # Update global variables in camera_manager module for complete consistency
+                        import camera_manager
+                        camera_manager.camera1_roi_x = camera1_roi_x
+                        camera_manager.camera1_roi_y = camera1_roi_y
+                        camera_manager.camera2_roi_x = camera2_roi_x
+                        camera_manager.camera2_roi_y = camera2_roi_y
             elif current_mode == "config_options":
                 from events import handle_config_events
                 modified_vars = handle_config_events(event, pos, input_rects, save_button, load_button,
@@ -975,8 +1002,11 @@ while running:
             elif current_mode == "sensor_calib":
                 # Camera slider hover states handled by modular camera code
                 from camera_manager import handle_sensor_calib_events
-                sensor_result = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
-                                                         camera1_connected, camera2_connected)
+                sensor_result, _ = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                                                         camera1_connected, camera2_connected,
+                                                         camera1_roi_size, camera2_roi_size,
+                                                         camera1_roi_x, camera1_roi_y,
+                                                         camera2_roi_x, camera2_roi_y)
             elif current_mode == "tracking_vis":
                 button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
                 button_states["recompute"]["hover"] = recompute_button.collidepoint(event.pos)
@@ -1003,8 +1033,11 @@ while running:
             elif current_mode == "sensor_calib":
                 # Handle sensor calibration events using modular handler
                 from camera_manager import handle_sensor_calib_events
-                sensor_result = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
-                                                         camera1_connected, camera2_connected)
+                sensor_result, _ = handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                                                         camera1_connected, camera2_connected,
+                                                         camera1_roi_size, camera2_roi_size,
+                                                         camera1_roi_x, camera1_roi_y,
+                                                         camera2_roi_x, camera2_roi_y)
             elif current_mode == "tracking_vis":
                 button_states["clear_filters"]["clicked"] = False
                 button_states["reset"]["clicked"] = False
@@ -1098,9 +1131,12 @@ while running:
     elif current_mode == "sensor_calib":
         # Modular camera display rendering - replaced ~200 lines of inline camera rendering code
         from camera_manager import render_sensor_calibration
+        print(f"MAIN PASSING ROI: size={camera1_roi_size}, x={camera1_roi_x:.3f}, y={camera1_roi_y:.3f}")
         render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height,
                                camera1_connected, camera2_connected,
-                               camera1_name, camera2_name)
+                               camera1_name, camera2_name,
+                               camera1_roi_size, camera2_roi_size, camera1_roi_x, camera1_roi_y,
+                               camera2_roi_x, camera2_roi_y)
 
         # Modular camera slider controls - positioned within camera display area
         from camera_manager import render_camera_sliders
@@ -1108,11 +1144,11 @@ while running:
 
         # Modular ROI controls for both cameras - replaced ~100+ lines of inline ROI control code
         from camera_manager import render_camera_roi_controls
-        render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height)
+        render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height, camera1_roi_size, camera2_roi_size)
 
         # Modular camera interface completion - replaced ~40 lines of inline combined view and status code
-        from camera_manager import render_camera_interface_completion
-        render_camera_interface_completion(menu_screen, sub_x, sub_y, sub_width, sub_height,
+        from camera_manager import render_combined_view_controls
+        render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_height,
                                         small_font, tiny_font)
     elif current_mode == "joystick_loop":
         sub_rect = (sub_x, sub_y, sub_width, sub_height)

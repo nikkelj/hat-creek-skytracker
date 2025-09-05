@@ -351,6 +351,7 @@ def set_camera1_roi():
     try:
         # Get current ROI size
         roi_width, roi_height = roi_sizes[camera1_roi_size]
+        print(f"[DEBUG] Camera 1 ROI - size index: {camera1_roi_size}, scale: ({roi_width}, {roi_height})")
 
         # Calculate pixel coordinates
         max_width = camera1_prop.get('MaxWidth', 1920)
@@ -360,6 +361,8 @@ def set_camera1_roi():
         start_y = int(camera1_roi_y * max_height)
         roi_w = int(roi_width * max_width)
         roi_h = int(roi_height * max_height)
+
+        print(f"[DEBUG] Camera 1 ROI - Raw calculated size: {roi_w}x{roi_h} (max: {max_width}x{max_height})")
 
         # Ensure ROI stays within bounds
         start_x = max(0, min(start_x, max_width - roi_w))
@@ -924,8 +927,9 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     roi_rect = pygame.Rect(sub_x + 10 + cam_display_width + 55 - 100, sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
+                    print(f"[DEBUG] Camera 1 ROI button {i} clicked - setting roi size to {roi_sizes[i]}")
                     camera1_roi_size = i
-                    print(f"Camera 1 ROI size set to {roi_sizes[i]}")
+                    print(f"[DEBUG] camera1_roi_size variable updated to: {camera1_roi_size}")
                     # Apply ROI settings to camera
                     if i == 5:  # "1.0" - Full image reset
                         camera1_roi_x = 0.0

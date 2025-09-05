@@ -380,9 +380,13 @@ def set_camera1_roi():
         roi_w = min(roi_w, max_width - start_x)
         roi_h = min(roi_h, max_height - start_y)
 
-        # Apply ROI to camera (if supported by ASI SDK)
+        # Get current ROI format to preserve bins and image_type
+        current_roi_format = camera1_cap.get_roi_format()
+
+        # Apply ROI to camera using correct API
         try:
-            camera1_cap.set_roi(start_x, start_y, roi_w, roi_h)
+            camera1_cap.set_roi_format(roi_w, roi_h, current_roi_format.bins, current_roi_format.image_type)
+            camera1_cap.set_roi_start_position(start_x, start_y)
             print(f"Camera 1 ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}")
             return True
         except AttributeError:
@@ -431,9 +435,13 @@ def set_camera2_roi():
         roi_w = min(roi_w, max_width - start_x)
         roi_h = min(roi_h, max_height - start_y)
 
-        # Apply ROI to camera (if supported by ASI SDK)
+        # Get current ROI format to preserve bins and image_type
+        current_roi_format = camera2_cap.get_roi_format()
+
+        # Apply ROI to camera using correct API
         try:
-            camera2_cap.set_roi(start_x, start_y, roi_w, roi_h)
+            camera2_cap.set_roi_format(roi_w, roi_h, current_roi_format.bins, current_roi_format.image_type)
+            camera2_cap.set_roi_start_position(start_x, start_y)
             print(f"Camera 2 ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}")
             return True
         except AttributeError:

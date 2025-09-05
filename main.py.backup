@@ -1108,7 +1108,7 @@ while running:
 
         # Modular ROI controls for both cameras - replaced ~100+ lines of inline ROI control code
         from camera_manager import render_camera_roi_controls
-        render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height)
+        render_camera_roi_controls(menu_screen, tiny_font)
 
         # Modular camera interface completion - replaced ~40 lines of inline combined view and status code
         from camera_manager import render_camera_interface_completion

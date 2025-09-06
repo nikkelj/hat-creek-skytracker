@@ -614,3 +614,50 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
     surface.blit(info_surface, (info_x, table_y + 5))  # Same Y as title
 
     return clickable_areas
+
+def filter_and_sort_pass_table(satellite_pass_table, filter_text, filter_above_alt_text, filter_below_alt_text, satellite_mean_altitudes, table_sort_keys, table_sort_reverse):
+    """
+    Filter and sort the satellite pass table based on name and altitude filters.
+    This consolidates the filtering logic that was duplicated throughout main.py.
+    """
+    if not satellite_pass_table:
+        return []
+
+    # Apply name and altitude filters
+    filtered_table = [entry for entry in satellite_pass_table if (
+        not filter_text or
+        filter_text.lower() in entry['satellite'].name.lower() or
+        filter_text in entry['satellite'].model.satnum_str
+    ) and (
+        not filter_above_alt_text or
+        float(satellite_mean_altitudes.get(entry['satellite'], 0.0)) >= float(filter_above_alt_text)
+    ) and (
+        not filter_below_alt_text or
+        float(satellite_mean_altitudes.get(entry['satellite'], 0.0)) <= float(filter_below_alt_text)
+    )]
+
+    # Apply sorting based on sort keys
+    if table_sort_keys and any(table_sort_keys):
+        # Find the column to sort by
+        sort_column = None
+        for i, is_sorted in enumerate(table_sort_keys):
+            if is_sorted:
+                sort_column = i
+                break
+
+        if sort_column is not None:
+            reverse_sort = table_sort_reverse[sort_column] if table_sort_reverse and sort_column < len(table_sort_reverse) else True
+
+            # Define sort key functions for each column
+            sort_keys = {
+                0: lambda x: x['satellite'].name.strip().lower(),  # Name (alphabetical)
+                1: lambda x: x['satellite'].model.satnum_str,      # NORAD ID (numerical string)
+                2: lambda x: x['azimuth_at_max'],                   # Azimuth
+                3: lambda x: x['max_elevation'],                    # Max Elevation
+                4: lambda x: x.get('closest_approach_time', '99:99')  # Closest Time (handle missing)
+            }
+
+            if sort_column in sort_keys:
+                filtered_table.sort(key=sort_keys[sort_column], reverse=reverse_sort)
+
+    return filtered_table

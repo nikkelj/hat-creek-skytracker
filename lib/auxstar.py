@@ -24,6 +24,7 @@ class Targets(Enum):
     HCPLUS = 0x0d
     AZM = 0x10
     ALT = 0x11
+    FOCUS = 0x12
     APP = 0x20
     GPS = 0xb0
     UKN2 = 0xb4
@@ -38,6 +39,7 @@ class Control(Enum):
     APP = 0x20
     
 # Command set, defined by command:(id, expected command bytes including msgid, expected response bytes)
+# Focus motor: https://www.cloudynights.com/topic/750060-celestron-mototfocus-command-interface/
 COMMANDS={
           'MC_GET_POSITION':(0x01, 1, 3),
           'MC_GOTO_FAST':(0x02, 4, 0),
@@ -64,6 +66,7 @@ COMMANDS={
           'MC_MAXRATE_ENABLED':(0x23, 1, 0),
           'MC_MOVE_POS':(0x24, 2, 0),
           'MC_MOVE_NEG':(0x25, 2, 0),
+          'FOC_GET_HS_POSITIONS':(0x2c, 2, 8), # returns 2 32-bit uints containing low and high limits
           'MC_ENABLE_CORDWRAP':(0x38, 1, 0),
           'MC_DISABLE_CORDWRAP':(0x39, 1, 0),
           'MC_SET_CORDWRAP_POS':(0x3a, 4, 0),

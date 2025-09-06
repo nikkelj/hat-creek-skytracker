@@ -104,7 +104,7 @@ def create_satellite_labels_and_metadata(satellites, ts):
     for sat in satellites:
         name = sat.name.strip()
         norad_id = sat.model.satnum_str
-        label_text = f"{norad_id}"
+        label_text = f"{norad_id} - {name}"
         # Create pygame text surface for the label
         font = pygame.font.Font(None, 16)  # Small font for satellite labels
         satellite_labels[sat] = font.render(label_text, True, (255, 255, 255))  # White text

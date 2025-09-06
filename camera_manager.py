@@ -70,6 +70,12 @@ class CameraManager:
         self.CAMERA_OPACITY_SLIDER_RECT = None
         self.CAMERA_OPACITY_SLIDER_HANDLE_RECT = None
 
+        # Camera connect/disconnect button rects
+        self.CAMERA1_CONNECT_BUTTON_RECT = None
+        self.CAMERA1_DISCONNECT_BUTTON_RECT = None
+        self.CAMERA2_CONNECT_BUTTON_RECT = None
+        self.CAMERA2_DISCONNECT_BUTTON_RECT = None
+
         # Initialize rects after pygame init
         self._initialize_control_rects()
 
@@ -92,25 +98,7 @@ class CameraManager:
             return self.cameras[index]
         return None
 
-    @property
-    def camera1(self):
-        """Backward compatibility property for camera 1"""
-        return self.get_camera(0)
 
-    @property
-    def camera2(self):
-        """Backward compatibility property for camera 2"""
-        return self.get_camera(1)
-
-    @property
-    def camera1_index(self):
-        """Backward compatibility property"""
-        return 0
-
-    @property
-    def camera2_index(self):
-        """Backward compatibility property"""
-        return 1
 
     def connect_camera(self, camera_index, update_status_callback=None):
         """Connect camera by index"""
@@ -167,6 +155,10 @@ class CameraManager:
             camera.cap = None
         camera.connected = False
         camera.frame = None
+        # Reset ROI settings to defaults
+        camera.roi_size = -1
+        camera.roi_x = 0.5
+        camera.roi_y = 0.5
         if update_status_callback:
             update_status_callback(f"Camera {camera_index+1} disconnected")
 
@@ -248,7 +240,14 @@ class CameraManager:
                 # Set to full resolution
                 camera.cap.set_roi_format(max_width, max_height, current_roi_format[2], current_roi_format[3])
                 camera.cap.set_roi_start_position(0, 0)
-                update_status_callback(f"Camera {camera_index+1} ROI reset to full: (0, 0) {max_width}x{max_height}")
+
+                # Update camera object state
+                camera.roi_size = -1
+                camera.roi_x = 0.5
+                camera.roi_y = 0.5
+
+                if update_status_callback:
+                    update_status_callback(f"Camera {camera_index+1} ROI reset to full: (0, 0) {max_width}x{max_height}")
                 return True
 
             # Get current ROI size
@@ -293,89 +292,29 @@ class CameraManager:
             try:
                 camera.cap.set_roi_format(roi_w, roi_h, current_roi_format[2], current_roi_format[3])
                 camera.cap.set_roi_start_position(start_x, start_y)
-                update_status_callback(f"Camera {camera_index+1} ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}")
+
+                # Update camera object state
+                camera.roi_size = roi_size
+                camera.roi_x = roi_x
+                camera.roi_y = roi_y
+
+                if update_status_callback:
+                    update_status_callback(f"Camera {camera_index+1} ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}")
                 return True
             except AttributeError:
                 # ROI setting not supported by this camera/driver
-                update_status_callback(f"Camera {camera_index+1} ROI setting not supported by hardware")
+                if update_status_callback:
+                    update_status_callback(f"Camera {camera_index+1} ROI setting not supported by hardware")
                 return False
         except Exception as e:
-            update_status_callback(f"Error setting Camera {camera_index+1} ROI: {str(e)}")
+            if update_status_callback:
+                update_status_callback(f"Error setting Camera {camera_index+1} ROI: {str(e)}")
             return False
 
-    # Legacy camera1/camera2 methods for backward compatibility
-    def connect_camera1(self, update_status_callback=None):
-        """Connect camera 1 - backward compatibility wrapper"""
-        return self.connect_camera(0, update_status_callback)
 
-    def connect_camera2(self, update_status_callback=None):
-        """Connect camera 2 - backward compatibility wrapper"""
-        return self.connect_camera(1, update_status_callback)
-
-    def disconnect_camera1(self, update_status_callback=None):
-        """Camera 1 disconnect - backward compatibility wrapper"""
-        self.disconnect_camera(0, update_status_callback)
-
-    def disconnect_camera2(self, update_status_callback=None):
-        """Camera 2 disconnect - backward compatibility wrapper"""
-        self.disconnect_camera(1, update_status_callback)
-
-    def stop_all_camera_threads(self):
-        """Stop all camera threads"""
-        for camera in self.cameras:
-            if camera.threads_running and camera.thread is not None:
-                camera.threads_running = False
-                camera.thread.stop()
-                camera.thread = None
-
-    def update_camera_frames_from_buffers(self):
-        """Update camera frames from thread buffers"""
-        for camera in self.cameras:
-            if camera.thread is not None:
-                latest_frame = camera.thread.buffer.get_latest_frame()
-                if latest_frame is not None:
-                    camera.frame = latest_frame['frame']
-                    camera.fps = camera.thread.get_buffer_fps()
-                    camera.utc_ts = camera.thread.get_utc_timestamp()
-                    camera.local_ts = camera.thread.get_local_timestamp()
-
-    # Legacy camera1/camera2 methods for backward compatibility
-    def set_camera1_gain(self, gain_value, update_status_callback=None):
-        """Set camera 1 gain - backward compatibility wrapper"""
-        self.set_camera_gain(0, gain_value, update_status_callback)
-
-    def set_camera2_gain(self, gain_value, update_status_callback=None):
-        """Set camera 2 gain - backward compatibility wrapper"""
-        self.set_camera_gain(1, gain_value, update_status_callback)
-
-    def set_camera1_exposure(self, exposure_value, update_status_callback=None):
-        """Set camera 1 exposure - backward compatibility wrapper"""
-        self.set_camera_exposure(0, exposure_value, update_status_callback)
-
-    def set_camera2_exposure(self, exposure_value, update_status_callback=None):
-        """Set camera 2 exposure - backward compatibility wrapper"""
-        self.set_camera_exposure(1, exposure_value, update_status_callback)
-
-    def set_camera1_roi(self, update_status_callback, roi_x, roi_y, roi_size):
-        """Set camera 1 ROI - backward compatibility wrapper"""
-        return self.set_camera_roi(0, update_status_callback, roi_x, roi_y, roi_size)
-
-    def set_camera2_roi(self, update_status_callback, roi_x, roi_y, roi_size):
-        """Set camera 2 ROI - backward compatibility wrapper"""
-        return self.set_camera_roi(1, update_status_callback, roi_x, roi_y, roi_size)
 
 # Create global camera manager instance
 camera_manager = CameraManager()
-
-# Backward compatibility variables for main.py imports
-camera1_connected = camera_manager.camera1.connected
-camera2_connected = camera_manager.camera2.connected
-camera1_roi_size = camera_manager.camera1.roi_size
-camera2_roi_size = camera_manager.camera2.roi_size
-camera1_roi_x = camera_manager.camera1.roi_x
-camera1_roi_y = camera_manager.camera1.roi_y
-camera2_roi_x = camera_manager.camera2.roi_x
-camera2_roi_y = camera_manager.camera2.roi_y
 
 # ROI constants moved to global scope for easy access
 roi_sizes = [
@@ -394,104 +333,37 @@ roi_label_texts = ["1.0", ".5", ".25", ".125", ".063", ".032"]
 
 def initialize_camera_buttons(menu_screen, total_width, total_height):
     """Initialize camera control button positions after pygame is set up"""
-    global CAMERA1_CONNECT_BUTTON, CAMERA1_DISCONNECT_BUTTON, CAMERA2_CONNECT_BUTTON, CAMERA2_DISCONNECT_BUTTON
-
-    CAMERA1_CONNECT_BUTTON = pygame.Rect(total_width - 200 - 20, total_height - 60, 60, 20)
-    CAMERA1_DISCONNECT_BUTTON = pygame.Rect(total_width - 200 - 80, total_height - 60, 60, 20)
-    CAMERA2_CONNECT_BUTTON = pygame.Rect(total_width - 200 - 20 - 200, total_height - 60, 60, 20)
-    CAMERA2_DISCONNECT_BUTTON = pygame.Rect(total_width - 200 - 80 - 200, total_height - 60, 60, 20)
+    # Store camera connect/disconnect button rectangles in camera_manager
+    camera_manager.CAMERA1_CONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 20, total_height - 60, 60, 20)
+    camera_manager.CAMERA1_DISCONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 80, total_height - 60, 60, 20)
+    camera_manager.CAMERA2_CONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 20 - 200, total_height - 60, 60, 20)
+    camera_manager.CAMERA2_DISCONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 80 - 200, total_height - 60, 60, 20)
 
     # Initialize combined view controls in camera_manager
     camera_manager.COMBINED_VIEW_BUTTON_RECT = pygame.Rect(total_width // 2 + 50, total_height - 60, 100, 20)
     camera_manager.CAMERA_OPACITY_SLIDER_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 300, 20)
     camera_manager.CAMERA_OPACITY_SLIDER_HANDLE_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 20, 20)
 
-def connect_camera1(update_status_callback=None):
-    """Connect to camera 1 - legacy wrapper for camera manager"""
-    return camera_manager.connect_camera1(update_status_callback)
-
-def connect_camera2(update_status_callback=None):
-    """Connect to camera 2 - legacy wrapper for camera manager"""
-    return camera_manager.connect_camera2(update_status_callback)
-
-def disconnect_camera1(update_status_callback=None):
-    """Disconnect camera 1 - legacy wrapper for camera manager"""
-    camera_manager.disconnect_camera1(update_status_callback)
-
-def disconnect_camera2(update_status_callback=None):
-    """Disconnect camera 2 - legacy wrapper for camera manager"""
-    camera_manager.disconnect_camera2(update_status_callback)
-
-# Legacy wrapper functions for backward compatibility (now cleaned up)
-def start_camera1_thread():
-    """Start camera 1 capture thread"""
-    camera_manager._start_camera_thread(camera_manager.cameras[0])
-
-def start_camera2_thread():
-    """Start camera 2 capture thread"""
-    camera_manager._start_camera_thread(camera_manager.cameras[1])
-
-def stop_camera1_thread():
-    """Stop camera 1 capture thread"""
-    camera_manager._stop_camera_thread(camera_manager.cameras[0])
-
-def stop_camera2_thread():
-    """Stop camera 2 capture thread"""
-    camera_manager._stop_camera_thread(camera_manager.cameras[1])
-
-def stop_all_camera_threads():
-    """Stop all camera threads - wrapper for camera manager"""
-    camera_manager.stop_all_camera_threads()
-
 def update_camera_frames_from_buffers():
-    """Update camera frames from thread buffers - wrapper for camera manager"""
-    camera_manager.update_camera_frames_from_buffers()
-
-def set_camera1_gain(gain_value, update_status_callback=None):
-    """Set camera 1 gain - wrapper for camera manager"""
-    camera_manager.set_camera1_gain(gain_value, update_status_callback)
-
-def set_camera2_gain(gain_value, update_status_callback=None):
-    """Set camera 2 gain - wrapper for camera manager"""
-    camera_manager.set_camera2_gain(gain_value, update_status_callback)
-
-def set_camera1_exposure(exposure_value, update_status_callback=None):
-    """Set camera 1 exposure - wrapper for camera manager"""
-    camera_manager.set_camera1_exposure(exposure_value, update_status_callback)
-
-def set_camera2_exposure(exposure_value, update_status_callback=None):
-    """Set camera 2 exposure - wrapper for camera manager"""
-    camera_manager.set_camera2_exposure(exposure_value, update_status_callback)
-
-def set_camera1_roi(update_status_callback, roi_x, roi_y, roi_size):
-    """Set camera 1 ROI - wrapper for camera manager"""
-    return camera_manager.set_camera1_roi(update_status_callback, roi_x, roi_y, roi_size)
-
-def set_camera2_roi(update_status_callback, roi_x, roi_y, roi_size):
-    """Set camera 2 ROI - wrapper for camera manager"""
-    return camera_manager.set_camera2_roi(update_status_callback, roi_x, roi_y, roi_size)
-
-def get_num_cameras():
-    """Get number of cameras available - wrapper for camera manager"""
-    return camera_manager.get_num_cameras()
-
-def get_camera_names():
-    """Get list of camera names - wrapper for camera manager"""
-    return camera_manager.get_camera_names()
+    """Update camera frames from thread buffers"""
+    for camera in camera_manager.cameras:
+        if camera.thread is not None:
+            latest_frame = camera.thread.buffer.get_latest_frame()
+            if latest_frame is not None:
+                camera.frame = latest_frame['frame']
+                camera.fps = camera.thread.get_buffer_fps()
+                camera.utc_ts = camera.thread.get_utc_timestamp()
+                camera.local_ts = camera.thread.get_local_timestamp()
 
 # ==============================================================================
 # CAMERA RENDERING FUNCTIONS (refactored from main.py)
 # ==============================================================================
 
-def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, camera1_connected, camera2_connected, camera1_name, camera2_name, camera1_roi_size, camera2_roi_size, camera1_roi_x, camera1_roi_y, camera2_roi_x, camera2_roi_y):
+def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, camera1_connected, camera2_connected, camera1_name, camera2_name):
     """Render sensor calibration interface - refactored for camera_manager"""
-    from camera_buffer import CameraThread
-    from utils import draw_button
-    import threading
-
     # Get camera references from camera_manager
-    camera1 = camera_manager.camera1
-    camera2 = camera_manager.camera2
+    camera1 = camera_manager.get_camera(0)
+    camera2 = camera_manager.get_camera(1)
     button_states = camera_manager.button_states
 
     menu_screen.fill((0, 0, 0), (sub_x, sub_y, sub_width, sub_height))
@@ -505,7 +377,7 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
 
     # Handle combined view mode
     combined_view_active = (camera_manager.combined_view_toggle and
-                           camera_manager.camera1.connected and camera_manager.camera2.connected and
+                           camera1.connected and camera2.connected and
                            camera1.frame is not None and camera2.frame is not None)
 
     if combined_view_active:
@@ -532,6 +404,13 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
             menu_screen.blit(combined_surface, (sub_x + 10, sub_y + 10))
             menu_screen.blit(combined_surface2, (sub_x + 10, sub_y + 10))
 
+            # Draw thin red crosshair at center of combined view
+            center_x = sub_x + 10 + combined_width // 2
+            center_y = sub_y + 10 + combined_height // 2
+            crosshair_length = 20
+            pygame.draw.line(menu_screen, (255, 0, 0), (center_x - crosshair_length, center_y), (center_x + crosshair_length, center_y), 1)  # Horizontal line
+            pygame.draw.line(menu_screen, (255, 0, 0), (center_x, center_y - crosshair_length), (center_x, center_y + crosshair_length), 1)  # Vertical line
+
             # Combined view info text
             status_font = pygame.font.Font(None, 20)
             name_text = status_font.render(f"Combined View - Camera Opacity: {camera_opacity:.1f}", True, (0, 255, 0))
@@ -543,19 +422,19 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
 
     if not combined_view_active:
         # Original separate camera display logic
-        if camera_manager.camera1.connected and camera1.frame is not None:
+        if camera1.connected and camera1.frame is not None:
             try:
                 # Resize camera frame to fit left half
                 camera1_frame_display = pygame.transform.scale(camera1.frame, (cam_display_width, cam_display_height))
                 menu_screen.blit(camera1_frame_display, (sub_x + 10, sub_y + 10))
 
-                # Draw ROI overlay for camera 1 if ROI is selected (index >= 0 and < 5)
-                if camera1_roi_size >= 0 and camera1_roi_size < 5:  # Only draw overlay if ROI is active (not full image and not deselected)
-                    roi_width_pct, roi_height_pct = roi_sizes[camera1_roi_size]
+                # Draw ROI overlay for Camera 1 using encapsulated camera state
+                if camera1 and camera1.roi_size >= 0:  # Only draw overlay if ROI is active (not -1 = deselected)
+                    roi_width_pct, roi_height_pct = roi_sizes[camera1.roi_size]
                     roi_width_px = int(roi_width_pct * cam_display_width)
                     roi_height_px = int(roi_height_pct * cam_display_height)
-                    roi_x_px = int(camera1_roi_x * (cam_display_width - roi_width_px))
-                    roi_y_px = int(camera1_roi_y * (cam_display_height - roi_height_px))
+                    roi_x_px = int(camera1.roi_x * (cam_display_width - roi_width_px))
+                    roi_y_px = int(camera1.roi_y * (cam_display_height - roi_height_px))
 
                     # Draw green ROI rectangle overlay
                     roi_rect = pygame.Rect(sub_x + 10 + roi_x_px, sub_y + 10 + roi_y_px, roi_width_px, roi_height_px)
@@ -601,7 +480,7 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
     mouse_pos = pygame.mouse.get_pos()
 
     camera1_connect_rect = pygame.Rect(sub_x + 230, sub_y + 10, 60, 20)
-    if not camera_manager.camera1.connected:
+    if not camera1.connected:
         button_states["camera0_connect"]["hover"] = camera1_connect_rect.collidepoint(mouse_pos)
         button_color = (100, 100, 255) if button_states["camera0_connect"]["hover"] else (70, 70, 200)
         pygame.draw.rect(menu_screen, button_color, camera1_connect_rect)
@@ -611,7 +490,7 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
 
     # Camera 1 Disconnect button (next to status)
     camera1_disconnect_rect = pygame.Rect(sub_x + 330, sub_y + 10, 60, 20)
-    if camera_manager.camera1.connected:
+    if camera1.connected:
         button_states["camera0_disconnect"]["hover"] = camera1_disconnect_rect.collidepoint(mouse_pos)
         button_color = (255, 100, 100) if button_states["camera0_disconnect"]["hover"] else (200, 70, 70)
         pygame.draw.rect(menu_screen, button_color, camera1_disconnect_rect)
@@ -620,19 +499,19 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
         menu_screen.blit(text_surface, text_rect)
 
     # Camera 2 display (right half)
-    if camera2_connected and camera2.frame is not None:
+    if camera2_connected and camera2.frame is not None and not combined_view_active:
         try:
             # Resize camera frame to fit right half
             camera2_frame_display = pygame.transform.scale(camera2.frame, (cam_display_width, cam_display_height))
             menu_screen.blit(camera2_frame_display, (sub_x + cam_display_width + 20, sub_y + 10))
 
-            # Draw ROI overlay for camera 2 if ROI is selected (index >= 0 and < 5)
-            if camera2_roi_size >= 0 and camera2_roi_size < 5:  # Only draw overlay if ROI is active (not full image and not deselected)
-                roi_width_pct, roi_height_pct = roi_sizes[camera2_roi_size]
+            # Draw ROI overlay for Camera 2 using encapsulated camera state
+            if camera2 and camera2.roi_size >= 0:  # Only draw overlay if ROI is active (not -1 = deselected)
+                roi_width_pct, roi_height_pct = roi_sizes[camera2.roi_size]
                 roi_width_px = int(roi_width_pct * cam_display_width)
                 roi_height_px = int(roi_height_pct * cam_display_height)
-                roi_x_px = int(camera2_roi_x * (cam_display_width - roi_width_px))
-                roi_y_px = int(camera2_roi_y * (cam_display_height - roi_height_px))
+                roi_x_px = int(camera2.roi_x * (cam_display_width - roi_width_px))
+                roi_y_px = int(camera2.roi_y * (cam_display_height - roi_height_px))
 
                 # Draw green ROI rectangle overlay
                 roi_rect = pygame.Rect(sub_x + cam_display_width + 20 + roi_x_px, sub_y + 10 + roi_y_px, roi_width_px, roi_height_px)
@@ -676,7 +555,7 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
 
     # Camera 2 Connect button (next to status)
     camera2_connect_rect = pygame.Rect(sub_x + cam_display_width + 230, sub_y + 10, 60, 20)
-    if not camera_manager.camera2.connected:
+    if not camera2.connected:
         button_states["camera1_connect"]["hover"] = camera2_connect_rect.collidepoint(mouse_pos)
         button_color = (100, 100, 255) if button_states["camera1_connect"]["hover"] else (70, 70, 200)
         pygame.draw.rect(menu_screen, button_color, camera2_connect_rect)
@@ -686,7 +565,7 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
 
     # Camera 2 Disconnect button (next to status)
     camera2_disconnect_rect = pygame.Rect(sub_x + cam_display_width + 330, sub_y + 10, 60, 20)
-    if camera_manager.camera2.connected:
+    if camera2.connected:
         button_states["camera1_disconnect"]["hover"] = camera2_disconnect_rect.collidepoint(mouse_pos)
         button_color = (255, 100, 100) if button_states["camera1_disconnect"]["hover"] else (200, 70, 70)
         pygame.draw.rect(menu_screen, button_color, camera2_disconnect_rect)
@@ -702,13 +581,13 @@ def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_h
     cam_display_width = (sub_width - 30) // 2  # Match the display function calculation
 
     # Get camera references from camera_manager
-    camera1 = camera_manager.camera1
-    camera2 = camera_manager.camera2
+    camera1 = camera_manager.get_camera(0)
+    camera2 = camera_manager.get_camera(1)
 
-    if camera_manager.camera1.connected:
+    if camera1.connected:
         # Camera 1 Gain Slider - Next to connect / disconnect buttons
-        if camera_manager.camera1.prop:
-            max_gain = camera_manager.camera1.prop.get('MaxGain', 500) if camera_manager.camera1.prop else 500
+        if camera1.prop:
+            max_gain = camera1.prop.get('MaxGain', 500) if camera1.prop else 500
             slider_x = sub_x + 450
             slider_y = sub_y + 20  # Next to connect / disconnect buttons
             slider_color = (100, 100, 100)
@@ -726,8 +605,8 @@ def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_h
             menu_screen.blit(label_text, (slider_x, slider_y + 20))
 
         # Camera 1 Exposure Slider - positioned next to gain slider
-        if camera_manager.camera1.prop:
-            max_exp = camera_manager.camera1.prop.get('MaxExposure', 2000000) if camera_manager.camera1.prop else 2000000
+        if camera1.prop:
+            max_exp = camera1.prop.get('MaxExposure', 2000000) if camera1.prop else 2000000
             slider_x = sub_x + 600
             slider_y = sub_y + 20 # Next to connect / disconnect buttons
             slider_color = (100, 100, 100)
@@ -822,18 +701,21 @@ def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_h
             menu_screen.blit(label_text, (slider_x, slider_y + 20))
 
 
-def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height, camera1_roi_size, camera2_roi_size):
+def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height):
     """Render ROI controls for both cameras - positioned near each camera image"""
     mouse_pos = pygame.mouse.get_pos()
     tiny_font = pygame.font.Font(None, 12)
 
     # Calculate camera display dimensions
     cam_display_width = (sub_width - 30) // 2
-    cam_display_height = sub_height - 30
+
+    # Get camera references
+    camera1 = camera_manager.get_camera(0)
+    camera2 = camera_manager.get_camera(1)
 
     # ROI sizes and labels
 
-    if camera_manager.camera1.connected:
+    if camera1.connected:
         # Camera 1 ROI Size Controls - positioned in upper right of camera 1 image
         for i, size_text in enumerate(roi_label_texts):
             # Position buttons vertically near upper right edge of camera 1 - moved 100 pixels left
@@ -842,7 +724,7 @@ def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height,
             else:  # Second column
                 rect = pygame.Rect(sub_x + 10 + cam_display_width + 55 - 100, sub_y + 10 + (i - 3) * 15, 28, 12)
 
-            is_selected = (camera1_roi_size == i)
+            is_selected = (camera1.roi_size == i)
             is_hovered = rect.collidepoint(mouse_pos)
 
             # Visual button appearance
@@ -866,16 +748,16 @@ def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height,
             text_rect = roi_text.get_rect(center=rect.center)
             menu_screen.blit(roi_text, text_rect)
 
-    if camera_manager.camera2.connected:
+    if camera2.connected:
         # Camera 2 ROI Size Controls - positioned in upper right of camera 2 image
         for i, size_text in enumerate(roi_label_texts):
             # Position buttons vertically near upper right edge of camera 2 - moved 800 pixels right
             if i < 3:  # First column
-                rect = pygame.Rect(sub_x + cam_display_width + 15 + 800, sub_y + 10 + i * 15, 28, 12)
+                rect = pygame.Rect(sub_x + cam_display_width + 15 + 780, sub_y + 10 + i * 15, 28, 12)
             else:  # Second column
-                rect = pygame.Rect(sub_x + cam_display_width + 55 + 800, sub_y + 10 + (i - 3) * 15, 28, 12)
+                rect = pygame.Rect(sub_x + cam_display_width + 55 + 780, sub_y + 10 + (i - 3) * 15, 28, 12)
 
-            is_selected = (camera2_roi_size == i)
+            is_selected = (camera2.roi_size == i)
             is_hovered = rect.collidepoint(mouse_pos)
 
             # Visual button appearance
@@ -904,6 +786,10 @@ def render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_heig
     """Complete camera interface rendering including combined view controls"""
     mouse_pos = pygame.mouse.get_pos()
 
+    # Get camera references
+    camera1 = camera_manager.get_camera(0)
+    camera2 = camera_manager.get_camera(1)
+
     # Combined view toggle button
     if camera_manager.COMBINED_VIEW_BUTTON_RECT:
         button_rect = camera_manager.COMBINED_VIEW_BUTTON_RECT
@@ -925,7 +811,7 @@ def render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_heig
         menu_screen.blit(combined_text, text_rect)
 
     # Camera opacity slider (only show when both cameras are connected or in combined view)
-    if camera_manager.CAMERA_OPACITY_SLIDER_RECT and camera_manager.camera1.connected and camera_manager.camera2.connected:
+    if camera_manager.CAMERA_OPACITY_SLIDER_RECT and camera1.connected and camera2.connected:
         slider_rect = camera_manager.CAMERA_OPACITY_SLIDER_RECT
         handle_rect = camera_manager.CAMERA_OPACITY_SLIDER_HANDLE_RECT
 
@@ -945,20 +831,11 @@ def render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_heig
         opacity_text = tiny_font.render(f"Camera Opacity: {camera_opacity:.1f}", True, (255, 255, 255))
         menu_screen.blit(opacity_text, (slider_rect.x, slider_rect.y - 20))
 
-def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, camera1_connected, camera2_connected, camera1_roi_size, camera2_roi_size, camera1_roi_x, camera1_roi_y, camera2_roi_x, camera2_roi_y, update_status_callback=None):
+def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, camera1_connected, camera2_connected, update_status_callback=None):
     """Handle sensor calibration mode events - modular event handler matching new layout"""
-    # Return updated ROI state
-    updated_roi_state = {
-        'camera1_roi_size': camera1_roi_size,
-        'camera2_roi_size': camera2_roi_size,
-        'camera1_roi_x': camera1_roi_x,
-        'camera1_roi_y': camera1_roi_y,
-        'camera2_roi_x': camera2_roi_x,
-        'camera2_roi_y': camera2_roi_y
-    }
-    result = None
-
-
+    # Get camera references - these will be modified directly by set_camera_roi calls
+    camera1 = camera_manager.get_camera(0)
+    camera2 = camera_manager.get_camera(1)
 
     if event.type == pygame.MOUSEBUTTONDOWN:
 
@@ -973,26 +850,14 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
         camera2_connect_rect = pygame.Rect(sub_x + cam_display_width + 230, sub_y + 10, 60, 20)
         camera2_disconnect_rect = pygame.Rect(sub_x + cam_display_width + 330, sub_y + 10, 60, 20)
 
-        # Camera 1 Gain Slider - coordinates must match render function exactly
-        camera1_gain_rect = pygame.Rect(sub_x + 450, sub_y + 20, 120, 25)  # Match: slider_x = sub_x + 450, slider_y = sub_y + 20
-        camera1_exposure_rect = pygame.Rect(sub_x + 600, sub_y + 20, 120, 25)  # Match: slider_x = sub_x + 600, slider_y = sub_y + 20
-
-        # Camera 2 Gain Slider - coordinates must match render function exactly
-        camera2_gain_rect = pygame.Rect(sub_x + cam_display_width + 450, sub_y + 20, 120, 25)  # Match: slider_x = sub_x + cam_display_width + 450, slider_y = sub_y + 20
-        camera2_exposure_rect = pygame.Rect(sub_x + cam_display_width + 600, sub_y + 20, 120, 25)  # Match: slider_x = sub_x + cam_display_width + 600, slider_y = sub_y + 20
-
         if camera1_connect_rect.collidepoint(pos) and not camera1_connected:
-            if connect_camera1():
-                result = {"action": "connect_camera1", "status": "Camera 1 connected"}
-        elif camera1_disconnect_rect.collidepoint(pos) and camera_manager.camera1.connected:
-            disconnect_camera1()
-            result = {"action": "disconnect_camera1", "status": "Camera 1 disconnected"}
+            camera_manager.connect_camera(0)
+        elif camera1_disconnect_rect.collidepoint(pos) and camera1.connected:
+            camera_manager.disconnect_camera(0)
         elif camera2_connect_rect.collidepoint(pos) and not camera2_connected:
-            if connect_camera2():
-                result = {"action": "connect_camera2", "status": "Camera 2 connected"}
-        elif camera2_disconnect_rect.collidepoint(pos) and camera2_connected:
-            disconnect_camera2()
-            result = {"action": "disconnect_camera2", "status": "Camera 2 disconnected"}
+            camera_manager.connect_camera(1)
+        elif camera2_disconnect_rect.collidepoint(pos) and camera2.connected:
+            camera_manager.disconnect_camera(1)
         # Check gain/exposure sliders - entire slider track is clickable for easier interaction
         if camera1_connected:
             # Camera 1 Gain Slider track detection
@@ -1016,12 +881,30 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
             if camera2_exposure_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_exposure_slider"]["dragging"] = True
 
+        # Combined view button click
+        is_combined_view_controls_click = False
+        if camera_manager.COMBINED_VIEW_BUTTON_RECT and camera_manager.COMBINED_VIEW_BUTTON_RECT.collidepoint(pos):
+            is_combined_view_controls_click = True
+            camera_manager.combined_view_toggle = not camera_manager.combined_view_toggle
+
+        # Camera opacity slider click (if both cameras connected)
+        if camera1.connected and camera2.connected:
+            if camera_manager.CAMERA_OPACITY_SLIDER_RECT and camera_manager.CAMERA_OPACITY_SLIDER_RECT.collidepoint(pos):
+                is_combined_view_controls_click = True
+                # Calculate new opacity based on click position
+                slider_rect = camera_manager.CAMERA_OPACITY_SLIDER_RECT
+                relative_x = min(max(pos[0] - slider_rect.x, 0), slider_rect.width)
+                new_opacity = relative_x / slider_rect.width
+                new_opacity = max(0.0, min(1.0, new_opacity))
+                camera_manager.camera_opacities[0] = new_opacity  # Update first camera opacity
+
         # ROI Size and Origin Selection for Camera 1
         if camera1_connected:
             cam_display_width = (sub_width - 30) // 2
             cam_display_height = sub_height - 30
 
             # Camera 1 ROI Size Control buttons - positions must match render function
+            is_roi_selection = False
             for i in range(6):
                 if i < 3:  # First column
                     roi_rect = pygame.Rect(sub_x + 10 + cam_display_width + 15 - 100, sub_y + 10 + i * 15, 28, 12)
@@ -1029,21 +912,22 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     roi_rect = pygame.Rect(sub_x + 10 + cam_display_width + 55 - 100, sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
+                    is_roi_selection = True
                     # If clicking the currently selected size, deselect ROI
-                    if updated_roi_state['camera1_roi_size'] == i:
-                        updated_roi_state['camera1_roi_size'] = -1
-                        updated_roi_state['camera1_roi_x'] = 0.5  # Reset to center
-                        updated_roi_state['camera1_roi_y'] = 0.5
+                    if camera1.roi_size == i:
+                        camera1.roi_size = -1
+                        camera1.roi_x = 0.5  # Reset to center
+                        camera1.roi_y = 0.5
                         # Actually reset camera to full resolution when deselecting
-                        if not set_camera1_roi(update_status_callback, None, None, -1):
-                            print("ERROR: Failed to reset camera1 to full resolution")
-                        result = {"action": "camera1_roi_none", "status": "Camera 1 ROI deselected"}
+                        camera_manager.set_camera_roi(0, update_status_callback, None, None, -1)
                     else:
-                        updated_roi_state['camera1_roi_size'] = i
-                        # Apply ROI settings to camera - retain current position (pass current values to avoid globals issue)
-                        if not set_camera1_roi(update_status_callback, updated_roi_state['camera1_roi_x'], updated_roi_state['camera1_roi_y'], i):
-                            print("ERROR: Failed to set camera1 ROI")
-                        result = {"action": f"camera1_roi_{roi_sizes[i][0]}", "status": f"Camera 1 ROI set to {roi_sizes[i]}"}
+                        was_first_selection = (camera1.roi_size == -1)
+                        camera1.roi_size = i
+                        if was_first_selection:
+                            camera1.roi_x = 0.5
+                            camera1.roi_y = 0.5
+                        # Retain current position for subsequent selections
+                        camera_manager.set_camera_roi(0, update_status_callback, camera1.roi_x, camera1.roi_y, i)
                     break
 
             # ROI Origin Selection by clicking on Camera 1 image
@@ -1054,37 +938,18 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
             camera1_exposure_track_rect = pygame.Rect(sub_x + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
             skip_camera1_click = camera1_gain_track_rect.collidepoint(pos) or camera1_exposure_track_rect.collidepoint(pos)
 
-            if camera1_image_rect.collidepoint(pos) and camera_manager.camera1.frame is not None and not skip_camera1_click:
+            if camera1_image_rect.collidepoint(pos) and camera1.frame is not None and not skip_camera1_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
                 rel_x = (pos[0] - (sub_x + 10)) / cam_display_width
                 rel_y = (pos[1] - (sub_y + 10)) / cam_display_height
-                updated_roi_state['camera1_roi_x'] = max(0.0, min(1.0, rel_x))
-                updated_roi_state['camera1_roi_y'] = max(0.0, min(1.0, rel_y))
+                camera1.roi_x = max(0.0, min(1.0, rel_x))
+                camera1.roi_y = max(0.0, min(1.0, rel_y))
 
                 # Apply ROI to camera if supported (pass current values to avoid globals issue)
-                if updated_roi_state['camera1_roi_size'] >= 0 and set_camera1_roi(update_status_callback, updated_roi_state['camera1_roi_x'], updated_roi_state['camera1_roi_y'], updated_roi_state['camera1_roi_size']):
-                    print(f"Camera 1 ROI origin set to ({updated_roi_state['camera1_roi_x']:.3f}, {updated_roi_state['camera1_roi_y']:.3f})")
+                if camera1.roi_size >= 0 and camera_manager.set_camera_roi(0, update_status_callback, camera1.roi_x, camera1.roi_y, camera1.roi_size):
+                    print(f"Camera 1 ROI origin set to ({camera1.roi_x:.3f}, {camera1.roi_y:.3f})")
                 else:
                     print("Camera 1 ROI setting not supported or failed")
-
-        # Combined view button click
-        if camera_manager.COMBINED_VIEW_BUTTON_RECT and camera_manager.COMBINED_VIEW_BUTTON_RECT.collidepoint(pos):
-            camera_manager.combined_view_toggle = not camera_manager.combined_view_toggle
-            result = {
-                "action": "toggle_combined_view",
-                "status": f"Combined view {'enabled' if camera_manager.combined_view_toggle else 'disabled'}"
-            }
-
-        # Camera opacity slider click (if both cameras connected)
-        if camera_manager.camera1.connected and camera_manager.camera2.connected:
-            if camera_manager.CAMERA_OPACITY_SLIDER_RECT and camera_manager.CAMERA_OPACITY_SLIDER_RECT.collidepoint(pos):
-                # Calculate new opacity based on click position
-                slider_rect = camera_manager.CAMERA_OPACITY_SLIDER_RECT
-                relative_x = min(max(pos[0] - slider_rect.x, 0), slider_rect.width)
-                new_opacity = relative_x / slider_rect.width
-                new_opacity = max(0.0, min(1.0, new_opacity))
-                camera_manager.camera_opacities[0] = new_opacity  # Update first camera opacity
-                result = {"action": "set_camera_opacity", "status": f"Camera opacity set to {new_opacity:.1f}"}
 
         # ROI Size and Origin Selection for Camera 2
         if camera2_connected:
@@ -1092,26 +957,30 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
             cam_display_height = sub_height - 30
 
             # Camera 2 ROI Size Control buttons - positions must match render function
+            is_roi_selection = False
             for i in range(6):
                 if i < 3:  # First column
-                    roi_rect = pygame.Rect(sub_x + cam_display_width + 15 + 800, sub_y + 10 + i * 15, 28, 12)
+                    roi_rect = pygame.Rect(sub_x + cam_display_width + 15 + 780, sub_y + 10 + i * 15, 28, 12)
                 else:  # Second column
-                    roi_rect = pygame.Rect(sub_x + cam_display_width + 55 + 800, sub_y + 10 + (i - 3) * 15, 28, 12)
+                    roi_rect = pygame.Rect(sub_x + cam_display_width + 55 + 780, sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
+                    is_roi_selection = True
                     # If clicking the currently selected size, deselect ROI
-                    if updated_roi_state['camera2_roi_size'] == i:
-                        updated_roi_state['camera2_roi_size'] = -1
-                        updated_roi_state['camera2_roi_x'] = 0.5  # Reset to center
-                        updated_roi_state['camera2_roi_y'] = 0.5
+                    if camera2.roi_size == i:
+                        camera2.roi_size = -1
+                        camera2.roi_x = 0.5  # Reset to center
+                        camera2.roi_y = 0.5
                         # Actually reset camera to full resolution when deselecting
-                        set_camera2_roi(update_status_callback, None, None, -1)
-                        result = {"action": "camera2_roi_none", "status": "Camera 2 ROI deselected"}
+                        camera_manager.set_camera_roi(1, update_status_callback, None, None, -1)
                     else:
-                        updated_roi_state['camera2_roi_size'] = i
-                        # Apply ROI settings to camera - retain current position (pass current values to avoid globals issue)
-                        set_camera2_roi(update_status_callback, updated_roi_state['camera2_roi_x'], updated_roi_state['camera2_roi_y'], i)
-                        result = {"action": f"camera2_roi_{roi_sizes[i][0]}", "status": f"Camera 2 ROI set to {roi_sizes[i]}"}
+                        was_first_selection = (camera2.roi_size == -1)
+                        camera2.roi_size = i
+                        if was_first_selection:
+                            camera2.roi_x = 0.5
+                            camera2.roi_y = 0.5
+                        # Retain current position for subsequent selections
+                        camera_manager.set_camera_roi(1, update_status_callback, camera2.roi_x, camera2.roi_y, i)
                     break
 
             # ROI Origin Selection by clicking on Camera 2 image
@@ -1122,14 +991,14 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
             camera2_exposure_track_rect = pygame.Rect(sub_x + cam_display_width + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
             skip_camera2_click = camera2_gain_track_rect.collidepoint(pos) or camera2_exposure_track_rect.collidepoint(pos)
 
-            if camera2_image_rect.collidepoint(pos) and camera_manager.camera2.frame is not None and not skip_camera2_click:
+            if camera2_image_rect.collidepoint(pos) and camera2.frame is not None and not skip_camera2_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
                 rel_x = (pos[0] - (sub_x + cam_display_width + 20)) / cam_display_width
                 rel_y = (pos[1] - (sub_y + 10)) / cam_display_height
-                updated_roi_state['camera2_roi_x'] = max(0.0, min(1.0, rel_x))
-                updated_roi_state['camera2_roi_y'] = max(0.0, min(1.0, rel_y))
+                camera2.roi_x = max(0.0, min(1.0, rel_x))
+                camera2.roi_y = max(0.0, min(1.0, rel_y))
                 # Apply ROI to camera if supported (pass current values to avoid globals issue)
-                set_camera2_roi(update_status_callback, updated_roi_state['camera2_roi_x'], updated_roi_state['camera2_roi_y'], updated_roi_state['camera2_roi_size'])
+                camera_manager.set_camera_roi(1, update_status_callback, camera2.roi_x, camera2.roi_y, camera2.roi_size)
 
     elif event.type == pygame.MOUSEMOTION:
         # Handle slider dragging based on mouse button state, not stored state
@@ -1144,18 +1013,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                 if camera1_gain_track_rect.collidepoint(current_pos):
                     slider_x = sub_x + 450
                     slider_width = 120
-                    max_gain = camera_manager.camera1.prop.get('MaxGain', 500) if camera_manager.camera1.prop else 500
+                    max_gain = camera1.prop.get('MaxGain', 500) if camera1.prop else 500
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
                     new_gain = int((relative_x / slider_width) * max_gain)
-                    set_camera1_gain(new_gain, lambda msg: print(f"Gain: {new_gain}"))
-                    return result, updated_roi_state  # Prevent other processing
+                    camera_manager.set_camera_gain(0, new_gain, lambda msg: print(f"Gain: {new_gain}"))
 
                 # Check if mouse is over Camera 1 Exposure Slider track
                 camera1_exposure_track_rect = pygame.Rect(sub_x + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
                 if camera1_exposure_track_rect.collidepoint(current_pos):
                     slider_x = sub_x + 600
                     slider_width = 120
-                    max_exp = camera_manager.camera1.prop.get('MaxExposure', 500000) if camera_manager.camera1.prop else 500000
+                    max_exp = camera1.prop.get('MaxExposure', 500000) if camera1.prop else 500000
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
                     slider_pos = relative_x / slider_width  # 0-1 position along slider
 
@@ -1168,8 +1036,7 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                         new_exposure = max(min_exposure, min(new_exposure, max_exp))
                     else:
                         new_exposure = max_exp
-                    set_camera1_exposure(new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
-                    return result, updated_roi_state  # Prevent other processing
+                    camera_manager.set_camera_exposure(0, new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
 
             if camera2_connected:
                 # Check if mouse is over Camera 2 Gain Slider track
@@ -1177,18 +1044,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                 if camera2_gain_track_rect.collidepoint(current_pos):
                     slider_x = sub_x + cam_display_width + 450
                     slider_width = 120
-                    max_gain = camera_manager.camera2.prop.get('MaxGain', 500) if camera_manager.camera2.prop else 500
+                    max_gain = camera2.prop.get('MaxGain', 500) if camera2.prop else 500
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
                     new_gain = int((relative_x / slider_width) * max_gain)
-                    set_camera2_gain(new_gain, lambda msg: print(f"Gain: {new_gain}"))
-                    return result, updated_roi_state  # Prevent other processing
+                    camera_manager.set_camera_gain(1, new_gain, lambda msg: print(f"Gain: {new_gain}"))
 
                 # Check if mouse is over Camera 2 Exposure Slider track
                 camera2_exposure_track_rect = pygame.Rect(sub_x + cam_display_width + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
                 if camera2_exposure_track_rect.collidepoint(current_pos):
                     slider_x = sub_x + cam_display_width + 600
                     slider_width = 120
-                    max_exp = camera_manager.camera2.prop.get('MaxExposure', 500000) if camera_manager.camera2.prop else 500000
+                    max_exp = camera2.prop.get('MaxExposure', 500000) if camera2.prop else 500000
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
                     slider_pos = relative_x / slider_width  # 0-1 position along slider
 
@@ -1201,7 +1067,4 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                         new_exposure = max(min_exposure, min(new_exposure, max_exp))
                     else:
                         new_exposure = max_exp
-                    set_camera2_exposure(new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
-                    return result, updated_roi_state  # Prevent other processing
-    # Return both the result and the updated ROI state
-    return result, updated_roi_state
+                    camera_manager.set_camera_exposure(1, new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))

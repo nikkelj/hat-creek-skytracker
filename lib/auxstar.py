@@ -7,11 +7,7 @@ https://raw.githubusercontent.com/jochym/nexstar-evo/master/nsevo/nexstarevo.py
 """
 
 import argparse
-import sys
 import serial
-import warnings
-import datetime
-import pytz
 import struct
 import time
 from enum import Enum
@@ -40,6 +36,7 @@ class Control(Enum):
     
 # Command set, defined by command:(id, expected command bytes including msgid, expected response bytes)
 # Focus motor: https://www.cloudynights.com/topic/750060-celestron-mototfocus-command-interface/
+# https://indilib.org/forum/general/4470-celestron-motorised-focuser-is-it-supported-in-ekos-yet.html
 COMMANDS={
           'MC_GET_POSITION':(0x01, 1, 3),
           'MC_GOTO_FAST':(0x02, 4, 0),
@@ -187,6 +184,7 @@ class NexstarHandController:
         self._device = device
         self.alt = 0
         self.azm = 0
+        self.focus = 0
 
     @property
     def device(self):
@@ -241,6 +239,8 @@ class NexstarHandController:
             self.alt = result
         if target == Targets.AZM:
             self.azm = result
+        if target == Targets.FOCUS:
+            self.focus = result
         return result
 
     def hc_goto_fast(self, target, dd, mm, ss):
@@ -350,19 +350,19 @@ class NexstarHandController:
 
 def status_report(controller):
 
-    tz = pytz.timezone('US/Pacific')
-
     alt_version = controller.hc_get_version(target=Targets.ALT)
     azm_version = controller.hc_get_version(target=Targets.AZM)
     hc_version = controller.hc_get_version(target=Targets.HC)
-    print("ALT version ............................. : {}".format(alt_version))
-    print("AZM version ............................. : {}".format(azm_version))
-    print("HC version ............................. : {}".format(hc_version))
+    print(f"ALT version ............................. : {alt_version}")
+    print(f"AZM version ............................. : {azm_version}")
+    print(f"HC version ............................. : {hc_version}")
     
     alt = controller.hc_get_position(target=Targets.ALT)
     azm = controller.hc_get_position(target=Targets.AZM)
-    print("ALT ............................. : {}".format(repr_angle(alt)))
-    print("AZM ............................. : {}".format(repr_angle(azm)))
+    focus = controller.hc_get_position(target=Targets.FOCUS)
+    print(f"ALT ............................. : {repr_angle(alt)}")
+    print(f"AZM ............................. : {repr_angle(azm)}")
+    print(f"FOCUS ............................. : {repr_angle(focus)}")
 
 def main():
     """Provide a basic CLI"""
@@ -381,7 +381,11 @@ def main():
         status_report(controller)
         print('Slewing ALT...')
         controller.hc_slew_fixed(Targets.ALT, 9)
+        time.sleep(1)
+        print('Slewing AZM...')
         controller.hc_slew_fixed(Targets.AZM, 9)
+        print('Slewing FOCUS...')
+        
         #controller.slew(NexstarDeviceId.ALT_DEC_MOTOR, +0.001)
         time.sleep(3)
         print('Stopping...')

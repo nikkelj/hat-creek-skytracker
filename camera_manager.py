@@ -76,13 +76,24 @@ class CameraManager:
         self.CAMERA2_CONNECT_BUTTON_RECT = None
         self.CAMERA2_DISCONNECT_BUTTON_RECT = None
 
-        # Initialize rects after pygame init
-        self._initialize_control_rects()
 
-    def _initialize_control_rects(self):
-        """Initialize UI control rectangles"""
-        # These will be set properly when pygame is initialized in main
-        pass
+
+    def _initialize_control_rects(self, menu_screen, total_width, total_height):
+        """Initialize UI control rectangles with proper dimensions"""
+        # Initialize combined view button and controls with display dimensions
+        self.COMBINED_VIEW_BUTTON_RECT = pygame.Rect(total_width // 2 + 50, total_height - 60, 100, 20)
+        self.CAMERA_OPACITY_SLIDER_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 300, 20)
+        self.CAMERA_OPACITY_SLIDER_HANDLE_RECT = pygame.Rect(total_width // 2 - 40, total_height - 30, 20, 20)
+
+        # Initialize camera connect/disconnect button rectangles
+        self.CAMERA1_CONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 20, total_height - 60, 60, 20)
+        self.CAMERA1_DISCONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 80, total_height - 60, 60, 20)
+        self.CAMERA2_CONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 20 - 200, total_height - 60, 60, 20)
+        self.CAMERA2_DISCONNECT_BUTTON_RECT = pygame.Rect(total_width - 200 - 80 - 200, total_height - 60, 60, 20)
+
+        # Update dictionary with actual rects
+        self.CAMERA_CONNECT_BUTTONS = [self.CAMERA1_CONNECT_BUTTON_RECT, self.CAMERA2_CONNECT_BUTTON_RECT]
+        self.CAMERA_DISCONNECT_BUTTONS = [self.CAMERA1_DISCONNECT_BUTTON_RECT, self.CAMERA2_DISCONNECT_BUTTON_RECT]
 
     def initialize_cameras(self, count):
         """Initialize n cameras dynamically"""

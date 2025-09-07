@@ -31,7 +31,7 @@ except Exception as e:
 from utils import draw_button, create_negative_image
 from trajectory import precompute_trajectories, interpolate_position, clear_trajectory_cache, build_satellite_pass_table, sort_pass_table
 from config import load_config, save_config, handle_input
-from visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table
+from tracking_visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, handle_sensor_calib_events, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, update_camera_frames_from_buffers
 # Camera button initialization is now handled internally by camera_manager
@@ -41,54 +41,14 @@ from events import *
 # CONSTANTS AND CONFIGURATION
 # ==============================================================================
 
-# UI Dimensions
-MENU_WIDTH = 200
-BUTTON_WIDTH = 180
-BUTTON_HEIGHT = 40
-INPUT_WIDTH = 200
-INPUT_HEIGHT = 30
-CENTER_TIME_WIDTH = 130
-DURATION_WIDTH = 130
-FILTER_WIDTH = 100
-
-# UI Spacing and Layout
-BUTTON_GAP = 20
-INPUT_GAP = 70
-FILTER_GAP = 50
-UI_MARGIN = 10
-UI_HEIGHT_OFFSET = 5
-
-# Background and Icon Images
-BG_IMAGE_SIZE = (160, 160)
-ICON_SIZE = (32, 32)
-BACKGROUND_FILENAME = 'lucky.jpg'
-
-# Font Sizes
-LARGE_FONT_SIZE = 36
-NORMAL_FONT_SIZE = 24
-SMALL_FONT_SIZE = 14
-
-# Default Values
-DEFAULT_DURATION_MINUTES = "30"
-DEFAULT_ELEVATION_MASK_DEG = 10.0
-
 # Update Intervals (seconds)
 POSITION_UPDATE_INTERVAL = 0.1  # 10 Hz
 TRAJECTORY_UPDATE_INTERVAL = 900  # 15 minutes
-FPS_TARGET = 60
 
 # Cache Settings
 CACHE_FILENAME = 'tle_cache.tle'
 CACHE_AGE_LIMIT_HOURS = 24
 CACHE_AGE_LIMIT_SECONDS = CACHE_AGE_LIMIT_HOURS * 3600
-
-# Colors (RGB tuples)
-COLOR_BACKGROUND_DARK = (30, 30, 30)
-COLOR_TEXT_WHITE = (255, 255, 255)
-COLOR_INPUT_BACKGROUND = (255, 255, 255)
-COLOR_INPUT_TEXT = (0, 0, 0)
-COLOR_FOCUS_BLUE = (0, 0, 255)
-COLOR_SELECTION = (0, 120, 215)
 
 # TLE API Configuration
 TLE_API_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle'
@@ -106,15 +66,8 @@ WINDOW_POSITION = "0,0"
 # ==============================================================================
 
 # Initialize Pygame and set up the display
-pygame.init()
-display_info = pygame.display.Info()
-total_width = display_info.current_w
-total_height = display_info.current_h
-menu_screen = pygame.display.set_mode((total_width, total_height))
-pygame.display.set_caption("Main Menu")
-
-# Initialize camera system
-# Camera button initialization is now handled internally by camera_manager
+from display import DisplaySetup
+display = DisplaySetup()
 
 # Enumerate cameras if available
 camera_infos = []
@@ -132,81 +85,6 @@ if ASI_AVAILABLE:
         print(f"Camera names updated: Camera 1='{camera1_name}', Camera 2='{camera2_name}'")
     except Exception as e:
         print(f"Failed to get camera names: {e}")
-
-# Load background image for menu and icon
-try:
-    bg_image = pygame.image.load(BACKGROUND_FILENAME)
-    bg_image_menu = pygame.transform.scale(bg_image, BG_IMAGE_SIZE)
-    bg_image_icon = pygame.transform.scale(bg_image, ICON_SIZE)
-    pygame.display.set_icon(bg_image_icon)
-    negative_image = create_negative_image(bg_image_menu)
-    rotation_angle = 0
-except pygame.error:
-    bg_image_menu = None
-    bg_image_icon = None
-    negative_image = None
-    rotation_angle = 0
-    print(f"Warning: '{BACKGROUND_FILENAME}' not found. Using fallback color and no icon.")
-
-font = pygame.font.Font(None, NORMAL_FONT_SIZE)
-large_font = pygame.font.Font(None, LARGE_FONT_SIZE)
-small_font = pygame.font.Font(None, SMALL_FONT_SIZE)
-tiny_font = pygame.font.Font(None, 12)  # Smaller font for compact camera buttons
-status_font = pygame.font.Font(None, SMALL_FONT_SIZE)
-
-sub_x = MENU_WIDTH
-sub_y = 0
-sub_width = total_width - MENU_WIDTH
-sub_height = total_height
-radius = min(sub_width, sub_height) // 2 - 50  # For scroll bar width
-
-# Combined view UI controls are now in camera_manager
-
-input_rects = {
-    'lat': pygame.Rect(sub_x + UI_MARGIN, sub_y + 60, INPUT_WIDTH, INPUT_HEIGHT),
-    'lon': pygame.Rect(sub_x + UI_MARGIN, sub_y + 150, INPUT_WIDTH, INPUT_HEIGHT),
-    'alt': pygame.Rect(sub_x + UI_MARGIN, sub_y + 240, INPUT_WIDTH, INPUT_HEIGHT),
-    'elevation_mask': pygame.Rect(sub_x + UI_MARGIN, sub_y + 330, INPUT_WIDTH, INPUT_HEIGHT),
-}
-save_button = pygame.Rect(sub_x + 20, sub_y + sub_height - 50, 100, 30)
-load_button = pygame.Rect(sub_x + 130, sub_y + sub_height - 50, 100, 30)
-clear_filters_button = pygame.Rect(sub_x + 10, sub_y + 30, 100, 30)  # Aligned with Name Filter
-recompute_button = pygame.Rect(sub_x + 230, sub_y + 30, 100, 30)  # Recompute Trajectories
-reset_button = pygame.Rect(sub_x + 140, sub_y + 30, 80, 30)  # Reset
-center_time_rect = pygame.Rect(sub_x + 140, sub_y + 90, 130, 30)  # Center Time ISO
-duration_rect = pygame.Rect(sub_x + 140, sub_y + 140, 130, 30)  # Duration Minutes
-filter_rect = pygame.Rect(sub_x + 10, sub_y + 70, 100, 30)  # Name Filter
-filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 130, 100, 30)  # Filter Above Alt
-filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 185, 100, 30)  # Filter Below Alt
-scroll_bar_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 35, 2 * radius, 10)  # Scroll bar below polar plot
-slider_rect = pygame.Rect(sub_x + sub_width // 2 - radius, sub_y + sub_height - 35, 20, 10)  # Slider
-pause_button = pygame.Rect(sub_x + sub_width // 2 + radius + 10, sub_y + sub_height - 45, 60, 30)  # Pause button
-play_button = pygame.Rect(sub_x + sub_width // 2 + radius + 80, sub_y + sub_height - 45, 60, 30)  # Play button
-legend_x = sub_x + sub_width - 170
-legend_y = sub_y + sub_height - 160
-
-buttons = [
-    {"rect": pygame.Rect(10, 10, 180, 40), "text": "Tracking Vis", "mode": "tracking_vis"},
-    {"rect": pygame.Rect(10, 60, 180, 40), "text": "Sensor Calib", "mode": "sensor_calib"},
-    {"rect": pygame.Rect(10, 110, 180, 40), "text": "Joystick Loop", "mode": "joystick_loop"},
-    {"rect": pygame.Rect(10, 160, 180, 40), "text": "Post Process", "mode": "post_process"},
-    {"rect": pygame.Rect(10, 210, 180, 40), "text": "Config Options", "mode": "config_options"},
-    {"rect": pygame.Rect(10, 260, 180, 40), "text": "Author Info", "mode": "author_info"},
-    {"rect": pygame.Rect(10, 310, 180, 40), "text": "Exit", "mode": "exit"},
-]
-
-image_y = 550 + 80 + 10  # Position underneath the buttons
-status_y_start = total_height - 14 * 4  # Adjusted for new font size, space for 4 lines
-
-current_mode = None
-clock = pygame.time.Clock()
-
-# For author info
-author_bg = None
-try:
-    author_bg = pygame.image.load('lucky.jpg')
-except pygame.error:
-    pass
 
 # Load configuration
 config = load_config()
@@ -231,27 +109,19 @@ recompute_triggered = False
 scroll_bar_start_label = "-15.0 min"
 scroll_bar_end_label = "+15.0 min"
 
-# Button states for embossment
-button_states = {btn["mode"]: {"hover": False, "clicked": False} for btn in buttons}
-button_states["save"] = {"hover": False, "clicked": False}
-button_states["load"] = {"hover": False, "clicked": False}
-button_states["clear_filters"] = {"hover": False, "clicked": False}
-button_states["recompute"] = {"hover": False, "clicked": False}
-button_states["reset"] = {"hover": False, "clicked": False}
-button_states["pause"] = {"hover": False, "clicked": False}
-button_states["play"] = {"hover": False, "clicked": False}
+current_mode = None
+clock = pygame.time.Clock()
+
+# For author info
+author_bg = None
+try:
+    author_bg = pygame.image.load('lucky.jpg')
+except pygame.error:
+    pass
 
 # Initial render of main menu
-menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
-if bg_image_menu:
-    menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))  # Center horizontally, adjusted for 160px width
-for btn in buttons:
-    draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
 status_messages = ["Starting TLE process..."]
-for i, msg in enumerate(status_messages[-4:]):
-    status_render = status_font.render(msg, True, (255, 255, 255))  # White text for dark theme
-    menu_screen.blit(status_render, (10, status_y_start + i * 14))
-pygame.display.flip()
+display.render_initial_menu(status_messages)
 print(f"Debug: Status - {'Starting TLE process...'}")
 
 # Cache file management
@@ -264,17 +134,16 @@ satellites = []
 ts = load.timescale()
 
 # Define status update callback for satellite loading
-def status_callback(message):
+def update_status_callback(message):
     status_messages.append(message)
-    status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
-    for btn in buttons:
-        draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
-    if bg_image_menu:
-        menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
+    display.menu_screen.fill(display.COLOR_BACKGROUND_DARK, (0, 0, display.MENU_WIDTH, display.total_height))  # Dark theme menu background
+    for btn in display.buttons:
+        draw_button(display.menu_screen, btn["rect"], btn["text"], display.button_states[btn["mode"]])
+    if display.bg_image_menu:
+        display.menu_screen.blit(display.bg_image_menu, display.image_rect.topleft if display.image_rect else ((display.MENU_WIDTH - 160) // 2, display.image_y))
     for i, msg in enumerate(status_messages[-4:]):
-        status_render = status_font.render(msg, True, (255, 255, 255))
-        menu_screen.blit(status_render, (10, status_y_start + i * 14))
+        status_render = display.status_font.render(msg, True, display.COLOR_TEXT_WHITE)
+        display.menu_screen.blit(status_render, (10, display.status_y_start + i * 14))
     pygame.display.flip()
     pygame.time.wait(50)  # Brief pause to ensure display update
     print(f"Debug: Status - {message}")
@@ -283,7 +152,7 @@ try:
     satellites, tle_loaded = load_satellite_data(
         cache_file=cache_file,
         cache_age_limit_seconds=cache_age_limit,
-        update_status_callback=status_callback
+        update_status_callback=update_status_callback
     )
 except Exception as e:
     status_messages.append(f"TLE loading error: {str(e)}")
@@ -324,24 +193,6 @@ table_sort_keys = [False, False, False, True, False]  # Default: sort by max ele
 table_sort_reverse = [True, True, True, True, True]  # Default: descending for all, 5 columns total
 pass_table_clickable_areas = []
 
-# Callback function for status updates during trajectory precomputation
-def update_status_callback(message):
-    status_messages.append(message)
-    status_render = status_font.render(status_messages[-1], True, (255, 255, 255))
-    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
-    for btn in buttons:
-        draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
-    if bg_image_menu:
-        menu_screen.blit(bg_image_menu, ((MENU_WIDTH - 160) // 2, image_y))
-    for i, msg in enumerate(status_messages[-4:]):
-        status_render = status_font.render(msg, True, (255, 255, 255))
-        menu_screen.blit(status_render, (10, status_y_start + i * 14))
-    pygame.display.flip()
-    pygame.time.wait(50)  # Brief pause to ensure display update
-    print(f"Debug: Status - {message}")
-
-
-
 # ==============================================================================
 # MAIN PROGRAM LOOP
 # ==============================================================================
@@ -350,14 +201,7 @@ running = True
 while running:
     current_time = time.time()
     mouse_pos = pygame.mouse.get_pos()
-    # Check if mouse is over the background image
-    image_rect = pygame.Rect((MENU_WIDTH - 160) // 2, image_y, 160, 160) if bg_image_menu else None
-    # Define rectangles inside the loop to ensure they are always current
-    filter_rect = pygame.Rect(sub_x + 10, sub_y + 90, 100, 30)  # Name Filter
-    filter_above_alt_rect = pygame.Rect(sub_x + 10, sub_y + 140, 100, 30)  # Filter Above Alt
-    filter_below_alt_rect = pygame.Rect(sub_x + 10, sub_y + 195, 100, 30)  # Filter Below Alt
-    center_time_rect = pygame.Rect(sub_x + 140, sub_y + 90, 130, 30)  # Center Time ISO
-    duration_rect = pygame.Rect(sub_x + 140, sub_y + 140, 130, 30)  # Duration Minutes
+
 
     if recompute_triggered and tle_loaded:
         try:
@@ -376,7 +220,7 @@ while running:
             scroll_bar_end_label = "+" + str(duration_minutes/2) + " min"
 
             update_status_callback("Recomputing trajectories...")
-            satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback, center_time, duration_minutes)
+            satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, display.sub_x, display.sub_y, display.sub_width, display.sub_height, satellite_labels, update_status_callback, center_time, duration_minutes)
 
             # Build satellite pass table (filtered for current visibility + upcoming passes)
             satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts)
@@ -400,7 +244,7 @@ while running:
             paused = False
             paused_tt = None
             fraction = max(0.0, min(1.0, (ts.now().tt - t0.tt) / (t1.tt - t0.tt)))
-            slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
+            display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
         except Exception as e:
             update_status_callback(f"Error recomputing: {str(e)}")
         recompute_triggered = False
@@ -422,7 +266,7 @@ while running:
         scroll_bar_start_label = "-" + str(duration_minutes_auto/2) + " min"
         scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"
 
-        satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback)
+        satellite_trajectories, satellite_arc_segments = precompute_trajectories(satellites, observer, ts, display.sub_x, display.sub_y, display.sub_width, display.sub_height, satellite_labels, update_status_callback)
 
         # Build satellite pass table (filtered for current visibility + upcoming passes)
         satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts, current_satellite_positions=satellite_positions)
@@ -444,13 +288,13 @@ while running:
         update_status_callback("Trajectories updated")
         # Initialize slider to current time
         fraction = (ts.now().tt - t0.tt) / (t1.tt - t0.tt)
-        slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
+        display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
 
     # Compute satellite positions at 10 Hz
     if current_time - last_update_time >= update_interval:
         satellite_positions = {}
         if dragging_slider:
-            fraction = (slider_rect.x - scroll_bar_rect.x) / (scroll_bar_rect.width - slider_rect.width)
+            fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
             current_tt = t0.tt + fraction * (t1.tt - t0.tt)
         elif paused:
             current_tt = paused_tt
@@ -459,7 +303,7 @@ while running:
             # Update slider position to reflect real-time
             if t0 is not None and t1 is not None:
                 fraction = (current_tt - t0.tt) / (t1.tt - t0.tt)
-                slider_rect.x = scroll_bar_rect.x + int(fraction * (scroll_bar_rect.width - slider_rect.width))
+                display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
         if selected_satellite:
             if selected_satellite in satellite_trajectories:
                 px, py, alt, dist = interpolate_position(satellite_trajectories[selected_satellite], current_tt)
@@ -491,7 +335,6 @@ while running:
         last_update_time = current_time
 
     # Handle events using modular event system
-    # Handle events using modular event system
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
@@ -501,27 +344,27 @@ while running:
             elif current_mode == "config_options" and focused_field:
                 lat_str, lon_str, alt_str, elevation_mask_str = handle_input(event, focused_field, lat_str, lon_str, alt_str, elevation_mask_str, cursor_pos, selection_start)
             elif current_mode == "tracking_vis":
-                if filter_rect.collidepoint(mouse_pos):
+                if display.filter_rect.collidepoint(mouse_pos):
                     if event.key != pygame.K_TAB:
                         focused_field = "filter"
                         cursor_pos['filter'] = len(filter_text)
                         selection_start['filter'] = None
-                elif filter_above_alt_rect.collidepoint(mouse_pos):
+                elif display.filter_above_alt_rect.collidepoint(mouse_pos):
                     if event.key != pygame.K_TAB:
                         focused_field = "filter_above_alt"
                         cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
                         selection_start['filter_above_alt'] = None
-                elif filter_below_alt_rect.collidepoint(mouse_pos):
+                elif display.filter_below_alt_rect.collidepoint(mouse_pos):
                     if event.key != pygame.K_TAB:
                         focused_field = "filter_below_alt"
                         cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
                         selection_start['filter_below_alt'] = None
-                elif center_time_rect.collidepoint(mouse_pos):
+                elif display.center_time_rect.collidepoint(mouse_pos):
                     if event.key != pygame.K_TAB:
                         focused_field = "center_time"
                         cursor_pos['center_time'] = len(center_time_str)
                         selection_start['center_time'] = None
-                elif duration_rect.collidepoint(mouse_pos):
+                elif display.duration_rect.collidepoint(mouse_pos):
                     if event.key != pygame.K_TAB:
                         focused_field = "duration"
                         cursor_pos['duration'] = len(duration_str)
@@ -790,14 +633,14 @@ while running:
             pos = event.pos
             # Always check main menu buttons first (allows switching back to menu or between modes)
             menu_result = None
-            for btn in buttons:
+            for btn in display.buttons:
                 if btn["rect"].collidepoint(pos):
                     menu_result = btn["mode"]
                     break
 
             if menu_result:
                 from events import handle_main_menu_events
-                result = handle_main_menu_events(event, buttons, current_mode)
+                result = handle_main_menu_events(event, display.buttons, current_mode)
                 if result == "exit":
                     running = False
                     break
@@ -811,7 +654,7 @@ while running:
             elif current_mode is None:
                 # Handle main menu button clicks when already in main menu mode
                 from events import handle_main_menu_events
-                result = handle_main_menu_events(event, buttons, current_mode)
+                result = handle_main_menu_events(event, display.buttons, current_mode)
                 if result == "exit":
                     running = False
                     break
@@ -826,12 +669,12 @@ while running:
             # Handle mode-specific events
             elif current_mode == "sensor_calib":
                 # Handle sensor calibration events using modular handler
-                handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                handle_sensor_calib_events(event, pos, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                          camera_manager.get_camera(0).connected, camera_manager.get_camera(1).connected,
                                          update_status_callback)
             elif current_mode == "config_options":
                 from events import handle_config_events
-                modified_vars = handle_config_events(event, pos, input_rects, save_button, load_button,
+                modified_vars = handle_config_events(event, pos, display.input_rects, display.save_button, display.load_button,
                                                      lat_str, lon_str, alt_str, elevation_mask_str,
                                                      focused_field, cursor_pos, selection_start,
                                                      button_states)
@@ -842,7 +685,7 @@ while running:
 
             # Handle tracking_vis button clicks
             elif current_mode == "tracking_vis":
-                if clear_filters_button.collidepoint(pos):
+                if display.clear_filters_button.collidepoint(pos):
                     button_states["clear_filters"]["clicked"] = True
                     filter_text = ""
                     filter_above_alt_text = ""
@@ -857,42 +700,42 @@ while running:
                     # Re-build satellite pass table to remove filters
                     satellite_pass_table = build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=float(elevation_mask_str or 10.0), ts=ts, current_satellite_positions=satellite_positions)
                     satellite_pass_table = sort_pass_table(satellite_pass_table, table_sort_keys, table_sort_reverse)
-                elif pause_button.collidepoint(pos):
+                elif display.pause_button.collidepoint(pos):
                     button_states["pause"]["clicked"] = True
                     paused = True
                     paused_tt = ts.now().tt
-                elif play_button.collidepoint(pos):
+                elif display.play_button.collidepoint(pos):
                     button_states["play"]["clicked"] = True
                     paused = False
                     paused_tt = None
-                elif scroll_bar_rect.collidepoint(pos):
+                elif display.scroll_bar_rect.collidepoint(pos):
                     dragging_slider = True
                     scroll_start = pos[0]
-                    slider_rect.x = max(scroll_bar_rect.x, min(pos[0] - slider_rect.width // 2, scroll_bar_rect.x + scroll_bar_rect.width - slider_rect.width))
-                elif filter_rect.collidepoint(pos):
+                    display.slider_rect.x = max(display.scroll_bar_rect.x, min(pos[0] - display.slider_rect.width // 2, display.scroll_bar_rect.x + display.scroll_bar_rect.width - display.slider_rect.width))
+                elif display.filter_rect.collidepoint(pos):
                     focused_field = 'filter'
                     cursor_pos['filter'] = len(filter_text)
                     selection_start['filter'] = None
-                elif filter_above_alt_rect.collidepoint(pos):
+                elif display.filter_above_alt_rect.collidepoint(pos):
                     focused_field = 'filter_above_alt'
                     cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
                     selection_start['filter_above_alt'] = None
-                elif filter_below_alt_rect.collidepoint(pos):
+                elif display.filter_below_alt_rect.collidepoint(pos):
                     focused_field = 'filter_below_alt'
                     cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
                     selection_start['filter_below_alt'] = None
-                elif center_time_rect.collidepoint(pos):
+                elif display.center_time_rect.collidepoint(pos):
                     focused_field = 'center_time'
                     cursor_pos['center_time'] = len(center_time_str)
                     selection_start['center_time'] = None
-                elif duration_rect.collidepoint(pos):
+                elif display.duration_rect.collidepoint(pos):
                     focused_field = 'duration'
                     cursor_pos['duration'] = len(duration_str)
                     selection_start['duration'] = None
-                elif recompute_button.collidepoint(pos):
+                elif display.recompute_button.collidepoint(pos):
                     recompute_triggered = True
                     button_states["recompute"]["clicked"] = True
-                elif reset_button.collidepoint(pos):
+                elif display.reset_button.collidepoint(pos):
                     button_states["reset"]["clicked"] = True
                     # Reset to current UTC time and default 30 minute duration
                     center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -938,28 +781,30 @@ while running:
                             if math.hypot(px - pos[0], py - pos[1]) < 10:
                                 selected_satellite = sat
                                 break
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            pos = event.pos
         elif event.type == pygame.MOUSEMOTION:
             if current_mode is None:
                 # Handle main menu hover states
-                for btn in buttons:
-                    button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
+                for btn in display.buttons:
+                    display.button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
             elif current_mode == "config_options":
-                button_states["save"]["hover"] = save_button.collidepoint(event.pos)
-                button_states["load"]["hover"] = load_button.collidepoint(event.pos)
+                button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
+                button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
             elif current_mode == "sensor_calib":
                 # Camera slider hover states handled by modular camera code
                 from camera_manager import handle_sensor_calib_events
-                handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                handle_sensor_calib_events(event, pos, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                          camera_manager.get_camera(0).connected, camera_manager.get_camera(1).connected,
                                          update_status_callback)
             elif current_mode == "tracking_vis":
-                button_states["clear_filters"]["hover"] = clear_filters_button.collidepoint(event.pos)
-                button_states["recompute"]["hover"] = recompute_button.collidepoint(event.pos)
-                button_states["reset"]["hover"] = reset_button.collidepoint(event.pos)
-                button_states["pause"]["hover"] = pause_button.collidepoint(event.pos)
-                button_states["play"]["hover"] = play_button.collidepoint(event.pos)
+                button_states["clear_filters"]["hover"] = display.clear_filters_button.collidepoint(event.pos)
+                button_states["recompute"]["hover"] = display.recompute_button.collidepoint(event.pos)
+                button_states["reset"]["hover"] = display.reset_button.collidepoint(event.pos)
+                button_states["pause"]["hover"] = display.pause_button.collidepoint(event.pos)
+                button_states["play"]["hover"] = display.play_button.collidepoint(event.pos)
                 if dragging_slider:
-                    slider_rect.x = max(scroll_bar_rect.x, min(event.pos[0] - slider_rect.width // 2, scroll_bar_rect.x + scroll_bar_rect.width - slider_rect.width))
+                    display.slider_rect.x = max(display.scroll_bar_rect.x, min(event.pos[0] - display.slider_rect.width // 2, display.scroll_bar_rect.x + display.scroll_bar_rect.width - display.slider_rect.width))
                 hovered_satellite = None
                 for sat, (px, py, _, _) in satellite_positions.items():
                     if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
@@ -968,17 +813,17 @@ while running:
 
         elif event.type == pygame.MOUSEBUTTONUP:
             # Reset all button clicked states - essential for UI feedback
-            for btn in buttons:
-                button_states[btn["mode"]]["clicked"] = False
+            for btn in display.buttons:
+                display.button_states[btn["mode"]]["clicked"] = False
             if current_mode is None:
                 pass
             elif current_mode == "config_options":
-                button_states["save"]["clicked"] = False
-                button_states["load"]["clicked"] = False
+                display.button_states["save"]["clicked"] = False
+                display.button_states["load"]["clicked"] = False
             elif current_mode == "sensor_calib":
                 # Handle sensor calibration events using modular handler
                 from camera_manager import handle_sensor_calib_events
-                handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height,
+                handle_sensor_calib_events(event, pos, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                          camera_manager.get_camera(0).connected, camera_manager.get_camera(1).connected,
                                          update_status_callback)
             elif current_mode == "tracking_vis":
@@ -988,7 +833,7 @@ while running:
                 button_states["play"]["clicked"] = False
                 # Reset dragging state
                 if dragging_slider and paused:
-                    fraction = (slider_rect.x - scroll_bar_rect.x) / (scroll_bar_rect.width - slider_rect.width)
+                    fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
                     paused_tt = t0.tt + fraction * (t1.tt - t0.tt)
                 dragging_slider = False
                 scroll_start = None
@@ -996,122 +841,120 @@ while running:
 
 
     # Render continuously
-    menu_screen.fill((30, 30, 30), (0, 0, MENU_WIDTH, total_height))  # Dark theme menu background
-    if bg_image_menu:
-        # Blit rotated negative image if mouse is over the image area, normal otherwise
-        if image_rect and image_rect.collidepoint(mouse_pos):
-            # Rotate the negative image slowly
-            rotated_image = pygame.transform.rotate(negative_image, rotation_angle)
-            # Center the rotated image
-            rotated_rect = rotated_image.get_rect(center=image_rect.center)
-            menu_screen.blit(rotated_image, rotated_rect.topleft)
-            rotation_angle = (rotation_angle + 1) % 360  # Increment angle, reset at 360
-        else:
-            menu_screen.blit(bg_image_menu, image_rect.topleft)
+    display.menu_screen.fill(display.COLOR_BACKGROUND_DARK, (0, 0, display.MENU_WIDTH, display.total_height))  # Dark theme menu background
+    if display.bg_image_menu:
+        # Update background rotation
+        display.update_background_rotation()
+        # Get the appropriate image
+        image_tool_use = display.get_rotated_image(display.image_rect)
+        if display.image_rect:
+            display.menu_screen.blit(image_tool_use, display.image_rect.topleft)
 
-    for btn in buttons:
-        draw_button(menu_screen, btn["rect"], btn["text"], button_states[btn["mode"]])
+    for btn in display.buttons:
+        draw_button(display.menu_screen, btn["rect"], btn["text"], display.button_states[btn["mode"]])
     # Render status messages each frame
     status_messages = status_messages[-4:]  # Keep last 4 messages
     for i, msg in enumerate(status_messages):
-        status_render = status_font.render(msg, True, (255, 255, 255))  # White text for dark theme
-        menu_screen.blit(status_render, (10, status_y_start + i * 14))
+        status_render = display.status_font.render(msg, True, display.COLOR_TEXT_WHITE)  # White text for dark theme
+        display.menu_screen.blit(status_render, (10, display.status_y_start + i * 14))
 
-    cx = sub_x + sub_width // 2
-    cy = sub_y + sub_height // 2
+    cx = display.sub_x + display.sub_width // 2
+    cy = display.sub_y + display.sub_height // 2
     if current_mode == "config_options":
-        draw_polar_plot(menu_screen, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states)
+        draw_polar_plot(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height, display.input_rects, lat_str, lon_str, alt_str, elevation_mask_str, display.font, focused_field, cursor_pos, selection_start, display.save_button, display.load_button, display.button_states)
     elif current_mode == "tracking_vis" and tle_loaded:
-        menu_screen.fill((0, 0, 0), (sub_x, sub_y, sub_width, sub_height))  # Clear the subplot area with black
-        draw_polar_plot(menu_screen, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts, current_tt, satellite_trajectories, satellite_positions, satellite_labels, satellite_mean_altitudes, selected_satellite, satellite_arc_segments, filter_text, filter_above_alt_text, legend_x, legend_y, clear_filters_button, tle_loaded=tle_loaded, obs_lat=float(lat_str or 0), obs_lon=float(lon_str or 0), obs_alt=float(alt_str or 0))
-        draw_satellites(menu_screen, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy)
-        draw_filters(menu_screen, filter_rect, filter_above_alt_rect, filter_below_alt_rect, filter_text, filter_above_alt_text, filter_below_alt_text, focused_field, cursor_pos, selection_start, small_font)
-        draw_legend(menu_screen, legend_x, legend_y, small_font)
-        draw_details(menu_screen, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font, satellite_perigee, satellite_apogee, satellite_positions)
-        draw_time_display(menu_screen, sub_x, sub_y, sub_height, small_font)
-        draw_satellite_count(menu_screen, sub_x, sub_y + 240, satellite_positions, small_font)
+        display.menu_screen.fill((0, 0, 0), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))  # Clear the subplot area with black
+        draw_polar_plot(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height, display.input_rects, lat_str, lon_str, alt_str, elevation_mask_str, display.font, focused_field, cursor_pos, selection_start, display.save_button, display.load_button, display.button_states, ts, current_tt, satellite_trajectories, satellite_positions, satellite_labels, satellite_mean_altitudes, selected_satellite, satellite_arc_segments, filter_text, filter_above_alt_text, display.legend_x, display.legend_y, display.clear_filters_button, tle_loaded=tle_loaded, obs_lat=float(lat_str or 0), obs_lon=float(lon_str or 0), obs_alt=float(alt_str or 0))
+        draw_satellites(display.menu_screen, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy)
+        draw_filters(display.menu_screen, display.filter_rect, display.filter_above_alt_rect, display.filter_below_alt_rect, filter_text, filter_above_alt_text, filter_below_alt_text, focused_field, cursor_pos, selection_start, display.small_font)
+        draw_legend(display.menu_screen, display.legend_x, display.legend_y, display.small_font)
+        draw_details(display.menu_screen, hovered_satellite, selected_satellite, satellite_mean_altitudes, display.sub_x, display.sub_y, display.sub_width, display.sub_height, display.small_font, satellite_perigee, satellite_apogee, satellite_positions)
+        draw_time_display(display.menu_screen, display.sub_x, display.sub_y, display.sub_height, display.small_font)
+        draw_satellite_count(display.menu_screen, display.sub_x, display.sub_y + 240, satellite_positions, display.small_font)
         # Modular pass table filtering and sorting - replaced ~30 lines of inline filtering logic
-        from visuals import filter_and_sort_pass_table
+        from tracking_visuals import filter_and_sort_pass_table
         sorted_filtered_pass_table = filter_and_sort_pass_table(satellite_pass_table, filter_text, filter_above_alt_text,
                                                                 filter_below_alt_text, satellite_mean_altitudes,
                                                                 table_sort_keys, table_sort_reverse)
 
         # Draw satellite pass table
-        pass_table_clickable_areas = draw_satellite_pass_table(menu_screen, sub_x, sub_y, sub_height, sorted_filtered_pass_table, selected_satellite, small_font, table_sort_keys, table_sort_reverse)
-        draw_button(menu_screen, clear_filters_button, "Clear Filters", button_states["clear_filters"])
-        draw_button(menu_screen, pause_button, "Pause", button_states["pause"])
-        draw_button(menu_screen, play_button, "Play", button_states["play"])
-        draw_scroll_bar(menu_screen, scroll_bar_rect, slider_rect, small_font)
-        draw_scroll_time_display(menu_screen, sub_x, sub_y, sub_width, sub_height, current_tt, ts, small_font)
+        pass_table_clickable_areas = draw_satellite_pass_table(display.menu_screen, display.sub_x, display.sub_y, display.sub_height, sorted_filtered_pass_table, selected_satellite, display.small_font, table_sort_keys, table_sort_reverse)
+        draw_button(display.menu_screen, display.clear_filters_button, "Clear Filters", display.button_states["clear_filters"])
+        draw_button(display.menu_screen, display.pause_button, "Pause", display.button_states["pause"])
+        draw_button(display.menu_screen, display.play_button, "Play", display.button_states["play"])
+        draw_scroll_bar(display.menu_screen, display.scroll_bar_rect, display.slider_rect, display.small_font)
+        draw_scroll_time_display(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height, current_tt, ts, display.small_font)
         # Draw Recompute Button
-        draw_button(menu_screen, recompute_button, "Update Traj", button_states["recompute"])
+        draw_button(display.menu_screen, display.recompute_button, "Update Traj", display.button_states["recompute"])
         # Draw Reset Button
-        draw_button(menu_screen, reset_button, "Reset", button_states["reset"])
+        draw_button(display.menu_screen, display.reset_button, "Reset", display.button_states["reset"])
         # Draw Center Time Input
-        pygame.draw.rect(menu_screen, (255, 255, 255), center_time_rect)
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.center_time_rect)
         if focused_field == 'center_time':
-            pygame.draw.rect(menu_screen, (0, 0, 255), center_time_rect, 2)
-        text_surface = small_font.render(center_time_str, True, (0, 0, 0))
-        menu_screen.blit(text_surface, (center_time_rect.x + 5, center_time_rect.y + 5))
+            pygame.draw.rect(display.menu_screen, (0, 0, 255), display.center_time_rect, 2)
+        text_surface = display.small_font.render(center_time_str, True, (0, 0, 0))
+        display.menu_screen.blit(text_surface, (display.center_time_rect.x + 5, display.center_time_rect.y + 5))
         if focused_field == 'center_time':
-            text_width, _ = small_font.size(center_time_str[:cursor_pos['center_time']])
-            pygame.draw.line(menu_screen, (0, 0, 255), (center_time_rect.x + 5 + text_width, center_time_rect.y + 5), (center_time_rect.x + 5 + text_width, center_time_rect.y + 25), 2)
+            text_width, _ = display.small_font.size(center_time_str[:cursor_pos['center_time']])
+            pygame.draw.line(display.menu_screen, (0, 0, 255), (display.center_time_rect.x + 5 + text_width, display.center_time_rect.y + 5), (display.center_time_rect.x + 5 + text_width, display.center_time_rect.y + 25), 2)
         # Label for Center Time
-        label = small_font.render("Center Time:", True, (255, 255, 255))
-        menu_screen.blit(label, (center_time_rect.x, center_time_rect.y - 15))
+        label = display.small_font.render("Center Time:", True, (255, 255, 255))
+        display.menu_screen.blit(label, (display.center_time_rect.x, display.center_time_rect.y - 15))
         # Draw Duration Input
-        pygame.draw.rect(menu_screen, (255, 255, 255), duration_rect)
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.duration_rect)
         if focused_field == 'duration':
-            pygame.draw.rect(menu_screen, (0, 0, 255), duration_rect, 2)
-        text_surface = small_font.render(duration_str, True, (0, 0, 0))
-        menu_screen.blit(text_surface, (duration_rect.x + 5, duration_rect.y + 5))
+            pygame.draw.rect(display.menu_screen, (0, 0, 255), display.duration_rect, 2)
+        text_surface = display.small_font.render(duration_str, True, (0, 0, 0))
+        display.menu_screen.blit(text_surface, (display.duration_rect.x + 5, display.duration_rect.y + 5))
         if focused_field == 'duration':
-            text_width, _ = small_font.size(duration_str[:cursor_pos['duration']])
-            pygame.draw.line(menu_screen, (0, 0, 255), (duration_rect.x + 5 + text_width, duration_rect.y + 5), (duration_rect.x + 5 + text_width, duration_rect.y + 25), 2)
+            text_width, _ = display.small_font.size(duration_str[:cursor_pos['duration']])
+            pygame.draw.line(display.menu_screen, (0, 0, 255), (display.duration_rect.x + 5 + text_width, display.duration_rect.y + 5), (display.duration_rect.x + 5 + text_width, display.duration_rect.y + 25), 2)
         # Label for Duration
-        label = small_font.render("Duration (min.):", True, (255, 255, 255))
-        menu_screen.blit(label, (duration_rect.x, duration_rect.y - 15))
+        label = display.small_font.render("Duration (min.):", True, (255, 255, 255))
+        display.menu_screen.blit(label, (display.duration_rect.x, display.duration_rect.y - 15))
     elif current_mode == "sensor_calib":
         # Modular camera display rendering - replaced ~200 lines of inline camera rendering code
         from camera_manager import render_sensor_calibration
-        render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height,
+        render_sensor_calibration(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                camera_manager.get_camera(0).connected, camera_manager.get_camera(1).connected,
                                camera1_name, camera2_name)
 
         # Modular camera slider controls - positioned within camera display area
         from camera_manager import render_camera_sliders
-        render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_height)
+        render_camera_sliders(display.menu_screen, display.tiny_font, display.sub_x, display.sub_y, display.sub_width, display.sub_height)
 
         # Modular ROI controls for both cameras - replaced ~100+ lines of inline ROI control code
         from camera_manager import render_camera_roi_controls
-        render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height)
+        render_camera_roi_controls(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height)
 
         # Modular camera interface completion - replaced ~40 lines of inline combined view and status code
         from camera_manager import render_combined_view_controls
-        render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_height,
-                                        small_font, tiny_font)
+        # Initialize camera control rects with proper dimensions
+        camera_manager._initialize_control_rects(display.menu_screen, display.total_width, display.total_height)
+        render_combined_view_controls(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
+                                        display.small_font, display.tiny_font)
     elif current_mode == "joystick_loop":
-        sub_rect = (sub_x, sub_y, sub_width, sub_height)
-        menu_screen.fill((100, 100, 100), sub_rect)
+        sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
+        display.menu_screen.fill((100, 100, 100), sub_rect)
         # Add manual joystick loop code here later
     elif current_mode == "post_process":
-        sub_rect = (sub_x, sub_y, sub_width, sub_height)
-        menu_screen.fill((150, 150, 150), sub_rect)
+        sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
+        display.menu_screen.fill((150, 150, 150), sub_rect)
         # Add post-processing tool code here later
     elif current_mode == "author_info":
-        sub_rect = (sub_x, sub_y, sub_width, sub_height)
+        sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         if author_bg:
-            scaled_bg = pygame.transform.scale(author_bg, (sub_width, sub_height))
-            menu_screen.blit(scaled_bg, (sub_x, sub_y))
+            scaled_bg = pygame.transform.scale(author_bg, (display.sub_width, display.sub_height))
+            display.menu_screen.blit(scaled_bg, (display.sub_x, display.sub_y))
         else:
-            menu_screen.fill((0, 0, 0), sub_rect)
-        text1 = large_font.render("Starlink-1060", True, (255, 255, 255))
-        menu_screen.blit(text1, (sub_x + 10, sub_y + 10))
+            display.menu_screen.fill((0, 0, 0), sub_rect)
+        text1 = display.large_font.render("Starlink-1060", True, (255, 255, 255))
+        display.menu_screen.blit(text1, (display.sub_x + 10, display.sub_y + 10))
         contact_text = "Jonathan Nikkel - @NikkelJonathan"
-        text2 = large_font.render(contact_text, True, (255, 255, 255))
-        menu_screen.blit(text2, (sub_x + 10, sub_y + 50))
+        text2 = display.large_font.render(contact_text, True, (255, 255, 255))
+        display.menu_screen.blit(text2, (display.sub_x + 10, display.sub_y + 50))
 
     pygame.display.flip()
-    clock.tick(60)  # Limit to 60 FPS for better responsiveness
+    clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness
 
 pygame.quit()

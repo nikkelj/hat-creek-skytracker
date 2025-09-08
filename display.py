@@ -78,6 +78,13 @@ class DisplaySetup:
         except pygame.error:
             print(f"Warning: '{self.BACKGROUND_FILENAME}' not found. Using fallback color and no icon.")
 
+        # Author background image for author_info mode
+        self.author_bg = None
+        try:
+            self.author_bg = pygame.image.load(self.BACKGROUND_FILENAME)
+        except pygame.error:
+            print(f"Warning: '{self.BACKGROUND_FILENAME}' not found for author background. Using fallback color.")
+
         # Define input rectangles
         self.input_rects = {
             'lat': pygame.Rect(self.sub_x + self.UI_MARGIN, self.sub_y + 60, self.INPUT_WIDTH, self.INPUT_HEIGHT),
@@ -126,6 +133,15 @@ class DisplaySetup:
         for btn in self.buttons:
             self.button_states[btn["mode"]] = {"hover": False, "clicked": False}
         for mode in ["save", "load", "clear_filters", "recompute", "reset", "pause", "play"]:
+            self.button_states[mode] = {"hover": False, "clicked": False}
+
+        # Initialize camera-specific button states
+        camera_button_modes = [
+            "camera1_connect", "camera1_disconnect", "camera2_connect", "camera2_disconnect",
+            "camera1_gain_slider", "camera2_gain_slider",
+            "camera1_exposure_slider", "camera2_exposure_slider"
+        ]
+        for mode in camera_button_modes:
             self.button_states[mode] = {"hover": False, "clicked": False}
 
     @property

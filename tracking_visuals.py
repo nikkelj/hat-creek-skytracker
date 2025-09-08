@@ -6,6 +6,126 @@ from utils import get_altitude_color, draw_button
 from skyfield.api import wgs84, load
 
 # ==============================================================================
+# TRACKING VISUALIZATION STATE CLASS
+# ==============================================================================
+
+class TrackingVisState:
+    """Encapsulates all state for tracking visualization mode."""
+
+    def __init__(self):
+        from datetime import datetime, timezone, timedelta
+
+        # Time-related state
+        self.center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # Initial to current UTC ISO
+        self.duration_str = "30"
+        self.t0 = None
+        self.t1 = None
+        self.current_tt = None
+        self.paused = False
+        self.paused_tt = None
+
+        # Input field state
+        self.focused_field = None
+        self.cursor_pos = {
+            "filter": 0,
+            "filter_above_alt": 0,
+            "filter_below_alt": 0,
+            "center_time": 0,
+            "duration": 0
+        }
+        self.selection_start = {
+            "filter": None,
+            "filter_above_alt": None,
+            "filter_below_alt": None,
+            "center_time": None,
+            "duration": None
+        }
+
+        # Filter state
+        self.filter_text = ""
+        self.filter_above_alt_text = ""
+        self.filter_below_alt_text = ""
+
+        # Satellite state
+        self.selected_satellite = None
+        self.hovered_satellite = None
+        self.satellite_positions = {}
+
+        # Pass table state
+        self.satellite_pass_table = []
+        self.table_sort_keys = [False, False, False, True, False]  # Default: sort by max elevation
+        self.table_sort_reverse = [True, True, True, True, True]  # Default: descending for all
+        self.pass_table_clickable_areas = []
+
+        # UI state
+        self.dragging_slider = False
+        self.scroll_start = None
+
+        # UI labels for scroll bar
+        self.scroll_bar_start_label = "-15.0 min"
+        self.scroll_bar_end_label = "+15.0 min"
+
+        # Flags
+        self.recompute_triggered = False
+
+        # Satellite data (moved from global variables)
+        self.satellite_labels = {}
+        self.satellite_mean_altitudes = {}
+        self.satellite_perigee = {}
+        self.satellite_apogee = {}
+        self.satellite_trajectories = {}
+        self.satellite_arc_segments = {}
+        self.tle_loaded = False
+        self.satellites = []
+        self.cache_file = "tle_cache.tle"
+        self.cache_age_limit = 24 * 3600  # 24 hours in seconds
+
+    def reset_input_fields(self):
+        """Reset input field positions when switching modes."""
+        self.cursor_pos = {
+            "filter": 0,
+            "filter_above_alt": 0,
+            "filter_below_alt": 0,
+            "center_time": 0,
+            "duration": 0
+        }
+        self.selection_start = {
+            "filter": None,
+            "filter_above_alt": None,
+            "filter_below_alt": None,
+            "center_time": None,
+            "duration": None
+        }
+        self.focused_field = None
+
+    def get_updated_params(self):
+        """Get dictionary of parameters for event handlers (for backward compatibility)."""
+        return {
+            'center_time_str': self.center_time_str,
+            'duration_str': self.duration_str,
+            'focused_field': self.focused_field,
+            'cursor_pos': self.cursor_pos,
+            'selection_start': self.selection_start,
+            'filter_text': self.filter_text,
+            'filter_above_alt_text': self.filter_above_alt_text,
+            'filter_below_alt_text': self.filter_below_alt_text,
+            'satellite_positions': self.satellite_positions,
+            'selected_satellite': self.selected_satellite,
+            'satellite_pass_table': self.satellite_pass_table,
+            'table_sort_keys': self.table_sort_keys,
+            'table_sort_reverse': self.table_sort_reverse,
+            'paused': self.paused,
+            'paused_tt': self.paused_tt,
+            'dragging_slider': self.dragging_slider,
+            't0': self.t0,
+            't1': self.t1,
+            'pass_table_clickable_areas': self.pass_table_clickable_areas,
+            'hovered_satellite': self.hovered_satellite,
+            'scroll_start': self.scroll_start
+        }
+
+
+# ==============================================================================
 # CONSTANTS
 # ==============================================================================
 
@@ -145,137 +265,99 @@ def draw_triangle(surface, x, y, color, size=5):
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
 
-def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, lat_str, lon_str, alt_str, elevation_mask_str, font, focused_field, cursor_pos, selection_start, save_button, load_button, button_states, ts=None, current_tt=None, satellite_trajectories=None, satellite_positions=None, satellite_labels=None, satellite_mean_altitudes=None, selected_satellite=None, satellite_arc_segments=None, filter_text="", filter_above_alt_text="", legend_x=None, legend_y=None, clear_filters_button=None, tle_loaded=False, obs_lat=0, obs_lon=0, obs_alt=0, obs_elevation_mask=0):
+def draw_polar_plot(display, config_state, ts, current_tt, state=None):
+    """
+    State-direct mutation function for drawing polar plot.
+    Takes display, config_state, and state objects directly instead of individual parameters.
+    """
     # Draw gradient background for config options
     if ts is None:
-        for y in range(sub_height):
-            color = (160 - (y / sub_height * 5), 160 - (y / sub_height * 5), 160 - (y / sub_height * 5))
-            pygame.draw.line(surface, color, (sub_x, sub_y + y), (sub_x + sub_width, sub_y + y))
+        for y in range(display.sub_height):
+            color = (160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5))
+            pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
         # Draw grouping box and label
-        group_rect = pygame.Rect(sub_x + 10, sub_y + 0, 220, 370)
-        pygame.draw.rect(surface, (0, 0, 0), group_rect, 2, border_radius=5)
-        group_label = font.render("Observer Location", True, (0, 0, 0))
-        surface.blit(group_label, (sub_x + 20, sub_y + 10))
+        group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 370)
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
+        group_label = display.font.render("Observer Location", True, (0, 0, 0))
+        display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
         # Draw labels and inputs
-        lat_label = font.render("Latitude:", True, (0, 0, 0))
-        surface.blit(lat_label, (sub_x + 20, sub_y + 30))
-        pygame.draw.rect(surface, (255, 255, 255), input_rects['lat'])
-        lat_text = font.render(lat_str, True, (0, 0, 0))
-        surface.blit(lat_text, (input_rects['lat'].x + 5, input_rects['lat'].y + 5))
-        if focused_field == 'lat':
-            pygame.draw.rect(surface, (0, 0, 255), input_rects['lat'], 2)
-            text_width, _ = font.size(lat_str[:cursor_pos['lat']])
-            pygame.draw.line(surface, (0, 0, 255),
-                            (input_rects['lat'].x + 5 + text_width, input_rects['lat'].y + 5),
-                            (input_rects['lat'].x + 5 + text_width, input_rects['lat'].y + 25), 2)
-            if selection_start['lat'] is not None:
-                start_width, _ = font.size(lat_str[:min(cursor_pos['lat'], selection_start['lat'])])
-                end_width, _ = font.size(lat_str[:max(cursor_pos['lat'], selection_start['lat'])])
-                pygame.draw.rect(surface, (0, 120, 215),
-                                (input_rects['lat'].x + 5 + start_width, input_rects['lat'].y + 5,
-                                 end_width - start_width, 20), 2)
+        lat_label = display.font.render("Latitude:", True, (0, 0, 0))
+        display.menu_screen.blit(lat_label, (display.sub_x + 20, display.sub_y + 30))
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lat'])
+        lat_text = display.font.render(config_state.lat_str, True, (0, 0, 0))
+        display.menu_screen.blit(lat_text, (display.input_rects['lat'].x + 5, display.input_rects['lat'].y + 5))
 
-        lon_label = font.render("Longitude:", True, (0, 0, 0))
-        surface.blit(lon_label, (sub_x + 20, sub_y + 120))
-        pygame.draw.rect(surface, (255, 255, 255), input_rects['lon'])
-        lon_text = font.render(lon_str, True, (0, 0, 0))
-        surface.blit(lon_text, (input_rects['lon'].x + 5, input_rects['lon'].y + 5))
-        if focused_field == 'lon':
-            pygame.draw.rect(surface, (0, 0, 255), input_rects['lon'], 2)
-            text_width, _ = font.size(lon_str[:cursor_pos['lon']])
-            pygame.draw.line(surface, (0, 0, 255),
-                            (input_rects['lon'].x + 5 + text_width, input_rects['lon'].y + 5),
-                            (input_rects['lon'].x + 5 + text_width, input_rects['lon'].y + 25), 2)
-            if selection_start['lon'] is not None:
-                start_width, _ = font.size(lon_str[:min(cursor_pos['lon'], selection_start['lon'])])
-                end_width, _ = font.size(lon_str[:max(cursor_pos['lon'], selection_start['lon'])])
-                pygame.draw.rect(surface, (0, 120, 215),
-                                (input_rects['lon'].x + 5 + start_width, input_rects['lon'].y + 5,
-                                 end_width - start_width, 20), 2)
+        lon_label = display.font.render("Longitude:", True, (0, 0, 0))
+        display.menu_screen.blit(lon_label, (display.sub_x + 20, display.sub_y + 120))
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lon'])
+        lon_text = display.font.render(config_state.lon_str, True, (0, 0, 0))
+        display.menu_screen.blit(lon_text, (display.input_rects['lon'].x + 5, display.input_rects['lon'].y + 5))
 
-        alt_label = font.render("Altitude (m):", True, (0, 0, 0))
-        surface.blit(alt_label, (sub_x + 20, sub_y + 210))
-        pygame.draw.rect(surface, (255, 255, 255), input_rects['alt'])
-        alt_text = font.render(alt_str, True, (0, 0, 0))
-        surface.blit(alt_text, (input_rects['alt'].x + 5, input_rects['alt'].y + 5))
-        if focused_field == 'alt':
-            pygame.draw.rect(surface, (0, 0, 255), input_rects['alt'], 2)
-            text_width, _ = font.size(alt_str[:cursor_pos['alt']])
-            pygame.draw.line(surface, (0, 0, 255),
-                            (input_rects['alt'].x + 5 + text_width, input_rects['alt'].y + 5),
-                            (input_rects['alt'].x + 5 + text_width, input_rects['alt'].y + 25), 2)
-            if selection_start['alt'] is not None:
-                start_width, _ = font.size(alt_str[:min(cursor_pos['alt'], selection_start['alt'])])
-                end_width, _ = font.size(alt_str[:max(cursor_pos['alt'], selection_start['alt'])])
-                pygame.draw.rect(surface, (0, 120, 215),
-                                (input_rects['alt'].x + 5 + start_width, input_rects['alt'].y + 5,
-                                 end_width - start_width, 20), 2)
+        alt_label = display.font.render("Altitude (m):", True, (0, 0, 0))
+        display.menu_screen.blit(alt_label, (display.sub_x + 20, display.sub_y + 210))
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt'])
+        alt_text = display.font.render(config_state.alt_str, True, (0, 0, 0))
+        display.menu_screen.blit(alt_text, (display.input_rects['alt'].x + 5, display.input_rects['alt'].y + 5))
 
-        elevation_mask_label = font.render("Elevation Mask (deg):", True, (0, 0, 0))
-        surface.blit(elevation_mask_label, (sub_x + 20, sub_y + 300))
-        pygame.draw.rect(surface, (255, 255, 255), input_rects['elevation_mask'])
-        elevation_mask_text = font.render(elevation_mask_str, True, (0, 0, 0))
-        surface.blit(elevation_mask_text, (input_rects['elevation_mask'].x + 5, input_rects['elevation_mask'].y + 5))
-        if focused_field == 'elevation_mask':
-            pygame.draw.rect(surface, (0, 0, 255), input_rects['elevation_mask'], 2)
-            text_width, _ = font.size(elevation_mask_str[:cursor_pos['elevation_mask']])
-            pygame.draw.line(surface, (0, 0, 255),
-                            (input_rects['elevation_mask'].x + 5 + text_width, input_rects['elevation_mask'].y + 5),
-                            (input_rects['elevation_mask'].x + 5 + text_width, input_rects['elevation_mask'].y + 25), 2)
-            if selection_start['elevation_mask'] is not None:
-                start_width, _ = font.size(elevation_mask_str[:min(cursor_pos['elevation_mask'], selection_start['elevation_mask'])])
-                end_width, _ = font.size(elevation_mask_str[:max(cursor_pos['elevation_mask'], selection_start['elevation_mask'])])
-                pygame.draw.rect(surface, (0, 120, 215),
-                                (input_rects['elevation_mask'].x + 5 + start_width, input_rects['elevation_mask'].y + 5,
-                                 end_width - start_width, 20), 2)
+        elevation_mask_label = display.font.render("Elevation Mask (deg):", True, (0, 0, 0))
+        display.menu_screen.blit(elevation_mask_label, (display.sub_x + 20, display.sub_y + 300))
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['elevation_mask'])
+        elevation_mask_text = display.font.render(config_state.elevation_mask_str, True, (0, 0, 0))
+        display.menu_screen.blit(elevation_mask_text, (display.input_rects['elevation_mask'].x + 5, display.input_rects['elevation_mask'].y + 5))
 
         # Draw buttons and divider
-        pygame.draw.line(surface, (0, 0, 0), (sub_x, sub_y + sub_height - 60), (sub_x + sub_width, sub_y + sub_height - 60), 1)
-        draw_button(surface, save_button, "Save", button_states["save"])
-        draw_button(surface, load_button, "Load", button_states["load"])
+        pygame.draw.line(display.menu_screen, (0, 0, 0), (display.sub_x, display.sub_y + display.sub_height - 60), (display.sub_x + display.sub_width, display.sub_y + display.sub_height - 60), 1)
+        # Config mode buttons use display object properties
+        from utils import draw_button_with_objects
+        draw_button_with_objects(display, "save")
+        draw_button_with_objects(display, "load")
     else:
-        elevation_mask = float(elevation_mask_str or 0)
+        # Tracking visualization mode - requires state object
+        if state is None:
+            return  # Skip drawing if no state provided
+
+        elevation_mask = float(config_state.elevation_mask_str or 0)
         # Draw polar plot for tracking vis
-        cx = sub_x + sub_width // 2
-        cy = sub_y + sub_height // 2
-        radius = min(sub_width, sub_height) // 2 - 50
+        cx = display.sub_x + display.sub_width // 2
+        cy = display.sub_y + display.sub_height // 2
+        radius = min(display.sub_width, display.sub_height) // 2 - 50
         # Draw horizon circle
-        pygame.draw.circle(surface, (255, 255, 255), (cx, cy), radius, 1)
+        pygame.draw.circle(display.menu_screen, (255, 255, 255), (cx, cy), radius, 1)
         # Draw elevation mask circle
         mask_radius = (90 - elevation_mask) / 90 * radius
-        pygame.draw.circle(surface, (255, 0, 0), (cx, cy), mask_radius, 2)
+        pygame.draw.circle(display.menu_screen, (255, 0, 0), (cx, cy), mask_radius, 2)
         # Draw elevation circles
         for el in [30, 60]:
             r = (90 - el) / 90 * radius
-            pygame.draw.circle(surface, (100, 100, 100), (cx, cy), int(r), 1)
+            pygame.draw.circle(display.menu_screen, (100, 100, 100), (cx, cy), int(r), 1)
             el_label = pygame.font.Font(None, 14).render(f"{el}°", True, (255, 255, 255))
-            surface.blit(el_label, (cx + r + 5, cy - 5))
+            display.menu_screen.blit(el_label, (cx + r + 5, cy - 5))
         # Draw azimuth lines and labels
         for az_deg in range(0, 360, 30):
             az_rad = math.radians(az_deg)
             x1 = cx + radius * math.sin(az_rad)
             y1 = cy - radius * math.cos(az_rad)
-            pygame.draw.line(surface, (100, 100, 100), (cx, cy), (x1, y1), 1)
+            pygame.draw.line(display.menu_screen, (100, 100, 100), (cx, cy), (x1, y1), 1)
             if az_deg % 90 == 0:
                 direction = {0: "N", 90: "E", 180: "S", 270: "W"}[az_deg]
                 direction_label = pygame.font.Font(None, 14).render(direction, True, (255, 255, 255))
                 if az_deg == 0:  # North
-                    surface.blit(direction_label, (cx - direction_label.get_width() // 2, cy - radius - 10))
+                    display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy - radius - 10))
                 elif az_deg == 90:  # East
-                    surface.blit(direction_label, (cx + radius + 10, cy - direction_label.get_height() // 2))
+                    display.menu_screen.blit(direction_label, (cx + radius + 10, cy - direction_label.get_height() // 2))
                 elif az_deg == 180:  # South
-                    surface.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 5))
+                    display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 5))
                 elif az_deg == 270:  # West
-                    surface.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
+                    display.menu_screen.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
         # Draw precomputed arc segments for selected satellite
-        if selected_satellite and tle_loaded and selected_satellite in satellite_arc_segments:
+        if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
             # Redraw selected satellite's arc segments with sunlit detection
-            if selected_satellite in satellite_arc_segments and satellite_trajectories and selected_satellite in satellite_trajectories:
-                trajectory_data, times_array = satellite_trajectories[selected_satellite]
+            if state.selected_satellite in state.satellite_arc_segments and state.satellite_trajectories and state.selected_satellite in state.satellite_trajectories:
+                trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
 
                 # Set up observer and sun for sunlit calculation
                 try:
-                    observer = wgs84.latlon(obs_lat or 0, obs_lon or 0, elevation_m=obs_alt or 0)
+                    observer = wgs84.latlon(float(config_state.lat_str or 0), float(config_state.lon_str or 0), elevation_m=float(config_state.alt_str or 0))
 
                     # Load sun ephemeris
                     sun_ephemeris = load('de421.bsp')['sun']
@@ -290,7 +372,7 @@ def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, l
                     for st in skyfield_times:
                         try:
                             # Get satellite position and sun position
-                            sat_pos = selected_satellite.at(st)
+                            sat_pos = state.selected_satellite.at(st)
                             sun_pos = sun_ephemeris.at(st)
 
                             # Calculate vectors
@@ -333,27 +415,31 @@ def draw_polar_plot(surface, sub_x, sub_y, sub_width, sub_height, input_rects, l
                             else:
                                 color = (128, 128, 128)  # Grey for past
 
-                            pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+                            pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
 
                 except Exception as e:
                     # Fallback to default arc segments if sunlit calculation fails
-                    for x0, y0, x1, y1, color in satellite_arc_segments[selected_satellite]:
-                        pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+                    for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+                        pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
             else:
                 # Default drawing if no trajectory data available
-                for x0, y0, x1, y1, color in satellite_arc_segments[selected_satellite]:
-                    pygame.draw.line(surface, color, (x0, y0), (x1, y1), 1)
+                for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+                    pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
 
-def draw_satellites(surface, satellite_positions, satellite_labels, satellite_mean_altitudes, hovered_satellite, selected_satellite, cx, cy):
-    for sat, (px, py, alt, _) in satellite_positions.items():
-        mean_altitude = satellite_mean_altitudes.get(sat, 0.0)
+def draw_satellites(display, state, cx, cy):
+    """
+    State-direct mutation function for drawing satellites.
+    Takes display and state objects directly instead of individual parameters.
+    """
+    for sat, (px, py, alt, _) in state.satellite_positions.items():
+        mean_altitude = state.satellite_mean_altitudes.get(sat, 0.0)
         eccentricity = sat.model.ecco
         if 2000 < mean_altitude <= 35786:  # MEO
             color = (255, 165, 0)  # Orange
-            draw_hexagon(surface, px, py, color)
+            draw_hexagon(display.menu_screen, px, py, color)
         elif abs(mean_altitude - 35786) <= 1000:  # GEO or nearby
             color = (128, 0, 128)  # Purple
-            draw_triangle(surface, px, py, color)
+            draw_triangle(display.menu_screen, px, py, color)
         else:  # LEO (0-2000 km)
             color = get_altitude_color(mean_altitude) or (0, 255, 0)  # Fallback to green if out of range
             if eccentricity > 0.01:
@@ -364,97 +450,112 @@ def draw_satellites(surface, satellite_positions, satellite_labels, satellite_me
                 pygame.draw.ellipse(oval_surface, color, (0, 0, width, height))
                 rotated_oval = pygame.transform.rotate(oval_surface, angle)
                 rotated_rect = rotated_oval.get_rect(center=(px, py))
-                surface.blit(rotated_oval, rotated_rect.topleft)
+                display.menu_screen.blit(rotated_oval, rotated_rect.topleft)
             else:
-                pygame.draw.circle(surface, color, (px, py), 3)
-        if sat == hovered_satellite or sat == selected_satellite:
-            pygame.draw.circle(surface, (255, 255, 0), (px, py), 5, 1)  # Highlight on hover or select
-        surface.blit(satellite_labels[sat], (px + 5, py))
+                pygame.draw.circle(display.menu_screen, color, (px, py), 3)
+        if sat == state.hovered_satellite or sat == state.selected_satellite:
+            pygame.draw.circle(display.menu_screen, (255, 255, 0), (px, py), 5, 1)  # Highlight on hover or select
+        display.menu_screen.blit(state.satellite_labels[sat], (px + 5, py))
 
-def draw_filters(surface, filter_rect, filter_above_alt_rect, filter_below_alt_rect, filter_text, filter_above_alt_text, filter_below_alt_text, focused_field, cursor_pos, selection_start, small_font):
+def draw_filters(display, state):
+    """
+    State-direct mutation function for drawing filter inputs.
+    Takes display and state objects directly instead of individual parameters.
+    """
     # Name filter
-    filter_label = small_font.render("Name Filter:", True, (255, 255, 255))
-    surface.blit(filter_label, (filter_rect.x, filter_rect.y - filter_label.get_height() - 5))
-    pygame.draw.rect(surface, (255, 255, 255), filter_rect)
-    filter_text_surface = small_font.render(filter_text, True, (0, 0, 0))
-    surface.blit(filter_text_surface, (filter_rect.x + 5, filter_rect.y + 5))
-    if focused_field == "filter":
-        pygame.draw.rect(surface, (0, 0, 255), filter_rect, 2)
-        text_width, _ = small_font.size(filter_text[:cursor_pos["filter"]])
-        pygame.draw.line(surface, (0, 0, 255),
+    filter_label = display.small_font.render("Name Filter:", True, (255, 255, 255))
+    filter_rect = display.filter_rect
+    display.menu_screen.blit(filter_label, (filter_rect.x, filter_rect.y - filter_label.get_height() - 5))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_rect)
+    filter_text_surface = display.small_font.render(state.filter_text, True, (0, 0, 0))
+    display.menu_screen.blit(filter_text_surface, (filter_rect.x + 5, filter_rect.y + 5))
+    if state.focused_field == "filter":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), filter_rect, 2)
+        text_width, _ = display.small_font.size(state.filter_text[:state.cursor_pos["filter"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
                         (filter_rect.x + 5 + text_width, filter_rect.y + 5),
                         (filter_rect.x + 5 + text_width, filter_rect.y + 25), 2)
-        if selection_start["filter"] is not None:
-            start_width, _ = small_font.size(filter_text[:min(cursor_pos["filter"], selection_start["filter"])])
-            end_width, _ = small_font.size(filter_text[:max(cursor_pos["filter"], selection_start["filter"])])
-            pygame.draw.rect(surface, (0, 120, 215),
+        if state.selection_start["filter"] is not None:
+            start_width, _ = display.small_font.size(state.filter_text[:min(state.cursor_pos["filter"], state.selection_start["filter"])])
+            end_width, _ = display.small_font.size(state.filter_text[:max(state.cursor_pos["filter"], state.selection_start["filter"])])
+            pygame.draw.rect(display.menu_screen, (0, 120, 215),
                             (filter_rect.x + 5 + start_width, filter_rect.y + 5,
                              end_width - start_width, 20), 2)
 
     # Filter Above Altitude
-    filter_above_alt_label = small_font.render("Filter Above Alt (km):", True, (255, 255, 255))
-    surface.blit(filter_above_alt_label, (filter_above_alt_rect.x, filter_above_alt_rect.y - filter_above_alt_label.get_height() - 5))
-    pygame.draw.rect(surface, (255, 255, 255), filter_above_alt_rect)
-    filter_above_alt_text_surface = small_font.render(filter_above_alt_text, True, (0, 0, 0))
-    surface.blit(filter_above_alt_text_surface, (filter_above_alt_rect.x + 5, filter_above_alt_rect.y + 5))
-    if focused_field == "filter_above_alt":
-        pygame.draw.rect(surface, (0, 0, 255), filter_above_alt_rect, 2)
-        text_width, _ = small_font.size(filter_above_alt_text[:cursor_pos["filter_above_alt"]])
-        pygame.draw.line(surface, (0, 0, 255),
+    filter_above_alt_label = display.small_font.render("Filter Above Alt (km):", True, (255, 255, 255))
+    filter_above_alt_rect = display.filter_above_alt_rect
+    display.menu_screen.blit(filter_above_alt_label, (filter_above_alt_rect.x, filter_above_alt_rect.y - filter_above_alt_label.get_height() - 5))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_above_alt_rect)
+    filter_above_alt_text_surface = display.small_font.render(state.filter_above_alt_text, True, (0, 0, 0))
+    display.menu_screen.blit(filter_above_alt_text_surface, (filter_above_alt_rect.x + 5, filter_above_alt_rect.y + 5))
+    if state.focused_field == "filter_above_alt":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), filter_above_alt_rect, 2)
+        text_width, _ = display.small_font.size(state.filter_above_alt_text[:state.cursor_pos["filter_above_alt"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
                         (filter_above_alt_rect.x + 5 + text_width, filter_above_alt_rect.y + 5),
                         (filter_above_alt_rect.x + 5 + text_width, filter_above_alt_rect.y + 25), 2)
-        if selection_start["filter_above_alt"] is not None:
-            start_width, _ = small_font.size(filter_above_alt_text[:min(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"])])
-            end_width, _ = small_font.size(filter_above_alt_text[:max(cursor_pos["filter_above_alt"], selection_start["filter_above_alt"])])
-            pygame.draw.rect(surface, (0, 120, 215),
+        if state.selection_start["filter_above_alt"] is not None:
+            start_width, _ = display.small_font.size(state.filter_above_alt_text[:min(state.cursor_pos["filter_above_alt"], state.selection_start["filter_above_alt"])])
+            end_width, _ = display.small_font.size(state.filter_above_alt_text[:max(state.cursor_pos["filter_above_alt"], state.selection_start["filter_above_alt"])])
+            pygame.draw.rect(display.menu_screen, (0, 120, 215),
                             (filter_above_alt_rect.x + 5 + start_width, filter_above_alt_rect.y + 5,
                              end_width - start_width, 20), 2)
 
     # Filter Below Altitude
-    filter_below_alt_label = small_font.render("Filter Below Alt (km):", True, (255, 255, 255))
-    surface.blit(filter_below_alt_label, (filter_below_alt_rect.x, filter_below_alt_rect.y - filter_below_alt_label.get_height() - 5))
-    pygame.draw.rect(surface, (255, 255, 255), filter_below_alt_rect)
-    filter_below_alt_text_surface = small_font.render(filter_below_alt_text, True, (0, 0, 0))
-    surface.blit(filter_below_alt_text_surface, (filter_below_alt_rect.x + 5, filter_below_alt_rect.y + 5))
-    if focused_field == "filter_below_alt":
-        pygame.draw.rect(surface, (0, 0, 255), filter_below_alt_rect, 2)
-        text_width, _ = small_font.size(filter_below_alt_text[:cursor_pos["filter_below_alt"]])
-        pygame.draw.line(surface, (0, 0, 255),
+    filter_below_alt_label = display.small_font.render("Filter Below Alt (km):", True, (255, 255, 255))
+    filter_below_alt_rect = display.filter_below_alt_rect
+    display.menu_screen.blit(filter_below_alt_label, (filter_below_alt_rect.x, filter_below_alt_rect.y - filter_below_alt_label.get_height() - 5))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_below_alt_rect)
+    filter_below_alt_text_surface = display.small_font.render(state.filter_below_alt_text, True, (0, 0, 0))
+    display.menu_screen.blit(filter_below_alt_text_surface, (filter_below_alt_rect.x + 5, filter_below_alt_rect.y + 5))
+    if state.focused_field == "filter_below_alt":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), filter_below_alt_rect, 2)
+        text_width, _ = display.small_font.size(state.filter_below_alt_text[:state.cursor_pos["filter_below_alt"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
                         (filter_below_alt_rect.x + 5 + text_width, filter_below_alt_rect.y + 5),
                         (filter_below_alt_rect.x + 5 + text_width, filter_below_alt_rect.y + 25), 2)
-        if selection_start["filter_below_alt"] is not None:
-            start_width, _ = small_font.size(filter_below_alt_text[:min(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"])])
-            end_width, _ = small_font.size(filter_below_alt_text[:max(cursor_pos["filter_below_alt"], selection_start["filter_below_alt"])])
-            pygame.draw.rect(surface, (0, 120, 215),
+        if state.selection_start["filter_below_alt"] is not None:
+            start_width, _ = display.small_font.size(state.filter_below_alt_text[:min(state.cursor_pos["filter_below_alt"], state.selection_start["filter_below_alt"])])
+            end_width, _ = display.small_font.size(state.filter_below_alt_text[:max(state.cursor_pos["filter_below_alt"], state.selection_start["filter_below_alt"])])
+            pygame.draw.rect(display.menu_screen, (0, 120, 215),
                             (filter_below_alt_rect.x + 5 + start_width, filter_below_alt_rect.y + 5,
                              end_width - start_width, 20), 2)
 
-def draw_legend(surface, legend_x, legend_y, small_font):
-    pygame.draw.rect(surface, (50, 50, 50), (legend_x, legend_y, 150, 140))  # Larger legend
-    pygame.draw.line(surface, (255, 255, 255), (legend_x, legend_y + 20), (legend_x + 150, legend_y + 20), 1)  # Title line
-    legend_title = small_font.render("Orbit Legend", True, (255, 255, 255))
-    surface.blit(legend_title, (legend_x + 5, legend_y + 5))
+def draw_legend(display):
+    """
+    State-direct mutation function for drawing orbit legend.
+    Takes display object directly instead of individual parameters.
+    """
+    pygame.draw.rect(display.menu_screen, (50, 50, 50), (display.legend_x, display.legend_y, 150, 140))  # Larger legend
+    pygame.draw.line(display.menu_screen, (255, 255, 255), (display.legend_x, display.legend_y + 20), (display.legend_x + 150, display.legend_y + 20), 1)  # Title line
+    legend_title = display.small_font.render("Orbit Legend", True, (255, 255, 255))
+    display.menu_screen.blit(legend_title, (display.legend_x + 5, display.legend_y + 5))
     # LEO heatmap
     for i in range(150):
         alt = i / 150 * 1000  # Scale from 0 to 1000 km
         color = get_altitude_color(alt) or (0, 255, 0)  # Fallback to green if out of range
-        pygame.draw.line(surface, color, (legend_x + i, legend_y + 40), (legend_x + i, legend_y + 60))
-    low_alt = small_font.render("0 km", True, (255, 255, 255))
-    high_alt = small_font.render("1000 km", True, (255, 255, 255))
-    surface.blit(low_alt, (legend_x, legend_y + 70))
-    surface.blit(high_alt, (legend_x + 140, legend_y + 70))
+        pygame.draw.line(display.menu_screen, color, (display.legend_x + i, display.legend_y + 40), (display.legend_x + i, display.legend_y + 60))
+    low_alt = display.small_font.render("0 km", True, (255, 255, 255))
+    high_alt = display.small_font.render("1000 km", True, (255, 255, 255))
+    display.menu_screen.blit(low_alt, (display.legend_x, display.legend_y + 70))
+    display.menu_screen.blit(high_alt, (display.legend_x + 140, display.legend_y + 70))
     # MEO hexagon
-    draw_hexagon(surface, legend_x + 20, legend_y + 90, (255, 165, 0))  # Orange
-    meo_label = small_font.render("MEO (Orange)", True, (255, 255, 255))
-    surface.blit(meo_label, (legend_x + 40, legend_y + 85))
+    draw_hexagon(display.menu_screen, display.legend_x + 20, display.legend_y + 90, (255, 165, 0))  # Orange
+    meo_label = display.small_font.render("MEO (Orange)", True, (255, 255, 255))
+    display.menu_screen.blit(meo_label, (display.legend_x + 40, display.legend_y + 85))
     # GEO triangle with line break
-    draw_triangle(surface, legend_x + 20, legend_y + 110, (128, 0, 128))  # Purple
-    geo_label = small_font.render("GEO (Purple)", True, (255, 255, 255))
-    surface.blit(geo_label, (legend_x + 40, legend_y + 105))
+    draw_triangle(display.menu_screen, display.legend_x + 20, display.legend_y + 110, (128, 0, 128))  # Purple
+    geo_label = display.small_font.render("GEO (Purple)", True, (255, 255, 255))
+    display.menu_screen.blit(geo_label, (display.legend_x + 40, display.legend_y + 105))
 
-def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_altitudes, sub_x, sub_y, sub_width, sub_height, small_font, satellite_perigee=None, satellite_apogee=None, satellite_positions=None):
-    if (hovered_satellite or selected_satellite):
-        sat = selected_satellite if selected_satellite else hovered_satellite
+def draw_details(display, state):
+    """
+    State-direct mutation function for drawing satellite details panel.
+    Takes display and state objects directly instead of individual parameters.
+    """
+    if (state.hovered_satellite or state.selected_satellite):
+        sat = state.selected_satellite if state.selected_satellite else state.hovered_satellite
         epoch_dt = sat.epoch.utc_datetime().strftime("%Y-%m-%d %H:%M:%S")
         details = [
             f"NORAD ID: {sat.model.satnum_str}",
@@ -468,77 +569,97 @@ def draw_details(surface, hovered_satellite, selected_satellite, satellite_mean_
             f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
             f"Rev Number: {sat.model.revnum}",
         ]
-        dist = satellite_positions[sat][3] if satellite_positions and sat in satellite_positions else None
-        if ((selected_satellite or hovered_satellite) and satellite_perigee and satellite_apogee):
-            details.extend([
-                f"Apogee Altitude (km): {satellite_apogee[sat]:.1f}",
-                f"Perigee Altitude (km): {satellite_perigee[sat]:.1f}"
-            ])
-        if ((selected_satellite or hovered_satellite) and dist is not None):
+        dist = state.satellite_positions[sat][3] if state.satellite_positions and sat in state.satellite_positions else None
+        if ((state.selected_satellite or state.hovered_satellite) and state.satellite_perigee and state.satellite_apogee):
+            sat_perigee = state.satellite_perigee[sat] if sat in state.satellite_perigee else None
+            sat_apogee = state.satellite_apogee[sat] if sat in state.satellite_apogee else None
+            if sat_perigee is not None and sat_apogee is not None:
+                details.extend([
+                    f"Apogee Altitude (km): {sat_apogee:.1f}",
+                    f"Perigee Altitude (km): {sat_perigee:.1f}"
+                ])
+        if ((state.selected_satellite or state.hovered_satellite) and dist is not None):
             details.append(f"Slant Range (km): {dist:.1f}")
-        details_rect = pygame.Rect(sub_x + sub_width - 250, sub_y + 20, 230, 250)
-        pygame.draw.rect(surface, (50, 50, 50), details_rect)  # Dark grey background
-        pygame.draw.rect(surface, (0, 0, 0), details_rect, 2)  # Black border
+        details_rect = pygame.Rect(display.sub_x + display.sub_width - 250, display.sub_y + 20, 230, 250)
+        pygame.draw.rect(display.menu_screen, (50, 50, 50), details_rect)  # Dark grey background
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), details_rect, 2)  # Black border
         for i, line in enumerate(details):
-            text_surface = small_font.render(line, True, (255, 255, 255))
-            surface.blit(text_surface, (details_rect.x + 5, details_rect.y + 5 + i * 15))
+            text_surface = display.small_font.render(line, True, (255, 255, 255))
+            display.menu_screen.blit(text_surface, (details_rect.x + 5, details_rect.y + 5 + i * 15))
 
-def draw_time_display(surface, sub_x, sub_y, sub_height, small_font):
+def draw_time_display(display):
+    """
+    State-direct mutation function for drawing time display.
+    Takes display object directly instead of individual parameters.
+    """
     current_utc = datetime.utcnow()
     current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     time_text = f"UTC: {utc_time_str}  Local: {local_time_str}"
-    time_surface = small_font.render(time_text, True, (255, 255, 255))
-    surface.blit(time_surface, (sub_x + 10, sub_y + sub_height - 30))
+    time_surface = display.small_font.render(time_text, True, (255, 255, 255))
+    display.menu_screen.blit(time_surface, (display.sub_x + 10, display.sub_y + display.sub_height - 30))
 
-def draw_satellite_count(surface, sub_x, sub_y, satellite_positions, small_font):
-    sat_count = len(satellite_positions)
+def draw_satellite_count(display, state):
+    """
+    State-direct mutation function for drawing satellite count display.
+    Takes display and state objects directly instead of individual parameters.
+    """
+    sat_count = len(state.satellite_positions)
     count_text = f"Satellites in view: {sat_count}"
-    count_surface = small_font.render(count_text, True, (255, 255, 255))
-    surface.blit(count_surface, (sub_x + 10, sub_y + 240))  # Moved below filter boxes
+    count_surface = display.small_font.render(count_text, True, (255, 255, 255))
+    display.menu_screen.blit(count_surface, (display.sub_x + 10, display.sub_y + 240))  # Moved below filter boxes
 
-def draw_scroll_bar(surface, scroll_bar_rect, slider_rect, small_font, start_label_text="-15 min", end_label_text="+15 min"):
+def draw_scroll_bar(display, state):
+    """
+    State-direct mutation function for drawing scroll bar.
+    Takes display and state objects directly instead of individual parameters.
+    """
     # Draw scroll bar track
-    pygame.draw.rect(surface, (100, 100, 100), scroll_bar_rect)
+    pygame.draw.rect(display.menu_screen, (100, 100, 100), display.scroll_bar_rect)
     # Draw slider
-    pygame.draw.rect(surface, (255, 255, 255), slider_rect)
-    # Draw time labels
-    start_label = small_font.render(start_label_text, True, (255, 255, 255))
-    end_label = small_font.render(end_label_text, True, (255, 255, 255))
-    surface.blit(start_label, (scroll_bar_rect.x, scroll_bar_rect.y + scroll_bar_rect.height + 5))
-    surface.blit(end_label, (scroll_bar_rect.x + scroll_bar_rect.width - end_label.get_width(), scroll_bar_rect.y + scroll_bar_rect.height + 5))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.slider_rect)
+    # Draw time labels from state
+    start_label = display.small_font.render(state.scroll_bar_start_label, True, (255, 255, 255))
+    end_label = display.small_font.render(state.scroll_bar_end_label, True, (255, 255, 255))
+    display.menu_screen.blit(start_label, (display.scroll_bar_rect.x, display.scroll_bar_rect.y + display.scroll_bar_rect.height + 5))
+    display.menu_screen.blit(end_label, (display.scroll_bar_rect.x + display.scroll_bar_rect.width - end_label.get_width(), display.scroll_bar_rect.y + display.scroll_bar_rect.height + 5))
 
-def draw_scroll_time_display(surface, sub_x, sub_y, sub_width, sub_height, current_tt, ts, small_font):
-    radius = min(sub_width, sub_height) // 2 - 50
+def draw_scroll_time_display(display, current_tt, ts):
+    """
+    State-direct mutation function for drawing scroll time display.
+    Takes display object, current_tt, and ts directly instead of individual parameters.
+    """
+    radius = min(display.sub_width, display.sub_height) // 2 - 50
     current_utc = ts.tt(jd=current_tt).utc_datetime()
     current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]
     time_text = f"Scroll UTC: {utc_time_str}  Local: {local_time_str}"
-    time_surface = small_font.render(time_text, True, (255, 255, 255))
-    text_width, _ = small_font.size(time_text)
-    surface.blit(time_surface, (sub_x + sub_width // 2 - text_width // 2, sub_y + sub_height - 15))
+    time_surface = display.small_font.render(time_text, True, (255, 255, 255))
+    text_width, _ = display.small_font.size(time_text)
+    display.menu_screen.blit(time_surface, (display.sub_x + display.sub_width // 2 - text_width // 2, display.sub_y + display.sub_height - 15))
 
-def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data, selected_satellite, small_font, sort_keys=None, sort_reverse_flags=None, elevation_mask_deg=10.0):
+def draw_satellite_pass_table(display, state):
     """
     Draw the satellite pass table in the lower left corner.
-    Returns a list of rectangles representing clickable areas for sorting and selection.
+    State-direct mutation function that modifies state.pass_table_clickable_areas directly.
     """
-    if not pass_table_data:
-        return []
+    if not state.satellite_pass_table:
+        state.pass_table_clickable_areas = []
+        return
 
     # Table positioning and dimensions
-    table_x = sub_x + 10
-    table_y = sub_y + sub_height - 370  # Position above the status messages and controls, moved up 50 pixels
+    table_x = display.sub_x + 10
+    table_y = display.sub_y + display.sub_height - 370  # Position above the status messages and controls, moved up 50 pixels
     table_width = 374  # Sum of column widths (354px) + margin (20px)
     table_height = 316  # Increased by ~2 rows to accommodate taller border
     row_height = 18
     header_height = 25
 
     # Background
-    pygame.draw.rect(surface, (40, 40, 40), (table_x, table_y, table_width, table_height))
-    pygame.draw.rect(surface, (200, 200, 200), (table_x, table_y, table_width, table_height), 2)
+    pygame.draw.rect(display.menu_screen, (40, 40, 40), (table_x, table_y, table_width, table_height))
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), (table_x, table_y, table_width, table_height), 2)
 
     # Column widths (Name, NORAD ID, Az, Max El, Closest Time)
     col_widths = [120, 55, 42, 57, 80]
@@ -548,31 +669,31 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
 
     # Table title
     title_text = "Satellite Passes"
-    title_surface = small_font.render(title_text, True, (255, 255, 255))
-    surface.blit(title_surface, (table_x + 5, table_y + 5))
+    title_surface = display.small_font.render(title_text, True, (255, 255, 255))
+    display.menu_screen.blit(title_surface, (table_x + 5, table_y + 5))
 
     # Column headers
     column_headers = ["Name", "NORAD", "Az", "Max El", "Closest"]
-    clickable_areas = []
+    state.pass_table_clickable_areas = []
 
     header_y = table_y + 25
     for i, header in enumerate(column_headers):
         # Draw header background
-        header_bg_color = (60, 60, 60) if sort_keys and i < len(sort_keys) and sort_keys[i] else (50, 50, 50)
-        pygame.draw.rect(surface, header_bg_color, (col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5))
+        header_bg_color = (60, 60, 60) if state.table_sort_keys and i < len(state.table_sort_keys) and state.table_sort_keys[i] else (50, 50, 50)
+        pygame.draw.rect(display.menu_screen, header_bg_color, (col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5))
 
         # Draw header text
-        header_surface = small_font.render(header, True, (255, 255, 255))
-        surface.blit(header_surface, (col_x_positions[i], header_y + 3))
+        header_surface = display.small_font.render(header, True, (255, 255, 255))
+        display.menu_screen.blit(header_surface, (col_x_positions[i], header_y + 3))
 
         # Add clickable border and area
         header_rect = pygame.Rect(col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5)
-        pygame.draw.rect(surface, (150, 150, 150), header_rect, 1)
-        clickable_areas.append(('header', i, header_rect))
+        pygame.draw.rect(display.menu_screen, (150, 150, 150), header_rect, 1)
+        state.pass_table_clickable_areas.append(('header', i, header_rect))
 
     # Draw table rows
     row_y = header_y + header_height - 5
-    for row_idx, pass_entry in enumerate(pass_table_data[:15]):  # Limit to 15 rows maximum
+    for row_idx, pass_entry in enumerate(state.satellite_pass_table[:15]):  # Limit to 15 rows maximum
         # Alternate row colors
         if row_idx % 2 == 0:
             row_bg_color = (45, 45, 45)
@@ -580,11 +701,11 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
             row_bg_color = (35, 35, 35)
 
         # Highlight selected satellite's row
-        if selected_satellite and pass_entry['satellite'] == selected_satellite:
+        if state.selected_satellite and pass_entry['satellite'] == state.selected_satellite:
             row_bg_color = (80, 100, 120)  # Blue highlight for selected
 
         # Draw row background
-        pygame.draw.rect(surface, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
+        pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
 
         # Draw cell contents
         cell_values = [
@@ -597,56 +718,57 @@ def draw_satellite_pass_table(surface, sub_x, sub_y, sub_height, pass_table_data
 
         for col_idx, value in enumerate(cell_values):
             # Draw cell text
-            value_surface = small_font.render(value, True, (255, 255, 255))
-            surface.blit(value_surface, (col_x_positions[col_idx], row_y + 2))
+            value_surface = display.small_font.render(value, True, (255, 255, 255))
+            display.menu_screen.blit(value_surface, (col_x_positions[col_idx], row_y + 2))
 
         # Add row clickable area for selection
         row_rect = pygame.Rect(table_x + 3, row_y, table_width - 6, row_height)
-        pygame.draw.rect(surface, (100, 100, 100), row_rect, 1)
-        clickable_areas.append(('row', row_idx, row_rect))
+        pygame.draw.rect(display.menu_screen, (100, 100, 100), row_rect, 1)
+        state.pass_table_clickable_areas.append(('row', row_idx, row_rect))
 
         row_y += row_height
 
     # Add info text about sorting in title row, right-justified
-    info_text = f"Sorted by: {['Name', 'NORAD', 'Az', 'Max El', 'Closest'][sort_keys.index(True) if sort_keys and True in sort_keys else 3]} ({'Desc' if sort_reverse_flags and sort_reverse_flags[sort_keys.index(True) if sort_keys and True in sort_keys else 3] else 'Asc'})"
-    info_surface = small_font.render(info_text, True, (180, 180, 180))
+    sort_index = state.table_sort_keys.index(True) if state.table_sort_keys and True in state.table_sort_keys else 3
+    sort_order = 'Desc' if state.table_sort_reverse and sort_index < len(state.table_sort_reverse) and state.table_sort_reverse[sort_index] else 'Asc'
+    info_text = f"Sorted by: {['Name', 'NORAD', 'Az', 'Max El', 'Closest'][sort_index]} ({sort_order})"
+    info_surface = display.small_font.render(info_text, True, (180, 180, 180))
     info_x = table_x + table_width - info_surface.get_width() - 5  # Right-justified
-    surface.blit(info_surface, (info_x, table_y + 5))  # Same Y as title
+    display.menu_screen.blit(info_surface, (info_x, table_y + 5))  # Same Y as title
 
-    return clickable_areas
-
-def filter_and_sort_pass_table(satellite_pass_table, filter_text, filter_above_alt_text, filter_below_alt_text, satellite_mean_altitudes, table_sort_keys, table_sort_reverse):
+def filter_and_sort_pass_table(state):
     """
     Filter and sort the satellite pass table based on name and altitude filters.
-    This consolidates the filtering logic that was duplicated throughout main.py.
+    State-direct mutation function that takes a tracking_vis_state object directly.
+    Returns the filtered and sorted pass table.
     """
-    if not satellite_pass_table:
+    if not state.satellite_pass_table:
         return []
 
     # Apply name and altitude filters
-    filtered_table = [entry for entry in satellite_pass_table if (
-        not filter_text or
-        filter_text.lower() in entry['satellite'].name.lower() or
-        filter_text in entry['satellite'].model.satnum_str
+    filtered_table = [entry for entry in state.satellite_pass_table if (
+        not state.filter_text or
+        state.filter_text.lower() in entry['satellite'].name.lower() or
+        state.filter_text in entry['satellite'].model.satnum_str
     ) and (
-        not filter_above_alt_text or
-        float(satellite_mean_altitudes.get(entry['satellite'], 0.0)) >= float(filter_above_alt_text)
+        not state.filter_above_alt_text or
+        float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0)) >= float(state.filter_above_alt_text)
     ) and (
-        not filter_below_alt_text or
-        float(satellite_mean_altitudes.get(entry['satellite'], 0.0)) <= float(filter_below_alt_text)
+        not state.filter_below_alt_text or
+        float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0)) <= float(state.filter_below_alt_text)
     )]
 
     # Apply sorting based on sort keys
-    if table_sort_keys and any(table_sort_keys):
+    if state.table_sort_keys and any(state.table_sort_keys):
         # Find the column to sort by
         sort_column = None
-        for i, is_sorted in enumerate(table_sort_keys):
+        for i, is_sorted in enumerate(state.table_sort_keys):
             if is_sorted:
                 sort_column = i
                 break
 
         if sort_column is not None:
-            reverse_sort = table_sort_reverse[sort_column] if table_sort_reverse and sort_column < len(table_sort_reverse) else True
+            reverse_sort = state.table_sort_reverse[sort_column] if state.table_sort_reverse and sort_column < len(state.table_sort_reverse) else True
 
             # Define sort key functions for each column
             sort_keys = {

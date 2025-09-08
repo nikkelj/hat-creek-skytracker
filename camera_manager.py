@@ -842,53 +842,52 @@ def render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_heig
         opacity_text = tiny_font.render(f"Camera Opacity: {camera_opacity:.1f}", True, (255, 255, 255))
         menu_screen.blit(opacity_text, (slider_rect.x, slider_rect.y - 20))
 
-def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, camera1_connected, camera2_connected, update_status_callback=None):
+def handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback=None):
     """Handle sensor calibration mode events - modular event handler matching new layout"""
     # Get camera references - these will be modified directly by set_camera_roi calls
     camera1 = camera_manager.get_camera(0)
     camera2 = camera_manager.get_camera(1)
 
+    # Calculate layout metrics to match render_sensor_calibration
+    cam_display_width = (display.sub_width - 30) // 2  # Same calculation as in render function
+
     if event.type == pygame.MOUSEBUTTONDOWN:
-
-        # Calculate layout metrics to match render_sensor_calibration
-        cam_display_width = (sub_width - 30) // 2  # Same calculation as in render function
-
         # Camera 1 Connect button (next to status info)
-        camera1_connect_rect = pygame.Rect(sub_x + 230, sub_y + 10, 60, 20)
-        camera1_disconnect_rect = pygame.Rect(sub_x + 330, sub_y + 10, 60, 20)
+        camera1_connect_rect = pygame.Rect(display.sub_x + 230, display.sub_y + 10, 60, 20)
+        camera1_disconnect_rect = pygame.Rect(display.sub_x + 330, display.sub_y + 10, 60, 20)
 
         # Camera 2 Connect button (next to status info)
-        camera2_connect_rect = pygame.Rect(sub_x + cam_display_width + 230, sub_y + 10, 60, 20)
-        camera2_disconnect_rect = pygame.Rect(sub_x + cam_display_width + 330, sub_y + 10, 60, 20)
+        camera2_connect_rect = pygame.Rect(display.sub_x + cam_display_width + 230, display.sub_y + 10, 60, 20)
+        camera2_disconnect_rect = pygame.Rect(display.sub_x + cam_display_width + 330, display.sub_y + 10, 60, 20)
 
-        if camera1_connect_rect.collidepoint(pos) and not camera1_connected:
-            camera_manager.connect_camera(0)
+        if camera1_connect_rect.collidepoint(pos) and not camera1.connected:
+            camera_manager.connect_camera(0, update_status_callback)
         elif camera1_disconnect_rect.collidepoint(pos) and camera1.connected:
-            camera_manager.disconnect_camera(0)
-        elif camera2_connect_rect.collidepoint(pos) and not camera2_connected:
-            camera_manager.connect_camera(1)
+            camera_manager.disconnect_camera(0, update_status_callback)
+        elif camera2_connect_rect.collidepoint(pos) and not camera2.connected:
+            camera_manager.connect_camera(1, update_status_callback)
         elif camera2_disconnect_rect.collidepoint(pos) and camera2.connected:
-            camera_manager.disconnect_camera(1)
+            camera_manager.disconnect_camera(1, update_status_callback)
         # Check gain/exposure sliders - entire slider track is clickable for easier interaction
-        if camera1_connected:
+        if camera1.connected:
             # Camera 1 Gain Slider track detection
-            camera1_gain_track_rect = pygame.Rect(sub_x + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera1_gain_track_rect = pygame.Rect(display.sub_x + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             if camera1_gain_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_gain_slider"]["dragging"] = True
 
             # Camera 1 Exposure Slider track detection
-            camera1_exposure_track_rect = pygame.Rect(sub_x + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera1_exposure_track_rect = pygame.Rect(display.sub_x + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             if camera1_exposure_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_exposure_slider"]["dragging"] = True
 
-        if camera2_connected:
+        if camera2.connected:
             # Camera 2 Gain Slider track detection
-            camera2_gain_track_rect = pygame.Rect(sub_x + cam_display_width + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera2_gain_track_rect = pygame.Rect(display.sub_x + cam_display_width + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             if camera2_gain_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_gain_slider"]["dragging"] = True
 
             # Camera 2 Exposure Slider track detection
-            camera2_exposure_track_rect = pygame.Rect(sub_x + cam_display_width + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera2_exposure_track_rect = pygame.Rect(display.sub_x + cam_display_width + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             if camera2_exposure_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_exposure_slider"]["dragging"] = True
 
@@ -910,17 +909,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                 camera_manager.camera_opacities[0] = new_opacity  # Update first camera opacity
 
         # ROI Size and Origin Selection for Camera 1
-        if camera1_connected:
-            cam_display_width = (sub_width - 30) // 2
-            cam_display_height = sub_height - 30
+        if camera1.connected:
+            cam_display_width = (display.sub_width - 30) // 2
+            cam_display_height = display.sub_height - 30
 
             # Camera 1 ROI Size Control buttons - positions must match render function
             is_roi_selection = False
             for i in range(6):
                 if i < 3:  # First column
-                    roi_rect = pygame.Rect(sub_x + 10 + cam_display_width + 15 - 100, sub_y + 10 + i * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + 10 + cam_display_width + 15 - 100, display.sub_y + 10 + i * 15, 28, 12)
                 else:  # Second column
-                    roi_rect = pygame.Rect(sub_x + 10 + cam_display_width + 55 - 100, sub_y + 10 + (i - 3) * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + 10 + cam_display_width + 55 - 100, display.sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
                     is_roi_selection = True
@@ -942,17 +941,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     break
 
             # ROI Origin Selection by clicking on Camera 1 image
-            camera1_image_rect = pygame.Rect(sub_x + 10, sub_y + 10, cam_display_width, cam_display_height)
+            camera1_image_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 10, cam_display_width, cam_display_height)
 
             # Skip camera image click if it's within a slider track area
-            camera1_gain_track_rect = pygame.Rect(sub_x + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
-            camera1_exposure_track_rect = pygame.Rect(sub_x + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera1_gain_track_rect = pygame.Rect(display.sub_x + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            camera1_exposure_track_rect = pygame.Rect(display.sub_x + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             skip_camera1_click = camera1_gain_track_rect.collidepoint(pos) or camera1_exposure_track_rect.collidepoint(pos)
 
             if camera1_image_rect.collidepoint(pos) and camera1.frame is not None and not skip_camera1_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
-                rel_x = (pos[0] - (sub_x + 10)) / cam_display_width
-                rel_y = (pos[1] - (sub_y + 10)) / cam_display_height
+                rel_x = (pos[0] - (display.sub_x + 10)) / cam_display_width
+                rel_y = (pos[1] - (display.sub_y + 10)) / cam_display_height
                 camera1.roi_x = max(0.0, min(1.0, rel_x))
                 camera1.roi_y = max(0.0, min(1.0, rel_y))
 
@@ -963,17 +962,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     print("Camera 1 ROI setting not supported or failed")
 
         # ROI Size and Origin Selection for Camera 2
-        if camera2_connected:
-            cam_display_width = (sub_width - 30) // 2
-            cam_display_height = sub_height - 30
+        if camera2.connected:
+            cam_display_width = (display.sub_width - 30) // 2
+            cam_display_height = display.sub_height - 30
 
             # Camera 2 ROI Size Control buttons - positions must match render function
             is_roi_selection = False
             for i in range(6):
                 if i < 3:  # First column
-                    roi_rect = pygame.Rect(sub_x + cam_display_width + 15 + 780, sub_y + 10 + i * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + cam_display_width + 15 + 780, display.sub_y + 10 + i * 15, 28, 12)
                 else:  # Second column
-                    roi_rect = pygame.Rect(sub_x + cam_display_width + 55 + 780, sub_y + 10 + (i - 3) * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + cam_display_width + 55 + 780, display.sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
                     is_roi_selection = True
@@ -995,17 +994,17 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     break
 
             # ROI Origin Selection by clicking on Camera 2 image
-            camera2_image_rect = pygame.Rect(sub_x + cam_display_width + 20, sub_y + 10, cam_display_width, cam_display_height)
+            camera2_image_rect = pygame.Rect(display.sub_x + cam_display_width + 20, display.sub_y + 10, cam_display_width, cam_display_height)
 
             # Skip camera image click if it's within a slider track area
-            camera2_gain_track_rect = pygame.Rect(sub_x + cam_display_width + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
-            camera2_exposure_track_rect = pygame.Rect(sub_x + cam_display_width + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+            camera2_gain_track_rect = pygame.Rect(display.sub_x + cam_display_width + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            camera2_exposure_track_rect = pygame.Rect(display.sub_x + cam_display_width + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             skip_camera2_click = camera2_gain_track_rect.collidepoint(pos) or camera2_exposure_track_rect.collidepoint(pos)
 
             if camera2_image_rect.collidepoint(pos) and camera2.frame is not None and not skip_camera2_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
-                rel_x = (pos[0] - (sub_x + cam_display_width + 20)) / cam_display_width
-                rel_y = (pos[1] - (sub_y + 10)) / cam_display_height
+                rel_x = (pos[0] - (display.sub_x + cam_display_width + 20)) / cam_display_width
+                rel_y = (pos[1] - (display.sub_y + 10)) / cam_display_height
                 camera2.roi_x = max(0.0, min(1.0, rel_x))
                 camera2.roi_y = max(0.0, min(1.0, rel_y))
                 # Apply ROI to camera if supported (pass current values to avoid globals issue)
@@ -1016,13 +1015,13 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
         if event.buttons[0]:  # Left mouse button is pressed
             current_pos = event.pos  # Use current mouse position for motion events
             # Calculate positions to match render function
-            cam_display_width = (sub_width - 30) // 2
+            cam_display_width = (display.sub_width - 30) // 2
 
-            if camera1_connected:
+            if camera1.connected:
                 # Check if mouse is over Camera 1 Gain Slider track
-                camera1_gain_track_rect = pygame.Rect(sub_x + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
+                camera1_gain_track_rect = pygame.Rect(display.sub_x + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
                 if camera1_gain_track_rect.collidepoint(current_pos):
-                    slider_x = sub_x + 450
+                    slider_x = display.sub_x + 450
                     slider_width = 120
                     max_gain = camera1.prop.get('MaxGain', 500) if camera1.prop else 500
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
@@ -1030,9 +1029,9 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     camera_manager.set_camera_gain(0, new_gain, lambda msg: print(f"Gain: {new_gain}"))
 
                 # Check if mouse is over Camera 1 Exposure Slider track
-                camera1_exposure_track_rect = pygame.Rect(sub_x + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+                camera1_exposure_track_rect = pygame.Rect(display.sub_x + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
                 if camera1_exposure_track_rect.collidepoint(current_pos):
-                    slider_x = sub_x + 600
+                    slider_x = display.sub_x + 600
                     slider_width = 120
                     max_exp = camera1.prop.get('MaxExposure', 500000) if camera1.prop else 500000
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
@@ -1049,11 +1048,11 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                         new_exposure = max_exp
                     camera_manager.set_camera_exposure(0, new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
 
-            if camera2_connected:
+            if camera2.connected:
                 # Check if mouse is over Camera 2 Gain Slider track
-                camera2_gain_track_rect = pygame.Rect(sub_x + cam_display_width + 450 - 10, sub_y + 20 - 10, 120 + 20, 25)
+                camera2_gain_track_rect = pygame.Rect(display.sub_x + cam_display_width + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
                 if camera2_gain_track_rect.collidepoint(current_pos):
-                    slider_x = sub_x + cam_display_width + 450
+                    slider_x = display.sub_x + cam_display_width + 450
                     slider_width = 120
                     max_gain = camera2.prop.get('MaxGain', 500) if camera2.prop else 500
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
@@ -1061,9 +1060,9 @@ def handle_sensor_calib_events(event, pos, sub_x, sub_y, sub_width, sub_height, 
                     camera_manager.set_camera_gain(1, new_gain, lambda msg: print(f"Gain: {new_gain}"))
 
                 # Check if mouse is over Camera 2 Exposure Slider track
-                camera2_exposure_track_rect = pygame.Rect(sub_x + cam_display_width + 600 - 10, sub_y + 20 - 10, 120 + 20, 25)
+                camera2_exposure_track_rect = pygame.Rect(display.sub_x + cam_display_width + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
                 if camera2_exposure_track_rect.collidepoint(current_pos):
-                    slider_x = sub_x + cam_display_width + 600
+                    slider_x = display.sub_x + cam_display_width + 600
                     slider_width = 120
                     max_exp = camera2.prop.get('MaxExposure', 500000) if camera2.prop else 500000
                     relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)

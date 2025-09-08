@@ -118,18 +118,19 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
 
     return visible_satellites
 
-def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback=None, center_time=None, duration_minutes=15):
-    """Optimized trajectory computation with caching, reduced resolution, vectorization, and visibility filtering"""
+def precompute_trajectories(state, observer, ts, display, update_status_callback=None, center_time=None, duration_minutes=15):
+    """Optimized trajectory computation with caching, reduced resolution, vectorization, and visibility filtering.
+    Modifies state object directly with trajectories and arc segments."""
 
     # OPTIMIZATION 8: Filter satellites by potential visibility first (potentially 2-10x speedup)
     visible_satellites = _filter_satellites_by_visibility(
-        satellites, observer, ts, center_time, duration_minutes, elevation_mask_deg=10.0, update_status_callback=update_status_callback
+        state.satellites, observer, ts, center_time, duration_minutes, elevation_mask_deg=10.0, update_status_callback=update_status_callback
     )
 
     # Setup constants
-    cx = sub_x + sub_width // 2
-    cy = sub_y + sub_height // 2
-    radius = min(sub_width, sub_height) // 2 - 50
+    cx = display.sub_x + display.sub_width // 2
+    cy = display.sub_y + display.sub_height // 2
+    radius = min(display.sub_width, display.sub_height) // 2 - 50
 
     # Get global sun ephemeris if not already loaded
     global SUN_EPHEMERIS_CACHE
@@ -153,7 +154,7 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
     satellites_in_label_dict = 0
 
     for sat in visible_satellites:
-        if sat in satellite_labels:
+        if sat in state.satellite_labels:
             satellites_in_label_dict += 1
             # Create cache key based on satellite ID and time range
             sat_model = getattr(sat, 'model', None)
@@ -164,8 +165,8 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
                 satellites_to_compute.append((sat, cache_key))
 
     total_sats = len(satellites_to_compute)
-    trajectories = {}
-    arc_segments = {}
+    state.satellite_trajectories = {}
+    state.satellite_arc_segments = {}
 
     if update_status_callback:
         update_status_callback(f"Computing optimized trajectories for {total_sats}/{satellites_in_label_dict} satellites...")
@@ -208,8 +209,8 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
         # Cache the computed trajectory
         TRAJECTORY_CACHE[cache_key] = (trajectory, times_array, segments)
 
-        trajectories[sat] = (trajectory, times_array)
-        arc_segments[sat] = segments
+        state.satellite_trajectories[sat] = (trajectory, times_array)
+        state.satellite_arc_segments[sat] = segments
 
         # Progress update
         if update_status_callback and processed_count % TRAJECTORY_COMPUTE_BATCH_SIZE == 0 and processed_count > 0:
@@ -217,22 +218,20 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
 
     # Load cached trajectories for satellites that don't need recomputation
     cache_hits = 0
-    for sat in satellites:
-        if sat in satellite_labels:
+    for sat in state.satellites:
+        if sat in state.satellite_labels:
             sat_model = getattr(sat, 'model', None)
             sat_id = getattr(sat_model, 'satnum_str', str(sat)) if sat_model else str(sat)
             cache_key = f"{sat_id}_{t0.tt:.6f}_{t1.tt:.6f}"
 
             if cache_key in TRAJECTORY_CACHE:
                 cached_data = TRAJECTORY_CACHE[cache_key]
-                trajectories[sat] = (cached_data[0], cached_data[1])
-                arc_segments[sat] = cached_data[2]
+                state.satellite_trajectories[sat] = (cached_data[0], cached_data[1])
+                state.satellite_arc_segments[sat] = cached_data[2]
                 cache_hits += 1
 
     if cache_hits > 0:
         print(f"DEBUG: Trajectory optimization: {cache_hits} satellites loaded from cache")
-
-    return trajectories, arc_segments
 
 def _create_arc_segments_simple(trajectory_data, start_time):
     """Create arc segments with simple time-based color coding"""
@@ -290,6 +289,44 @@ def interpolate_position(trajectory_data, current_tt):
         alt = alt0 + fraction * (alt1 - alt0)
         dist = dist0 + fraction * (dist1 - dist0)
         return px, py, alt, dist
+
+def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
+    """
+    Update satellite positions for the current timestamp with filtering.
+    Modifies state object directly with updated satellite_positions dictionary.
+    """
+    state.satellite_positions = {}
+
+    # Handle selected satellite case first
+    if state.selected_satellite and state.selected_satellite in state.satellite_trajectories:
+        px, py, alt, dist = interpolate_position(state.satellite_trajectories[state.selected_satellite], current_tt)
+        if px is not None and alt > elevation_mask_deg:
+            state.satellite_positions[state.selected_satellite] = (px, py, alt, dist)
+    else:
+        # Handle all satellites with filtering
+        for sat in state.satellites:
+            if sat in state.satellite_trajectories:
+                px, py, alt, dist = interpolate_position(state.satellite_trajectories[sat], current_tt)
+                if px is not None and alt > elevation_mask_deg:
+                    # Apply filters
+                    include_sat = True
+                    if state.filter_text:
+                        include_sat = state.filter_text.lower() in sat.name.lower() or state.filter_text in sat.model.satnum_str
+                    if state.filter_above_alt_text:
+                        try:
+                            alt_filter = float(state.filter_above_alt_text)
+                            include_sat = include_sat and state.satellite_mean_altitudes[sat] >= alt_filter
+                        except ValueError:
+                            include_sat = False
+                    if state.filter_below_alt_text:
+                        try:
+                            alt_filter = float(state.filter_below_alt_text)
+                            include_sat = include_sat and state.satellite_mean_altitudes[sat] <= alt_filter
+                        except ValueError:
+                            include_sat = False
+
+                    if include_sat:
+                        state.satellite_positions[sat] = (px, py, alt, dist)
 
 def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """
@@ -354,11 +391,11 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
         'is_visible': np.any(visible_points)
     }
 
-def build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=10.0, max_rows=20, ts=None, current_satellite_positions=None):
+def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=None):
     """
     Build pass table data from all satellite trajectories.
     Only includes satellites that are currently in view OR will be in view soon (future closest approach).
-    Returns sorted list of pass data (default: max elevation descending).
+    Modifies state object directly with sorted satellite pass table.
     """
     pass_entries = []
 
@@ -366,9 +403,9 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
     current_datetime = datetime.now(timezone.utc)
     current_local = current_datetime.astimezone()
 
-    for sat in satellites:
-        if sat in satellite_trajectories and sat in satellite_labels:
-            pass_data = extract_pass_data_from_trajectory(satellite_trajectories[sat], sat, satellite_labels, elevation_mask_deg, ts)
+    for sat in state.satellites:
+        if sat in state.satellite_trajectories and sat in state.satellite_labels:
+            pass_data = extract_pass_data_from_trajectory(state.satellite_trajectories[sat], sat, state.satellite_labels, elevation_mask_deg, ts)
             if pass_data and pass_data['is_visible']:
                 # Filter for satellites that are either:
                 # 1. Currently in view (checked against satellite_positions)
@@ -376,7 +413,7 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                 include_in_table = False
 
                 # Check if satellite is currently in view
-                if current_satellite_positions and sat in current_satellite_positions:
+                if state.satellite_positions and sat in state.satellite_positions:
                     include_in_table = True
                 else:
                     # Check if the closest approach time is in the future
@@ -384,7 +421,7 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                     if closest_time_str != '--:--':
                         try:
                             # Convert time string back to local time for comparison
-                            h, m = map(int, closest_time_str.split(':'))
+                            h, m = map(int, closest_time_str.split(':'))                                                            
                             closest_datetime = current_local.replace(hour=h, minute=m, second=0, microsecond=0)
 
                             # Handle case where closest time is before current time (next day)
@@ -407,11 +444,93 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                 if include_in_table:
                     pass_entries.append(pass_data)
 
-    # Sort by max elevation descending by default
-    pass_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+    # Apply state-based filtering (text filter + altitude filters + sort)
+    filtered_entries = []
+    for entry in pass_entries:
+        # Text filtering
+        text_match = True
+        if state.filter_text:
+            satellite_name = entry['satellite'].name.lower() if entry['satellite'] and hasattr(entry['satellite'], 'name') else ""
+            satellite_norad = entry['satellite'].model.satnum_str if entry['satellite'] and hasattr(entry['satellite'], 'model') and hasattr(entry['satellite'].model, 'satnum_str') else ""
+            text_match = (
+                state.filter_text.lower() in satellite_name or
+                state.filter_text in satellite_norad
+            )
 
-    # Limit to max_rows
-    return pass_entries[:max_rows]
+        # Above altitude filtering
+        above_alt_match = True
+        if state.filter_above_alt_text:
+            try:
+                alt_filter = float(state.filter_above_alt_text)
+                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
+                above_alt_match = satellite_altitude >= alt_filter
+            except (ValueError, TypeError):
+                above_alt_match = False
+
+        # Below altitude filtering
+        below_alt_match = True
+        if state.filter_below_alt_text:
+            try:
+                alt_filter = float(state.filter_below_alt_text)
+                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
+                below_alt_match = satellite_altitude <= alt_filter
+            except (ValueError, TypeError):
+                below_alt_match = False
+
+        # Include entry if all filters pass
+        if text_match and above_alt_match and below_alt_match:
+            filtered_entries.append(entry)
+
+    # Apply state-based sorting
+    if state.table_sort_keys and len(state.table_sort_keys) > 0:
+        # Multi-column sorting based on state's sort configuration
+        # Find the active column
+        active_column = None
+        reverse_sort = False
+        for i, is_active in enumerate(state.table_sort_keys):
+            if is_active:
+                active_column = i
+                reverse_sort = state.table_sort_reverse[i] if state.table_sort_reverse and len(state.table_sort_reverse) > i else False
+                break
+
+        if active_column is not None:
+            column_mapping = {
+                0: 'name',
+                1: 'norad_id',
+                2: 'azimuth_at_max',
+                3: 'max_elevation',
+                4: 'closest_approach_time'
+            }
+
+            sort_key = column_mapping.get(active_column, 'max_elevation')
+
+            if sort_key == 'name':
+                filtered_entries.sort(key=lambda x: x['name'], reverse=reverse_sort)
+            elif sort_key == 'norad_id':
+                filtered_entries.sort(key=lambda x: x['norad_id'], reverse=reverse_sort)
+            elif sort_key == 'azimuth_at_max':
+                filtered_entries.sort(key=lambda x: x['azimuth_at_max'], reverse=reverse_sort)
+            elif sort_key == 'max_elevation':
+                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=reverse_sort)
+            elif sort_key == 'closest_approach_time':
+                def time_sort_key(x):
+                    time_str = x['closest_approach_time']
+                    if time_str == '--:--':
+                        return '23:59'  # Put unknown times at the end
+                    return time_str
+                filtered_entries.sort(key=time_sort_key, reverse=reverse_sort)
+            else:
+                # Default sort by max elevation descending
+                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+        else:
+            # Default sort by max elevation descending
+            filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+    else:
+        # Default sort by max elevation descending
+        filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+
+    # Limit to max_rows and update state directly
+    state.satellite_pass_table = filtered_entries[:max_rows]
 
 def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
     """

@@ -4,6 +4,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from utils import get_altitude_color, draw_button
 from skyfield.api import wgs84, load
+from enum import Enum
+
+# Polar plot mode enumeration
+class PolarPlotMode(Enum):
+    FULL_SCREEN = "full_screen"  # Full area polar plot (tracking visualization mode)
+    UPPER_RIGHT_QUADRANT = "upper_right_quadrant"  # Upper right quadrant only (joystick mode)
 
 # ==============================================================================
 # TRACKING VISUALIZATION STATE CLASS
@@ -265,11 +271,24 @@ def draw_triangle(surface, x, y, color, size=5):
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
 
-def draw_polar_plot(display, config_state, ts, current_tt, state=None):
+def draw_polar_plot(display, config_state, ts, current_tt, state=None, mode=PolarPlotMode.FULL_SCREEN):
     """
     State-direct mutation function for drawing polar plot.
-    Takes display, config_state, and state objects directly instead of individual parameters.
+    Takes display, config_state, and state objects directly. Supports different size modes.
     """
+    # Adjust display bounds based on mode
+    original_sub_x = display.sub_x
+    original_sub_y = display.sub_y
+    original_sub_width = display.sub_width
+    original_sub_height = display.sub_height
+
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        # Resize to upper right quadrant only
+        display.sub_x = original_sub_x + original_sub_width // 2  # Right half
+        display.sub_y = original_sub_y  # Top
+        display.sub_width = original_sub_width // 2  # Half width
+        display.sub_height = original_sub_height // 2  # Half height
+
     # Draw gradient background for config options
     if ts is None:
         for y in range(display.sub_height):
@@ -415,47 +434,191 @@ def draw_polar_plot(display, config_state, ts, current_tt, state=None):
                             else:
                                 color = (128, 128, 128)  # Grey for past
 
+                            # Transform coordinates when in upper right quadrant mode
+                            if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+                                # Calculate the quadrant center (where the polar plot circle is drawn)
+                                quadrant_center_x = display.sub_x + display.sub_width // 2
+                                quadrant_center_y = display.sub_y + display.sub_height // 2
+
+                                # Calculate original full screen center (where arcs were calculated)
+                                full_screen_center_x = original_sub_x + original_sub_width // 2
+                                full_screen_center_y = original_sub_y + original_sub_height // 2
+
+                                # First, translate coordinates relative to full screen center
+                                rel_x0 = x0 - full_screen_center_x
+                                rel_y0 = y0 - full_screen_center_y
+                                rel_x1 = x1 - full_screen_center_x
+                                rel_y1 = y1 - full_screen_center_y
+
+                                # Scale down by factor of 2 (since quadrant is half the size of full screen)
+                                scale_factor = 0.45
+                                rel_x0 *= scale_factor
+                                rel_y0 *= scale_factor
+                                rel_x1 *= scale_factor
+                                rel_y1 *= scale_factor
+
+                                # Translate to quadrant center
+                                x0 = rel_x0 + quadrant_center_x
+                                y0 = rel_y0 + quadrant_center_y
+                                x1 = rel_x1 + quadrant_center_x
+                                y1 = rel_y1 + quadrant_center_y
+
                             pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
 
                 except Exception as e:
                     # Fallback to default arc segments if sunlit calculation fails
                     for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+                        # Transform coordinates when in upper right quadrant mode
+                        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+                            # Calculate the quadrant center (where the polar plot circle is drawn)
+                            quadrant_center_x = display.sub_x + display.sub_width // 2
+                            quadrant_center_y = display.sub_y + display.sub_height // 2
+
+                            # Calculate original full screen center (where arcs were calculated)
+                            full_screen_center_x = original_sub_x + original_sub_width // 2
+                            full_screen_center_y = original_sub_y + original_sub_height // 2
+
+                            # First, translate coordinates relative to full screen center
+                            rel_x0 = x0 - full_screen_center_x
+                            rel_y0 = y0 - full_screen_center_y
+                            rel_x1 = x1 - full_screen_center_x
+                            rel_y1 = y1 - full_screen_center_y
+
+                            # Scale down by factor of 2 (since quadrant is half the size of full screen)
+                            scale_factor = 0.45
+                            rel_x0 *= scale_factor
+                            rel_y0 *= scale_factor
+                            rel_x1 *= scale_factor
+                            rel_y1 *= scale_factor
+
+                            # Translate to quadrant center
+                            x0 = rel_x0 + quadrant_center_x
+                            y0 = rel_y0 + quadrant_center_y
+                            x1 = rel_x1 + quadrant_center_x
+                            y1 = rel_y1 + quadrant_center_y
                         pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
             else:
-                # Default drawing if no trajectory data available
+                        # Default drawing if no trajectory data available
                 for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+                    # Transform coordinates when in upper right quadrant mode
+                    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+                        # Calculate the quadrant center (where the polar plot circle is drawn)
+                        quadrant_center_x = display.sub_x + display.sub_width // 2
+                        quadrant_center_y = display.sub_y + display.sub_height // 2
+
+                        # Calculate original full screen center (where arcs were calculated)
+                        full_screen_center_x = original_sub_x + original_sub_width // 2
+                        full_screen_center_y = original_sub_y + original_sub_height // 2
+
+                        # First, translate coordinates relative to full screen center
+                        rel_x0 = x0 - full_screen_center_x
+                        rel_y0 = y0 - full_screen_center_y
+                        rel_x1 = x1 - full_screen_center_x
+                        rel_y1 = y1 - full_screen_center_y
+
+                        # Scale down by factor of 2 (since quadrant is half the size of full screen)
+                        scale_factor = 0.45
+                        rel_x0 *= scale_factor
+                        rel_y0 *= scale_factor
+                        rel_x1 *= scale_factor
+                        rel_y1 *= scale_factor
+
+                        # Translate to quadrant center
+                        x0 = rel_x0 + quadrant_center_x
+                        y0 = rel_y0 + quadrant_center_y
+                        x1 = rel_x1 + quadrant_center_x
+                        y1 = rel_y1 + quadrant_center_y
                     pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
 
-def draw_satellites(display, state, cx, cy):
+    # Restore original display bounds after drawing
+    display.sub_x = original_sub_x
+    display.sub_y = original_sub_y
+    display.sub_width = original_sub_width
+    display.sub_height = original_sub_height
+
+def draw_satellites(display, state, cx, cy, mode=PolarPlotMode.FULL_SCREEN):
     """
     State-direct mutation function for drawing satellites.
     Takes display and state objects directly instead of individual parameters.
     """
+    # Adjust display bounds if in upper right quadrant mode
+    original_sub_x = display.sub_x
+    original_sub_y = display.sub_y
+    original_sub_width = display.sub_width
+    original_sub_height = display.sub_height
+
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        # Resize to upper right quadrant only
+        display.sub_x = original_sub_x + original_sub_width // 2  # Right half
+        display.sub_y = original_sub_y  # Top
+        display.sub_width = original_sub_width // 2  # Half width
+        display.sub_height = original_sub_height // 2  # Half height
+
     for sat, (px, py, alt, _) in state.satellite_positions.items():
+        # Transform coordinates when in upper right quadrant mode
+        draw_px, draw_py = px, py
+        if mode == PolarPlotMode.FULL_SCREEN:
+            # In full screen mode, use original coordinates
+            draw_px = px
+            draw_py = py
+        elif mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            # In quadrant mode, transform coordinates the same way as arcs
+
+            # Full screen center where satellite positions were calculated
+            full_cx = original_sub_x + original_sub_width // 2
+            full_cy = original_sub_y + original_sub_height // 2
+
+            # Quadrant center where we want to draw (this is correct quadrant center)
+            quad_cx = display.sub_x + display.sub_width // 2
+            quad_cy = display.sub_y + display.sub_height // 2
+
+            # Transform: scale by 0.45 and place relative to quadrant center
+            # Same transformation as arcs, but ensure we're using the right centers
+            rel_x = px - full_cx
+            rel_y = py - full_cy
+
+            # Scale down by factor matching arcs
+            scale_factor = 0.45
+            rel_x *= scale_factor
+            rel_y *= scale_factor
+
+            # Place relative to quadrant center
+            draw_px = quad_cx + rel_x
+            draw_py = quad_cy + rel_y
+        else:
+            # Fallback for any other modes
+            draw_px = px
+            draw_py = py
+
         mean_altitude = state.satellite_mean_altitudes.get(sat, 0.0)
         eccentricity = sat.model.ecco
         if 2000 < mean_altitude <= 35786:  # MEO
             color = (255, 165, 0)  # Orange
-            draw_hexagon(display.menu_screen, px, py, color)
+            draw_hexagon(display.menu_screen, draw_px, draw_py, color)
         elif abs(mean_altitude - 35786) <= 1000:  # GEO or nearby
             color = (128, 0, 128)  # Purple
-            draw_triangle(display.menu_screen, px, py, color)
+            draw_triangle(display.menu_screen, draw_px, draw_py, color)
         else:  # LEO (0-2000 km)
             color = get_altitude_color(mean_altitude) or (0, 255, 0)  # Fallback to green if out of range
             if eccentricity > 0.01:
                 width = 6
                 height = 3
-                angle = math.degrees(math.atan2(py - cy, px - cx))
+                angle = math.degrees(math.atan2(draw_py - cy, draw_px - cx))
                 oval_surface = pygame.Surface((width, height), pygame.SRCALPHA)
-                pygame.draw.ellipse(oval_surface, color, (0, 0, width, height))
                 rotated_oval = pygame.transform.rotate(oval_surface, angle)
-                rotated_rect = rotated_oval.get_rect(center=(px, py))
+                rotated_rect = rotated_oval.get_rect(center=(draw_px, draw_py))
                 display.menu_screen.blit(rotated_oval, rotated_rect.topleft)
             else:
-                pygame.draw.circle(display.menu_screen, color, (px, py), 3)
+                pygame.draw.circle(display.menu_screen, color, (draw_px, draw_py), 3)
         if sat == state.hovered_satellite or sat == state.selected_satellite:
-            pygame.draw.circle(display.menu_screen, (255, 255, 0), (px, py), 5, 1)  # Highlight on hover or select
-        display.menu_screen.blit(state.satellite_labels[sat], (px + 5, py))
+            pygame.draw.circle(display.menu_screen, (255, 255, 0), (draw_px, draw_py), 5, 1)  # Highlight on hover or select
+        display.menu_screen.blit(state.satellite_labels[sat], (draw_px + 5, draw_py))
+
+    # Restore original display bounds after drawing
+    display.sub_x = original_sub_x
+    display.sub_y = original_sub_y
+    display.sub_width = original_sub_width
+    display.sub_height = original_sub_height
 
 def draw_filters(display, state):
     """
@@ -580,7 +743,7 @@ def draw_details(display, state):
                 ])
         if ((state.selected_satellite or state.hovered_satellite) and dist is not None):
             details.append(f"Slant Range (km): {dist:.1f}")
-        details_rect = pygame.Rect(display.sub_x + display.sub_width - 250, display.sub_y + 20, 230, 250)
+        details_rect = pygame.Rect(display.sub_x + display.sub_width - 190, display.sub_y + 20, 170, 250)
         pygame.draw.rect(display.menu_screen, (50, 50, 50), details_rect)  # Dark grey background
         pygame.draw.rect(display.menu_screen, (0, 0, 0), details_rect, 2)  # Black border
         for i, line in enumerate(details):

@@ -31,9 +31,10 @@ except Exception as e:
 from utils import draw_button, create_negative_image, draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, interpolate_position, clear_trajectory_cache, update_satellite_positions, build_satellite_pass_table
 from config import load_config, save_config, handle_input, ConfigState
-from tracking_visuals import TrackingVisState, draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
+from tracking_visuals import TrackingVisState, draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table, PolarPlotMode
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, update_camera_frames_from_buffers, handle_sensor_calib_events
+from joystick_controller import JoystickModeState, render_joystick_mode, handle_joystick_mode_events
 # Camera button initialization is now handled internally by camera_manager
 from events import *
 
@@ -99,6 +100,10 @@ print(f"Debug: Status - {'Starting TLE process...'}")
 # Tracking Visualization State Management
 global tracking_vis_state
 tracking_vis_state = TrackingVisState()
+
+# Joystick Mode State Management
+global joystick_mode_state
+joystick_mode_state = JoystickModeState()
 
 # Define status update callback for satellite loading
 def update_status_callback(message):
@@ -329,6 +334,10 @@ while running:
                     import traceback
                     traceback.print_exc()
 
+            # Handle joystick mode events
+            elif current_mode == "joystick_loop":
+                handle_joystick_mode_events(event, joystick_mode_state, display)
+
 
         elif event.type == pygame.MOUSEMOTION:
             if current_mode is None:
@@ -403,7 +412,7 @@ while running:
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         display.menu_screen.fill((0, 0, 0), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))  # Clear the subplot area with black
         draw_polar_plot(display, config_state, ts, current_tt, tracking_vis_state)
-        draw_satellites(display, tracking_vis_state, cx, cy)
+        draw_satellites(display, tracking_vis_state, cx, cy, PolarPlotMode.FULL_SCREEN)
         draw_filters(display, tracking_vis_state)
         draw_legend(display)
         draw_details(display, tracking_vis_state)
@@ -470,9 +479,10 @@ while running:
         render_combined_view_controls(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                         display.small_font, display.tiny_font)
     elif current_mode == "joystick_loop":
-        sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
-        display.menu_screen.fill((100, 100, 100), sub_rect)
-        # Add manual joystick loop code here later
+        render_joystick_mode(display, joystick_mode_state, tracking_vis_state, config_state)
+        # Update joystick rate control
+        if joystick_mode_state.telescope_connected:
+            joystick_mode_state.rate_control()
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         display.menu_screen.fill((150, 150, 150), sub_rect)

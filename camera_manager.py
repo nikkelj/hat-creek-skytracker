@@ -6,12 +6,12 @@ from camera_buffer import CameraThread, CircularBuffer
 
 class CameraState:
     """Class to encapsulate camera state and settings"""
-    def __init__(self):
+    def __init__(self, index=0):
         # Connection state
         self.connected = False
         self.cap = None
         self.prop = None
-        self.index = 0
+        self.index = index
         self.width_res = 1920  # Default resolution
         self.height_res = 1280
 
@@ -35,6 +35,26 @@ class CameraState:
         # Threads
         self.thread = None
         self.threads_running = False
+
+    def __del__(self):
+        """Safe cleanup method to prevent AttributeError during garbage collection"""
+        try:
+            if self.thread is not None:
+                self.thread.stop()
+                self.thread = None
+        except:
+            pass
+
+        try:
+            if self.cap is not None:
+                self.cap.close()
+                self.cap = None
+        except:
+            pass
+
+        # Clear other attributes to prevent any attribute errors
+        self.prop = None
+        self.frame = None
 
 
 class CameraManager:
@@ -151,7 +171,10 @@ class CameraManager:
         except Exception as e:
             if update_status_callback:
                 update_status_callback(f"Camera {camera_index+1} connection error: {str(e)}")
+            # Properly clean up any partially initialized camera object
             camera.cap = None
+            camera.prop = None
+            camera.connected = False
 
         return False
 

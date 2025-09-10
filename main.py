@@ -244,7 +244,25 @@ while running:
         last_update_time = current_time
 
     # Handle events using modular event system
+    # Always process joystick events first, regardless of current mode
+    # Check for existing joysticks that were connected before this point
+    if not hasattr(joystick_mode_state, '_initialized'):
+        # Get current connected joysticks and add them to the state
+        for i in range(pygame.joystick.get_count()):
+            joy = pygame.joystick.Joystick(i)
+            joystick_mode_state.joysticks[joy.get_instance_id()] = joy
+            print(f"Existing joystick {joy.get_instance_id()} detected: {joy.get_name()}")
+            # Auto-connect to first joystick
+            if joystick_mode_state.connected_joystick is None:
+                joystick_mode_state.connected_joystick = joy.get_instance_id()
+                joystick_mode_state.reset_tare()
+        joystick_mode_state._initialized = True
+
     for event in pygame.event.get():
+        # Always handle joystick events regardless of current mode
+        if event.type in [pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED, pygame.JOYBUTTONDOWN, pygame.JOYAXISMOTION]:
+            joystick_mode_state.process_joystick_events(event)
+
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:

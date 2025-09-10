@@ -13,6 +13,9 @@ from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
 from utils import draw_button
 
+# PS4 Controller Button Labels (zero-indexed)
+BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
+
 # ==============================================================================
 # JOYSTICK MODE STATE CLASS
 # ==============================================================================
@@ -24,6 +27,10 @@ class JoystickModeState:
     """
 
     def __init__(self):
+        # Initialize Pygame joystick subsystem
+        pygame.joystick.init()
+        print(f"Pygame joystick initialized: {pygame.joystick.get_count()} joysticks detected")
+
         # Joystick state
         self.joysticks = {}  # Dict of active joysticks
         self.connected_joystick = None  # Currently active joystick
@@ -54,7 +61,7 @@ class JoystickModeState:
 
     def tare_current_joystick(self):
         """Tare the currently connected joystick"""
-        if self.connected_joystick and self.connected_joystick in self.joysticks:
+        if self.connected_joystick is not None:
             joy = self.joysticks[self.connected_joystick]
             tare_values = []
             for i in range(joy.get_numaxes()):
@@ -107,7 +114,7 @@ class JoystickModeState:
 
     def rate_control(self):
         """Handle rate control based on connected joystick"""
-        if not self.telescope_connected or not self.connected_joystick:
+        if not self.telescope_connected or self.connected_joystick is None:
             return
 
         if self.connected_joystick not in self.joysticks:
@@ -164,7 +171,7 @@ class JoystickModeState:
             print(f"Joystick {joy.get_instance_id()} connected: {joy.get_name()}")
 
             # Auto-connect to first joystick
-            if not self.connected_joystick:
+            if self.connected_joystick is None:
                 self.connected_joystick = joy.get_instance_id()
                 # Initialize tare values
                 self.reset_tare()
@@ -297,43 +304,147 @@ def render_joystick_status(display, joystick_state):
     y_start = display.sub_y + 140
 
     # Joystick name
-    if joystick_state.connected_joystick and joystick_state.connected_joystick in joystick_state.joysticks:
+    if joystick_state.connected_joystick is not None and joystick_state.connected_joystick in joystick_state.joysticks:
         joy = joystick_state.joysticks[joystick_state.connected_joystick]
         name_text = display.small_font.render(f"Joystick: {joy.get_name()}", True, (255, 255, 255))
     else:
         name_text = display.small_font.render("Joystick: None", True, (255, 0, 0))
     display.menu_screen.blit(name_text, (display.sub_x + 10, y_start))
 
-    buttons_y = y_start + 25
-    buttons_label = display.small_font.render("Buttons:", True, (255, 255, 255))
-    display.menu_screen.blit(buttons_label, (display.sub_x + 10, buttons_y))
+    current_y = y_start + 25
 
     # Button states
-    if joystick_state.connected_joystick and joystick_state.connected_joystick in joystick_state.joysticks:
+    if joystick_state.connected_joystick is not None:
         joy = joystick_state.joysticks[joystick_state.connected_joystick]
-        button_y = buttons_y + 20
 
-        # Display first 8 buttons in a grid
-        for i in range(min(8, joy.get_numbuttons())):
-            button_state = joy.get_button(i)
-            button_color = (0, 255, 0) if button_state else (100, 100, 100)
+        # Buttons section
+        buttons_label = display.small_font.render("Buttons:", True, (255, 255, 255))
+        display.menu_screen.blit(buttons_label, (display.sub_x + 10, current_y))
+        current_y += 20
 
-            col = i % 4
-            row = i // 4
-            button_rect = pygame.Rect(display.sub_x + 10 + col * 40, button_y + row * 25, 30, 20)
-            pygame.draw.rect(display.menu_screen, button_color, button_rect)
+        # Display buttons dynamically
+        num_buttons = joy.get_numbuttons()
+        if num_buttons > 0:
+            for i in range(num_buttons):
+                button_state = joy.get_button(i)
+                button_color = (0, 255, 0) if button_state else (100, 100, 100)
 
-            button_text = display.tiny_font.render(str(i), True, (255, 255, 255))
-            text_rect = button_text.get_rect(center=button_rect.center)
-            display.menu_screen.blit(button_text, text_rect)
+                col = i % 4
+                row = i // 4
+                button_rect = pygame.Rect(display.sub_x + 10 + col * 40, current_y + row * 25, 30, 20)
+                pygame.draw.rect(display.menu_screen, button_color, button_rect)
 
-    # Stopped indicator
-    stopped_y = buttons_y + 70
-    if joystick_state.stopped:
-        stopped_text = display.small_font.render("MOVEMENT STOPPED", True, (255, 0, 0))
-    else:
-        stopped_text = display.small_font.render("Movement Active", True, (0, 255, 0))
-    display.menu_screen.blit(stopped_text, (display.sub_x + 10, stopped_y))
+                # Use button labels if available, otherwise fall back to numbers
+                if i < len(BUTTON_LABELS):
+                    button_label = BUTTON_LABELS[i]
+                else:
+                    button_label = str(i)
+
+                button_text = display.tiny_font.render(button_label, True, (255, 255, 255))
+                text_rect = button_text.get_rect(center=button_rect.center)
+                display.menu_screen.blit(button_text, text_rect)
+
+            current_y += ((num_buttons - 1) // 4 + 1) * 25 + 15
+
+        # Axes section
+        axes_label = display.small_font.render("Axes:", True, (255, 255, 255))
+        display.menu_screen.blit(axes_label, (display.sub_x + 10, current_y))
+        current_y += 20
+
+        # Display axes
+        num_axes = joy.get_numaxes()
+        axes_displayed = 0
+
+        # Display first two pairs of axes as 2D boxes with crosshairs
+        for pair in range(2):
+            axis_x = pair * 2
+            axis_y = pair * 2 + 1
+
+            if axis_x < num_axes and axis_y < num_axes:
+                # 2D controller display as square
+                box_size = 60
+
+                # Position the square box
+                box_x = display.sub_x + 10
+                box_y = current_y
+                center_x = box_x + box_size // 2
+                center_y = box_y + box_size // 2
+
+                # Draw 2D square box background
+                pygame.draw.rect(display.menu_screen, (80, 80, 80),
+                               (box_x, box_y, box_size, box_size))
+                pygame.draw.rect(display.menu_screen, (150, 150, 150),
+                               (box_x, box_y, box_size, box_size), 1)
+
+                # Get axis values (-1 to 1 range)
+                x_val = joy.get_axis(axis_x)
+                y_val = joy.get_axis(axis_y)
+
+                # Draw crosshairs (inverted Y interpretation)
+                crosshair_range = 20  # 20 pixels in each direction
+                crosshair_x = center_x + int(x_val * crosshair_range)
+                crosshair_y = center_y + int(y_val * crosshair_range)  # Inverted Y interpretation
+
+                # Vertical line
+                pygame.draw.line(display.menu_screen, (255, 255, 255),
+                               (crosshair_x, center_y - crosshair_range),
+                               (crosshair_x, center_y + crosshair_range), 1)
+                # Horizontal line
+                pygame.draw.line(display.menu_screen, (255, 255, 255),
+                               (center_x - crosshair_range, crosshair_y),
+                               (center_x + crosshair_range, crosshair_y), 1)
+
+                # Label
+                if pair == 0:
+                    pair_label = "Left Stick"
+                else:
+                    pair_label = "Right Stick"
+                label_text = display.tiny_font.render(pair_label, True, (255, 255, 255))
+                display.menu_screen.blit(label_text, (display.sub_x + 10 + box_size + 10, current_y + 20))
+
+                current_y += box_size + 10
+                axes_displayed += 2
+
+        # Display remaining axes as linear sliders
+        remaining_axes = num_axes - axes_displayed
+        if remaining_axes > 0:
+            for i in range(axes_displayed, num_axes):
+                # Linear slider
+                slider_width = 100
+                slider_height = 12
+                slider_x = display.sub_x + 10
+                slider_y = current_y
+
+                # Draw slider background
+                pygame.draw.rect(display.menu_screen, (80, 80, 80),
+                               (slider_x, slider_y, slider_width, slider_height))
+                pygame.draw.rect(display.menu_screen, (150, 150, 150),
+                               (slider_x, slider_y, slider_width, slider_height), 1)
+
+                # Get axis value and display position
+                axis_val = joy.get_axis(i)
+                slider_pos = int((axis_val + 1) / 2 * slider_width)  # Convert -1..1 to 0..width
+
+                # Draw slider position
+                pygame.draw.rect(display.menu_screen, (255, 255, 0),
+                               (slider_x + slider_pos - 2, slider_y - 2, 4, slider_height + 4))
+
+                # Slider value text - use special labels for L2/R2
+                if i == 4:
+                    axis_label = "L2"
+                elif i == 5:
+                    axis_label = "R2"
+                else:
+                    axis_label = f"A{i}"
+                val_text = display.tiny_font.render(f"{axis_label}: {axis_val:+.2f}", True, (255, 255, 255))
+                display.menu_screen.blit(val_text, (slider_x + slider_width + 10, slider_y))
+
+                current_y += slider_height + 8
+
+        # Hat information
+        num_hats = joy.get_numhats()
+        hats_label = display.small_font.render(f"Hats: {num_hats}", True, (255, 255, 255))
+        display.menu_screen.blit(hats_label, (display.sub_x + 10, current_y))
 
 def render_polar_graph(display, joystick_state, tracking_vis_state, config_state):
     """Render polar graph using existing tracking visuals function"""

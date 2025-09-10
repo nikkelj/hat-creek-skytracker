@@ -85,6 +85,14 @@ if ASI_AVAILABLE:
 # Load configuration using ConfigState
 config_state = load_config()
 
+# Update camera manager with config values after loading (convert to numeric types)
+if camera_manager.cameras[0]:
+    camera_manager.cameras[0].gain = int(float(config_state.get_camera_gain("camera1")))
+    camera_manager.cameras[0].exposure = int(float(config_state.get_camera_exposure("camera1")))
+if camera_manager.cameras[1]:
+    camera_manager.cameras[1].gain = int(float(config_state.get_camera_gain("camera2")))
+    camera_manager.cameras[1].exposure = int(float(config_state.get_camera_exposure("camera2")))
+
 # Input field state for tracking vis (now handled by TrackingVisState class)
 
 current_mode = None
@@ -328,6 +336,22 @@ while running:
                     try:
                         config_state.load_from_file()
                         status_messages.append("Configuration loaded")
+
+                        # Update camera manager gain and exposure for connected cameras after loading config
+                        if camera_manager.cameras[0].connected:
+                            gain1 = int(float(config_state.get_camera_gain("camera1")))
+                            exposure1 = int(float(config_state.get_camera_exposure("camera1")))
+                            camera_manager.cameras[0].gain = gain1
+                            camera_manager.cameras[0].exposure = exposure1
+                            camera_manager.set_camera_gain(0, gain1)
+                            camera_manager.set_camera_exposure(0, exposure1)
+                        if camera_manager.cameras[1].connected:
+                            gain2 = int(float(config_state.get_camera_gain("camera2")))
+                            exposure2 = int(float(config_state.get_camera_exposure("camera2")))
+                            camera_manager.cameras[1].gain = gain2
+                            camera_manager.cameras[1].exposure = exposure2
+                            camera_manager.set_camera_gain(1, gain2)
+                            camera_manager.set_camera_exposure(1, exposure2)
                     except Exception as e:
                         status_messages.append(f"Error loading config: {e}")
                     break

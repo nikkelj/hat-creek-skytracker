@@ -19,17 +19,23 @@ class ConfigState:
         self.alt_str = "120.0"
         self.elevation_mask_str = "0.0"
 
-        # Camera configuration (units: pixel_size=um, array_size_diagonal=mm, focal_length=mm)
+        # Camera configuration (units: pixel_size=um, array_size_diagonal=mm, focal_length=mm, alignment_rotation=deg, gain=unitless, exposure=us)
         self.camera_configs = {
             "camera1": {
                 "pixel_size": 3.75,  # μm
                 "array_size_diagonal": 11.0,  # mm
-                "focal_length": 25.0  # mm
+                "focal_length": 25.0,  # mm
+                "alignment_rotation": 0.0,  # degrees
+                "gain": 1.0,  # unitless
+                "exposure": 10000.0  # microseconds
             },
             "camera2": {
                 "pixel_size": 3.75,  # μm
                 "array_size_diagonal": 11.0,  # mm
-                "focal_length": 25.0  # mm
+                "focal_length": 25.0,  # mm
+                "alignment_rotation": 0.0,  # degrees
+                "gain": 1.0,  # unitless
+                "exposure": 10000.0  # microseconds
             }
         }
 
@@ -37,13 +43,17 @@ class ConfigState:
         self.focused_field = None
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
-            "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0,
-            "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0
+            "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
+            "camera1_gain": 0, "camera1_exposure": 0,
+            "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
+            "camera2_gain": 0, "camera2_exposure": 0
         }
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
-            "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None,
-            "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None
+            "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
+            "camera1_gain": None, "camera1_exposure": None,
+            "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
+            "camera2_gain": None, "camera2_exposure": None
         }
 
     def get_config_dict(self):
@@ -65,19 +75,41 @@ class ConfigState:
 
         # Load camera configurations if present
         if "camera_configs" in config_dict:
-            self.camera_configs.update(config_dict["camera_configs"])
+            for camera_name, config_data in config_dict["camera_configs"].items():
+                if camera_name not in self.camera_configs:
+                    self.camera_configs[camera_name] = {}
+                self.camera_configs[camera_name].update(config_data)
+
+        # Ensure default values for new config fields
+        defaults = {
+            "pixel_size": 3.75,
+            "array_size_diagonal": 11.0,
+            "focal_length": 25.0,
+            "alignment_rotation": 0.0,
+            "gain": 1.0,
+            "exposure": 10000.0
+        }
+
+        for camera_name in self.camera_configs:
+            for key, default_value in defaults.items():
+                if key not in self.camera_configs[camera_name]:
+                    self.camera_configs[camera_name][key] = default_value
 
     def reset_input_fields(self):
         """Reset input field positions when switching modes."""
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
-            "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0,
-            "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0
+            "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
+            "camera1_gain": 0, "camera1_exposure": 0,
+            "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
+            "camera2_gain": 0, "camera2_exposure": 0
         }
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
-            "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None,
-            "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None
+            "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
+            "camera1_gain": None, "camera1_exposure": None,
+            "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
+            "camera2_gain": None, "camera2_exposure": None
         }
         self.focused_field = None
 
@@ -119,6 +151,18 @@ class ConfigState:
     def get_camera_focal_length(self, camera_name):
         """Get focal length for a camera (mm)."""
         return self.camera_configs.get(camera_name, {}).get("focal_length", 25.0)
+
+    def get_camera_alignment_rotation(self, camera_name):
+        """Get alignment rotation for a camera (degrees)."""
+        return self.camera_configs.get(camera_name, {}).get("alignment_rotation", 0.0)
+
+    def get_camera_gain(self, camera_name):
+        """Get gain for a camera (unitless)."""
+        return self.camera_configs.get(camera_name, {}).get("gain", 1.0)
+
+    def get_camera_exposure(self, camera_name):
+        """Get exposure for a camera (microseconds)."""
+        return self.camera_configs.get(camera_name, {}).get("exposure", 10000.0)
 
     def set_camera_config(self, camera_name, config_dict):
         """Update configuration for a specific camera."""
@@ -229,7 +273,7 @@ def draw_config_options(display, config_state):
                             (display.input_rects['elevation_mask'].x + 5 + text_width, display.input_rects['elevation_mask'].y + 25), 2)
 
     # Camera 1 configuration
-    camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 200)
+    camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 380)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), camera1_group_rect, 2, border_radius=5)
     camera1_label = display.font.render("Camera 1", True, (0, 0, 0))
     display.menu_screen.blit(camera1_label, (display.sub_x + 245, display.sub_y + 10))
@@ -241,7 +285,7 @@ def draw_config_options(display, config_state):
     display.menu_screen.blit(pixel_size1_text, (display.input_rects['camera1_pixel_size'].x + 5, display.input_rects['camera1_pixel_size'].y + 5))
 
     array_diag1_label = display.font.render("Array Diagonal (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag1_label, (display.sub_x + 245, display.sub_y + 95))
+    display.menu_screen.blit(array_diag1_label, (display.sub_x + 245, display.sub_y + 90))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_array_size_diagonal'])
     array_diag1_text = display.font.render(f"{config_state.camera_configs['camera1']['array_size_diagonal']:.1f}", True, (0, 0, 0))
     display.menu_screen.blit(array_diag1_text, (display.input_rects['camera1_array_size_diagonal'].x + 5, display.input_rects['camera1_array_size_diagonal'].y + 5))
@@ -252,29 +296,65 @@ def draw_config_options(display, config_state):
     focal_length1_text = display.font.render(f"{config_state.camera_configs['camera1']['focal_length']:.1f}", True, (0, 0, 0))
     display.menu_screen.blit(focal_length1_text, (display.input_rects['camera1_focal_length'].x + 5, display.input_rects['camera1_focal_length'].y + 5))
 
+    alignment_rotation1_label = display.font.render("Alignment Rotation (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(alignment_rotation1_label, (display.sub_x + 245, display.sub_y + 205))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_alignment_rotation'])
+    alignment_rotation1_text = display.font.render(f"{config_state.camera_configs['camera1']['alignment_rotation']:.1f}", True, (0, 0, 0))
+    display.menu_screen.blit(alignment_rotation1_text, (display.input_rects['camera1_alignment_rotation'].x + 5, display.input_rects['camera1_alignment_rotation'].y + 5))
+
+    gain1_label = display.font.render("Gain:", True, (0, 0, 0))
+    display.menu_screen.blit(gain1_label, (display.sub_x + 245, display.sub_y + 265))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_gain'])
+    gain1_text = display.font.render(f"{config_state.camera_configs['camera1']['gain']:.2f}", True, (0, 0, 0))
+    display.menu_screen.blit(gain1_text, (display.input_rects['camera1_gain'].x + 5, display.input_rects['camera1_gain'].y + 5))
+
+    exposure1_label = display.font.render("Exposure (µs):", True, (0, 0, 0))
+    display.menu_screen.blit(exposure1_label, (display.sub_x + 245, display.sub_y + 325))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_exposure'])
+    exposure1_text = display.font.render(f"{config_state.camera_configs['camera1']['exposure']:.0f}", True, (0, 0, 0))
+    display.menu_screen.blit(exposure1_text, (display.input_rects['camera1_exposure'].x + 5, display.input_rects['camera1_exposure'].y + 5))
+
     # Camera 2 configuration
-    camera2_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 205, 240, 200)
+    camera2_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 390, 240, 360)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), camera2_group_rect, 2, border_radius=5)
     camera2_label = display.font.render("Camera 2", True, (0, 0, 0))
-    display.menu_screen.blit(camera2_label, (display.sub_x + 245, display.sub_y + 215))
+    display.menu_screen.blit(camera2_label, (display.sub_x + 245, display.sub_y + 400))
 
     pixel_size2_label = display.font.render("Pixel Size (μm):", True, (0, 0, 0))
-    display.menu_screen.blit(pixel_size2_label, (display.sub_x + 245, display.sub_y + 235))
+    display.menu_screen.blit(pixel_size2_label, (display.sub_x + 245, display.sub_y + 415))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_pixel_size'])
     pixel_size2_text = display.font.render(f"{config_state.camera_configs['camera2']['pixel_size']:.2f}", True, (0, 0, 0))
     display.menu_screen.blit(pixel_size2_text, (display.input_rects['camera2_pixel_size'].x + 5, display.input_rects['camera2_pixel_size'].y + 5))
 
     array_diag2_label = display.font.render("Array Diagonal (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag2_label, (display.sub_x + 245, display.sub_y + 295))
+    display.menu_screen.blit(array_diag2_label, (display.sub_x + 245, display.sub_y + 470))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_array_size_diagonal'])
     array_diag2_text = display.font.render(f"{config_state.camera_configs['camera2']['array_size_diagonal']:.1f}", True, (0, 0, 0))
     display.menu_screen.blit(array_diag2_text, (display.input_rects['camera2_array_size_diagonal'].x + 5, display.input_rects['camera2_array_size_diagonal'].y + 5))
 
     focal_length2_label = display.font.render("Focal Length (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(focal_length2_label, (display.sub_x + 245, display.sub_y + 345))
+    display.menu_screen.blit(focal_length2_label, (display.sub_x + 245, display.sub_y + 525))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_focal_length'])
     focal_length2_text = display.font.render(f"{config_state.camera_configs['camera2']['focal_length']:.1f}", True, (0, 0, 0))
     display.menu_screen.blit(focal_length2_text, (display.input_rects['camera2_focal_length'].x + 5, display.input_rects['camera2_focal_length'].y + 5))
+
+    alignment_rotation2_label = display.font.render("Alignment Rotation (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(alignment_rotation2_label, (display.sub_x + 245, display.sub_y + 585))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_alignment_rotation'])
+    alignment_rotation2_text = display.font.render(f"{config_state.camera_configs['camera2']['alignment_rotation']:.1f}", True, (0, 0, 0))
+    display.menu_screen.blit(alignment_rotation2_text, (display.input_rects['camera2_alignment_rotation'].x + 5, display.input_rects['camera2_alignment_rotation'].y + 5))
+
+    gain2_label = display.font.render("Gain:", True, (0, 0, 0))
+    display.menu_screen.blit(gain2_label, (display.sub_x + 245, display.sub_y + 645))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_gain'])
+    gain2_text = display.font.render(f"{config_state.camera_configs['camera2']['gain']:.2f}", True, (0, 0, 0))
+    display.menu_screen.blit(gain2_text, (display.input_rects['camera2_gain'].x + 5, display.input_rects['camera2_gain'].y + 5))
+
+    exposure2_label = display.font.render("Exposure (µs):", True, (0, 0, 0))
+    display.menu_screen.blit(exposure2_label, (display.sub_x + 245, display.sub_y + 695))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_exposure'])
+    exposure2_text = display.font.render(f"{config_state.camera_configs['camera2']['exposure']:.0f}", True, (0, 0, 0))
+    display.menu_screen.blit(exposure2_text, (display.input_rects['camera2_exposure'].x + 5, display.input_rects['camera2_exposure'].y + 5))
 
     # Camera field focus highlights
     # Camera 1 fields
@@ -302,6 +382,30 @@ def draw_config_options(display, config_state):
                         (display.input_rects['camera1_focal_length'].x + 5 + text_width, display.input_rects['camera1_focal_length'].y + 5),
                         (display.input_rects['camera1_focal_length'].x + 5 + text_width, display.input_rects['camera1_focal_length'].y + 25), 2)
 
+    if config_state.focused_field == "camera1_alignment_rotation":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_alignment_rotation'], 2)
+        alignment_rotation1_str = f"{config_state.camera_configs['camera1']['alignment_rotation']:.1f}"
+        text_width, _ = display.font.size(alignment_rotation1_str[:config_state.cursor_pos["camera1_alignment_rotation"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera1_alignment_rotation'].x + 5 + text_width, display.input_rects['camera1_alignment_rotation'].y + 5),
+                        (display.input_rects['camera1_alignment_rotation'].x + 5 + text_width, display.input_rects['camera1_alignment_rotation'].y + 25), 2)
+
+    if config_state.focused_field == "camera1_gain":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_gain'], 2)
+        gain1_str = f"{config_state.camera_configs['camera1']['gain']:.2f}"
+        text_width, _ = display.font.size(gain1_str[:config_state.cursor_pos["camera1_gain"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera1_gain'].x + 5 + text_width, display.input_rects['camera1_gain'].y + 5),
+                        (display.input_rects['camera1_gain'].x + 5 + text_width, display.input_rects['camera1_gain'].y + 25), 2)
+
+    if config_state.focused_field == "camera1_exposure":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_exposure'], 2)
+        exposure1_str = f"{config_state.camera_configs['camera1']['exposure']:.0f}"
+        text_width, _ = display.font.size(exposure1_str[:config_state.cursor_pos["camera1_exposure"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera1_exposure'].x + 5 + text_width, display.input_rects['camera1_exposure'].y + 5),
+                        (display.input_rects['camera1_exposure'].x + 5 + text_width, display.input_rects['camera1_exposure'].y + 25), 2)
+
     # Camera 2 fields
     if config_state.focused_field == "camera2_pixel_size":
         pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_pixel_size'], 2)
@@ -326,6 +430,30 @@ def draw_config_options(display, config_state):
         pygame.draw.line(display.menu_screen, (0, 0, 255),
                         (display.input_rects['camera2_focal_length'].x + 5 + text_width, display.input_rects['camera2_focal_length'].y + 5),
                         (display.input_rects['camera2_focal_length'].x + 5 + text_width, display.input_rects['camera2_focal_length'].y + 25), 2)
+
+    if config_state.focused_field == "camera2_alignment_rotation":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_alignment_rotation'], 2)
+        alignment_rotation2_str = f"{config_state.camera_configs['camera2']['alignment_rotation']:.1f}"
+        text_width, _ = display.font.size(alignment_rotation2_str[:config_state.cursor_pos["camera2_alignment_rotation"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera2_alignment_rotation'].x + 5 + text_width, display.input_rects['camera2_alignment_rotation'].y + 5),
+                        (display.input_rects['camera2_alignment_rotation'].x + 5 + text_width, display.input_rects['camera2_alignment_rotation'].y + 25), 2)
+
+    if config_state.focused_field == "camera2_gain":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_gain'], 2)
+        gain2_str = f"{config_state.camera_configs['camera2']['gain']:.2f}"
+        text_width, _ = display.font.size(gain2_str[:config_state.cursor_pos["camera2_gain"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera2_gain'].x + 5 + text_width, display.input_rects['camera2_gain'].y + 5),
+                        (display.input_rects['camera2_gain'].x + 5 + text_width, display.input_rects['camera2_gain'].y + 25), 2)
+
+    if config_state.focused_field == "camera2_exposure":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_exposure'], 2)
+        exposure2_str = f"{config_state.camera_configs['camera2']['exposure']:.0f}"
+        text_width, _ = display.font.size(exposure2_str[:config_state.cursor_pos["camera2_exposure"]])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                        (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 5),
+                        (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 25), 2)
 
     # Draw buttons and divider
     pygame.draw.line(display.menu_screen, (0, 0, 0), (display.sub_x, display.sub_y + display.sub_height - 60), (display.sub_x + display.sub_width, display.sub_y + display.sub_height - 60), 1)
@@ -356,12 +484,24 @@ def handle_input(event, config_state):
         field_str = str(config_state.camera_configs["camera1"]["array_size_diagonal"])
     elif focused_field == "camera1_focal_length":
         field_str = str(config_state.camera_configs["camera1"]["focal_length"])
+    elif focused_field == "camera1_alignment_rotation":
+        field_str = str(config_state.camera_configs["camera1"]["alignment_rotation"])
     elif focused_field == "camera2_pixel_size":
         field_str = str(config_state.camera_configs["camera2"]["pixel_size"])
     elif focused_field == "camera2_array_size_diagonal":
         field_str = str(config_state.camera_configs["camera2"]["array_size_diagonal"])
     elif focused_field == "camera2_focal_length":
         field_str = str(config_state.camera_configs["camera2"]["focal_length"])
+    elif focused_field == "camera1_gain":
+        field_str = str(config_state.camera_configs["camera1"]["gain"])
+    elif focused_field == "camera1_exposure":
+        field_str = str(config_state.camera_configs["camera1"]["exposure"])
+    elif focused_field == "camera2_gain":
+        field_str = str(config_state.camera_configs["camera2"]["gain"])
+    elif focused_field == "camera2_exposure":
+        field_str = str(config_state.camera_configs["camera2"]["exposure"])
+    elif focused_field == "camera2_alignment_rotation":
+        field_str = str(config_state.camera_configs["camera2"]["alignment_rotation"])
     else:
         return
 
@@ -450,8 +590,48 @@ def handle_input(event, config_state):
             config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
         except ValueError:
             pass  # Keep current value if invalid
+    elif focused_field == "camera1_alignment_rotation":
+        try:
+            config_state.camera_configs["camera1"]["alignment_rotation"] = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_pixel_size":
+        try:
+            config_state.camera_configs["camera2"]["pixel_size"] = float(field_str) if field_str else 3.75
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_array_size_diagonal":
+        try:
+            config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
+        except ValueError:
+            pass  # Keep current value if invalid
     elif focused_field == "camera2_focal_length":
         try:
             config_state.camera_configs["camera2"]["focal_length"] = float(field_str) if field_str else 25.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_gain":
+        try:
+            config_state.camera_configs["camera1"]["gain"] = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_exposure":
+        try:
+            config_state.camera_configs["camera1"]["exposure"] = float(field_str) if field_str else 10000.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_gain":
+        try:
+            config_state.camera_configs["camera2"]["gain"] = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_exposure":
+        try:
+            config_state.camera_configs["camera2"]["exposure"] = float(field_str) if field_str else 10000.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_alignment_rotation":
+        try:
+            config_state.camera_configs["camera2"]["alignment_rotation"] = float(field_str) if field_str else 0.0
         except ValueError:
             pass  # Keep current value if invalid

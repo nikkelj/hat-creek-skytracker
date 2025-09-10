@@ -89,9 +89,11 @@ config_state = load_config()
 if camera_manager.cameras[0]:
     camera_manager.cameras[0].gain = int(float(config_state.get_camera_gain("camera1")))
     camera_manager.cameras[0].exposure = int(float(config_state.get_camera_exposure("camera1")))
+    camera_manager.cameras[0].alignment_rotation = float(config_state.get_camera_alignment_rotation("camera1"))
 if camera_manager.cameras[1]:
     camera_manager.cameras[1].gain = int(float(config_state.get_camera_gain("camera2")))
     camera_manager.cameras[1].exposure = int(float(config_state.get_camera_exposure("camera2")))
+    camera_manager.cameras[1].alignment_rotation = float(config_state.get_camera_alignment_rotation("camera2"))
 
 # Input field state for tracking vis (now handled by TrackingVisState class)
 
@@ -321,7 +323,7 @@ while running:
             # Handle mode-specific events
             elif current_mode == "sensor_calib":
                 # Handle sensor calibration events using modular handler
-                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback)
+                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback, config_state)
             elif current_mode == "config_options":
                 # Handle save button click
                 if display.save_button.collidepoint(pos) and str(pos) and len(str(pos).strip()) > 2:
@@ -509,6 +511,10 @@ while running:
         # Modular camera slider controls - positioned within camera display area
         from camera_manager import render_camera_sliders
         render_camera_sliders(display.menu_screen, display.tiny_font, display.sub_x, display.sub_y, display.sub_width, display.sub_height)
+
+        # Modular alignment rotation sliders - positioned at bottom-center of each camera image
+        from camera_manager import render_alignment_rotation_sliders
+        render_alignment_rotation_sliders(display.menu_screen, display.tiny_font, display.sub_x, display.sub_y, display.sub_width, display.sub_height)
 
         # Modular ROI controls for both cameras - replaced ~100+ lines of inline ROI control code
         from camera_manager import render_camera_roi_controls

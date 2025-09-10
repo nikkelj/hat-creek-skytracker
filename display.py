@@ -91,6 +91,14 @@ class DisplaySetup:
             'lon': pygame.Rect(self.sub_x + self.UI_MARGIN, self.sub_y + 150, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'alt': pygame.Rect(self.sub_x + self.UI_MARGIN, self.sub_y + 240, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'elevation_mask': pygame.Rect(self.sub_x + self.UI_MARGIN, self.sub_y + 330, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+
+            # Camera configuration input rectangles
+            'camera1_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 55, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'camera1_array_size_diagonal': pygame.Rect(self.sub_x + 250, self.sub_y + 115, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'camera1_focal_length': pygame.Rect(self.sub_x + 250, self.sub_y + 165, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'camera2_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 255, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'camera2_array_size_diagonal': pygame.Rect(self.sub_x + 250, self.sub_y + 315, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'camera2_focal_length': pygame.Rect(self.sub_x + 250, self.sub_y + 365, self.INPUT_WIDTH, self.INPUT_HEIGHT),
         }
 
         # Define button rectangles

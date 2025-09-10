@@ -30,7 +30,7 @@ except Exception as e:
     asi = None
 from utils import draw_button, create_negative_image, draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, interpolate_position, clear_trajectory_cache, update_satellite_positions, build_satellite_pass_table
-from config import load_config, save_config, handle_input, ConfigState
+from config import load_config, save_config, handle_input, ConfigState, draw_config_options
 from tracking_visuals import TrackingVisState, draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table, PolarPlotMode
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, update_camera_frames_from_buffers, handle_sensor_calib_events
@@ -426,7 +426,7 @@ while running:
     cx = display.sub_x + display.sub_width // 2
     cy = display.sub_y + display.sub_height // 2
     if current_mode == "config_options":
-        draw_polar_plot(display, config_state, None, None, None)
+        draw_config_options(display, config_state)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         display.menu_screen.fill((0, 0, 0), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))  # Clear the subplot area with black
         draw_polar_plot(display, config_state, ts, current_tt, tracking_vis_state)

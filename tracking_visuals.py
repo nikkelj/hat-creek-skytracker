@@ -289,185 +289,109 @@ def draw_polar_plot(display, config_state, ts, current_tt, state=None, mode=Pola
         display.sub_width = original_sub_width // 2  # Half width
         display.sub_height = original_sub_height // 2  # Half height
 
-    # Draw gradient background for config options
-    if ts is None:
-        for y in range(display.sub_height):
-            color = (160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5))
-            pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
-        # Draw grouping box and label
-        group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 370)
-        pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
-        group_label = display.font.render("Observer Location", True, (0, 0, 0))
-        display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
-        # Draw labels and inputs
-        lat_label = display.font.render("Latitude:", True, (0, 0, 0))
-        display.menu_screen.blit(lat_label, (display.sub_x + 20, display.sub_y + 30))
-        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lat'])
-        lat_text = display.font.render(config_state.lat_str, True, (0, 0, 0))
-        display.menu_screen.blit(lat_text, (display.input_rects['lat'].x + 5, display.input_rects['lat'].y + 5))
+    # Tracking visualization mode - requires state object
+    if state is None:
+        return  # Skip drawing if no state provided
 
-        lon_label = display.font.render("Longitude:", True, (0, 0, 0))
-        display.menu_screen.blit(lon_label, (display.sub_x + 20, display.sub_y + 120))
-        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lon'])
-        lon_text = display.font.render(config_state.lon_str, True, (0, 0, 0))
-        display.menu_screen.blit(lon_text, (display.input_rects['lon'].x + 5, display.input_rects['lon'].y + 5))
+    elevation_mask = float(config_state.elevation_mask_str or 0)
+    # Draw polar plot for tracking vis
+    cx = display.sub_x + display.sub_width // 2
+    cy = display.sub_y + display.sub_height // 2
+    radius = min(display.sub_width, display.sub_height) // 2 - 50
+    # Draw horizon circle
+    pygame.draw.circle(display.menu_screen, (255, 255, 255), (cx, cy), radius, 1)
+    # Draw elevation mask circle
+    mask_radius = (90 - elevation_mask) / 90 * radius
+    pygame.draw.circle(display.menu_screen, (255, 0, 0), (cx, cy), mask_radius, 2)
+    # Draw elevation circles
+    for el in [30, 60]:
+        r = (90 - el) / 90 * radius
+        pygame.draw.circle(display.menu_screen, (100, 100, 100), (cx, cy), int(r), 1)
+        el_label = pygame.font.Font(None, 14).render(f"{el}°", True, (255, 255, 255))
+        display.menu_screen.blit(el_label, (cx + r + 5, cy - 5))
+    # Draw azimuth lines and labels
+    for az_deg in range(0, 360, 30):
+        az_rad = math.radians(az_deg)
+        x1 = cx + radius * math.sin(az_rad)
+        y1 = cy - radius * math.cos(az_rad)
+        pygame.draw.line(display.menu_screen, (100, 100, 100), (cx, cy), (x1, y1), 1)
+        if az_deg % 90 == 0:
+            direction = {0: "N", 90: "E", 180: "S", 270: "W"}[az_deg]
+            direction_label = pygame.font.Font(None, 14).render(direction, True, (255, 255, 255))
+            if az_deg == 0:  # North
+                display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy - radius - 10))
+            elif az_deg == 90:  # East
+                display.menu_screen.blit(direction_label, (cx + radius + 10, cy - direction_label.get_height() // 2))
+            elif az_deg == 180:  # South
+                display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 5))
+            elif az_deg == 270:  # West
+                display.menu_screen.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
+    # Draw precomputed arc segments for selected satellite
+    if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
+        # Redraw selected satellite's arc segments with sunlit detection
+        if state.selected_satellite in state.satellite_arc_segments and state.satellite_trajectories and state.selected_satellite in state.satellite_trajectories:
+            trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
 
-        alt_label = display.font.render("Altitude (m):", True, (0, 0, 0))
-        display.menu_screen.blit(alt_label, (display.sub_x + 20, display.sub_y + 210))
-        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt'])
-        alt_text = display.font.render(config_state.alt_str, True, (0, 0, 0))
-        display.menu_screen.blit(alt_text, (display.input_rects['alt'].x + 5, display.input_rects['alt'].y + 5))
+            # Set up observer and sun for sunlit calculation
+            try:
+                observer = wgs84.latlon(float(config_state.lat_str or 0), float(config_state.lon_str or 0), elevation_m=float(config_state.alt_str or 0))
 
-        elevation_mask_label = display.font.render("Elevation Mask (deg):", True, (0, 0, 0))
-        display.menu_screen.blit(elevation_mask_label, (display.sub_x + 20, display.sub_y + 300))
-        pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['elevation_mask'])
-        elevation_mask_text = display.font.render(config_state.elevation_mask_str, True, (0, 0, 0))
-        display.menu_screen.blit(elevation_mask_text, (display.input_rects['elevation_mask'].x + 5, display.input_rects['elevation_mask'].y + 5))
+                # Load sun ephemeris
+                sun_ephemeris = load('de421.bsp')['sun']
 
-        # Draw buttons and divider
-        pygame.draw.line(display.menu_screen, (0, 0, 0), (display.sub_x, display.sub_y + display.sub_height - 60), (display.sub_x + display.sub_width, display.sub_y + display.sub_height - 60), 1)
-        # Config mode buttons use display object properties
-        from utils import draw_button_with_objects
-        draw_button_with_objects(display, "save")
-        draw_button_with_objects(display, "load")
-    else:
-        # Tracking visualization mode - requires state object
-        if state is None:
-            return  # Skip drawing if no state provided
+                # Create Skyfield Time objects for current trajectory times
+                skyfield_times = []
+                for tt_time in times_array:
+                    skyfield_times.append(ts.tt(jd=tt_time))
 
-        elevation_mask = float(config_state.elevation_mask_str or 0)
-        # Draw polar plot for tracking vis
-        cx = display.sub_x + display.sub_width // 2
-        cy = display.sub_y + display.sub_height // 2
-        radius = min(display.sub_width, display.sub_height) // 2 - 50
-        # Draw horizon circle
-        pygame.draw.circle(display.menu_screen, (255, 255, 255), (cx, cy), radius, 1)
-        # Draw elevation mask circle
-        mask_radius = (90 - elevation_mask) / 90 * radius
-        pygame.draw.circle(display.menu_screen, (255, 0, 0), (cx, cy), mask_radius, 2)
-        # Draw elevation circles
-        for el in [30, 60]:
-            r = (90 - el) / 90 * radius
-            pygame.draw.circle(display.menu_screen, (100, 100, 100), (cx, cy), int(r), 1)
-            el_label = pygame.font.Font(None, 14).render(f"{el}°", True, (255, 255, 255))
-            display.menu_screen.blit(el_label, (cx + r + 5, cy - 5))
-        # Draw azimuth lines and labels
-        for az_deg in range(0, 360, 30):
-            az_rad = math.radians(az_deg)
-            x1 = cx + radius * math.sin(az_rad)
-            y1 = cy - radius * math.cos(az_rad)
-            pygame.draw.line(display.menu_screen, (100, 100, 100), (cx, cy), (x1, y1), 1)
-            if az_deg % 90 == 0:
-                direction = {0: "N", 90: "E", 180: "S", 270: "W"}[az_deg]
-                direction_label = pygame.font.Font(None, 14).render(direction, True, (255, 255, 255))
-                if az_deg == 0:  # North
-                    display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy - radius - 10))
-                elif az_deg == 90:  # East
-                    display.menu_screen.blit(direction_label, (cx + radius + 10, cy - direction_label.get_height() // 2))
-                elif az_deg == 180:  # South
-                    display.menu_screen.blit(direction_label, (cx - direction_label.get_width() // 2, cy + radius + 5))
-                elif az_deg == 270:  # West
-                    display.menu_screen.blit(direction_label, (cx - radius - 10 - direction_label.get_width(), cy - direction_label.get_height() // 2))
-        # Draw precomputed arc segments for selected satellite
-        if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
-            # Redraw selected satellite's arc segments with sunlit detection
-            if state.selected_satellite in state.satellite_arc_segments and state.satellite_trajectories and state.selected_satellite in state.satellite_trajectories:
-                trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
+                # Calculate sunlit status for each trajectory point
+                sunlit_status = []
+                for st in skyfield_times:
+                    try:
+                        # Get satellite position and sun position
+                        sat_pos = state.selected_satellite.at(st)
+                        sun_pos = sun_ephemeris.at(st)
 
-                # Set up observer and sun for sunlit calculation
-                try:
-                    observer = wgs84.latlon(float(config_state.lat_str or 0), float(config_state.lon_str or 0), elevation_m=float(config_state.alt_str or 0))
+                        # Calculate vectors
+                        sat_to_sun = (sun_pos.position.km - sat_pos.position.km)
+                        sat_to_center = -sat_pos.position.km  # Vector from satellite to Earth center
 
-                    # Load sun ephemeris
-                    sun_ephemeris = load('de421.bsp')['sun']
+                        # Calculate angle between sun vector and Earth center vector
+                        dot_product = np.dot(sat_to_sun, sat_to_center)
+                        mag_sat_sun = np.linalg.norm(sat_to_sun)
+                        mag_sat_center = np.linalg.norm(sat_to_center)
 
-                    # Create Skyfield Time objects for current trajectory times
-                    skyfield_times = []
-                    for tt_time in times_array:
-                        skyfield_times.append(ts.tt(jd=tt_time))
-
-                    # Calculate sunlit status for each trajectory point
-                    sunlit_status = []
-                    for st in skyfield_times:
-                        try:
-                            # Get satellite position and sun position
-                            sat_pos = state.selected_satellite.at(st)
-                            sun_pos = sun_ephemeris.at(st)
-
-                            # Calculate vectors
-                            sat_to_sun = (sun_pos.position.km - sat_pos.position.km)
-                            sat_to_center = -sat_pos.position.km  # Vector from satellite to Earth center
-
-                            # Calculate angle between sun vector and Earth center vector
-                            dot_product = np.dot(sat_to_sun, sat_to_center)
-                            mag_sat_sun = np.linalg.norm(sat_to_sun)
-                            mag_sat_center = np.linalg.norm(sat_to_center)
-
-                            if mag_sat_sun > 0 and mag_sat_center > 0:
-                                cos_angle = dot_product / (mag_sat_sun * mag_sat_center)
-                                angle = math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
-                                # If the satellite is closer to the sun-side relative to Earth, it's sunlit
-                                # Invert the logic: if angle > 90°, then the sun is on the same side as the horizon
-                                is_sunlit = angle > 90.0
-                            else:
-                                is_sunlit = False
-
-                        except Exception:
+                        if mag_sat_sun > 0 and mag_sat_center > 0:
+                            cos_angle = dot_product / (mag_sat_sun * mag_sat_center)
+                            angle = math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
+                            # If the satellite is closer to the sun-side relative to Earth, it's sunlit
+                            # Invert the logic: if angle > 90°, then the sun is on the same side as the horizon
+                            is_sunlit = angle > 90.0
+                        else:
                             is_sunlit = False
 
-                        sunlit_status.append(is_sunlit)
+                    except Exception:
+                        is_sunlit = False
 
-                    # Redraw segments with sunlit-aware colors
-                    segments = []
-                    current_start_time = times_array[0] if len(times_array) > 0 else 0
+                    sunlit_status.append(is_sunlit)
 
-                    for i in range(len(trajectory_data) - 1):
-                        x0, y0, x1, y1 = trajectory_data[i][4], trajectory_data[i][5], trajectory_data[i + 1][4], trajectory_data[i + 1][5]
-                        alt = trajectory_data[i][1]
+                # Redraw segments with sunlit-aware colors
+                segments = []
+                current_start_time = times_array[0] if len(times_array) > 0 else 0
 
-                        if alt > 0:  # Above horizon
-                            is_future = times_array[i] > current_tt if current_tt else False
-                            is_sunlit = sunlit_status[i] if i < len(sunlit_status) else False
+                for i in range(len(trajectory_data) - 1):
+                    x0, y0, x1, y1 = trajectory_data[i][4], trajectory_data[i][5], trajectory_data[i + 1][4], trajectory_data[i + 1][5]
+                    alt = trajectory_data[i][1]
 
-                            if is_future:
-                                color = (255, 255, 0) if is_sunlit else (255, 0, 0)  # Yellow for sunlit future, red for shadowed
-                            else:
-                                color = (128, 128, 128)  # Grey for past
+                    if alt > 0:  # Above horizon
+                        is_future = times_array[i] > current_tt if current_tt else False
+                        is_sunlit = sunlit_status[i] if i < len(sunlit_status) else False
 
-                            # Transform coordinates when in upper right quadrant mode
-                            if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
-                                # Calculate the quadrant center (where the polar plot circle is drawn)
-                                quadrant_center_x = display.sub_x + display.sub_width // 2
-                                quadrant_center_y = display.sub_y + display.sub_height // 2
+                        if is_future:
+                            color = (255, 255, 0) if is_sunlit else (255, 0, 0)  # Yellow for sunlit future, red for shadowed
+                        else:
+                            color = (128, 128, 128)  # Grey for past
 
-                                # Calculate original full screen center (where arcs were calculated)
-                                full_screen_center_x = original_sub_x + original_sub_width // 2
-                                full_screen_center_y = original_sub_y + original_sub_height // 2
-
-                                # First, translate coordinates relative to full screen center
-                                rel_x0 = x0 - full_screen_center_x
-                                rel_y0 = y0 - full_screen_center_y
-                                rel_x1 = x1 - full_screen_center_x
-                                rel_y1 = y1 - full_screen_center_y
-
-                                # Scale down by factor of 2 (since quadrant is half the size of full screen)
-                                scale_factor = 0.45
-                                rel_x0 *= scale_factor
-                                rel_y0 *= scale_factor
-                                rel_x1 *= scale_factor
-                                rel_y1 *= scale_factor
-
-                                # Translate to quadrant center
-                                x0 = rel_x0 + quadrant_center_x
-                                y0 = rel_y0 + quadrant_center_y
-                                x1 = rel_x1 + quadrant_center_x
-                                y1 = rel_y1 + quadrant_center_y
-
-                            pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
-
-                except Exception as e:
-                    # Fallback to default arc segments if sunlit calculation fails
-                    for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
                         # Transform coordinates when in upper right quadrant mode
                         if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
                             # Calculate the quadrant center (where the polar plot circle is drawn)
@@ -496,9 +420,11 @@ def draw_polar_plot(display, config_state, ts, current_tt, state=None, mode=Pola
                             y0 = rel_y0 + quadrant_center_y
                             x1 = rel_x1 + quadrant_center_x
                             y1 = rel_y1 + quadrant_center_y
+
                         pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
-            else:
-                        # Default drawing if no trajectory data available
+
+            except Exception as e:
+                # Fallback to default arc segments if sunlit calculation fails
                 for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
                     # Transform coordinates when in upper right quadrant mode
                     if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
@@ -529,6 +455,38 @@ def draw_polar_plot(display, config_state, ts, current_tt, state=None, mode=Pola
                         x1 = rel_x1 + quadrant_center_x
                         y1 = rel_y1 + quadrant_center_y
                     pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
+        else:
+                    # Default drawing if no trajectory data available
+            for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+                # Transform coordinates when in upper right quadrant mode
+                if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+                    # Calculate the quadrant center (where the polar plot circle is drawn)
+                    quadrant_center_x = display.sub_x + display.sub_width // 2
+                    quadrant_center_y = display.sub_y + display.sub_height // 2
+
+                    # Calculate original full screen center (where arcs were calculated)
+                    full_screen_center_x = original_sub_x + original_sub_width // 2
+                    full_screen_center_y = original_sub_y + original_sub_height // 2
+
+                    # First, translate coordinates relative to full screen center
+                    rel_x0 = x0 - full_screen_center_x
+                    rel_y0 = y0 - full_screen_center_y
+                    rel_x1 = x1 - full_screen_center_x
+                    rel_y1 = y1 - full_screen_center_y
+
+                    # Scale down by factor of 2 (since quadrant is half the size of full screen)
+                    scale_factor = 0.45
+                    rel_x0 *= scale_factor
+                    rel_y0 *= scale_factor
+                    rel_x1 *= scale_factor
+                    rel_y1 *= scale_factor
+
+                    # Translate to quadrant center
+                    x0 = rel_x0 + quadrant_center_x
+                    y0 = rel_y0 + quadrant_center_y
+                    x1 = rel_x1 + quadrant_center_x
+                    y1 = rel_y1 + quadrant_center_y
+                pygame.draw.line(display.menu_screen, color, (x0, y0), (x1, y1), 1)
 
     # Restore original display bounds after drawing
     display.sub_x = original_sub_x

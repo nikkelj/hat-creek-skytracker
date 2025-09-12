@@ -35,6 +35,16 @@ class CameraThread(threading.Thread):
         self.frame_counter = 0
         self.latest_frame = None  # Simple single frame buffer - no locks!
 
+        # MEMORY OPTIMIZATION: Pre-allocate common data structures to avoid dynamic allocation in hot path
+        self._frame_data_template = {
+            'frame': None,
+            'timestamp': 0,
+            'datetime_utc': '',
+            'datetime_local': '',
+            'camera_index': camera_index,
+            'capture_time': 0
+        }
+
         # Get camera properties
         try:
             self.camera_props = camera_cap.get_camera_property()
@@ -92,16 +102,19 @@ class CameraThread(threading.Thread):
             # Step 3: Get data immediately once ready
             data = self.camera_cap.get_data_after_exposure()
 
-            # Step 4: Handle data conversion (copied from zwoasi capture method)
+            # Step 4: Handle data conversion - FIXED MEMORY ISSUE
             whbi = self.camera_cap.get_roi_format()
             shape = [whbi[1], whbi[0]]  # height, width
 
             if whbi[3] == asi.ASI_IMG_RAW8 or whbi[3] == asi.ASI_IMG_Y8:
-                img = np.frombuffer(data, dtype=np.uint8)
+                # CRITICAL FIX: Use .copy() to avoid buffer lifetime issues
+                img = np.frombuffer(data, dtype=np.uint8).copy()
             elif whbi[3] == asi.ASI_IMG_RAW16:
-                img = np.frombuffer(data, dtype=np.uint16)
+                # CRITICAL FIX: Use .copy() to avoid buffer lifetime issues
+                img = np.frombuffer(data, dtype=np.uint16).copy()
             elif whbi[3] == asi.ASI_IMG_RGB24:
-                img = np.frombuffer(data, dtype=np.uint8)
+                # CRITICAL FIX: Use .copy() to avoid buffer lifetime issues
+                img = np.frombuffer(data, dtype=np.uint8).copy()
                 shape.append(3)
             else:
                 # Unsupported image type - handle silently
@@ -235,15 +248,14 @@ class CameraThread(threading.Thread):
                     try:
                         surface = self._process_raw_frame(raw_frame)
                         if surface is not None:
-                            # Create new frame data - direct assignment, no buffer overhead
-                            self.latest_frame = {
-                                'frame': surface,
-                                'timestamp': current_time,
-                                'datetime_utc': datetime.now(timezone.utc).isoformat(),  # Real-time UTC timestamp
-                                'datetime_local': datetime.now().isoformat(),  # Real-time local timestamp
-                                'camera_index': self.camera_index,
-                                'capture_time': capture_time
-                            }
+                            # MEMORY OPTIMIZATION: Use pre-allocated template with updates
+                            self._frame_data_template['frame'] = surface
+                            self._frame_data_template['timestamp'] = current_time
+                            self._frame_data_template['datetime_utc'] = datetime.now(timezone.utc).isoformat()
+                            self._frame_data_template['datetime_local'] = datetime.now().isoformat()
+                            self._frame_data_template['capture_time'] = capture_time
+                            # Assign reference (no copy) for maximum speed
+                            self.latest_frame = self._frame_data_template
                             # Direct counters - no buffer locking overhead!
                             self.frame_count += 1
                             self.frame_counter += 1  # Use instance variable for FPS calculation

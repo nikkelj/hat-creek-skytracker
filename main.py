@@ -11,7 +11,7 @@ from tkinter import filedialog
 from skyfield.api import wgs84, load, utc
 from datetime import datetime, timedelta, timezone
 import numpy as np
-from camera_buffer import CircularBuffer, CameraThread
+from camera_buffer import SimpleBuffer, CameraThread
 
 # Camera imports (for ASI cameras)
 try:
@@ -549,6 +549,6 @@ while running:
         display.menu_screen.blit(text2, (display.sub_x + 10, display.sub_y + 50))
 
     pygame.display.flip()
-    clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness
+    # clock.tick(display.FPS_TARGET)  # REMOVED: Main loop throttling - test if this is limiting camera FPS
 
 pygame.quit()

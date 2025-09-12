@@ -2,7 +2,7 @@ import pygame
 import zwoasi as asi
 import numpy as np
 import json
-from camera_buffer import CameraThread, CircularBuffer
+from camera_buffer import CameraThread, SimpleBuffer
 import config
 
 
@@ -212,8 +212,13 @@ class CameraManager:
             return
 
         camera.threads_running = True
-        camera.thread = CameraThread(camera.index, camera.cap, 60, 15)  # BUFFER_SIZE=60, TARGET_FPS=15
+        # Set target FPS based on current ROI size
+        initial_fps = 15 if camera.roi_size == -1 else roi_target_fps[camera.roi_size]
+        camera.thread = CameraThread(camera.index, camera.cap, 60, initial_fps)  # BUFFER_SIZE=60, DYNAMIC TARGET_FPS
         camera.thread.start()
+
+        # Set initial ROI size in thread for buffer management
+        camera.thread.update_roi_size(camera.roi_size)
 
     def _stop_camera_thread(self, camera):
         """Stop capture thread for camera"""
@@ -290,6 +295,11 @@ class CameraManager:
                 camera.roi_x = 0.5
                 camera.roi_y = 0.5
 
+                # Update thread target FPS back to default (full resolution) and ROI size
+                if camera.thread is not None:
+                    camera.thread.set_target_fps(roi_target_fps[0])
+                    camera.thread.update_roi_size(-1)
+
                 if update_status_callback:
                     update_status_callback(f"Camera {camera_index+1} ROI reset to full: (0, 0) {max_width}x{max_height}")
                 return True
@@ -342,8 +352,21 @@ class CameraManager:
                 camera.roi_x = roi_x
                 camera.roi_y = roi_y
 
+                # Update thread target FPS based on new ROI size
+                if camera.thread is not None:
+                    new_target_fps = roi_target_fps[roi_size]
+                    camera.thread.set_target_fps(new_target_fps)
+                    camera.thread.update_roi_size(roi_size)
+
+                # Verify ROI was set correctly
+                try:
+                    roi_format = camera.cap.get_roi_format()
+                    print(f"Camera {camera_index+1} ROI verification: {roi_format}")
+                except:
+                    print(f"Camera {camera_index+1} ROI verification failed")
+
                 if update_status_callback:
-                    update_status_callback(f"Camera {camera_index+1} ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}")
+                    update_status_callback(f"Camera {camera_index+1} ROI set: ({start_x}, {start_y}) {roi_w}x{roi_h}, FPS: {roi_target_fps[roi_size]}")
                 return True
             except AttributeError:
                 # ROI setting not supported by this camera/driver
@@ -371,6 +394,9 @@ roi_sizes = [
 ]
 roi_label_texts = ["1.0", ".5", ".25", ".125", ".063", ".032"]
 
+# Target FPS for each ROI size - smaller ROI allows higher FPS
+roi_target_fps = [15, 30, 60, 100, 100, 0]  # 0 = no limiting for fastest possible
+
 # ==============================================================================
 # CAMERA INITIALIZATION
 # ==============================================================================
@@ -394,7 +420,14 @@ def update_camera_frames_from_buffers():
         if camera.thread is not None:
             latest_frame = camera.thread.buffer.get_latest_frame()
             if latest_frame is not None:
-                camera.frame = latest_frame['frame']
+                # Handle both processed and raw capture formats
+                if 'rgb_array' in latest_frame:
+                    # Standard processed frame
+                    camera.frame = pygame.surfarray.make_surface(latest_frame['rgb_array'])
+                elif 'raw_data' in latest_frame and latest_frame.get('fast_capture'):
+                    # Fast capture mode - raw bytes (skip for now, create placeholder)
+                    camera.frame = None  # No display for raw capture mode
+
                 camera.fps = camera.thread.get_buffer_fps()
                 camera.utc_ts = camera.thread.get_utc_timestamp()
                 camera.local_ts = camera.thread.get_local_timestamp()

@@ -392,10 +392,11 @@ def update_camera_frames_from_buffers():
     """Update camera frames from thread buffers"""
     for camera in camera_manager.cameras:
         if camera.thread is not None:
-            latest_frame = camera.thread.buffer.get_latest_frame()
+            latest_frame = camera.thread.get_latest_frame()  # Use direct method instead of buffer
             if latest_frame is not None:
                 camera.frame = latest_frame['frame']
-                camera.fps = camera.thread.get_buffer_fps()
+                camera.thread.calculate_fps()  # Calculate and update FPS internally
+                camera.fps = camera.thread.fps  # Get the updated FPS value
                 camera.utc_ts = camera.thread.get_utc_timestamp()
                 camera.local_ts = camera.thread.get_local_timestamp()
 

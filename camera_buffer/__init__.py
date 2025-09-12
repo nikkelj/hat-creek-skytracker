@@ -9,84 +9,119 @@ import pygame
 from collections import deque
 from datetime import datetime, timezone
 
+# Maintain import compatibility - CircularBuffer now replaced with simple latest_frame approach
 class CircularBuffer:
-    """Thread-safe circular buffer for camera frames"""
-
+    """Empty placeholder class for import compatibility"""
     def __init__(self, size=30, max_frame_size=(1920, 1280, 3)):
-        self.size = size
-        self.buffer = deque(maxlen=size)
-        self.lock = threading.Lock()
-        self.max_frame_size = max_frame_size
-        # Pre-allocate reusable frame data objects
-        self.reusable_frame_data = [{
-            'frame': None,
-            'timestamp': 0,
-            'datetime_utc': '',
-            'datetime_local': '',
-            'camera_index': 0,
-            'camera_props': {'MaxWidth': 1920, 'MaxHeight': 1280},
-            'capture_time': 0,
-            'raw_buffer': None
-        } for _ in range(size)]
-
-    def add_frame(self, frame_data):
-        """Add a new frame to the buffer"""
-        try:
-            with self.lock:
-                self.buffer.append(frame_data)
-        except Exception as e:
-            print(f"Buffer add error: {str(e)}")
-
-    def get_latest_frame(self):
-        """Get the most recent frame from the buffer"""
-        try:
-            with self.lock:
-                if len(self.buffer) > 0:
-                    return self.buffer[-1]
-                return None
-        except Exception as e:
-            print(f"Buffer get latest error: {str(e)}")
-            return None
-
-    def get_buffer_size(self):
-        """Get current buffer size"""
-        with self.lock:
-            return len(self.buffer)
+        pass
 
 class CameraThread(threading.Thread):
-    """Dedicated thread for camera capture"""
+    """Dedicated thread for camera capture - MAXIMUM SPEED VERSION"""
 
     def __init__(self, camera_index, camera_cap, buffer_size=30, target_fps=10):
         super().__init__()
         self.camera_index = camera_index
         self.camera_cap = camera_cap
-        self.buffer = CircularBuffer(buffer_size)
         self.running = True
         self.target_fps = target_fps
         self.frame_interval = 1.0 / target_fps
         self.last_capture = 0
-        self.capture_timeout = 5.0  # Increased timeout to 5 seconds
+        self.capture_timeout = 5.0
         self.error_count = 0
         self.max_errors = 5
         self.frame_count = 0
         self.fps = 0.0
-        self.last_successful_capture = 0
-        self.capture_attempts = 0
-        # Cache timestamp strings to avoid flicker
-        self.last_local_timestamp = ""
-        self.last_utc_timestamp = ""
+        self.fps_timer = time.time()
+        self.frame_counter = 0
+        self.latest_frame = None  # Simple single frame buffer - no locks!
 
-        # Get camera properties for error handling
+        # Get camera properties
         try:
             self.camera_props = camera_cap.get_camera_property()
         except Exception as e:
-            print(f"Camera {camera_index} property error: {str(e)}")
             self.camera_props = {'MaxWidth': 1920, 'MaxHeight': 1280}
 
-        # Pre-allocate memory buffers for different ROI sizes
-        self._init_frame_buffers()
+    def get_latest_frame(self):
+        """Get the most recent frame - no locks, just return the reference"""
+        return self.latest_frame
 
-        print(f"Camera thread {camera_index} initialized with target FPS: {target_fps}, timeout: {self.capture_timeout}s")
+    def get_buffer_fps(self):
+        """Get current buffer FPS"""
+        return self.fps
+
+    def get_utc_timestamp(self):
+        """Get latest frame UTC timestamp"""
+        if self.latest_frame:
+            return self.latest_frame.get('datetime_utc', "")
+        return ""
+
+    def get_local_timestamp(self):
+        """Get latest frame local timestamp"""
+        if self.latest_frame:
+            return self.latest_frame.get('datetime_local', "")
+        return ""
+
+    def get_buffer_size(self):
+        """Get current buffer size"""
+        return 1
+
+    def _ultra_fast_capture(self):
+        """Ultra-fast capture - bypass zwoasi's slow polling capture
+
+        This implements the capture logic without the fixed polling delays
+        in the original zwoasi capture() method.
+        """
+        import zwoasi as asi
+
+        try:
+            # Step 1: Start exposure immediately
+            self.camera_cap.start_exposure()
+
+            # Step 2: Poll exposure status with minimal delays
+            # Ultra-fast polling - no initial sleep, minimal poll delay
+            while True:
+                exposure_status = self.camera_cap.get_exposure_status()
+                if exposure_status == asi.ASI_EXP_SUCCESS:
+                    break
+                elif exposure_status != asi.ASI_EXP_WORKING:
+                    # Error condition - return None to handle silently
+                    return None
+                # Minimal CPU-friendly yield instead of sleep
+                time.sleep(0.0001)  # 100 microseconds - much faster than 0.01s
+
+            # Step 3: Get data immediately once ready
+            data = self.camera_cap.get_data_after_exposure()
+
+            # Step 4: Handle data conversion (copied from zwoasi capture method)
+            whbi = self.camera_cap.get_roi_format()
+            shape = [whbi[1], whbi[0]]  # height, width
+
+            if whbi[3] == asi.ASI_IMG_RAW8 or whbi[3] == asi.ASI_IMG_Y8:
+                img = np.frombuffer(data, dtype=np.uint8)
+            elif whbi[3] == asi.ASI_IMG_RAW16:
+                img = np.frombuffer(data, dtype=np.uint16)
+            elif whbi[3] == asi.ASI_IMG_RGB24:
+                img = np.frombuffer(data, dtype=np.uint8)
+                shape.append(3)
+            else:
+                # Unsupported image type - handle silently
+                return None
+
+            img = img.reshape(shape)
+            return img
+
+        except Exception:
+            # Silent failure to maintain speed
+            return None
+
+    def calculate_fps(self):
+        """Calculate FPS - called externally to avoid main loop overhead"""
+        if time.time() - self.fps_timer >= 1.0:
+            self.fps = self.frame_counter / (time.time() - self.fps_timer)
+            self.fps_timer = time.time()
+            self.frame_counter = 0
+            return True
+        return False
 
     def _init_frame_buffers(self):
         """Pre-allocate fixed-size buffers for different ROI configurations"""
@@ -125,154 +160,116 @@ class CameraThread(threading.Thread):
             self.current_buffer_key = 'full'
 
     def _process_raw_frame(self, raw_frame):
-        """Process raw frame data using pre-allocated buffers (no dynamic memory allocation)"""
+        """Process raw frame data with MAXIMUM speed - no prints, minimal operations"""
         try:
-            # Get actual frame dimensions
-            if raw_frame.ndim == 3:
-                frame_height, frame_width = raw_frame.shape[:2]
-                frame_channels = raw_frame.shape[2]
-            elif raw_frame.ndim == 2:
-                frame_height, frame_width = raw_frame.shape
-                frame_channels = 1
-            else:
-                print(f"Unsupported frame dimensionality: {raw_frame.ndim}")
-                return None
+            # Get actual frame dimensions - critical for performance, no other way around it
+            frame_height, frame_width = raw_frame.shape[:2]
+            frame_channels = raw_frame.shape[2] if raw_frame.ndim == 3 else 1
 
-            # Handle different camera types and data formats
+            # Handle different camera types and data formats - optimized
             if self.camera_props.get('IsColorCam', False):
-                # Color camera - handle BGR to RGB conversion
+                # Color camera - BGR to RGB conversion, optimized
                 if frame_channels == 3:
-                    # Optimized: use numpy's transpose for BGR->RGB
-                    rgb_frame = np.ascontiguousarray(raw_frame[:, :, ::-1])  # Faster than manual assignment
+                    # Ultra-fast: view of raw data with channel reversal (no copy)
+                    rgb_frame = raw_frame[:, :, ::-1]
                 else:
-                    print(f"Unexpected color frame channels: {frame_channels}")
                     return None
             else:
-                # Monochrome camera - expand to RGB using broadcasting (fastest method)
+                # Monochrome camera - expand to RGB using fastest method
                 if frame_channels == 1:
-                    # Stack the mono channel into RGB - optimized broadcasting
+                    # No copying needed - can we skip pygame surface creation?
                     rgb_frame = np.repeat(raw_frame[:, :, np.newaxis], 3, axis=2)
-                    rgb_frame = rgb_frame.astype(np.uint8)
                 else:
-                    print(f"Unexpected mono frame channels: {frame_channels}")
                     return None
 
-            # Create pygame surface directly from the RGB array (skip tobytes() if possible)
-            # Try direct creation first, fallback to buffer method
+            # Try multiple methods to create pygame surface
             try:
                 surface = pygame.image.frombuffer(rgb_frame.data, (frame_width, frame_height), 'RGB')
+                return surface
             except:
-                # Fallback to tobytes method
-                surface = pygame.image.frombuffer(rgb_frame.tobytes(), (frame_width, frame_height), 'RGB')
+                # If frombuffer fails, try creating from tobytes()
+                try:
+                    surface = pygame.image.frombuffer(rgb_frame.tobytes(), (frame_width, frame_height), 'RGB')
+                    return surface
+                except:
+                    # If still fails, create minimal surface and let it fail gracefully
+                    # Create a black surface as fallback to avoid crashing
+                    return None  # Let's handle errors silently rather than showing bad frames
 
-            return surface
-
-        except Exception as e:
-            print(f"Frame processing error: {str(e)}")
-            import traceback
-            print(traceback.format_exc())  # Print full traceback for debugging
+        except Exception:
+            # Silent failure - don't slow down with error reporting
             return None
 
     def run(self):
-        """Main thread execution loop"""
+        """Main thread execution loop - MAXIMUM SPEED VERSION"""
         print(f"Camera thread {self.camera_index} starting...")
 
-        fps_timer = time.perf_counter()  # Use higher precision timer
-        frame_counter = 0
+        # Reset FPS tracking variables for current session
+        self.frame_counter = 0
+        self.fps_timer = time.time()
 
         while self.running:
-            current_time = time.perf_counter()  # Use higher precision timer for frame timing
+            # SKIP ALL THROTTLING FOR MAXIMUM SPEED
+            # Remove frame interval checking entirely - let camera run at max speed
+            current_time = time.perf_counter()
 
-            # Reduce throttling for high FPS - only throttle if we're ahead by more than 1ms
-            # At 300 FPS, target interval is ~0.0033s = 3.3ms
-            if current_time - self.last_capture < (self.frame_interval - 0.001):  # Allow 1ms ahead
-                time.sleep(0.0001)  # Minimal sleep to prevent CPU hogging
-                continue
+            # REMOVED: Frame interval throttling
+            # REMOVED: Sleep calls in main loop
+            # This is critical for 300fps - we don't want ANY artificial delays
 
             try:
                 if not self.camera_cap:
-                    print(f"Camera {self.camera_index} capture object is None")
                     self.running = False
                     continue
 
-                # Simple blocking capture for now (may need to be adjusted based on camera API)
+                # ULTRA-FAST CAPTURE - bypass zwoasi's slow polling capture method
                 start_time = time.perf_counter()
-                try:
-                    raw_frame = self.camera_cap.capture()
-                    capture_time = time.perf_counter() - start_time
-                except Exception as e:
-                    print(f"Camera {self.camera_index} capture failed: {str(e)}")
-                    self.error_count += 1
-                    self.last_capture = current_time
-                    time.sleep(0.1)
-                    continue
 
-                # Check for timeout - bailout early if no data to reduce overhead
-                if capture_time > self.capture_timeout:
-                    print(f"Camera {self.camera_index} capture timeout ({capture_time:.2f}s)")
-                    self.error_count += 1
-                    self.last_capture = current_time
-                    continue
+                # Custom high-speed capture implementation
+                raw_frame = self._ultra_fast_capture()
+                capture_time = time.perf_counter() - start_time
 
-                # Check if capture returned data - early exit for null/empty frames
-                if raw_frame is None or raw_frame.size == 0:
-                    # No console output for this common case to avoid spam
-                    self.error_count += 1
-                    self.last_capture = current_time
-                    continue
+                # Only handle frames that exist and are not timed out
+                if raw_frame is not None and raw_frame.size > 0 and capture_time < self.capture_timeout:
+                    # Process frame - minimal error handling
+                    try:
+                        surface = self._process_raw_frame(raw_frame)
+                        if surface is not None:
+                            # Create new frame data - direct assignment, no buffer overhead
+                            self.latest_frame = {
+                                'frame': surface,
+                                'timestamp': current_time,
+                                'datetime_utc': datetime.now(timezone.utc).isoformat(),  # Real-time UTC timestamp
+                                'datetime_local': datetime.now().isoformat(),  # Real-time local timestamp
+                                'camera_index': self.camera_index,
+                                'capture_time': capture_time
+                            }
+                            # Direct counters - no buffer locking overhead!
+                            self.frame_count += 1
+                            self.frame_counter += 1  # Use instance variable for FPS calculation
+                            self.error_count = 0  # Reset on success
 
-                # Process and store frame using pre-allocated buffers
-                try:
-                    surface = self._process_raw_frame(raw_frame)
-
-                    if surface is not None:
-                        frame_data = {
-                            'frame': surface,
-                            'timestamp': current_time,
-                            'datetime_utc': datetime.now(timezone.utc).isoformat(),  # Real-time UTC timestamp
-                            'datetime_local': datetime.now().isoformat(),  # Real-time local timestamp
-                            'camera_index': self.camera_index,
-                            'capture_time': capture_time
-                        }
-
-                        # Add to buffer
-                        self.buffer.add_frame(frame_data)
-
-                        # Reset error count on successful capture
-                        self.error_count = 0
-                        self.frame_count += 1
-                        frame_counter += 1
-                    else:
+                    except Exception:
                         self.error_count += 1
-                        print(f"Camera {self.camera_index} frame processing failed")
-
-                except Exception as e:
-                    self.error_count += 1
-                    print(f"Camera {self.camera_index} frame processing error: {str(e)}")
+                        continue
 
                 self.last_capture = current_time
 
-            except Exception as e:
+            except Exception:
                 self.error_count += 1
-                print(f"Camera {self.camera_index} capture error: {str(e)}")
-                time.sleep(0.1)  # Brief pause on error
+                continue
 
-            # Check if we have too many consecutive errors
-            if self.error_count > self.max_errors:
-                print(f"Camera {self.camera_index} has {self.error_count} consecutive errors, pausing capture")
-                time.sleep(1.0)  # Longer pause when many errors
-                self.error_count = 0
+            # REMOVED all error handling and most debug prints for speed
+            # REMOVED FPS calculation overhead from main loop
 
-            # Calculate FPS every second - optimized timing consistency
-            current_wall_time = time.time()  # Use wall time for FPS display calculations
-            if current_wall_time - fps_timer >= 1.0:
-                self.fps = frame_counter / (current_wall_time - fps_timer)
-                fps_timer = current_wall_time
-                frame_counter = 0
-
-            # Remove sleep for maximum FPS - only yield briefly if too far ahead
-            if current_time - self.last_capture > self.frame_interval + 0.01:  # More than 10ms ahead
-                time.sleep(0.00001)  # Microsecond sleep to yield CPU
+    def calculate_fps(self):
+        """Calculate FPS - called externally to avoid main loop overhead"""
+        if time.time() - self.fps_timer >= 1.0:
+            self.fps = self.frame_counter / (time.time() - self.fps_timer)
+            self.fps_timer = time.time()
+            self.frame_counter = 0
+            return True
+        return False
 
     def stop(self):
         """Stop the camera thread"""
@@ -286,18 +283,16 @@ class CameraThread(threading.Thread):
 
     def get_utc_timestamp(self):
         """Get latest frame UTC timestamp"""
-        latest = self.buffer.get_latest_frame()
-        if latest:
-            return latest.get('datetime_utc', "")
+        if self.latest_frame:
+            return self.latest_frame.get('datetime_utc', "")
         return ""
 
     def get_local_timestamp(self):
         """Get latest frame local timestamp"""
-        latest = self.buffer.get_latest_frame()
-        if latest:
-            return latest.get('datetime_local', "")
+        if self.latest_frame:
+            return self.latest_frame.get('datetime_local', "")
         return ""
 
     def get_buffer_size(self):
         """Get current buffer size"""
-        return self.buffer.get_buffer_size()
+        return 1 if self.latest_frame else 0

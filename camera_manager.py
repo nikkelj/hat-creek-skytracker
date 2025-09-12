@@ -172,12 +172,13 @@ class CameraManager:
                 camera.width_res = camera.prop.get('MaxWidth', 1920)
                 camera.height_res = camera.prop.get('MaxHeight', 1280)
 
-                # Start camera thread for continuous capture
-                self._start_camera_thread(camera)
+            # Start camera thread for continuous capture
+            self._start_camera_thread(camera)
 
-                if update_status_callback:
-                    update_status_callback(f"Camera {camera_index+1} connected successfully: {camera.width_res}x{camera.height_res}")
-                return True
+            if update_status_callback:
+                update_status_callback(f"Camera {camera_index+1} connected successfully: {camera.width_res}x{camera.height_res} at {camera.thread.target_fps} FPS")
+            return True
+
         except Exception as e:
             if update_status_callback:
                 update_status_callback(f"Camera {camera_index+1} connection error: {str(e)}")
@@ -185,8 +186,7 @@ class CameraManager:
             camera.cap = None
             camera.prop = None
             camera.connected = False
-
-        return False
+            return False
 
     def disconnect_camera(self, camera_index, update_status_callback=None):
         """Disconnect camera by index"""
@@ -212,7 +212,7 @@ class CameraManager:
             return
 
         camera.threads_running = True
-        camera.thread = CameraThread(camera.index, camera.cap, 60, 15)  # BUFFER_SIZE=60, TARGET_FPS=15
+        camera.thread = CameraThread(camera.index, camera.cap, 60, 300)  # BUFFER_SIZE=60, TARGET_FPS=300
         camera.thread.start()
 
     def _stop_camera_thread(self, camera):

@@ -86,6 +86,9 @@ class TrackingVisState:
         self.cache_file = "tle_cache.tle"
         self.cache_age_limit = 24 * 3600  # 24 hours in seconds
 
+        # Performance cache for sunlit trajectories (satellite -> sunlit_array)
+        self.sunlit_status_cache = {}
+
     def reset_input_fields(self):
         """Reset input field positions when switching modes."""
         self.cursor_pos = {

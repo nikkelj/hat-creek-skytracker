@@ -35,6 +35,7 @@ from tracking_visuals import TrackingVisState, draw_polar_plot, draw_satellites,
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, update_camera_frames_from_buffers, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, render_joystick_mode, handle_joystick_mode_events
+from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 # Camera button initialization is now handled internally by camera_manager
 from events import *
 
@@ -115,6 +116,29 @@ tracking_vis_state = TrackingVisState()
 global joystick_mode_state
 joystick_mode_state = JoystickModeState()
 
+# Rendering Thread Management
+global tracking_viz_thread
+global joystick_viz_thread
+global position_update_lock
+
+# Thread safety for position updates
+position_update_lock = threading.Lock()
+
+# Initialize rendering threads
+print("Initializing rendering threads...")
+tracking_viz_thread = TrackingVisualizationThread(display, config_state, tracking_vis_state, target_fps=10)
+joystick_viz_thread = JoystickVisualizationThread(display, config_state, tracking_vis_state, target_fps=10)
+
+# Share the timescale reference with rendering threads for synchronization
+ts = load.timescale()
+tracking_viz_thread.set_timescale(ts)
+joystick_viz_thread.set_timescale(ts)
+
+# Start rendering threads
+tracking_viz_thread.start()
+joystick_viz_thread.start()
+print("Rendering threads started.")
+
 # Define status update callback for satellite loading
 def update_status_callback(message):
     status_messages.append(message)
@@ -129,8 +153,6 @@ def update_status_callback(message):
     pygame.display.flip()
     pygame.time.wait(50)  # Brief pause to ensure display update
     print(f"Debug: Status - {message}")
-
-ts = load.timescale()
 
 try:
     from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
@@ -229,28 +251,32 @@ while running:
 
     # Compute satellite positions at 10 Hz
     if current_time - last_update_time >= update_interval:
-        tracking_vis_state.satellite_positions = {}
+        # Use lock to protect position updates for thread safety
+        with position_update_lock:
+            tracking_vis_state.satellite_positions = {}
 
-        # Calculate current time for trajectory interpolation - ensure it's never None
-        if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
-            # User is actively dragging slider - use slider position
-            fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
-            current_tt = tracking_vis_state.t0.tt + fraction * (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
-        elif tracking_vis_state.paused and tracking_vis_state.paused_tt is not None:
-            # Simulation is paused - use paused time
-            current_tt = tracking_vis_state.paused_tt
-        else:
-            # Default to current time
-            current_tt = ts.now().tt
+            # Calculate current time for trajectory interpolation - ensure it's never None
+            if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
+                # User is actively dragging slider - use slider position
+                fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
+                current_tt = tracking_vis_state.t0.tt + fraction * (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
+            elif tracking_vis_state.paused and tracking_vis_state.paused_tt is not None:
+                # Simulation is paused - use paused time
+                current_tt = tracking_vis_state.paused_tt
+            else:
+                # Default to current time
+                current_tt = ts.now().tt
 
-            # Update slider position to reflect real-time (only if trajectories are available)
-            if tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None and not tracking_vis_state.dragging_slider:
-                fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
-                display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
-        # Use state-direct mutation approach for satellite position updates
-        # Only update positions if trajectories are available
-        if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
-            update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+                # Update slider position to reflect real-time (only if trajectories are available)
+                if tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None and not tracking_vis_state.dragging_slider:
+                    fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
+                    display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
+
+            # Use state-direct mutation approach for satellite position updates
+            # Only update positions if trajectories are available
+            if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
+                update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+
         last_update_time = current_time
 
     # Handle events using modular event system
@@ -451,17 +477,31 @@ while running:
 
     cx = display.sub_x + display.sub_width // 2
     cy = display.sub_y + display.sub_height // 2
+    viz_surface = None
     if current_mode == "config_options":
         draw_config_options(display, config_state)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
-        display.menu_screen.fill((0, 0, 0), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))  # Clear the subplot area with black
-        draw_polar_plot(display, config_state, ts, current_tt, tracking_vis_state)
-        draw_satellites(display, tracking_vis_state, cx, cy, PolarPlotMode.FULL_SCREEN)
+        # Only clear if we don't have a thread surface (initial loading)
+        # This prevents washing away the displayed surface while thread is rendering
+        if not hasattr(tracking_viz_thread, 'latest_surface') or tracking_viz_thread.latest_surface is None:
+            display.menu_screen.fill((0, 0, 0), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))
+
+        # Calculate center coordinates for satellite rendering calculations
+        cx = display.sub_x + display.sub_width // 2
+        cy = display.sub_y + display.sub_height // 2
+
+        # Get completed surface from thread and blit it once when available
+        viz_surface = tracking_viz_thread.get_latest_surface()
+        if viz_surface:
+            display.menu_screen.blit(viz_surface, (display.sub_x, display.sub_y))
+
+        # Draw UI elements on top of the polar plot
         draw_filters(display, tracking_vis_state)
         draw_legend(display)
         draw_details(display, tracking_vis_state)
         draw_time_display(display)
         draw_satellite_count(display, tracking_vis_state)
+
         # Modular pass table filtering and sorting - replaced ~30 lines of inline filtering logic
         from tracking_visuals import filter_and_sort_pass_table
         sorted_filtered_pass_table = filter_and_sort_pass_table(tracking_vis_state)
@@ -527,7 +567,23 @@ while running:
         render_combined_view_controls(display.menu_screen, display.sub_x, display.sub_y, display.sub_width, display.sub_height,
                                         display.small_font, display.tiny_font)
     elif current_mode == "joystick_loop":
-        render_joystick_mode(display, joystick_mode_state, tracking_vis_state, config_state)
+        # Clear the main area
+        display.menu_screen.fill((30, 30, 30), (display.sub_x, display.sub_y,
+                                        display.sub_width, display.sub_height))
+
+        # Blit pre-rendered polar plot from joystick visual thread
+        joystick_surface = joystick_viz_thread.get_latest_surface()
+        if joystick_surface:
+            display.menu_screen.blit(joystick_surface, (display.sub_x + display.sub_width // 2, display.sub_y))
+
+        # Render connection controls and joystick status (not threaded)
+        from joystick_controller import render_connection_controls, render_joystick_status, render_camera_feeds
+        render_connection_controls(display, joystick_mode_state)
+        render_joystick_status(display, joystick_mode_state)
+
+        # Render camera feeds
+        render_camera_feeds(display, joystick_mode_state)
+
         # Update joystick rate control
         if joystick_mode_state.telescope_connected:
             joystick_mode_state.rate_control()
@@ -552,3 +608,13 @@ while running:
     clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness
 
 pygame.quit()
+
+# Clean up rendering threads
+print("Shutting down rendering threads...")
+if tracking_viz_thread:
+    tracking_viz_thread.stop()
+if joystick_viz_thread:
+    joystick_viz_thread.stop()
+print("Rendering threads stopped. All cleanup complete.")
+
+print("Program exit complete.")

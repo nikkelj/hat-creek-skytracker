@@ -297,36 +297,30 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     """
     state.satellite_positions = {}
 
-    # Handle selected satellite case first
-    if state.selected_satellite and state.selected_satellite in state.satellite_trajectories:
-        px, py, alt, dist = interpolate_position(state.satellite_trajectories[state.selected_satellite], current_tt)
-        if px is not None and alt > elevation_mask_deg:
-            state.satellite_positions[state.selected_satellite] = (px, py, alt, dist)
-    else:
-        # Handle all satellites with filtering
-        for sat in state.satellites:
-            if sat in state.satellite_trajectories:
-                px, py, alt, dist = interpolate_position(state.satellite_trajectories[sat], current_tt)
-                if px is not None and alt > elevation_mask_deg:
-                    # Apply filters
-                    include_sat = True
-                    if state.filter_text:
-                        include_sat = state.filter_text.lower() in sat.name.lower() or state.filter_text in sat.model.satnum_str
-                    if state.filter_above_alt_text:
-                        try:
-                            alt_filter = float(state.filter_above_alt_text)
-                            include_sat = include_sat and state.satellite_mean_altitudes[sat] >= alt_filter
-                        except ValueError:
-                            include_sat = False
-                    if state.filter_below_alt_text:
-                        try:
-                            alt_filter = float(state.filter_below_alt_text)
-                            include_sat = include_sat and state.satellite_mean_altitudes[sat] <= alt_filter
-                        except ValueError:
-                            include_sat = False
+    # Always handle all satellites with filtering (don't exclude other satellites when one is selected)
+    for sat in state.satellites:
+        if sat in state.satellite_trajectories:
+            px, py, alt, dist = interpolate_position(state.satellite_trajectories[sat], current_tt)
+            if px is not None and alt > elevation_mask_deg:
+                # Apply filters
+                include_sat = True
+                if state.filter_text:
+                    include_sat = state.filter_text.lower() in sat.name.lower() or state.filter_text in sat.model.satnum_str
+                if state.filter_above_alt_text:
+                    try:
+                        alt_filter = float(state.filter_above_alt_text)
+                        include_sat = include_sat and state.satellite_mean_altitudes[sat] >= alt_filter
+                    except ValueError:
+                        include_sat = False
+                if state.filter_below_alt_text:
+                    try:
+                        alt_filter = float(state.filter_below_alt_text)
+                        include_sat = include_sat and state.satellite_mean_altitudes[sat] <= alt_filter
+                    except ValueError:
+                        include_sat = False
 
-                    if include_sat:
-                        state.satellite_positions[sat] = (px, py, alt, dist)
+                if include_sat:
+                    state.satellite_positions[sat] = (px, py, alt, dist)
 
 def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """

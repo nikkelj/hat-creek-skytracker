@@ -519,8 +519,9 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
 
                     self._frame_counter += 1
 
-                    # Clear every 6 frames (roughly 60fps/10fps = 6 frames sync)
-                    if self._frame_counter % 6 == 0:
+                    # Clear every n-frames
+                    # If the thread gets really slow, increase the modulo to ward off darkness from delay
+                    if self._frame_counter % 1 == 0:
                         self.surface.fill((0, 0, 0))
 
                     # Set up display bounds for surface rendering
@@ -621,8 +622,9 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
 
                     self._frame_counter += 1
 
-                    # Clear every 6 frames (roughly 60fps/10fps = 6 frames sync)
-                    if self._frame_counter % 6 == 0:
+                    # Clear every n-frames
+                    # If the thread gets really slow, increase the modulo to ward off darkness from delay
+                    if self._frame_counter % 1 == 0:
                         self.surface.fill((0, 0, 0))
 
                     # Set up display bounds for quadrant mode

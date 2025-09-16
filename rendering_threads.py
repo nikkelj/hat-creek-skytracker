@@ -252,6 +252,96 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
                 pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
 
+def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
+    """
+    Draw satellite details panel on a specified surface with given bounds.
+    Surface-based version of draw_details from tracking_visuals.py
+    """
+    global SATELLITE_LABEL_FONT
+
+    if not (state.hovered_satellite or state.selected_satellite):
+        return
+
+    # Get the satellite to display details for
+    sat = state.selected_satellite if state.selected_satellite else state.hovered_satellite
+
+    # Get satellite data the same way as the main draw_details function
+    epoch_dt = sat.epoch.utc_datetime().strftime("%Y-%m-%d %H:%M:%S")
+    details = [
+        f"NORAD ID: {sat.model.satnum_str}",
+        f"Name: {sat.name.strip()}",
+        f"Int. Designator: {sat.model.intldesg}",
+        f"Epoch: {epoch_dt}",
+        f"Inclination (deg): {math.degrees(sat.model.inclo):.2f}",
+        f"RAAN (deg): {math.degrees(sat.model.nodeo):.2f}",
+        f"Arg. of Perigee (deg): {math.degrees(sat.model.argpo):.2f}",
+        f"Mean Anomaly (deg): {math.degrees(sat.model.mo):.2f}",
+        f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
+        f"Rev Number: {sat.model.revnum}",
+    ]
+
+    # Add altitude information
+    dist = None
+    if state.satellite_positions and sat in state.satellite_positions:
+        dist = state.satellite_positions[sat][3]  # Slant range from position data
+
+    if ((state.selected_satellite or state.hovered_satellite) and
+        hasattr(state, 'satellite_perigee') and hasattr(state, 'satellite_apogee') and
+        state.satellite_perigee and state.satellite_apogee):
+        sat_perigee = state.satellite_perigee[sat] if sat in state.satellite_perigee else None
+        sat_apogee = state.satellite_apogee[sat] if sat in state.satellite_apogee else None
+        if sat_perigee is not None and sat_apogee is not None:
+            details.extend([
+                f"Apogee Altitude (km): {sat_apogee:.1f}",
+                f"Perigee Altitude (km): {sat_perigee:.1f}"
+            ])
+
+    if dist is not None:
+        details.append(f"Slant Range (km): {dist:.1f}")
+
+    # Position the details panel based on mode and surface bounds
+    surface_width, surface_height = surface.get_size()
+
+    # Use the same panel size and font size as tracking visuals mode for consistency
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        # In quadrant mode, position relative to the quadrant surface bounds
+        panel_x = surface_width - 190  # Right side of quadrant surface (same as full-screen)
+        panel_y = 20  # Top margin
+        panel_width = 170  # Same width as tracking visuals mode
+        panel_height = min(250, surface_height - 30)  # Same height as tracking visuals mode
+    else:
+        # Full screen mode - original positioning relative to surface
+        panel_x = surface_width - 190
+        panel_y = 20
+        panel_width = 170
+        panel_height = min(250, surface_height - 30)
+
+    # Create font if needed (always use same font size as tracking visuals)
+    if SATELLITE_LABEL_FONT is None:
+        SATELLITE_LABEL_FONT = pygame.font.Font(None, 12)  # Same as tracking visuals
+
+    # Use consistent font size for both modes (same as tracking visuals)
+    dynamic_font = pygame.font.Font(None, 12)  # Same as tracking visuals
+
+    # Draw panel background
+    pygame.draw.rect(surface, (50, 50, 50), (panel_x, panel_y, panel_width, panel_height))  # Dark grey background
+    pygame.draw.rect(surface, (0, 0, 0), (panel_x, panel_y, panel_width, panel_height), 2)  # Black border
+
+    # Set consistent line height and padding (same as tracking visuals)
+    line_height = 15  # Same as tracking visuals
+    padding = 5  # Same as tracking visuals
+
+    # Draw detail lines
+    y_offset = panel_y + padding
+    for i, line in enumerate(details):
+        text_surface = dynamic_font.render(line, True, (255, 255, 255))
+        surface.blit(text_surface, (panel_x + padding, y_offset))
+        y_offset += line_height
+
+        # Prevent drawing below panel
+        if y_offset > panel_y + panel_height - padding:
+            break
+
 def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """Draw satellites on a specified surface with given bounds."""
 
@@ -663,6 +753,9 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
 
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, render_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
                     draw_satellites_on_surface(self.surface, render_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+
+                    # Draw satellite details panel after satellites
+                    draw_details_on_surface(self.surface, render_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                 else:
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))

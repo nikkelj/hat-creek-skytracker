@@ -53,6 +53,12 @@ class JoystickModeState:
         self.ts = None  # Loaded timescope for polar plot
         self.current_tt = None  # Current time for polar plot
 
+        # Capture integration
+        self.capture_active = False
+        self.capture_progress = 0.0
+        self.capture_status = ""
+        self.capture_button_rect = None
+
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
         self.joystick_tare = {}
@@ -163,8 +169,8 @@ class JoystickModeState:
                     self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
                     print(f"ALT rate: {rate}")
 
-    def process_joystick_events(self, event):
-        """Process pygame joystick events"""
+    def process_joystick_events(self, event, current_mode=None, current_tracking_surface=None, tracking_vis_state=None, config_state=None):
+        """Process pygame joystick events (non-mode-specific)"""
         if event.type == pygame.JOYDEVICEADDED:
             joy = pygame.joystick.Joystick(event.device_index)
             self.joysticks[joy.get_instance_id()] = joy
@@ -190,7 +196,16 @@ class JoystickModeState:
                         self.connected_joystick = next(iter(self.joysticks.keys()))
 
         elif event.type == pygame.JOYBUTTONDOWN:
-            # Handle stop button (typically Circle button on PS controller)
+            # Handle button events based on mode
+            print(f"process_joystick_events: Button {event.button} pressed in mode {current_mode}")
+
+            # Capture button (X button) - works in ANY mode
+            if event.button == 0:  # X button
+                print("process_joystick_events: X button pressed - calling _handle_capture_toggle")
+                self._handle_capture_toggle(current_tracking_surface, tracking_vis_state, config_state)
+                return  # Don't process any other buttons after handling capture
+
+            # Handle stop button (Circle button) - this is universal
             if event.button == 1:  # Circle button
                 self.stopped = not self.stopped
                 print(f"Stop toggled: {self.stopped}")
@@ -200,9 +215,44 @@ class JoystickModeState:
                     self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
                     self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
 
-            # Handle tare button (typically X button on PS controller)
-            elif event.button == 0:  # X button
+            elif event.button == 2:  # Square button for tare
+                print(f"Taring joystick axes")
                 self.tare_current_joystick()
+
+        elif event.type == pygame.JOYAXISMOTION:
+            # Update joystick axis state for display (this stays in process for all modes)
+            if self.connected_joystick is not None and event.joy == self.connected_joystick:
+                # Could store axis state here if needed for display updates
+                pass
+
+    def _handle_capture_toggle(self, tracking_surface, tracking_vis_state, config_state):
+        """Handle capture toggle for joystick"""
+        from camera_manager import camera_manager
+        from capture_manager import capture_manager
+
+        if self.capture_active:
+            # Stop capture and begin dump process for all cameras
+            capture_manager.stop_capture(None, tracking_vis_state, tracking_vis_state.selected_satellite, config_state, tracking_surface)
+            print("Capture stopped on all cameras, dump process started")
+            self.capture_active = False
+        else:
+            # Start capture on all connected cameras
+            # Check if any camera is available and connected
+            any_camera_available = False
+            for idx in range(len(camera_manager.cameras)):
+                camera = camera_manager.get_camera(idx)
+                if camera and camera.connected:
+                    any_camera_available = True
+                    break
+
+            if any_camera_available:
+                capture_manager.start_capture()  # Start capture on all cameras
+                self.capture_active = True
+                print("Capture started on all connected cameras")
+            else:
+                print("No cameras available for capture")
+
+    # Helper methods to get states from global scope - removed to avoid circular import
 
     def update_polar_plot_time(self):
         """Update current time for polar plot"""
@@ -229,7 +279,8 @@ def render_joystick_mode(display, joystick_state, tracking_vis_state, config_sta
     # Top right - Polar graph
     render_polar_graph(display, joystick_state, tracking_vis_state, config_state)
 
-    # Bottom half - Camera feeds
+    # Bottom half - Capture controls and camera feeds
+    render_capture_controls(display, joystick_state)
     render_camera_feeds(display, joystick_state)
 
 def render_connection_controls(display, joystick_state):
@@ -466,7 +517,164 @@ def render_polar_graph(display, joystick_state, tracking_vis_state, config_state
 
     # Draw satellite info pane to the right of the polar plot
     from tracking_visuals import draw_details
-    draw_details(display, tracking_vis_state)
+    draw_details(display, tracking_vis_state, PolarPlotMode.UPPER_RIGHT_QUADRANT)
+
+def render_capture_controls(display, joystick_state):
+    """Render capture controls and progress indicator below polar graph"""
+    try:
+        # Update capture progress from capture manager
+        from capture_manager import capture_manager
+        progress, status = capture_manager.get_dump_progress()
+
+        # Update joystick state
+        joystick_state.capture_progress = progress
+        joystick_state.capture_status = status if status else ""
+
+        # Determine if cameras are connected and get individual camera status
+        camera_connected = False
+        camera_buffer_info = {}
+        joystick_state.capture_active = False
+
+        for idx in range(len(camera_manager.cameras)):
+            camera = camera_manager.get_camera(idx)
+            if camera and camera.connected and camera.thread:
+                camera_connected = True
+                buffer_info = camera.thread.get_capture_buffer_info()
+
+                # Store individual camera info
+                camera_buffer_info[idx] = buffer_info
+
+                # Check if any camera is actively capturing
+                if buffer_info.get('capture_active', False):
+                    joystick_state.capture_active = True
+
+        # Capture toggle button
+        button_y = display.sub_y + display.sub_height // 2 - 80  # Between polar graph and camera feeds
+        button_width = 90
+        button_height = 35
+        button_x = display.sub_x + display.sub_width - button_width - 20  # Right side of screen
+
+        joystick_state.capture_button_rect = pygame.Rect(button_x, button_y, button_width, button_height)
+
+        # Button color based on capture state
+        mouse_pos = pygame.mouse.get_pos()
+        hover = joystick_state.capture_button_rect.collidepoint(mouse_pos)
+
+        if joystick_state.capture_active:
+            button_color = (0, 150, 0) if hover else (0, 100, 0)  # Green when active
+            button_text = "Stop Capture"
+        else:
+            button_color = (150, 150, 150) if hover else (120, 120, 120)  # Grey when inactive
+            button_text = "Start Capture"
+
+        pygame.draw.rect(display.menu_screen, button_color, joystick_state.capture_button_rect)
+        pygame.draw.rect(display.menu_screen, (200, 200, 200), joystick_state.capture_button_rect, 1)
+
+        # Button text
+        button_surface = display.small_font.render(button_text, True, (255, 255, 255))
+        text_rect = button_surface.get_rect(center=joystick_state.capture_button_rect.center)
+        display.menu_screen.blit(button_surface, text_rect)
+
+        # Buffer fill progress bar (below button)
+        progress_y = button_y + button_height + 10
+        progress_width = button_width
+        progress_height = 15
+
+        # Progress bar background
+        pygame.draw.rect(display.menu_screen, (50, 50, 50), (button_x, progress_y, progress_width, progress_height))
+        pygame.draw.rect(display.menu_screen, (150, 150, 150), (button_x, progress_y, progress_width, progress_height), 1)
+
+        # Display individual camera buffer status
+        if camera_connected and camera_buffer_info:
+            # Display format: C1: [frames] [percent]% | C2: [frames] [percent]%
+            camera_status_lines = []
+            camera_fill_ratios = []
+            total_capacity = 0
+
+            for cam_idx in sorted(camera_buffer_info.keys()):
+                buffer_info = camera_buffer_info[cam_idx]
+                cam_num = cam_idx + 1
+                max_buffer_size = buffer_info.get('max_buffer_size', 1000)
+                total_capacity += max_buffer_size
+
+                if joystick_state.capture_active:
+                    # During capture: show frame count and capture progress percentage
+                    captured_frames = buffer_info.get('capture_frame_count', 0)
+                    capture_progress_ratio = buffer_info.get('capture_progress_ratio', 0.0)
+                    camera_fill_ratios.append(capture_progress_ratio)
+                    camera_status_lines.append(f"C{cam_num}: {captured_frames} {int(capture_progress_ratio * 100)}%")
+                else:
+                    # When idle: show buffer capacity with zero percent
+                    camera_status_lines.append(f"C{cam_num}: {max_buffer_size} 0%")
+
+            # Draw progress bar only when capturing or dumping
+            if camera_fill_ratios:
+                # Use average fill ratio for progress bar color and length
+                avg_fill_ratio = sum(camera_fill_ratios) / len(camera_fill_ratios)
+
+                if avg_fill_ratio < 0.7:
+                    # Green for low fill
+                    fill_color = (0, int(255 * avg_fill_ratio / 0.7), 0)
+                elif avg_fill_ratio < 0.9:
+                    # Yellow to orange for medium fill
+                    fill_level = (avg_fill_ratio - 0.7) / 0.2
+                    fill_color = (int(255 * fill_level), int(200 * fill_level), 0)
+                else:
+                    # Red for high fill
+                    fill_color = (255, int(100 * (avg_fill_ratio - 0.9) / 0.1), 0)
+
+                # Draw progress fill based on average of both cameras
+                fill_width = int(progress_width * avg_fill_ratio)
+                if fill_width > 0:
+                    pygame.draw.rect(display.menu_screen, fill_color,
+                                    (button_x, progress_y, fill_width, progress_height))
+
+            # Show camera status lines (C1: frames %, C2: frames %)
+            if camera_status_lines:
+                status_text = " | ".join(camera_status_lines)
+                fill_text = display.tiny_font.render(status_text, True, (255, 255, 255))
+
+                text_width = fill_text.get_width()
+                text_y = progress_y + progress_height + 5
+                text_x = button_x + (progress_width - text_width) // 2
+                display.menu_screen.blit(fill_text, (text_x, text_y))
+
+        # Status and progress information (to the left of progress bar)
+        info_x = button_x - 200
+        info_y = progress_y - 5
+
+        # Capture status
+        if joystick_state.capture_active:
+            status_text = display.small_font.render("REC", True, (255, 0, 0))
+            display.menu_screen.blit(status_text, (info_x, info_y))
+
+            # Recording time (would need to track actual time)
+            # For now, just show "Recording..." when active
+            recording_text = display.tiny_font.render("Recording...", True, (255, 0, 0))
+            display.menu_screen.blit(recording_text, (info_x, info_y + 15))
+        else:
+            status_text = display.small_font.render("Ready", True, (0, 200, 0))
+            display.menu_screen.blit(status_text, (info_x, info_y))
+
+        # Dump progress (when dumping)
+        if progress > 0:
+            if progress < 1.0:
+                dump_progress = int(progress * 100)
+                dump_text = display.tiny_font.render(f"Dumping: {dump_progress}%", True, (255, 165, 0))
+            else:
+                dump_text = display.tiny_font.render("Dump Complete!", True, (0, 255, 0))
+            display.menu_screen.blit(dump_text, (info_x, info_y + 30))
+
+        # Camera status
+        if not camera_connected:
+            no_cam_text = display.tiny_font.render("Camera not connected", True, (255, 0, 0))
+            display.menu_screen.blit(no_cam_text, (info_x + 20, info_y + 15))
+
+    except Exception as e:
+        print(f"Error in render_capture_controls: {e}")
+        # Fallback: render simple error message
+        error_text = display.tiny_font.render("Capture Error", True, (255, 0, 0))
+        display.menu_screen.blit(error_text, (display.sub_x + 10, display.sub_y + display.sub_height // 2 - 60))
 
 def render_camera_feeds(display, joystick_state=None):
     """Render camera feeds with cross-hairs using existing camera manager"""
@@ -480,14 +688,16 @@ def render_camera_feeds(display, joystick_state=None):
         camera1_frame = None
         camera2_frame = None
 
-        # Safely access cameras with bounds checking
+        # Safely access cameras with bounds checking and get time/fps info
         if len(camera_manager.cameras) > 0:
-            camera1_connected = camera_manager.cameras[0].connected
-            camera1_frame = camera_manager.cameras[0].frame
+            camera1 = camera_manager.cameras[0]
+            camera1_connected = camera1.connected
+            camera1_frame = camera1.frame
 
         if len(camera_manager.cameras) > 1:
-            camera2_connected = camera_manager.cameras[1].connected
-            camera2_frame = camera_manager.cameras[1].frame
+            camera2 = camera_manager.cameras[1]
+            camera2_connected = camera2.connected
+            camera2_frame = camera2.frame
 
         display_width = display.sub_width - 20
         display_height = display.sub_height // 2 - 20  # Bottom half minus some margin
@@ -536,6 +746,17 @@ def render_camera_feeds(display, joystick_state=None):
                 # Camera 1 label
                 cam1_text = display.small_font.render("Camera 1", True, (255, 255, 255))
                 display.menu_screen.blit(cam1_text, (camera_area_x + 10, camera_area_y + 10))
+
+                # Display time and FPS info below camera 1 (similar to sensor calibration mode)
+                info_font = pygame.font.Font(None, 16)
+                fps_text = info_font.render(f"FPS: {camera1.fps:.1f}", True, (255, 255, 255))
+                display.menu_screen.blit(fps_text, (camera_area_x + cam1_width - 80, camera_area_y + cam1_height - 25))
+
+                utc_text = info_font.render(f"UTC: {camera1.utc_ts}", True, (255, 255, 255))
+                display.menu_screen.blit(utc_text, (camera_area_x + 10, camera_area_y + cam1_height - 25))
+
+                local_text = info_font.render(f"Local: {camera1.local_ts}", True, (255, 255, 255))
+                display.menu_screen.blit(local_text, (camera_area_x + cam1_width // 2, camera_area_y + cam1_height - 25))
             except Exception as e:
                 error_text = display.small_font.render("Camera 1 Error", True, (255, 0, 0))
                 display.menu_screen.blit(error_text, (camera_area_x + 10, camera_area_y + 10))
@@ -570,6 +791,17 @@ def render_camera_feeds(display, joystick_state=None):
                 # Camera 2 label
                 cam2_text = display.small_font.render("Camera 2", True, (255, 255, 255))
                 display.menu_screen.blit(cam2_text, (cam2_x + 10, camera_area_y + 10))
+
+                # Display time and FPS info below camera 2 (similar to sensor calibration mode)
+                info_font = pygame.font.Font(None, 16)
+                fps_text = info_font.render(f"FPS: {camera2.fps:.1f}", True, (255, 255, 255))
+                display.menu_screen.blit(fps_text, (cam2_x + cam2_width - 80, camera_area_y + cam2_height - 25))
+
+                utc_text = info_font.render(f"UTC: {camera2.utc_ts}", True, (255, 255, 255))
+                display.menu_screen.blit(utc_text, (cam2_x + 10, camera_area_y + cam2_height - 25))
+
+                local_text = info_font.render(f"Local: {camera2.local_ts}", True, (255, 255, 255))
+                display.menu_screen.blit(local_text, (cam2_x + cam2_width // 2, camera_area_y + cam2_height - 25))
             except Exception as e:
                 error_text = display.small_font.render("Camera 2 Error", True, (255, 0, 0))
                 display.menu_screen.blit(error_text, (cam2_x + 10, camera_area_y + 10))
@@ -603,8 +835,8 @@ def render_camera_feeds(display, joystick_state=None):
 # JOYSTICK MODE EVENT HANDLING
 # ==============================================================================
 
-def handle_joystick_mode_events(event, joystick_state, display):
-    """Handle events specific to joystick mode"""
+def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_vis_state, config_state, current_tracking_surface):
+    """Handle mouse events specific to joystick mode"""
     if event.type == pygame.MOUSEBUTTONDOWN:
         pos = event.pos
 
@@ -638,5 +870,100 @@ def handle_joystick_mode_events(event, joystick_state, display):
                 joystick_state.selected_port = joystick_state.available_ports[next_index]['device']
                 print(f"Selected port: {joystick_state.selected_port}")
 
-    # Always process joystick events (handled internally by joystick_state)
-    joystick_state.process_joystick_events(event)
+        # Handle satellite selection/hover in polar plot area
+        quadrant_x = display.sub_x + display.sub_width // 2
+        quadrant_y = display.sub_y
+        quadrant_width = display.sub_width // 2
+        quadrant_height = display.sub_height // 2
+
+        quadrant_rect = pygame.Rect(quadrant_x, quadrant_y, quadrant_width, quadrant_height)
+        if quadrant_rect.collidepoint(pos):
+            # Mouse is over polar plot quadrant - check for satellite hover/selection
+            hovered_sat = None
+
+            # Debug: print mouse position on click
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                print(f"Click at ({pos[0]}, {pos[1]}) in polar plot quadrant")
+
+            # Pre-calculate centers and scale factor to match draw_satellites exactly
+            full_screen_center_x = display.sub_x + display.sub_width // 2
+            full_screen_center_y = display.sub_y + display.sub_height // 2
+            quadrant_center_x = display.sub_x + display.sub_width // 2
+            quadrant_center_y = display.sub_y + display.sub_height // 2
+            scale_factor = 0.45
+
+            for sat, (px, py, alt, _) in tracking_vis_state.satellite_positions.items():
+                # Exact coordinate transformation matching draw_satellites
+                rel_x = px - full_screen_center_x
+                rel_y = py - full_screen_center_y
+                trans_x = quadrant_center_x + rel_x * scale_factor
+                trans_y = quadrant_center_y + rel_y * scale_factor
+
+                if alt > 0:  # Only consider satellites above horizon
+                    # Debug satellite positions on click
+                    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                        print(f"Satellite {sat.name}: orig({px},{py}) -> trans({trans_x},{trans_y})")
+
+                    # Check if mouse is over satellite (larger hit area for easier clicking)
+                    dist_to_sat = math.sqrt((pos[0] - trans_x)**2 + (pos[1] - trans_y)**2)
+                    if dist_to_sat <= 15:  # 15 pixel radius for easier clicking/hovering
+                        hovered_sat = sat
+                        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                            print(f"  -> Hit! Distance: {dist_to_sat}")
+                        break
+
+            # Update hover state on motion
+            if event.type == pygame.MOUSEMOTION:
+                tracking_vis_state.hovered_satellite = hovered_sat
+
+            # Handle satellite selection on click
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if hovered_sat is not None:
+                    if tracking_vis_state.selected_satellite == hovered_sat:
+                        tracking_vis_state.selected_satellite = None  # Deselect if clicking same
+                        print("Deselected satellite")
+                    else:
+                        tracking_vis_state.selected_satellite = hovered_sat  # Select new satellite
+                        print(f"Selected satellite: {hovered_sat.name}")
+                else:
+                    print("  -> Clicked empty area")
+                    # Click in empty area - deselect current selection
+                    tracking_vis_state.selected_satellite = None
+                    print("Deselected satellite (empty area clicked)")
+        else:
+            # Mouse not over polar plot area - clear hover state
+            if event.type == pygame.MOUSEMOTION:
+                tracking_vis_state.hovered_satellite = None
+
+        # Capture button (mouse click)
+        if (hasattr(joystick_state, 'capture_button_rect') and
+            joystick_state.capture_button_rect and
+            joystick_state.capture_button_rect.collidepoint(pos)):
+            _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, current_tracking_surface)
+
+def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tracking_surface=None):
+    """Handle capture toggle from UI or joystick"""
+    from camera_manager import camera_manager
+    from capture_manager import capture_manager
+
+    if joystick_state.capture_active:
+        # Stop capture and begin dump process for all cameras
+        capture_manager.stop_capture(None, tracking_vis_state, tracking_vis_state.selected_satellite, config_state, tracking_surface)
+        print("Capture stopped on all cameras, dump process started")
+        joystick_state.capture_active = False
+    else:
+        # Start capture on all connected cameras
+        # Check if any camera is available and connected
+        any_camera_available = False
+        for idx in range(len(camera_manager.cameras)):
+            camera = camera_manager.get_camera(idx)
+            if camera and camera.connected:
+                any_camera_available = True
+                break
+
+        if any_camera_available:
+            capture_manager.start_capture()  # Start capture on all cameras
+            joystick_state.capture_active = True
+            print("Capture started on all connected cameras")
+        else:
+            print("No cameras available for capture")

@@ -673,7 +673,7 @@ def draw_legend(display):
     geo_label = display.small_font.render("GEO (Purple)", True, (255, 255, 255))
     display.menu_screen.blit(geo_label, (display.legend_x + 40, display.legend_y + 105))
 
-def draw_details(display, state):
+def draw_details(display, state, mode=PolarPlotMode.FULL_SCREEN):
     """
     State-direct mutation function for drawing satellite details panel.
     Takes display and state objects directly instead of individual parameters.
@@ -704,12 +704,31 @@ def draw_details(display, state):
                 ])
         if ((state.selected_satellite or state.hovered_satellite) and dist is not None):
             details.append(f"Slant Range (km): {dist:.1f}")
-        details_rect = pygame.Rect(display.sub_x + display.sub_width - 190, display.sub_y + 20, 170, 250)
+
+        # Position the details panel based on mode
+        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            # In quadrant mode, position relative to the quadrant bounds (scaled and offset)
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 90, display.sub_y + 20, 85, 125)
+        else:
+            # Full screen mode - original positioning
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 190, display.sub_y + 20, 170, 250)
+
         pygame.draw.rect(display.menu_screen, (50, 50, 50), details_rect)  # Dark grey background
         pygame.draw.rect(display.menu_screen, (0, 0, 0), details_rect, 2)  # Black border
+
+        # Adjust font size and spacing for smaller quadrant panel
+        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            font_to_use = display.tiny_font
+            line_height = 12
+            padding = 3
+        else:
+            font_to_use = display.small_font
+            line_height = 15
+            padding = 5
+
         for i, line in enumerate(details):
-            text_surface = display.small_font.render(line, True, (255, 255, 255))
-            display.menu_screen.blit(text_surface, (details_rect.x + 5, details_rect.y + 5 + i * 15))
+            text_surface = font_to_use.render(line, True, (255, 255, 255))
+            display.menu_screen.blit(text_surface, (details_rect.x + padding, details_rect.y + padding + i * line_height))
 
 def draw_time_display(display):
     """

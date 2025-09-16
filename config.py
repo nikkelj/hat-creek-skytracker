@@ -19,6 +19,10 @@ class ConfigState:
         self.alt_str = "120.0"
         self.elevation_mask_str = "0.0"
 
+        # System configuration
+        self.buffer_size = 1000  # Circular buffer size (frames)
+        self.image_format = "BMP"  # Capture image format (BMP/PNG)
+
         # Camera configuration (units: pixel_size=um, array_size_diagonal=mm, focal_length=mm, alignment_rotation=deg, gain=unitless, exposure=us)
         self.camera_configs = {
             "camera1": {
@@ -72,6 +76,10 @@ class ConfigState:
         self.lon_str = config_dict.get("lon", self.lon_str)
         self.alt_str = config_dict.get("alt", self.alt_str)
         self.elevation_mask_str = config_dict.get("elevation_mask", self.elevation_mask_str)
+
+        # Load system configuration
+        self.buffer_size = config_dict.get("buffer_size", self.buffer_size)
+        self.image_format = config_dict.get("image_format", self.image_format)
 
         # Load camera configurations if present
         if "camera_configs" in config_dict:

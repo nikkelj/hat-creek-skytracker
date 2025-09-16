@@ -3,6 +3,10 @@ import zwoasi as asi
 import numpy as np
 import json
 from camera_buffer import CameraThread, CircularBuffer
+
+# Create global capture manager instance
+from capture_manager import CaptureManager
+capture_manager = CaptureManager()
 import config
 
 
@@ -206,14 +210,29 @@ class CameraManager:
         if update_status_callback:
             update_status_callback(f"Camera {camera_index+1} disconnected")
 
-    def _start_camera_thread(self, camera):
-        """Start capture thread for camera"""
+    def _start_camera_thread(self, camera, config_state=None):
+        """Start capture thread for camera with configurable circular buffer"""
         if camera.threads_running or not camera.connected or camera.cap is None:
             return
 
+        # Use configurable buffer size from config_state if provided, else use default
+        buffer_size = 1000  # Default fallback
+        if config_state:
+            buffer_size = getattr(config_state, 'buffer_size', 1000)
+
         camera.threads_running = True
-        camera.thread = CameraThread(camera.index, camera.cap, 60, 300)  # BUFFER_SIZE=60, TARGET_FPS=300
+        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size, target_fps=30)
         camera.thread.start()
+
+        if config_state:
+            # Update camera settings from config after thread start
+            camera.gain = int(float(config_state.camera_configs[f"camera{camera.index + 1}"]["gain"]))
+            camera.exposure = int(float(config_state.camera_configs[f"camera{camera.index + 1}"]["exposure"]))
+
+            # Apply settings to camera if connected
+            if camera.cap:
+                self.set_camera_gain(camera.index, camera.gain)
+                self.set_camera_exposure(camera.index, camera.exposure)
 
     def _stop_camera_thread(self, camera):
         """Stop capture thread for camera"""

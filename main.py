@@ -34,7 +34,7 @@ from config import load_config, save_config, handle_input, ConfigState, draw_con
 from tracking_visuals import TrackingVisState, draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table, PolarPlotMode
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, update_camera_frames_from_buffers, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, render_joystick_mode, handle_joystick_mode_events
+from joystick_controller import JoystickModeState, render_joystick_mode, handle_joystick_mode_mouse_events
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 # Camera button initialization is now handled internally by camera_manager
 from events import *
@@ -115,6 +115,10 @@ tracking_vis_state = TrackingVisState()
 # Joystick Mode State Management
 global joystick_mode_state
 joystick_mode_state = JoystickModeState()
+
+# Current tracking visualization surface for capture
+global current_tracking_surface
+current_tracking_surface = None
 
 # Rendering Thread Management
 global tracking_viz_thread
@@ -295,9 +299,9 @@ while running:
         joystick_mode_state._initialized = True
 
     for event in pygame.event.get():
-        # Always handle joystick events regardless of current mode
+        # Handle joystick connection events first regardless of current mode
         if event.type in [pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED, pygame.JOYBUTTONDOWN, pygame.JOYAXISMOTION]:
-            joystick_mode_state.process_joystick_events(event)
+            joystick_mode_state.process_joystick_events(event, current_mode, current_tracking_surface, tracking_vis_state, config_state)
 
         if event.type == pygame.QUIT:
             running = False
@@ -406,7 +410,7 @@ while running:
 
             # Handle joystick mode events
             elif current_mode == "joystick_loop":
-                handle_joystick_mode_events(event, joystick_mode_state, display)
+                handle_joystick_mode_mouse_events(event, joystick_mode_state, display, tracking_vis_state, config_state, current_tracking_surface)
 
 
         elif event.type == pygame.MOUSEMOTION:
@@ -458,6 +462,8 @@ while running:
                 tracking_vis_state.scroll_start = None
 
     # Render continuously
+    # (Global current_tracking_surface already declared at top)
+
     display.menu_screen.fill(display.COLOR_BACKGROUND_DARK, (0, 0, display.MENU_WIDTH, display.total_height))  # Dark theme menu background
     if display.bg_image_menu:
         # Update background rotation
@@ -494,6 +500,8 @@ while running:
         viz_surface = tracking_viz_thread.get_latest_surface()
         if viz_surface:
             display.menu_screen.blit(viz_surface, (display.sub_x, display.sub_y))
+            # Store for capture functionality
+            current_tracking_surface = viz_surface
 
         # Draw UI elements on top of the polar plot
         draw_filters(display, tracking_vis_state)
@@ -575,11 +583,20 @@ while running:
         joystick_surface = joystick_viz_thread.get_latest_surface()
         if joystick_surface:
             display.menu_screen.blit(joystick_surface, (display.sub_x + display.sub_width // 2, display.sub_y))
+            # Update tracking surface for capture functionality in joystick mode
+            current_tracking_surface = joystick_surface
+        else:
+            # If no joystick surface available, keep existing tracking surface
+            # This handles timing when switching modes or if thread isn't ready yet
+            pass
 
         # Render connection controls and joystick status (not threaded)
-        from joystick_controller import render_connection_controls, render_joystick_status, render_camera_feeds
+        from joystick_controller import render_connection_controls, render_joystick_status, render_capture_controls, render_camera_feeds
         render_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)
+
+        # Render capture controls (progress indicator, capture button)
+        render_capture_controls(display, joystick_mode_state)
 
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)

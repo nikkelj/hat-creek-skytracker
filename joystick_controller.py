@@ -8,7 +8,7 @@ from enum import Enum
 
 # Import existing components
 from lib.auxstar import NexstarHandController, RATES, Targets
-from tracking_visuals import draw_polar_plot, PolarPlotMode
+from tracking_visuals import PolarPlotMode
 from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
 from utils import draw_button
@@ -264,25 +264,6 @@ class JoystickModeState:
 # JOYSTICK MODE RENDERING FUNCTIONS
 # ==============================================================================
 
-def render_joystick_mode(display, joystick_state, tracking_vis_state, config_state):
-    """
-    Render the complete joystick mode UI
-    """
-    # Clear the main area
-    display.menu_screen.fill((30, 30, 30), (display.sub_x, display.sub_y,
-                                            display.sub_width, display.sub_height))
-
-    # Top section - Connection controls and joystick status
-    render_connection_controls(display, joystick_state)
-    render_joystick_status(display, joystick_state)
-
-    # Top right - Polar graph
-    render_polar_graph(display, joystick_state, tracking_vis_state, config_state)
-
-    # Bottom half - Capture controls and camera feeds
-    render_capture_controls(display, joystick_state)
-    render_camera_feeds(display, joystick_state)
-
 def render_connection_controls(display, joystick_state):
     """Render connection controls in upper left"""
     # Update available ports
@@ -496,28 +477,6 @@ def render_joystick_status(display, joystick_state):
         num_hats = joy.get_numhats()
         hats_label = display.small_font.render(f"Hats: {num_hats}", True, (255, 255, 255))
         display.menu_screen.blit(hats_label, (display.sub_x + 10, current_y))
-
-def render_polar_graph(display, joystick_state, tracking_vis_state, config_state):
-    """Render polar graph using existing tracking visuals function"""
-    # Update current time
-    joystick_state.update_polar_plot_time()
-
-    # Use tracking visualization state for polar plot data
-    # Use UPPER_RIGHT_QUADRANT mode for joystick mode
-    draw_polar_plot(display, config_state, joystick_state.ts, joystick_state.current_tt, tracking_vis_state, PolarPlotMode.UPPER_RIGHT_QUADRANT)
-
-    # Draw satellites on the polar plot
-    # Calculate center coordinates for the quadrant
-    quadrant_center_x = display.sub_x + display.sub_width // 2
-    quadrant_center_y = display.sub_y + display.sub_height // 2
-
-    # Import draw_satellites - need to get the existing function
-    from tracking_visuals import draw_satellites
-    draw_satellites(display, tracking_vis_state, quadrant_center_x, quadrant_center_y, PolarPlotMode.UPPER_RIGHT_QUADRANT)
-
-    # Draw satellite info pane to the right of the polar plot
-    from tracking_visuals import draw_details
-    draw_details(display, tracking_vis_state, PolarPlotMode.UPPER_RIGHT_QUADRANT)
 
 def render_capture_controls(display, joystick_state):
     """Render capture controls and progress indicator below polar graph"""

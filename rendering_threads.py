@@ -13,7 +13,7 @@ import math
 import numpy as np
 from datetime import datetime, timedelta
 from enum import Enum
-from tracking_visuals import draw_polar_plot, draw_satellites, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, PolarPlotMode
+from tracking_visuals import draw_legend, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, PolarPlotMode
 from skyfield.api import wgs84, load
 from utils import get_altitude_color, draw_button
 
@@ -83,69 +83,24 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
     # Draw precomputed arc segments for selected satellite
     if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
-# Draw arcs with sunlit detection (preferred method)
+    # Draw arcs with sunlit detection (preferred method)
         if state.selected_satellite in state.satellite_trajectories and state.satellite_trajectories[state.selected_satellite]:
             trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
 
             # Use cached sunlit status for performance optimization
             sat_name = state.selected_satellite.name
-            if hasattr(state, 'sunlit_status_cache') and sat_name in state.sunlit_status_cache:
-                # Use cached sunlit status
-                sunlit_status = state.sunlit_status_cache[sat_name]
-            else:
+            if sat_name not in state.sunlit_status_cache:
                 # Compute sunlit status and cache it
                 try:
-                    observer = wgs84.latlon(float(config_state.lat_str or 0), float(config_state.lon_str or 0), elevation_m=float(config_state.alt_str or 0))
-
-                    # Load sun ephemeris
-                    sun_ephemeris = load('de421.bsp')['sun'] if 'sun' in load('de421.bsp') else None
-
                     # Create Skyfield Time objects for current trajectory times
-                    skyfield_times = []
+                    state.sunlit_status_cache[sat_name] = []
                     for tt_time in times_array:
-                        skyfield_times.append(ts.tt(jd=tt_time))
-
-                    # Calculate sunlit status for each trajectory point
-                    sunlit_status = []
-                    for st in skyfield_times:
-                        try:
-                            # Get satellite position and sun position
-                            sat_pos = state.selected_satellite.at(st)
-                            sun_pos = sun_ephemeris.at(st) if sun_ephemeris else None
-
-                            if sun_pos is not None:
-                                # Calculate vectors
-                                sat_to_sun = (sun_pos.position.km - sat_pos.position.km)
-                                sat_to_center = -sat_pos.position.km  # Vector from satellite to Earth center
-
-                                # Calculate angle between sun vector and Earth center vector
-                                dot_product = np.dot(sat_to_sun, sat_to_center)
-                                mag_sat_sun = np.linalg.norm(sat_to_sun)
-                                mag_sat_center = np.linalg.norm(sat_to_center)
-
-                                if mag_sat_sun > 0 and mag_sat_center > 0:
-                                    cos_angle = dot_product / (mag_sat_sun * mag_sat_center)
-                                    angle = math.degrees(math.acos(np.clip(cos_angle, -1.0, 1.0)))
-                                    # If the satellite is closer to the sun-side relative to Earth, it's sunlit
-                                    is_sunlit = angle > 90.0
-                                else:
-                                    is_sunlit = False
-                            else:
-                                is_sunlit = False
-
-                        except Exception:
-                            is_sunlit = False
-
-                        sunlit_status.append(is_sunlit)
-
-                    # Cache the sunlit status for future use
-                    if not hasattr(state, 'sunlit_status_cache'):
-                        state.sunlit_status_cache = {}
-                    state.sunlit_status_cache[sat_name] = sunlit_status
+                        state.sunlit_status_cache[sat_name].append(state.selected_satellite.at(ts.tt(jd=tt_time)).is_sunlit(state.ephemeris))
 
                 except Exception as e:
                     # Fallback if sunlit calculation fails
-                    sunlit_status = [False] * len(times_array)
+                    state.sunlit_status_cache[sat_name] = [False] * len(times_array)
+                    print('!!!!!! SUNLIT CACHING FAILED !!!!!!!')
 
             # Draw segments with sunlit-aware colors (same logic as original)
             for i in range(len(trajectory_data) - 1):
@@ -155,7 +110,7 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
                 if alt > 0:  # Above horizon
                     # Determine if this time point is in the future or past
                     is_future = times_array[i] > current_tt if current_tt else False
-                    is_sunlit = sunlit_status[i] if i < len(sunlit_status) else False
+                    is_sunlit = state.sunlit_status_cache[sat_name][i] if i < len(state.sunlit_status_cache[sat_name]) else False
 
                     # Apply coloring logic from original code:
                     # Future trajectories: Yellow if sunlit, Red if shadowed
@@ -584,6 +539,10 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                                 # List of satellites
                                 self.satellites = getattr(original, 'satellites', []) if original else []
 
+                                # Ephemeris
+                                self.sun_ephemeris = getattr(original, 'sun_ephemeris', None) if original else None
+                                self.ephemeris = getattr(original, 'ephemeris', None) if original else None
+
                         render_state = RenderState(self.tracking_vis_state)
 
                     # Clear surface periodically to prevent trail accumulation
@@ -613,9 +572,9 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     # Draw polar plot and satellites using surface-based functions
 
                     # Draw polar plot background first
-                    draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, render_state, display_bounds, PolarPlotMode.FULL_SCREEN)
+                    draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.FULL_SCREEN)
                     # Now draw satellites on top
-                    draw_satellites_on_surface(self.surface, render_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
+                    draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
                 else:
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))
@@ -715,6 +674,10 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                                 # List of satellites
                                 self.satellites = getattr(original, 'satellites', []) if original else []
 
+                                # Ephemeris
+                                self.sun_ephemeris = getattr(original, 'sun_ephemeris', None) if original else None
+                                self.ephemeris = getattr(original, 'ephemeris', None) if original else None
+
                     render_state = RenderState(self.tracking_vis_state)
 
                     # Clear surface periodically to prevent trail accumulation
@@ -751,11 +714,11 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         'sub_height': self.display.sub_height
                     }
 
-                    draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, render_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
-                    draw_satellites_on_surface(self.surface, render_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+                    draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
+                    draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
 
                     # Draw satellite details panel after satellites
-                    draw_details_on_surface(self.surface, render_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+                    draw_details_on_surface(self.surface, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                 else:
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))

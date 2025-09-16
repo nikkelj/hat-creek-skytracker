@@ -150,5 +150,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Project data
 data/
-tle_cache.tle
+
+# Cached ephemeris
+./tle_cache.tle
+./de421.bsp

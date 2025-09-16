@@ -154,5 +154,5 @@ cython_debug/
 data/
 
 # Cached ephemeris
-./tle_cache.tle
-./de421.bsp
+tle_cache.tle*
+de421.bsp*

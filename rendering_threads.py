@@ -511,39 +511,6 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     if not satellite_positions_snapshot:
                         # Empty render if no satellites to display
                         self.surface.fill((0, 0, 0))
-                    else:
-                        # For arc drawing, capture trajectory data snapshots
-                        if selected_satellite_snapshot and hasattr(self.tracking_vis_state, 'satellite_arc_segments'):
-                            satellite_arc_segments_snapshot = self.tracking_vis_state.satellite_arc_segments.copy() if self.tracking_vis_state.satellite_arc_segments else {}
-                            satellite_trajectories_snapshot = self.tracking_vis_state.satellite_trajectories.copy() if hasattr(self.tracking_vis_state, 'satellite_trajectories') and self.tracking_vis_state.satellite_trajectories else {}
-
-                        # Create temporary state object with snapshots
-                        class RenderState:
-                            def __init__(self, original):
-                                # Core state
-                                self.satellite_positions = satellite_positions_snapshot
-                                self.selected_satellite = selected_satellite_snapshot
-                                self.hovered_satellite = hovered_satellite_snapshot
-                                self.tle_loaded = getattr(original, 'tle_loaded', False) if original else False
-
-                                # Trajectory data
-                                self.satellite_arc_segments = getattr(original, 'satellite_arc_segments', {}).copy() if original and getattr(original, 'satellite_arc_segments', None) else {}
-                                self.satellite_trajectories = getattr(original, 'satellite_trajectories', {}).copy() if original and getattr(original, 'satellite_trajectories', None) else {}
-
-                                # Drawing attributes
-                                self.satellite_labels = getattr(original, 'satellite_labels', {}).copy() if original and getattr(original, 'satellite_labels', None) else {}
-                                self.satellite_mean_altitudes = getattr(original, 'satellite_mean_altitudes', {}).copy() if original and getattr(original, 'satellite_mean_altitudes', None) else {}
-                                self.satellite_perigee = getattr(original, 'satellite_perigee', {}).copy() if original and getattr(original, 'satellite_perigee', None) else {}
-                                self.satellite_apogee = getattr(original, 'satellite_apogee', {}).copy() if original and getattr(original, 'satellite_apogee', None) else {}
-
-                                # List of satellites
-                                self.satellites = getattr(original, 'satellites', []) if original else []
-
-                                # Ephemeris
-                                self.sun_ephemeris = getattr(original, 'sun_ephemeris', None) if original else None
-                                self.ephemeris = getattr(original, 'ephemeris', None) if original else None
-
-                        render_state = RenderState(self.tracking_vis_state)
 
                     # Clear surface periodically to prevent trail accumulation
                     # but not every frame to avoid frequency mismatch with main loop
@@ -646,39 +613,6 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     if not satellite_positions_snapshot:
                         # Empty render if no satellites to display
                         self.surface.fill((0, 0, 0))
-                    else:
-                        # For arc drawing, capture trajectory data snapshots
-                        if selected_satellite_snapshot and hasattr(self.tracking_vis_state, 'satellite_arc_segments'):
-                            satellite_arc_segments_snapshot = self.tracking_vis_state.satellite_arc_segments.copy() if self.tracking_vis_state.satellite_arc_segments else {}
-                            satellite_trajectories_snapshot = self.tracking_vis_state.satellite_trajectories.copy() if hasattr(self.tracking_vis_state, 'satellite_trajectories') and self.tracking_vis_state.satellite_trajectories else {}
-
-                        # Create temporary state object with snapshots
-                        class RenderState:
-                            def __init__(self, original):
-                                # Core state
-                                self.satellite_positions = satellite_positions_snapshot
-                                self.selected_satellite = selected_satellite_snapshot
-                                self.hovered_satellite = hovered_satellite_snapshot
-                                self.tle_loaded = getattr(original, 'tle_loaded', False) if original else False
-
-                                # Trajectory data
-                                self.satellite_arc_segments = getattr(original, 'satellite_arc_segments', {}).copy() if original and getattr(original, 'satellite_arc_segments', None) else {}
-                                self.satellite_trajectories = getattr(original, 'satellite_trajectories', {}).copy() if original and getattr(original, 'satellite_trajectories', None) else {}
-
-                                # Drawing attributes
-                                self.satellite_labels = getattr(original, 'satellite_labels', {}).copy() if original and getattr(original, 'satellite_labels', None) else {}
-                                self.satellite_mean_altitudes = getattr(original, 'satellite_mean_altitudes', {}).copy() if original and getattr(original, 'satellite_mean_altitudes', None) else {}
-                                self.satellite_perigee = getattr(original, 'satellite_perigee', {}).copy() if original and getattr(original, 'satellite_perigee', None) else {}
-                                self.satellite_apogee = getattr(original, 'satellite_apogee', {}).copy() if original and getattr(original, 'satellite_apogee', None) else {}
-
-                                # List of satellites
-                                self.satellites = getattr(original, 'satellites', []) if original else []
-
-                                # Ephemeris
-                                self.sun_ephemeris = getattr(original, 'sun_ephemeris', None) if original else None
-                                self.ephemeris = getattr(original, 'ephemeris', None) if original else None
-
-                    render_state = RenderState(self.tracking_vis_state)
 
                     # Clear surface periodically to prevent trail accumulation
                     # but not every frame to avoid frequency mismatch with main loop

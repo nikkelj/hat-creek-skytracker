@@ -1,5 +1,6 @@
 import pygame
 import time
+from time import perf_counter
 import math
 import threading
 from skyfield.api import wgs84, load
@@ -27,6 +28,7 @@ from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_f
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events
+from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 # Camera button initialization is now handled internally by camera_manager
 from events import *
@@ -111,6 +113,14 @@ joystick_mode_state = JoystickModeState()
 # Current tracking visualization surface for capture
 global current_tracking_surface
 current_tracking_surface = None
+
+# Position polling frequency measurement
+import time
+position_poll_count = 0
+position_poll_start_time = time.time()
+position_poll_frequency = 0.0
+last_azm_duration = 0.0
+last_alt_duration = 0.0
 
 # Rendering Thread Management
 global tracking_viz_thread
@@ -583,9 +593,10 @@ while running:
             pass
 
         # Render connection controls and joystick status (not threaded)
-        from joystick_controller import render_connection_controls, render_joystick_status, render_capture_controls, render_camera_feeds
+        from joystick_controller import render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds
         render_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)
+        render_position_display(display, joystick_mode_state)
 
         # Render capture controls (progress indicator, capture button)
         render_capture_controls(display, joystick_mode_state)
@@ -593,9 +604,47 @@ while running:
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)
 
-        # Update joystick rate control
+        # Update joystick rate control and position polling
         if joystick_mode_state.telescope_connected:
             joystick_mode_state.rate_control()
+
+            # Poll current position at 10 Hz for display
+            try:
+                if hasattr(joystick_mode_state.telescope_controller, 'hc_get_position'):
+                    # Measure polling frequency
+                    position_poll_count += 1
+                    current_poll_time = time.time()
+
+                    # Time AZM call
+                    azm_start = perf_counter()
+                    joystick_mode_state.current_azm = joystick_mode_state.telescope_controller.hc_get_position(Targets.AZM)
+                    azm_duration = (perf_counter() - azm_start) * 1000  # Convert to milliseconds
+
+                    # Time ALT call
+                    alt_start = perf_counter()
+                    joystick_mode_state.current_alt = joystick_mode_state.telescope_controller.hc_get_position(Targets.ALT)
+                    alt_duration = (perf_counter() - alt_start) * 1000  # Convert to milliseconds
+
+                    # Update frequency and timing report every second
+                    if current_poll_time - position_poll_start_time >= 1.0:
+                        elapsed = current_poll_time - position_poll_start_time
+                        position_poll_frequency = position_poll_count / elapsed
+                        position_poll_count = 0
+                        position_poll_start_time = current_poll_time
+                        print(f"Telescope polling: {position_poll_frequency:.1f} Hz | AZM: {azm_duration:.1f}ms | ALT: {alt_duration:.1f}ms | Total: {azm_duration + alt_duration:.1f}ms")
+
+                    # Format for display
+                    from lib.auxstar import f2dms, format_angle_compact
+                    azm_d, azm_m, azm_s = f2dms(joystick_mode_state.current_azm)
+                    alt_d, alt_m, alt_s = f2dms(joystick_mode_state.current_alt)
+                    joystick_mode_state.azm_display_str = f"{azm_d:3d}°{azm_m:02d}'{azm_s:04.1f}\""
+                    joystick_mode_state.alt_display_str = f"{alt_d:3d}°{alt_m:02d}'{alt_s:04.1f}\""
+            except Exception as e:
+                # On polling error, maintain previous values or show error
+                if not joystick_mode_state.azm_display_str == "--":
+                    joystick_mode_state.azm_display_str = "ERROR"
+                    joystick_mode_state.alt_display_str = "ERROR"
+                print(f"Position polling error: {e}")
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         display.menu_screen.fill((150, 150, 150), sub_rect)

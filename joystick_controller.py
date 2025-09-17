@@ -2,6 +2,7 @@ import pygame
 import serial
 import serial.tools.list_ports
 import math
+import time
 from datetime import datetime, timezone
 from skyfield.api import load
 from enum import Enum
@@ -58,6 +59,12 @@ class JoystickModeState:
         self.capture_progress = 0.0
         self.capture_status = ""
         self.capture_button_rect = None
+
+        # Telescope position tracking for display
+        self.current_azm = 0.0
+        self.current_alt = 0.0
+        self.azm_display_str = "--"
+        self.alt_display_str = "--"
 
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
@@ -151,23 +158,26 @@ class JoystickModeState:
             axis_value = max(-1.0, min(1.0, axis_value))
 
             # Convert to rate (0 = stop, 1-9 positive, -1 to -9 negative)
-            if abs(axis_value) < 0.1:  # Deadzone
+            if abs(axis_value) < 0.01:  # Much smaller deadband: 0.01
                 rate = 0
             else:
-                # Scale to available rates (assuming list(RATES.keys()) has 9 rates: 1-9)
-                rate = int(math.floor(axis_value * 9))
-                # Clamp to max rate (9)
-                rate = max(-9, min(9, rate))
+                # Scale to achieve maximum rate at >0.9 instead of corners
+                # Map 0.01 to 0.9 range to 0 to 9 rate range
+                normalized = (abs(axis_value) - 0.01) / (0.9 - 0.01)
+                # Clamp to ensure we never go over maximum (for axes that can hit >0.9 in corner)
+                normalized = min(normalized, 1.0)
+                rate = int(math.ceil(normalized * 9))  # Use ceil to ensure we can reach max rate
+                rate = max(1, min(9, rate))  # Ensure positive rates start at 1
+                # Apply the original sign
+                rate *= 1 if axis_value > 0 else -1
 
             # Send command
             if i == 2:  # AZM
                 if rate != 0:
                     self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
-                    print(f"AZM rate: {rate}")
             elif i == 3:  # ALT
                 if rate != 0:
                     self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
-                    print(f"ALT rate: {rate}")
 
     def process_joystick_events(self, event, current_mode=None, current_tracking_surface=None, tracking_vis_state=None, config_state=None):
         """Process pygame joystick events (non-mode-specific)"""
@@ -219,6 +229,25 @@ class JoystickModeState:
                 print(f"Taring joystick axes")
                 self.tare_current_joystick()
 
+            elif event.button == 3:  # Triangle/Park button for park command
+                if self.telescope_connected:
+                    print("Parking telescope to 0, 0...")
+                    # Loop until parked
+                    angle = 1
+                    while angle > 0.003:
+                        success = self.telescope_controller.hc_goto_fast(Targets.AZM, 0, 0, 0)
+                        print("AZM Park command sent")
+                        time.sleep(0.1)
+                        angle = self.telescope_controller.hc_get_position(Targets.AZM)
+                    angle = 1
+                    while angle > 0.003:
+                        success = self.telescope_controller.hc_goto_fast(Targets.ALT, 0, 0, 0)
+                        print("ALT Park command sent")
+                        time.sleep(0.1)
+                        angle = self.telescope_controller.hc_get_position(Targets.ALT)
+                else:
+                    print("Cannot park: telescope not connected")
+
         elif event.type == pygame.JOYAXISMOTION:
             # Update joystick axis state for display (this stays in process for all modes)
             if self.connected_joystick is not None and event.joy == self.connected_joystick:
@@ -259,6 +288,55 @@ class JoystickModeState:
         if not self.ts:
             self.ts = load.timescale()
         self.current_tt = self.ts.now().tt
+
+def render_position_display(display, joystick_state):
+    """Render the current AZM and ALT position display"""
+    if not joystick_state.telescope_connected:
+        return
+
+    # Position to the right of joystick axes display (around x=165)
+    x_start = display.sub_x + 165
+    y_start = display.sub_y + 380  # Moved up 100 pixels to 380
+    width = 100  # ~100 pixels wide as requested
+
+    # Background color based on stop state
+    if joystick_state.stopped:
+        bg_color = (120, 60, 60)  # Reddish background when stopped
+        border_color = (200, 100, 100)
+    else:
+        bg_color = (60, 60, 60)   # Normal grey when active
+        border_color = (100, 100, 100)
+
+    # Background rectangle for position display
+    pygame.draw.rect(display.menu_screen, bg_color,
+                     (x_start, y_start, width, 65))
+    pygame.draw.rect(display.menu_screen, border_color,
+                     (x_start, y_start, width, 65), 1)
+
+    # Stop indicator at the top
+    stop_status = "STOPPED" if joystick_state.stopped else "ACTIVE"
+    stop_color = (255, 100, 100) if joystick_state.stopped else (100, 255, 100)
+    stop_text = display.tiny_font.render(stop_status, True, stop_color)
+    display.menu_screen.blit(stop_text, (x_start + 5, y_start + 2))
+
+    # Compact title below stop indicator
+    title_text = display.tiny_font.render("Position:", True, (255, 255, 255))
+    display.menu_screen.blit(title_text, (x_start + 5, y_start + 15))
+
+    # Compact AZM display
+    azm_label_text = display.tiny_font.render("AZM", True, (255, 255, 255))
+    display.menu_screen.blit(azm_label_text, (x_start + 5, y_start + 27))
+
+    # Use tiny font for values to fit in compact space
+    azm_value_text = display.tiny_font.render(joystick_state.azm_display_str[:12], True, (0, 255, 0))
+    display.menu_screen.blit(azm_value_text, (x_start + 5, y_start + 37))
+
+    # Compact ALT display
+    alt_label_text = display.tiny_font.render("ALT", True, (255, 255, 255))
+    display.menu_screen.blit(alt_label_text, (x_start + 5, y_start + 47))
+
+    alt_value_text = display.tiny_font.render(joystick_state.alt_display_str[:12], True, (0, 255, 0))
+    display.menu_screen.blit(alt_value_text, (x_start + 5, y_start + 57))
 
 # ==============================================================================
 # JOYSTICK MODE RENDERING FUNCTIONS

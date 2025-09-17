@@ -107,18 +107,18 @@ def f2dms(f):
     ss=(d-dd-mm/60)*3600
     return s*dd,mm,ss
 
-def dms2f(dd,mm,ss, sign):
+def dms2f(dd,mm,ss, sign=1):
     """Convert degrees, minutes, seconds to floating point fraction of full rotation
 
     Args:
         dd (float): Degrees
         mm (float): Minutes
         ss (float): Seconds
+        sign (int): Sign of the input angle (-1 or 1)
         
     Returns:
-        float: fraction of full rotation
+        float: signed fraction of full rotation
     """
-    sign = 1 if dd > 360 else -1
     assert dd < 360
     assert mm < 60
     assert ss < 60
@@ -139,6 +139,11 @@ def repr_pos(alt,azm):
 
 def repr_angle(a):
     return u'%03d°%02d\'%04.1f"' % f2dms(a)
+
+def format_angle_compact(angle):
+    """Format angle as compact DMS string without degree symbol"""
+    d, m, s = f2dms(angle)
+    return f"{d:3d}°{m:02d}'{s:04.1f}\""
 
 def unpack_int3(d):
     return struct.unpack('!i',b'\x00'+d[:3])[0]/2**24
@@ -248,42 +253,40 @@ class NexstarHandController:
 
         Args:
             target (int): Target device id for command
-            dd (float): Target position degrees
-            mm (float): Target position minutes
-            ss (float): Target position seconds
+            dd (float): Target position degrees (can be signed)
+            mm (float): Target position minutes (can be signed)
+            ss (float): Target position seconds (can be signed)
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
-        fofr = pack_int3(dms2f(dd,mm,ss))
+        fofr = pack_int3(dms2f(dd,mm,ss, 1)) # Signed fraction of full rotation
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0], fofr, COMMANDS['MC_GOTO_FAST'][2])
+        request = '50{:02x}{:02x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_GOTO_FAST'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_GOTO_FAST'][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
 
     def hc_set_position(self, target, dd, mm, ss):
         """Goto position at normal rate
 
         Args:
             target (int): Target device id for command
-            dd (float): Target position degrees
-            mm (float): Target position minutes
-            ss (float): Target position seconds
+            dd (float): Target position degrees (can be signed)
+            mm (float): Target position minutes (can be signed)
+            ss (float): Target position seconds (can be signed)
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
-        fofr = pack_int3(dms2f(dd,mm,ss))
+        fofr = pack_int3(dms2f(dd,mm,ss, 1))
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0], fofr, COMMANDS['MC_SET_POSITION'][2])
+        request = '50{:02x}{:02x}{:02x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_SET_POSITION'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_SET_POSITION'][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_set_guide_rate(self, target, rate, sidereal=False, solar=False, lunar=False):
         """Set guide rate
@@ -293,7 +296,7 @@ class NexstarHandController:
             rate (float): Guide rate (TODO: units???), sign-only if sidereal/solar/lunar
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_SET_POS_GUIDERATE' if rate > 0 else 'MC_SET_NEG_GUIDERATE'
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
@@ -309,8 +312,7 @@ class NexstarHandController:
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_slew_fixed(self, target, rate):
         """Move axis. Axis will keep moving until a stop is sent!
@@ -320,15 +322,14 @@ class NexstarHandController:
             rate (int): Rate step, where 0 = stop, 1 to 9 = positive, -1 to -9 = negative
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_MOVE_POS' if rate >= 0 else 'MC_MOVE_NEG'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], abs(rate), COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = ''.join(format(x, '02x') for x in binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_set_backlash(self, target, backlash):
         """Set backlash, +/- 0-99
@@ -338,15 +339,14 @@ class NexstarHandController:
             backlash (int): Backlash setting, from +/- 0-99
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_SET_POS_BACKLASH' if backlash >= 0 else 'MC_SET_NEG_BACKLASH'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], backlash, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = ''.join(format(x, '02x') for x in binary_response)
-        return result
+        return binary_response == b'#'
 
 def status_report(controller):
 

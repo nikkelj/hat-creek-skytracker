@@ -604,9 +604,9 @@ while running:
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)
 
-        # Update joystick rate control and position polling
+        # Update joystick tracking control and position polling
         if joystick_mode_state.telescope_connected:
-            joystick_mode_state.rate_control()
+            joystick_mode_state.tracking_control()
 
             # Poll current position at 10 Hz for display
             try:
@@ -644,7 +644,7 @@ while running:
                 if not joystick_mode_state.azm_display_str == "--":
                     joystick_mode_state.azm_display_str = "ERROR"
                     joystick_mode_state.alt_display_str = "ERROR"
-                print(f"Position polling error: {e}")
+                print(f"Position polling error: {e}. Are you sure the mount is powered?")
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         display.menu_screen.fill((150, 150, 150), sub_rect)

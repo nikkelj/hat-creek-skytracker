@@ -91,6 +91,8 @@ class DisplaySetup:
             'lon': pygame.Rect(self.sub_x + 20, self.sub_y + 150, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'alt': pygame.Rect(self.sub_x + 20, self.sub_y + 240, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'elevation_mask': pygame.Rect(self.sub_x + 20, self.sub_y + 330, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'alignment_azimuth': pygame.Rect(self.sub_x + 20, self.sub_y + 410, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'alignment_elevation': pygame.Rect(self.sub_x + 20, self.sub_y + 490, self.INPUT_WIDTH, self.INPUT_HEIGHT),
 
             # Camera configuration input rectangles
             'camera1_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 55, self.INPUT_WIDTH, self.INPUT_HEIGHT),

@@ -94,6 +94,9 @@ class TrackingVisState:
         self.ephemeris = load('de421.bsp')
         self.sun_ephemeris = self.ephemeris['sun'] if 'sun' in self.ephemeris else None
 
+        # Camera FOV data
+        self.camera_fov_data = []
+
     def reset_input_fields(self):
         """Reset input field positions when switching modes."""
         self.cursor_pos = {

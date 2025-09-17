@@ -7,6 +7,18 @@ from datetime import datetime, timezone
 from skyfield.api import load
 from enum import Enum
 
+# ==============================================================================
+# TRACKING MODES ENUM
+# ==============================================================================
+
+class TrackingMode(Enum):
+    STANDBY = 1      # Poll telescope position only, bypass rate control
+    RATE_CONTROL = 2 # Current rate control functionality
+    PROGRAM = 3      # Program track mode (stub)
+    HANDOFF = 4      # Handoff mode (stub)
+    HOTSPOT = 5      # Hotspot mode (stub)
+    MTI = 6          # MTI mode (stub)
+
 # Import existing components
 from lib.auxstar import NexstarHandController, RATES, Targets
 from tracking_visuals import PolarPlotMode
@@ -37,6 +49,9 @@ class JoystickModeState:
         self.connected_joystick = None  # Currently active joystick
         self.joystick_tare = {}  # Tare values for deadzone calibration
         self.stopped = False  # Stop button state
+
+        # Tracking mode state
+        self.tracking_mode = TrackingMode.RATE_CONTROL  # Default to current behavior
 
         # Telescope connection state
         self.telescope_connected = False
@@ -125,8 +140,8 @@ class JoystickModeState:
         self.telescope_connected = False
         print("Disconnected from telescope")
 
-    def rate_control(self):
-        """Handle rate control based on connected joystick"""
+    def tracking_control(self):
+        """Handle tracking control based on connected joystick and tracking mode"""
         if not self.telescope_connected or self.connected_joystick is None:
             return
 
@@ -135,12 +150,34 @@ class JoystickModeState:
 
         joy = self.joysticks[self.connected_joystick]
 
-        # Reset stopped state if needed
+        # Universal stop check - stop movement in any mode when stopped
         if self.stopped:
             self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
             self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
             return
 
+        # Dispatch to appropriate tracking method based on mode
+        if self.tracking_mode == TrackingMode.STANDBY:
+            # STANDBY: No rate control, just position polling
+            pass
+        elif self.tracking_mode == TrackingMode.RATE_CONTROL:
+            # RATE_CONTROL: Current joystick control logic
+            self._handle_rate_control(joy)
+        elif self.tracking_mode == TrackingMode.PROGRAM:
+            # PROGRAM: Stub implementation
+            self.program_track()
+        elif self.tracking_mode == TrackingMode.HANDOFF:
+            # HANDOFF: Stub implementation
+            self.handoff_track()
+        elif self.tracking_mode == TrackingMode.HOTSPOT:
+            # HOTSPOT: Stub implementation
+            self.hotspot_track()
+        elif self.tracking_mode == TrackingMode.MTI:
+            # MTI: Stub implementation
+            self.mti_track()
+
+    def _handle_rate_control(self, joy):
+        """Handle the original rate control logic"""
         # Process axes 2 and 3 (PlayStation right stick)
         for i in [2, 3]:  # AZM and ALT axes
             if i >= joy.get_numaxes():
@@ -178,6 +215,42 @@ class JoystickModeState:
             elif i == 3:  # ALT
                 if rate != 0:
                     self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
+
+    def cycle_tracking_mode_forward(self):
+        """Cycle to the next tracking mode in forward sequence"""
+        modes = list(TrackingMode)
+        current_index = modes.index(self.tracking_mode)
+        next_index = (current_index + 1) % len(modes)
+        self.tracking_mode = modes[next_index]
+        print(f"Tracking mode: {self.tracking_mode.name}")
+
+    def cycle_tracking_mode_backward(self):
+        """Cycle to the next tracking mode in reverse sequence"""
+        modes = list(TrackingMode)
+        current_index = modes.index(self.tracking_mode)
+        prev_index = (current_index - 1) % len(modes)
+        self.tracking_mode = modes[prev_index]
+        print(f"Tracking mode: {self.tracking_mode.name}")
+
+    def program_track(self):
+        """Program track mode - stub implementation"""
+        # TODO: Implement program track mode
+        print("Program track mode - stub")
+
+    def handoff_track(self):
+        """Handoff track mode - stub implementation"""
+        # TODO: Implement handoff track mode
+        print("Handoff track mode - stub")
+
+    def hotspot_track(self):
+        """Hotspot track mode - stub implementation"""
+        # TODO: Implement hotspot track mode
+        print("Hotspot track mode - stub")
+
+    def mti_track(self):
+        """MTI track mode - stub implementation"""
+        # TODO: Implement MTI track mode
+        print("MTI track mode - stub")
 
     def process_joystick_events(self, event, current_mode=None, current_tracking_surface=None, tracking_vis_state=None, config_state=None):
         """Process pygame joystick events (non-mode-specific)"""
@@ -248,6 +321,14 @@ class JoystickModeState:
                 else:
                     print("Cannot park: telescope not connected")
 
+            elif event.button == 8:  # RS button for forward tracking mode cycle
+                self.cycle_tracking_mode_forward()
+                return  # Don't process any other buttons after handling mode cycle
+
+            elif event.button == 15:  # Pad button for backward tracking mode cycle
+                self.cycle_tracking_mode_backward()
+                return  # Don't process any other buttons after handling mode cycle
+
         elif event.type == pygame.JOYAXISMOTION:
             # Update joystick axis state for display (this stays in process for all modes)
             if self.connected_joystick is not None and event.joy == self.connected_joystick:
@@ -313,11 +394,15 @@ def render_position_display(display, joystick_state):
     pygame.draw.rect(display.menu_screen, border_color,
                      (x_start, y_start, width, 65), 1)
 
-    # Stop indicator at the top
-    stop_status = "STOPPED" if joystick_state.stopped else "ACTIVE"
-    stop_color = (255, 100, 100) if joystick_state.stopped else (100, 255, 100)
-    stop_text = display.tiny_font.render(stop_status, True, stop_color)
-    display.menu_screen.blit(stop_text, (x_start + 5, y_start + 2))
+    # Mode/status indicator at the top
+    if joystick_state.stopped:
+        status_text = "STOPPED"
+        status_color = (255, 100, 100)  # Red when stopped
+    else:
+        status_text = joystick_state.tracking_mode.name  # Show current tracking mode
+        status_color = (100, 255, 100)  # Green when active
+    status_render = display.tiny_font.render(status_text, True, status_color)
+    display.menu_screen.blit(status_render, (x_start + 5, y_start + 2))
 
     # Compact title below stop indicator
     title_text = display.tiny_font.render("Position:", True, (255, 255, 255))

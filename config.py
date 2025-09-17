@@ -19,6 +19,10 @@ class ConfigState:
         self.alt_str = "120.0"
         self.elevation_mask_str = "0.0"
 
+        # Mount alignment configuration
+        self.alignment_azimuth_str = "0.0"
+        self.alignment_elevation_str = "0.0"
+
         # System configuration
         self.buffer_size = 1000  # Circular buffer size (frames)
         self.image_format = "BMP"  # Capture image format (BMP/PNG)
@@ -47,6 +51,7 @@ class ConfigState:
         self.focused_field = None
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
+            "alignment_azimuth": 0, "alignment_elevation": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -54,6 +59,7 @@ class ConfigState:
         }
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
+            "alignment_azimuth": None, "alignment_elevation": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -67,6 +73,8 @@ class ConfigState:
             "lon": self.lon_str,
             "alt": self.alt_str,
             "elevation_mask": self.elevation_mask_str,
+            "alignment_azimuth": self.alignment_azimuth_str,
+            "alignment_elevation": self.alignment_elevation_str,
             "camera_configs": self.camera_configs
         }
 
@@ -76,6 +84,8 @@ class ConfigState:
         self.lon_str = config_dict.get("lon", self.lon_str)
         self.alt_str = config_dict.get("alt", self.alt_str)
         self.elevation_mask_str = config_dict.get("elevation_mask", self.elevation_mask_str)
+        self.alignment_azimuth_str = config_dict.get("alignment_azimuth", self.alignment_azimuth_str)
+        self.alignment_elevation_str = config_dict.get("alignment_elevation", self.alignment_elevation_str)
 
         # Load system configuration
         self.buffer_size = config_dict.get("buffer_size", self.buffer_size)
@@ -107,6 +117,7 @@ class ConfigState:
         """Reset input field positions when switching modes."""
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
+            "alignment_azimuth": 0, "alignment_elevation": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -114,6 +125,7 @@ class ConfigState:
         }
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
+            "alignment_azimuth": None, "alignment_elevation": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -217,7 +229,7 @@ def draw_config_options(display, config_state):
         pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
 
     # Draw grouping box and label
-    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 370)
+    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 620)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
     group_label = display.font.render("Observer Location", True, (0, 0, 0))
     display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
@@ -246,6 +258,22 @@ def draw_config_options(display, config_state):
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['elevation_mask'])
     elevation_mask_text = display.font.render(config_state.elevation_mask_str, True, (0, 0, 0))
     display.menu_screen.blit(elevation_mask_text, (display.input_rects['elevation_mask'].x + 5, display.input_rects['elevation_mask'].y + 5))
+
+    # Mount Alignment fields
+    mount_alignment_header = display.font.render("Mount Alignment:", True, (0, 0, 0))
+    display.menu_screen.blit(mount_alignment_header, (display.sub_x + 20, display.sub_y + 380))
+
+    azimuth_label = display.font.render("Azimuth (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(azimuth_label, (display.sub_x + 20, display.sub_y + 410))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_azimuth'])
+    azimuth_text = display.font.render(config_state.alignment_azimuth_str, True, (0, 0, 0))
+    display.menu_screen.blit(azimuth_text, (display.input_rects['alignment_azimuth'].x + 5, display.input_rects['alignment_azimuth'].y + 5))
+
+    elevation_alignment_label = display.font.render("Elevation (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(elevation_alignment_label, (display.sub_x + 20, display.sub_y + 470))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_elevation'])
+    elevation_alignment_text = display.font.render(config_state.alignment_elevation_str, True, (0, 0, 0))
+    display.menu_screen.blit(elevation_alignment_text, (display.input_rects['alignment_elevation'].x + 5, display.input_rects['alignment_elevation'].y + 5))
 
     # Focus highlights for location fields
     if config_state.focused_field == "lat":
@@ -279,6 +307,22 @@ def draw_config_options(display, config_state):
             pygame.draw.line(display.menu_screen, (0, 0, 255),
                             (display.input_rects['elevation_mask'].x + 5 + text_width, display.input_rects['elevation_mask'].y + 5),
                             (display.input_rects['elevation_mask'].x + 5 + text_width, display.input_rects['elevation_mask'].y + 25), 2)
+
+    if config_state.focused_field == "alignment_azimuth":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alignment_azimuth'], 2)
+        if config_state.focused_field == "alignment_azimuth":
+            text_width, _ = display.font.size(config_state.alignment_azimuth_str[:config_state.cursor_pos["alignment_azimuth"]])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['alignment_azimuth'].x + 5 + text_width, display.input_rects['alignment_azimuth'].y + 5),
+                            (display.input_rects['alignment_azimuth'].x + 5 + text_width, display.input_rects['alignment_azimuth'].y + 25), 2)
+
+    if config_state.focused_field == "alignment_elevation":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alignment_elevation'], 2)
+        if config_state.focused_field == "alignment_elevation":
+            text_width, _ = display.font.size(config_state.alignment_elevation_str[:config_state.cursor_pos["alignment_elevation"]])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 5),
+                            (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 25), 2)
 
     # Camera 1 configuration
     camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 380)
@@ -510,6 +554,10 @@ def handle_input(event, config_state):
         field_str = str(config_state.camera_configs["camera2"]["exposure"])
     elif focused_field == "camera2_alignment_rotation":
         field_str = str(config_state.camera_configs["camera2"]["alignment_rotation"])
+    elif focused_field == "alignment_azimuth":
+        field_str = config_state.alignment_azimuth_str
+    elif focused_field == "alignment_elevation":
+        field_str = config_state.alignment_elevation_str
     else:
         return
 
@@ -643,3 +691,7 @@ def handle_input(event, config_state):
             config_state.camera_configs["camera2"]["alignment_rotation"] = float(field_str) if field_str else 0.0
         except ValueError:
             pass  # Keep current value if invalid
+    elif focused_field == "alignment_azimuth":
+        config_state.alignment_azimuth_str = field_str
+    elif focused_field == "alignment_elevation":
+        config_state.alignment_elevation_str = field_str

@@ -66,6 +66,8 @@ def AzAlt2AzEl(AZM, ALT, alignment_azimuth, alignment_elevation):
     """
     Transform from mount coordinates (AZM, ALT) to true az/el (azimuth, elevation).
 
+    Uses quaternion-based rotations for accurate, invertible transformations.
+
     Args:
         AZM: Mount azimuth angle (degrees)
         ALT: Mount altitude angle (degrees)
@@ -75,76 +77,247 @@ def AzAlt2AzEl(AZM, ALT, alignment_azimuth, alignment_elevation):
     Returns:
         tuple: (az, el) in degrees
     """
-    # Compute direction in standard local coordinates (before alignment)
-    d = cartesian_from_az_el(AZM, ALT)
+    from scipy.spatial.transform import Rotation as R
 
-    # Apply inverse alignment rotation (negative angle)
-    R_align = alignment_rotation_matrix(alignment_azimuth, alignment_elevation)
-    # For the transformation from mount to sky, we apply the inverse alignment
-    R_inv = R_align.T  # Transpose for rotation matrix inverse
+    # Convert angles to radians
+    azm_rad = np.radians(AZM)
+    alt_rad = np.radians(ALT)
+    align_az_rad = np.radians(alignment_azimuth)
+    align_el_rad = np.radians(alignment_elevation)
 
-    # Also apply the alignment rotation for the coordinate system
-    d_aligned = R_inv @ d
+    # Build the transformation as a composition of rotations:
+
+    # 1. First: Rotate the telescope mount to point at the alignment direction
+    # This is equivalent to rotating from zenith (0,90) to alignment (align_az, align_el)
+    # We need to rotate the sky coordinate system so that (align_az, align_el) becomes (0,90)
+
+    # Define the standard zenith direction (top of sky)
+    zenith = np.array([0, 0, 1])  # [x, y, z] = [north, east, up]
+
+    # Define the alignment direction
+    align_vec = np.array([
+        np.cos(align_el_rad) * np.cos(align_az_rad),  # north component
+        np.cos(align_el_rad) * np.sin(align_az_rad),  # east component
+        np.sin(align_el_rad)                         # up component
+    ])
+
+    # Create rotation that maps zenith to alignment direction
+    # This represents the misalignment of the telescope mount
+    alignment_rotation = R.align_vectors([align_vec], [zenith])[0]
+
+    # 2. AZM rotation: Rotation around the vertical axis (around zenith/up)
+    # This moves the telescope azimuthally around the sky
+    azm_rotation = R.from_rotvec(azm_rad * np.array([0, 0, 1]))
+
+    # 3. ALT rotation: Rotation around the east-west horizontal axis
+    # The rotation axis depends on current azimuth position
+    # For ALT, we rotate around an axis perpendicular to both zenith and meridians
+    # Current position of the "right" axis after AZM rotation is [-sin(azm), cos(azm), 0]
+    right_axis = np.array([-np.sin(azm_rad), np.cos(azm_rad), 0])
+    alt_rotation = R.from_rotvec(alt_rad * right_axis)
+
+    # Apply transformations in sequence:
+    # Start with zenith-directed telescope and apply rotations
+
+    # The total transformation is:
+    # final_position = alignment_rotation @ alt_rotation @ azm_rotation @ zenith
+    # But we need to think about the coordinate frame transformation
+
+    # For the forward transformation, we want:
+    # Mount coordinates (AZM, ALT) → Sky coordinates (az, el)
+
+    # The mount's zero position points to the alignment direction
+    # We want to find where the current mount position points in sky coordinates
+
+    # Start with the alignment direction and apply the AZM and ALT rotations to it
+    final_rotation = alignment_rotation * alt_rotation * azm_rotation
+
+    # Apply the combined rotation to the sky coordinate frame
+    # The mount's current pointing direction in sky coordinates
+    current_pointing = final_rotation.apply(zenith)
 
     # Convert back to az/el
-    az, el = az_el_from_cartesian(d_aligned)
+    az, el = az_el_from_cartesian(current_pointing)
+
     return az, el
 
-def AzEl2AzAlt(az, el, alignment_azimuth, alignment_elevation, max_iter=10, tolerance=1e-6):
+def _AzAlt2AzEl_fallback(AZM, ALT, alignment_azimuth, alignment_elevation):
+    """
+    Fallback implementation using direct mathematical transformations.
+    """
+    # Convert to radians
+    azm_rad = np.radians(AZM)
+    alt_rad = np.radians(ALT)
+    align_az_rad = np.radians(alignment_azimuth)
+    align_el_rad = np.radians(alignment_elevation)
+
+    # Start from the alignment direction
+    d_az = np.cos(align_el_rad) * np.cos(align_az_rad)
+    d_el = np.cos(align_el_rad) * np.sin(align_az_rad)
+    d_vert = np.sin(align_el_rad)
+
+    # Apply AZM rotation around vertical axis
+    cos_azm = np.cos(azm_rad)
+    sin_azm = np.sin(azm_rad)
+
+    d_az_new = d_az * cos_azm - d_el * sin_azm
+    d_el_new = d_az * sin_azm + d_el * cos_azm
+    d_vert_new = d_vert
+
+    # Apply ALT rotation around the east-west axis
+    cos_alt = np.cos(alt_rad)
+    sin_alt = np.sin(alt_rad)
+
+    # The axis of rotation for ALT is perpendicular to the current pointing direction
+    # For ALT, we rotate around the axis [-sin(azm), cos(azm), 0] (east direction)
+    right_axis = np.array([-np.sin(azm_rad), np.cos(azm_rad), 0])
+    horiz_length = np.sqrt(d_az_new**2 + d_el_new**2)
+
+    if horiz_length > 1e-10:
+        # Rotate the pointing vector around the right axis
+        rotation_axis = right_axis
+        rotation_angle = alt_rad
+
+        # Rodrigues formula for rotation
+        cos_a = np.cos(rotation_angle)
+        sin_a = np.sin(rotation_angle)
+        rot_matrix = np.array([
+            [cos_a + rotation_axis[0]**2 * (1 - cos_a),
+             rotation_axis[0]*rotation_axis[1]*(1 - cos_a) - rotation_axis[2]*sin_a,
+             rotation_axis[0]*rotation_axis[2]*(1 - cos_a) + rotation_axis[1]*sin_a],
+            [rotation_axis[1]*rotation_axis[0]*(1 - cos_a) + rotation_axis[2]*sin_a,
+             cos_a + rotation_axis[1]**2 * (1 - cos_a),
+             rotation_axis[1]*rotation_axis[2]*(1 - cos_a) - rotation_axis[0]*sin_a],
+            [rotation_axis[2]*rotation_axis[0]*(1 - cos_a) - rotation_axis[1]*sin_a,
+             rotation_axis[2]*rotation_axis[1]*(1 - cos_a) + rotation_axis[0]*sin_a,
+             cos_a + rotation_axis[2]**2 * (1 - cos_a)]
+        ])
+
+        final_vec = rot_matrix @ np.array([d_az_new, d_el_new, d_vert_new])
+        d_az_final = final_vec[0]
+        d_el_final = final_vec[1]
+        d_vert_final = final_vec[2]
+
+    else:
+        # Special case: pointing straight up/down
+        d_az_final = d_az_new
+        d_el_final = d_el_new
+        d_vert_final = d_vert_new * np.cos(alt_rad)
+
+    # Convert to az/el
+    az, el = az_el_from_cartesian(np.array([d_az_final, d_el_final, d_vert_final]))
+
+    return az, el
+
+def AzEl2AzAlt(az, el, alignment_azimuth, alignment_elevation):
     """
     Transform from true az/el (azimuth, elevation) to mount coordinates (AZM, ALT).
 
-    Uses numerical approximation to solve the inverse transformation.
+    Uses numerical optimization with multiple initial guesses to find the inverse transformation accurately.
 
     Args:
         az: True azimuth angle (degrees)
         el: True elevation angle (degrees)
         alignment_azimuth: Alignment azimuth offset (degrees)
         alignment_elevation: Alignment elevation offset (degrees)
-        max_iter: Maximum iterations for numerical solution
-        tolerance: Tolerance for convergence
 
     Returns:
         tuple: (AZM, ALT) in degrees
     """
-    # Initial guess: simple linear correction
-    AZM_guess = (az - alignment_azimuth) % 360
-    ALT_guess = el - alignment_elevation
+    from scipy.optimize import minimize
+    import random
 
-    for i in range(max_iter):
-        # Compute current transformation
-        az_guess, el_guess = AzAlt2AzEl(AZM_guess, ALT_guess, alignment_azimuth, alignment_elevation)
+    target_vec = cartesian_from_az_el(az, el)
 
-        # Compute error
-        daz = az - az_guess
-        dele = el - el_guess
+    # Objective function: error between target and forward transformation
+    def error_function(params):
+        azm, alt = params
+        computed_az, computed_el = AzAlt2AzEl(azm, alt, alignment_azimuth, alignment_elevation)
+        computed_vec = cartesian_from_az_el(computed_az, computed_el)
+        return np.linalg.norm(target_vec - computed_vec)
 
-        # Normalize az difference to [-180, 180]
-        daz = (daz + 180) % 360 - 180
+    # Generate multiple initial guesses
+    initial_guesses = []
+
+    # Simple approximation
+    initial_azm = (az - alignment_azimuth) % 360
+    initial_alt = np.clip(el - alignment_elevation, -90, 90)
+    initial_guesses.append([initial_azm, initial_alt])
+
+    # Additional random guesses
+    for i in range(20):
+        rand_azm = random.uniform(0, 360)
+        rand_alt = random.uniform(-90, 90)
+        initial_guesses.append([rand_azm, rand_alt])
+
+    # Perform optimization from each initial guess
+    results = []
+    for guess in initial_guesses:
+        result = minimize(error_function, guess, bounds=[(0, 360), (-90, 90)],
+                         method='L-BFGS-B', options={'maxiter': 100, 'ftol': 1e-6})
+        if result.success:
+            results.append((result.fun, result.x))
+
+    # Find the best result
+    if results:
+        best_result = min(results, key=lambda x: x[0])
+        best_error, best_params = best_result
+        # If error is too large, there might be issues
+        if best_error > 1e-3:
+            print(f"Warning: Large optimization error {best_error} for az={az}, el={el}")
+        return best_params[0] % 360, best_params[1]
+
+    # Fallback to original method if all optimizations fail
+    print(f"Warning: All optimizations failed for az={az}, el={el}, using simple approximation")
+    initial_azm = (az - alignment_azimuth) % 360
+    initial_alt = np.clip(el - alignment_elevation, -90, 90)
+    return initial_azm, initial_alt
+
+def _AzEl2AzAlt_numerical(az, el, alignment_azimuth, alignment_elevation):
+    """
+    Fallback numerical solution for AzEl2AzAlt when scipy not available.
+    """
+    # Simple numerical solution - iteratively refine
+    current_azm = (az - alignment_azimuth) % 360
+    if current_azm > 180:
+        current_azm -= 360
+
+    current_alt = el - alignment_elevation
+    current_alt = np.clip(current_alt, -90, 90)
+
+    # Simple gradient descent approach
+    learning_rate = 0.1
+    max_iterations = 50
+
+    for _ in range(max_iterations):
+        # Compute current output
+        test_az, test_el = AzAlt2AzEl(current_azm, current_alt, alignment_azimuth, alignment_elevation)
+
+        # Compute errors
+        az_error = az - test_az
+        el_error = el - test_el
+
+        # Handle azimuth wraparound
+        if az_error > 180:
+            az_error -= 360
+        elif az_error < -180:
+            az_error += 360
+
+        # Update estimates
+        if abs(az_error) > 1.0:  # Only update if error is significant
+            current_azm += az_error * learning_rate
+        if abs(el_error) > 1.0:
+            current_alt += el_error * learning_rate * 2  # Higher gain for elevation
+
+        # Keep in bounds
+        current_azm = (current_azm + 360) % 360
+        current_alt = np.clip(current_alt, -90, 90)
 
         # Check convergence
-        if abs(daz) < tolerance and abs(dele) < tolerance:
+        if abs(az_error) < 0.1 and abs(el_error) < 0.1:
             break
 
-        # Jacobian approximation (estimated partial derivatives)
-        jac_az_azm = 1.0 + 0.01 * abs(ALT_guess - 90)  # Approximates coupling effect
-        jac_el_alt = 1.0
-
-        # Update guess using Newton's method
-        AZM_guess += daz / jac_az_azm
-        ALT_guess += dele / jac_el_alt
-
-        # Keep within bounds
-        AZM_guess %= 360
-        ALT_guess = np.clip(ALT_guess, -90, 90)
-
-        # Handle pole crossing
-        if ALT_guess > 80 or ALT_guess < -80:
-            # Near singularity, flip azimuth
-            AZM_guess = (AZM_guess + 180) % 360
-            ALT_guess = 90 - np.abs(ALT_guess) if ALT_guess > 0 else -90 + np.abs(ALT_guess)
-
-    return AZM_guess, ALT_guess
+    return current_azm, current_alt
 
 def apply_rotation_to_az_el(az, el, rotation_angle):
     """

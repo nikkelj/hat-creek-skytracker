@@ -307,17 +307,17 @@ class JoystickModeState:
                     print("Parking telescope to 0, 0...")
                     # Loop until parked
                     angle = 1
-                    while angle > 0.003:
-                        success = self.telescope_controller.hc_goto_fast(Targets.AZM, 0, 0, 0)
+                    while (angle - float(config_state.azm_offset_str)) > 1:
+                        success = self.telescope_controller.hc_goto_fast(Targets.AZM, float(config_state.azm_offset_str), 0, 0)
                         print("AZM Park command sent")
                         time.sleep(0.1)
-                        angle = self.telescope_controller.hc_get_position(Targets.AZM)
+                        angle = self.telescope_controller.hc_get_position(Targets.AZM) * 360
                     angle = 1
-                    while angle > 0.003:
-                        success = self.telescope_controller.hc_goto_fast(Targets.ALT, 0, 0, 0)
+                    while (angle - float(config_state.alt_offset_str)) > 1: # keep trying until <1 degree
+                        success = self.telescope_controller.hc_goto_fast(Targets.ALT, float(config_state.alt_offset_str), 0, 0)
                         print("ALT Park command sent")
                         time.sleep(0.1)
-                        angle = self.telescope_controller.hc_get_position(Targets.ALT)
+                        angle = self.telescope_controller.hc_get_position(Targets.ALT) * 360
                 else:
                     print("Cannot park: telescope not connected")
 

@@ -97,6 +97,20 @@ class TrackingVisState:
         # Camera FOV data
         self.camera_fov_data = []
 
+        # Telescope position (updated from joystick mode)
+        self.telescope_azimuth = 0.0  # Mount AZM angle (degrees)
+        self.telescope_altitude = 0.0 # Mount ALT angle (degrees)
+
+        # Telescope alignment parameters
+        self.alignment_azimuth = 266.0
+        self.alignment_elevation = 34.874
+
+        # Camera FOV intermediate parameters storage
+        self.camera_fov_params = {
+            'camera1': {},
+            'camera2': {}
+        }
+
     def reset_input_fields(self):
         """Reset input field positions when switching modes."""
         self.cursor_pos = {

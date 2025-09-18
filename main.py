@@ -617,12 +617,12 @@ while running:
 
                     # Time AZM call
                     azm_start = perf_counter()
-                    joystick_mode_state.current_azm = joystick_mode_state.telescope_controller.hc_get_position(Targets.AZM)
+                    joystick_mode_state.current_azm = joystick_mode_state.telescope_controller.hc_get_position(Targets.AZM) * 360.0 - float(config_state.azm_offset_str)
                     azm_duration = (perf_counter() - azm_start) * 1000  # Convert to milliseconds
 
                     # Time ALT call
                     alt_start = perf_counter()
-                    joystick_mode_state.current_alt = joystick_mode_state.telescope_controller.hc_get_position(Targets.ALT)
+                    joystick_mode_state.current_alt = joystick_mode_state.telescope_controller.hc_get_position(Targets.ALT) * 360.0 - float(config_state.alt_offset_str)
                     alt_duration = (perf_counter() - alt_start) * 1000  # Convert to milliseconds
 
                     # Update frequency and timing report every second
@@ -633,18 +633,25 @@ while running:
                         position_poll_start_time = current_poll_time
                         print(f"Telescope polling: {position_poll_frequency:.1f} Hz | AZM: {azm_duration:.1f}ms | ALT: {alt_duration:.1f}ms | Total: {azm_duration + alt_duration:.1f}ms")
 
-                    # Format for display
+                    # Format for display (convert degrees back to fractions for proper DMS formatting)
                     from lib.auxstar import f2dms, format_angle_compact
-                    azm_d, azm_m, azm_s = f2dms(joystick_mode_state.current_azm)
-                    alt_d, alt_m, alt_s = f2dms(joystick_mode_state.current_alt)
+                    azm_fraction = joystick_mode_state.current_azm / 360.0
+                    alt_fraction = joystick_mode_state.current_alt / 360.0
+                    azm_d, azm_m, azm_s = f2dms(azm_fraction)
+                    alt_d, alt_m, alt_s = f2dms(alt_fraction)
                     joystick_mode_state.azm_display_str = f"{azm_d:3d}°{azm_m:02d}'{azm_s:04.1f}\""
                     joystick_mode_state.alt_display_str = f"{alt_d:3d}°{alt_m:02d}'{alt_s:04.1f}\""
+
+                    # Sync to tracking visualization state
+                    tracking_vis_state.telescope_azimuth = joystick_mode_state.current_azm
+                    tracking_vis_state.telescope_altitude = joystick_mode_state.current_alt
             except Exception as e:
                 # On polling error, maintain previous values or show error
                 if not joystick_mode_state.azm_display_str == "--":
                     joystick_mode_state.azm_display_str = "ERROR"
                     joystick_mode_state.alt_display_str = "ERROR"
                 print(f"Position polling error: {e}. Are you sure the mount is powered?")
+
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         display.menu_screen.fill((150, 150, 150), sub_rect)

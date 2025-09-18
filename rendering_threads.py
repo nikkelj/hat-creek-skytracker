@@ -27,6 +27,9 @@ SATELLITE_LABEL_FONT = None
 # Cache for rendered satellite label surfaces to avoid expensive re-rendering
 SATELLITE_LABEL_CACHE = {}
 
+# Polar plot constants (must match tracking_visuals.py)
+POLAR_RADIUS_OFFSET = 50
+
 # ==============================================================================
 # SURFACE-BASED DRAWING FUNCTIONS FOR THREADED RENDERING
 # ==============================================================================
@@ -530,8 +533,10 @@ class VisualizationRenderingThread(threading.Thread):
 
     def get_latest_surface(self):
         """Get the most recent rendered surface - thread-safe."""
-        with self.surface_lock:
-            return self.latest_surface
+        if hasattr(self, 'surface_lock'):
+            with self.surface_lock:
+                return self.latest_surface
+        return self.latest_surface
 
     def calculate_fps(self):
         """Calculate current rendering FPS."""
@@ -663,34 +668,17 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
     def compute_camera_fov_data(self):
         """Compute FOV parameters for both cameras and store in tracking_vis_state."""
         try:
-            # Import globals
-            from joystick_controller import joystick_mode_state
-            from config import load_config
+            # Use telescope position stored in tracking_vis_state
+            current_azm = self.tracking_vis_state.telescope_azimuth
+            current_alt = self.tracking_vis_state.telescope_altitude
 
-            # Load current config
-            config_state = load_config()
-            if not config_state:
-                return
-
-            # Get alignment parameters from config
+            # Get alignment parameters from config_state (already available)
             try:
-                alignment_azimuth = float(config_state.alignment_azimuth_str or 0.0)
-                alignment_elevation = float(config_state.alignment_elevation_str or 0.0)
+                alignment_azimuth = float(self.config_state.alignment_azimuth_str or 0.0)
+                alignment_elevation = float(self.config_state.alignment_elevation_str or 0.0)
             except (AttributeError, ValueError):
                 alignment_azimuth = 0.0
                 alignment_elevation = 0.0
-
-            # Get current telescope position
-            current_azm = None
-            current_alt = None
-            if hasattr(joystick_mode_state, 'current_azm') and hasattr(joystick_mode_state, 'current_alt'):
-                current_azm = joystick_mode_state.current_azm
-                current_alt = joystick_mode_state.current_alt
-
-            if current_azm is None:
-                current_azm = 0.0
-            if current_alt is None:
-                current_alt = 0.0
 
             # Initialize FOV data list
             fov_data_list = []
@@ -701,7 +689,7 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     camera_key = f"camera{camera_idx + 1}"
 
                     # Get camera parameters from config
-                    camera_config = config_state.camera_configs.get(camera_key, {})
+                    camera_config = self.config_state.camera_configs.get(camera_key, {})
                     pixel_size_um = float(camera_config.get('pixel_size', 2.9))
                     focal_length_mm = float(camera_config.get('focal_length', 162.0))
                     alignment_rotation = float(camera_config.get('alignment_rotation', 0.0))
@@ -862,7 +850,14 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         'sub_height': self.display.sub_height
                     }
 
+                    # Compute camera FOV data
+                    self.compute_camera_fov_data()
+
+                    # Draw polar plot background first
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
+                    # Now draw FOV boxes
+                    draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, None)
+                    # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
 
                     # Draw satellite details panel after satellites
@@ -883,3 +878,101 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                 safe_time.sleep(0.1)  # Brief pause on error
 
         print("JoystickVisualizationThread stopped.")
+
+    def compute_camera_fov_data(self):
+        """Compute FOV parameters for both cameras and store in tracking_vis_state."""
+        try:
+            # Use telescope position stored in tracking_vis_state
+            current_azm = self.tracking_vis_state.telescope_azimuth
+            current_alt = self.tracking_vis_state.telescope_altitude
+
+            # Get alignment parameters from config_state (already available)
+            try:
+                alignment_azimuth = float(self.config_state.alignment_azimuth_str or 0.0)
+                alignment_elevation = float(self.config_state.alignment_elevation_str or 0.0)
+            except (AttributeError, ValueError):
+                alignment_azimuth = 0.0
+                alignment_elevation = 0.0
+
+            # Initialize FOV data list
+            fov_data_list = []
+
+            # Process each camera
+            for camera_idx in [0, 1]:  # Camera1 and Camera2
+                try:
+                    camera_key = f"camera{camera_idx + 1}"
+
+                    # Get camera parameters from config
+                    camera_config = self.config_state.camera_configs.get(camera_key, {})
+                    pixel_size_um = float(camera_config.get('pixel_size', 2.9))
+                    focal_length_mm = float(camera_config.get('focal_length', 162.0))
+                    alignment_rotation = float(camera_config.get('alignment_rotation', 0.0))
+
+                    # Get current ROI settings (from camera_manager)
+                    from camera_manager import camera_manager
+                    camera_obj = camera_manager.get_camera(camera_idx)
+                    if not camera_obj:
+                        continue
+
+                    # Get camera resolution (use defaults if not connected)
+                    width_pixels = camera_obj.width_res if camera_obj.connected else 1920
+                    height_pixels = camera_obj.height_res if camera_obj.connected else 1280
+
+                    # Get ROI settings
+                    roi_width_pct = 0.5 ** camera_obj.roi_size if camera_obj.roi_size > 0 else 1.0
+                    roi_height_pct = 0.5 ** camera_obj.roi_size if camera_obj.roi_size > 0 else 1.0
+
+                    # Compute FOV for this camera
+                    fov_params = compute_fov_for_camera(
+                        pixel_size_um=pixel_size_um,
+                        focal_length_mm=focal_length_mm,
+                        roi_width_pct=roi_width_pct,
+                        roi_height_pct=roi_height_pct,
+                        camera_width_pixels=width_pixels,
+                        camera_height_pixels=height_pixels
+                    )
+
+                    # Transform telescope position to sky coordinates
+                    true_az, true_el = AzAlt2AzEl(
+                        current_azm, current_alt,
+                        alignment_azimuth, alignment_elevation
+                    )
+
+                    # Apply camera alignment rotation
+                    az, el = apply_rotation_to_az_el(true_az, true_el, alignment_rotation)
+
+                    # Offset FOV center based on ROI position
+                    roi_x = getattr(camera_obj, 'roi_x', 0.5)
+                    roi_y = getattr(camera_obj, 'roi_y', 0.5)
+
+                    # Offset calculations (simplified)
+                    az_offset = (roi_x - 0.5) * fov_params['fov_width_deg'] / 4  # Scale down for better visibility
+                    el_offset = (roi_y - 0.5) * fov_params['fov_height_deg'] / 4
+
+                    fov_center_az = az + az_offset
+                    fov_center_el = el + el_offset
+
+                    # Create FOV data dictionary
+                    fov_data = {
+                        'camera_id': camera_idx,
+                        'az': fov_center_az,
+                        'el': fov_center_el,
+                        'fov_width_deg': fov_params['fov_width_deg'],
+                        'fov_height_deg': fov_params['fov_height_deg'],
+                        'rotation': alignment_rotation,
+                        'spot_size_arcsec_per_pixel': fov_params['spot_size_arcsec_per_pixel'],
+                        'color': (255, 0, 0) if camera_idx == 0 else (255, 165, 0),  # Red for cam1, orange for cam2
+                    }
+
+                    fov_data_list.append(fov_data)
+
+                except Exception as cam_e:
+                    print(f"Error computing FOV for camera {camera_idx}: {cam_e}")
+                    continue
+
+            # Update the tracking_vis_state with computed FOV data
+            self.tracking_vis_state.camera_fov_data = fov_data_list
+
+        except Exception as e:
+            print(f"Error computing camera FOV data: {e}")
+            self.tracking_vis_state.camera_fov_data = []

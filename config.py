@@ -23,6 +23,10 @@ class ConfigState:
         self.alignment_azimuth_str = "0.0"
         self.alignment_elevation_str = "0.0"
 
+        # Position offset configuration
+        self.azm_offset_str = "0.0"
+        self.alt_offset_str = "0.0"
+
         # System configuration
         self.buffer_size = 1000  # Circular buffer size (frames)
         self.image_format = "BMP"  # Capture image format (BMP/PNG)
@@ -52,6 +56,7 @@ class ConfigState:
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
+            "azm_offset": 0, "alt_offset": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -60,6 +65,7 @@ class ConfigState:
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
             "alignment_azimuth": None, "alignment_elevation": None,
+            "azm_offset": None, "alt_offset": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -75,6 +81,8 @@ class ConfigState:
             "elevation_mask": self.elevation_mask_str,
             "alignment_azimuth": self.alignment_azimuth_str,
             "alignment_elevation": self.alignment_elevation_str,
+            "azm_offset": self.azm_offset_str,
+            "alt_offset": self.alt_offset_str,
             "camera_configs": self.camera_configs
         }
 
@@ -86,6 +94,8 @@ class ConfigState:
         self.elevation_mask_str = config_dict.get("elevation_mask", self.elevation_mask_str)
         self.alignment_azimuth_str = config_dict.get("alignment_azimuth", self.alignment_azimuth_str)
         self.alignment_elevation_str = config_dict.get("alignment_elevation", self.alignment_elevation_str)
+        self.azm_offset_str = config_dict.get("azm_offset", self.azm_offset_str)
+        self.alt_offset_str = config_dict.get("alt_offset", self.alt_offset_str)
 
         # Load system configuration
         self.buffer_size = config_dict.get("buffer_size", self.buffer_size)
@@ -118,6 +128,7 @@ class ConfigState:
         self.cursor_pos = {
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
+            "azm_offset": 0, "alt_offset": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -126,6 +137,7 @@ class ConfigState:
         self.selection_start = {
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
             "alignment_azimuth": None, "alignment_elevation": None,
+            "azm_offset": None, "alt_offset": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -229,7 +241,7 @@ def draw_config_options(display, config_state):
         pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
 
     # Draw grouping box and label
-    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 620)
+    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 720)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
     group_label = display.font.render("Observer Location", True, (0, 0, 0))
     display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
@@ -260,20 +272,32 @@ def draw_config_options(display, config_state):
     display.menu_screen.blit(elevation_mask_text, (display.input_rects['elevation_mask'].x + 5, display.input_rects['elevation_mask'].y + 5))
 
     # Mount Alignment fields
-    mount_alignment_header = display.font.render("Mount Alignment:", True, (0, 0, 0))
+    mount_alignment_header = display.font.render("Azimuth Alignment (deg):", True, (0, 0, 0))
     display.menu_screen.blit(mount_alignment_header, (display.sub_x + 20, display.sub_y + 380))
 
-    azimuth_label = display.font.render("Azimuth (deg):", True, (0, 0, 0))
+    azimuth_label = display.font.render("Azimuth Alignment (deg):", True, (0, 0, 0))
     display.menu_screen.blit(azimuth_label, (display.sub_x + 20, display.sub_y + 410))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_azimuth'])
     azimuth_text = display.font.render(config_state.alignment_azimuth_str, True, (0, 0, 0))
     display.menu_screen.blit(azimuth_text, (display.input_rects['alignment_azimuth'].x + 5, display.input_rects['alignment_azimuth'].y + 5))
 
-    elevation_alignment_label = display.font.render("Elevation (deg):", True, (0, 0, 0))
+    elevation_alignment_label = display.font.render("Elevation Alignment (deg):", True, (0, 0, 0))
     display.menu_screen.blit(elevation_alignment_label, (display.sub_x + 20, display.sub_y + 470))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_elevation'])
     elevation_alignment_text = display.font.render(config_state.alignment_elevation_str, True, (0, 0, 0))
     display.menu_screen.blit(elevation_alignment_text, (display.input_rects['alignment_elevation'].x + 5, display.input_rects['alignment_elevation'].y + 5))
+
+    azm_offset_label = display.font.render("Azm Offset (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(azm_offset_label, (display.sub_x + 20, display.sub_y + 550))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_offset'])
+    azm_offset_text = display.font.render(config_state.azm_offset_str, True, (0, 0, 0))
+    display.menu_screen.blit(azm_offset_text, (display.input_rects['azm_offset'].x + 5, display.input_rects['azm_offset'].y + 5))
+
+    alt_offset_label = display.font.render("Alt Offset (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(alt_offset_label, (display.sub_x + 20, display.sub_y + 630))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_offset'])
+    alt_offset_text = display.font.render(config_state.alt_offset_str, True, (0, 0, 0))
+    display.menu_screen.blit(alt_offset_text, (display.input_rects['alt_offset'].x + 5, display.input_rects['alt_offset'].y + 5))
 
     # Focus highlights for location fields
     if config_state.focused_field == "lat":
@@ -323,6 +347,22 @@ def draw_config_options(display, config_state):
             pygame.draw.line(display.menu_screen, (0, 0, 255),
                             (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 5),
                             (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 25), 2)
+
+    if config_state.focused_field == "azm_offset":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_offset'], 2)
+        if config_state.focused_field == "azm_offset":
+            text_width, _ = display.font.size(config_state.azm_offset_str[:config_state.cursor_pos["azm_offset"]])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['azm_offset'].x + 5 + text_width, display.input_rects['azm_offset'].y + 5),
+                            (display.input_rects['azm_offset'].x + 5 + text_width, display.input_rects['azm_offset'].y + 25), 2)
+
+    if config_state.focused_field == "alt_offset":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_offset'], 2)
+        if config_state.focused_field == "alt_offset":
+            text_width, _ = display.font.size(config_state.alt_offset_str[:config_state.cursor_pos["alt_offset"]])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 5),
+                            (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 25), 2)
 
     # Camera 1 configuration
     camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 380)
@@ -558,6 +598,10 @@ def handle_input(event, config_state):
         field_str = config_state.alignment_azimuth_str
     elif focused_field == "alignment_elevation":
         field_str = config_state.alignment_elevation_str
+    elif focused_field == "azm_offset":
+        field_str = config_state.azm_offset_str
+    elif focused_field == "alt_offset":
+        field_str = config_state.alt_offset_str
     else:
         return
 
@@ -695,3 +739,7 @@ def handle_input(event, config_state):
         config_state.alignment_azimuth_str = field_str
     elif focused_field == "alignment_elevation":
         config_state.alignment_elevation_str = field_str
+    elif focused_field == "azm_offset":
+        config_state.azm_offset_str = field_str
+    elif focused_field == "alt_offset":
+        config_state.alt_offset_str = field_str

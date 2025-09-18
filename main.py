@@ -24,7 +24,7 @@ except Exception as e:
 from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table
 from config import load_config, handle_input, draw_config_options
-from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
+from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events
@@ -512,6 +512,7 @@ while running:
         draw_filters(display, tracking_vis_state)
         draw_legend(display)
         draw_details(display, tracking_vis_state)
+        draw_camera_fov_details(display, tracking_vis_state, 290)  # Start below satellite details (20+250+20)
         draw_time_display(display)
         draw_satellite_count(display, tracking_vis_state)
 

@@ -214,6 +214,82 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
                 pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
 
+def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
+    """
+    Draw camera FOV details panels on a specified surface with given bounds.
+    Each camera gets its own info pane positioned below the satellite details pane.
+    """
+    global SATELLITE_LABEL_FONT
+
+    if not hasattr(state, 'camera_fov_data') or not state.camera_fov_data:
+        return
+
+    surface_width, surface_height = surface.get_size()
+    current_y = y_offset + 10  # Start below satellite details with some spacing
+
+    for i, fov_data in enumerate(state.camera_fov_data):
+        # Use the same panel positioning as tracking visuals mode for consistency
+        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            # Adjust for quadrant surface bounds
+            panel_x = surface_width - 190
+            panel_y = current_y
+            panel_width = 170
+            panel_height = 120
+        else:
+            # Full screen mode - same positioning as tracking visuals
+            panel_x = surface_width - 190
+            panel_y = current_y
+            panel_width = 170
+            panel_height = 120
+
+        # Create font if needed (always use same font size as tracking visuals)
+        if SATELLITE_LABEL_FONT is None:
+            SATELLITE_LABEL_FONT = pygame.font.Font(None, 12)  # Same as tracking visuals
+
+        # Use consistent font size for both modes (same as tracking visuals)
+        dynamic_font = SATELLITE_LABEL_FONT
+
+        # Draw panel background
+        pygame.draw.rect(surface, (50, 50, 50), (panel_x, panel_y, panel_width, panel_height))
+        pygame.draw.rect(surface, (0, 0, 0), (panel_x, panel_y, panel_width, panel_height), 2)
+
+        # Panel title
+        camera_num = fov_data.get('camera_id', i) + 1
+        title = f"Camera {camera_num} FOV"
+        title_surface = dynamic_font.render(title, True, (255, 255, 255))
+        surface.blit(title_surface, (panel_x + 5, panel_y + 5))
+
+        # FOV details
+        details = [
+            f"Az: {fov_data.get('az', 0.0):.2f}°",
+            f"El: {fov_data.get('el', 0.0):.2f}°",
+            f"FOV Width: {fov_data.get('fov_width_deg', 1.0):.3f}°",
+            f"FOV Height: {fov_data.get('fov_height_deg', 1.0):.3f}°",
+            f"Rotation: {fov_data.get('rotation', 0.0):.1f}°",
+            f"Spot Size: {fov_data.get('spot_size_arcsec_per_pixel', 0.5):.2f}\"/pix",
+        ]
+
+        # Draw detail lines
+        y_offset_line = panel_y + 25
+        for line_no, line in enumerate(details):
+            # Color-coded display
+            if line_no == 0:  # Azimuth
+                color = (200, 200, 255)  # Light blue
+            elif line_no == 1:  # Elevation
+                color = (200, 255, 200)  # Light green
+            elif line_no == 5:  # Spot size
+                color = (255, 255, 200)  # Light yellow
+            else:  # FOV parameters
+                color = (255, 255, 255)  # White
+
+            line_surface = dynamic_font.render(line, True, color)
+            surface.blit(line_surface, (panel_x + 5, y_offset_line))
+            y_offset_line += 15
+
+        # Update vertical position for next camera panel
+        current_y += panel_height + 0  # Panel height + spacing
+
+
 def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """
     Draw satellite details panel on a specified surface with given bounds.
@@ -862,6 +938,8 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
 
                     # Draw satellite details panel after satellites
                     draw_details_on_surface(self.surface, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+                    # Draw camera FOV details below satellite details (accounting for reduced height in quadrant mode)
+                    draw_camera_fov_details_on_surface(self.surface, self.tracking_vis_state, display_bounds, 210, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                 else:
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))

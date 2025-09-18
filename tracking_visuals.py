@@ -399,6 +399,66 @@ def draw_legend(display):
     geo_label = display.small_font.render("GEO (Purple)", True, (255, 255, 255))
     display.menu_screen.blit(geo_label, (display.legend_x + 40, display.legend_y + 105))
 
+
+def draw_camera_fov_details(display, state, y_offset, mode=PolarPlotMode.FULL_SCREEN):
+    """
+    State-direct mutation function for drawing camera FOV details panels.
+    Each camera gets its own info pane positioned below the satellite details pane.
+    """
+    if not hasattr(state, 'camera_fov_data') or not state.camera_fov_data:
+        return
+
+    current_y = y_offset + 10  # Start below satellite details with some spacing
+
+    for i, fov_data in enumerate(state.camera_fov_data):
+        panel_x = display.sub_x + display.sub_width - 190
+        panel_y = current_y
+
+        # Panel dimensions (similar to satellite details but smaller per camera)
+        panel_width = 170
+        panel_height = 120
+
+        # Draw panel background
+        pygame.draw.rect(display.menu_screen, (50, 50, 50), (panel_x, panel_y, panel_width, panel_height))
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), (panel_x, panel_y, panel_width, panel_height), 2)
+
+        # Panel title
+        camera_num = fov_data.get('camera_id', i) + 1
+        title = f"Camera {camera_num} FOV"
+        title_surface = display.small_font.render(title, True, (255, 255, 255))
+        display.menu_screen.blit(title_surface, (panel_x + 5, panel_y + 5))
+
+        # FOV details
+        details = [
+            f"Az: {fov_data.get('az', 0.0):.2f}°",
+            f"El: {fov_data.get('el', 0.0):.2f}°",
+            f"FOV Width: {fov_data.get('fov_width_deg', 1.0):.3f}°",
+            f"FOV Height: {fov_data.get('fov_height_deg', 1.0):.3f}°",
+            f"Rotation: {fov_data.get('rotation', 0.0):.1f}°",
+            f"Spot Size: {fov_data.get('spot_size_arcsec_per_pixel', 0.5):.2f}\"/pix",
+        ]
+
+        # Draw detail lines
+        y_offset_line = panel_y + 25
+        for line_no, line in enumerate(details):
+            # Color-coded display
+            if line_no == 0:  # Azimuth
+                color = (200, 200, 255)  # Light blue
+            elif line_no == 1:  # Elevation
+                color = (200, 255, 200)  # Light green
+            elif line_no == 5:  # Spot size
+                color = (255, 255, 200)  # Light yellow
+            else:  # FOV parameters
+                color = (255, 255, 255)  # White
+
+            line_surface = display.small_font.render(line, True, color)
+            display.menu_screen.blit(line_surface, (panel_x + 5, y_offset_line))
+            y_offset_line += 15
+
+        # Update vertical position for next camera panel
+        current_y += panel_height + 10  # Panel height + spacing
+
+
 def draw_details(display, state, mode=PolarPlotMode.FULL_SCREEN):
     """
     State-direct mutation function for drawing satellite details panel.

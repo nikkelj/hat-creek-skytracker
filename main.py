@@ -240,6 +240,9 @@ while running:
         tracking_vis_state.t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes_auto/2))
         tracking_vis_state.t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes_auto/2))
 
+        # Update the center time UI field to reflect the new center time
+        tracking_vis_state.center_time_str = current_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
         # Update scroll bar time range labels based on the duration being used
         tracking_vis_state.scroll_bar_start_label = "-" + str(duration_minutes_auto/2) + " min"
         tracking_vis_state.scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"

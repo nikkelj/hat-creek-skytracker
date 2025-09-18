@@ -112,7 +112,8 @@ class TrackingVisState:
         }
 
     def reset_input_fields(self):
-        """Reset input field positions when switching modes."""
+        """Reset input field positions and values to defaults when switching modes or pressing reset."""
+        # Reset cursor positions
         self.cursor_pos = {
             "filter": 0,
             "filter_above_alt": 0,
@@ -128,6 +129,16 @@ class TrackingVisState:
             "duration": None
         }
         self.focused_field = None
+
+        # Reset actual field values to defaults
+        from datetime import datetime, timezone
+        self.center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.duration_str = "30"
+
+        # Clear filter text
+        self.filter_text = ""
+        self.filter_above_alt_text = ""
+        self.filter_below_alt_text = ""
 
     def get_updated_params(self):
         """Get dictionary of parameters for event handlers (for backward compatibility)."""

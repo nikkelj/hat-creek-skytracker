@@ -27,6 +27,26 @@ class ConfigState:
         self.azm_offset_str = "0.0"
         self.alt_offset_str = "0.0"
 
+        # PID gain configuration
+        self.pid_azm_p_gain = 1.0
+        self.pid_azm_i_gain = 0.0
+        self.pid_azm_d_gain = 0.0
+        self.pid_alt_p_gain = 1.0
+        self.pid_alt_i_gain = 0.0
+        self.pid_alt_d_gain = 0.0
+
+        # Feed-forward configuration
+        self.feed_forward_azm_enabled = False
+        self.feed_forward_alt_enabled = False
+
+        # Bias control configuration
+        self.bias_azm_deg = 0.0  # Bias in azimuth direction (degrees)
+        self.bias_alt_deg = 0.0  # Bias in elevation direction (degrees)
+        self.bias_control_mode = "coarse"  # "coarse" or "fine" movement mode
+
+        # Mount mode configuration
+        self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
+
         # System configuration
         self.buffer_size = 1000  # Circular buffer size (frames)
         self.image_format = "BMP"  # Capture image format (BMP/PNG)
@@ -57,6 +77,8 @@ class ConfigState:
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
             "azm_offset": 0, "alt_offset": 0,
+            "pid_azm_p_gain": 0, "pid_azm_i_gain": 0, "pid_azm_d_gain": 0,
+            "pid_alt_p_gain": 0, "pid_alt_i_gain": 0, "pid_alt_d_gain": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -66,6 +88,8 @@ class ConfigState:
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
             "alignment_azimuth": None, "alignment_elevation": None,
             "azm_offset": None, "alt_offset": None,
+            "pid_azm_p_gain": None, "pid_azm_i_gain": None, "pid_azm_d_gain": None,
+            "pid_alt_p_gain": None, "pid_alt_i_gain": None, "pid_alt_d_gain": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -83,7 +107,19 @@ class ConfigState:
             "alignment_elevation": self.alignment_elevation_str,
             "azm_offset": self.azm_offset_str,
             "alt_offset": self.alt_offset_str,
-            "camera_configs": self.camera_configs
+            "camera_configs": self.camera_configs,
+            "pid_azm_p_gain": self.pid_azm_p_gain,
+            "pid_azm_i_gain": self.pid_azm_i_gain,
+            "pid_azm_d_gain": self.pid_azm_d_gain,
+            "pid_alt_p_gain": self.pid_alt_p_gain,
+            "pid_alt_i_gain": self.pid_alt_i_gain,
+            "pid_alt_d_gain": self.pid_alt_d_gain,
+            "feed_forward_azm_enabled": self.feed_forward_azm_enabled,
+            "feed_forward_alt_enabled": self.feed_forward_alt_enabled,
+            "bias_azm_deg": self.bias_azm_deg,
+            "bias_alt_deg": self.bias_alt_deg,
+            "bias_control_mode": self.bias_control_mode,
+            "mount_mode": self.mount_mode
         }
 
     def load_from_dict(self, config_dict):
@@ -100,6 +136,24 @@ class ConfigState:
         # Load system configuration
         self.buffer_size = config_dict.get("buffer_size", self.buffer_size)
         self.image_format = config_dict.get("image_format", self.image_format)
+
+        # Load PID gains
+        self.pid_azm_p_gain = config_dict.get("pid_azm_p_gain", self.pid_azm_p_gain)
+        self.pid_azm_i_gain = config_dict.get("pid_azm_i_gain", self.pid_azm_i_gain)
+        self.pid_azm_d_gain = config_dict.get("pid_azm_d_gain", self.pid_azm_d_gain)
+        self.pid_alt_p_gain = config_dict.get("pid_alt_p_gain", self.pid_alt_p_gain)
+        self.pid_alt_i_gain = config_dict.get("pid_alt_i_gain", self.pid_alt_i_gain)
+        self.pid_alt_d_gain = config_dict.get("pid_alt_d_gain", self.pid_alt_d_gain)
+
+        # Load feed-forward and bias control settings
+        self.feed_forward_azm_enabled = config_dict.get("feed_forward_azm_enabled", self.feed_forward_azm_enabled)
+        self.feed_forward_alt_enabled = config_dict.get("feed_forward_alt_enabled", self.feed_forward_alt_enabled)
+        self.bias_azm_deg = config_dict.get("bias_azm_deg", self.bias_azm_deg)
+        self.bias_alt_deg = config_dict.get("bias_alt_deg", self.bias_alt_deg)
+        self.bias_control_mode = config_dict.get("bias_control_mode", self.bias_control_mode)
+
+        # Load mount mode
+        self.mount_mode = config_dict.get("mount_mode", self.mount_mode)
 
         # Load camera configurations if present
         if "camera_configs" in config_dict:
@@ -129,6 +183,8 @@ class ConfigState:
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
             "azm_offset": 0, "alt_offset": 0,
+            "pid_azm_p_gain": 0, "pid_azm_i_gain": 0, "pid_azm_d_gain": 0,
+            "pid_alt_p_gain": 0, "pid_alt_i_gain": 0, "pid_alt_d_gain": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
             "camera1_gain": 0, "camera1_exposure": 0,
             "camera2_pixel_size": 0, "camera2_array_size_diagonal": 0, "camera2_focal_length": 0, "camera2_alignment_rotation": 0,
@@ -138,6 +194,8 @@ class ConfigState:
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
             "alignment_azimuth": None, "alignment_elevation": None,
             "azm_offset": None, "alt_offset": None,
+            "pid_azm_p_gain": None, "pid_azm_i_gain": None, "pid_azm_d_gain": None,
+            "pid_alt_p_gain": None, "pid_alt_i_gain": None, "pid_alt_d_gain": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
             "camera1_gain": None, "camera1_exposure": None,
             "camera2_pixel_size": None, "camera2_array_size_diagonal": None, "camera2_focal_length": None, "camera2_alignment_rotation": None,
@@ -203,28 +261,341 @@ class ConfigState:
         self.camera_configs[camera_name].update(config_dict)
 
 
-def load_config(file_path=None):
-    """Create and initialize ConfigState from file (backward compatibility)."""
-    config_state = ConfigState()
-    config_state.load_from_file(file_path)
-    return config_state
+def draw_angle_groups(display, config_state):
+    """
+    Draw PID and alignment configuration UI groups.
+    This extends draw_config_options with PID parameter controls.
+    """
+    import pygame
+    from utils import draw_button_with_objects
+
+    # Draw PID configuration group (right side)
+    pid_group_rect = pygame.Rect(display.sub_x + 480, display.sub_y + 0, 320, 280)
+    pygame.draw.rect(display.menu_screen, (0, 0, 0), pid_group_rect, 2, border_radius=5)
+    pid_label = display.font.render("PID Control", True, (0, 0, 0))
+    display.menu_screen.blit(pid_label, (display.sub_x + 490, display.sub_y + 10))
+
+    current_y = display.sub_y + 40
+
+    # AZM PID gains
+    azm_p_label = display.small_font.render("AZM P:", True, (0, 0, 0))
+    display.menu_screen.blit(azm_p_label, (display.sub_x + 490, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_p_gain'])
+    azm_p_text = display.small_font.render(f"{config_state.pid_azm_p_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(azm_p_text, (display.input_rects['pid_azm_p_gain'].x + 5, display.input_rects['pid_azm_p_gain'].y + 5))
+
+    azm_i_label = display.small_font.render("I:", True, (0, 0, 0))
+    display.menu_screen.blit(azm_i_label, (display.sub_x + 600, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_i_gain'])
+    azm_i_text = display.small_font.render(f"{config_state.pid_azm_i_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(azm_i_text, (display.input_rects['pid_azm_i_gain'].x + 5, display.input_rects['pid_azm_i_gain'].y + 5))
+
+    azm_d_label = display.small_font.render("D:", True, (0, 0, 0))
+    display.menu_screen.blit(azm_d_label, (display.sub_x + 710, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_d_gain'])
+    azm_d_text = display.small_font.render(f"{config_state.pid_azm_d_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(azm_d_text, (display.input_rects['pid_azm_d_gain'].x + 5, display.input_rects['pid_azm_d_gain'].y + 5))
+
+    current_y += 70
+
+    # ALT PID gains
+    alt_p_label = display.small_font.render("ALT P:", True, (0, 0, 0))
+    display.menu_screen.blit(alt_p_label, (display.sub_x + 490, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_p_gain'])
+    alt_p_text = display.small_font.render(f"{config_state.pid_alt_p_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_p_text, (display.input_rects['pid_alt_p_gain'].x + 5, display.input_rects['pid_alt_p_gain'].y + 5))
+
+    alt_i_label = display.small_font.render("I:", True, (0, 0, 0))
+    display.menu_screen.blit(alt_i_label, (display.sub_x + 600, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_i_gain'])
+    alt_i_text = display.small_font.render(f"{config_state.pid_alt_i_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_i_text, (display.input_rects['pid_alt_i_gain'].x + 5, display.input_rects['pid_alt_i_gain'].y + 5))
+
+    alt_d_label = display.small_font.render("D:", True, (0, 0, 0))
+    display.menu_screen.blit(alt_d_label, (display.sub_x + 710, current_y))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_d_gain'])
+    alt_d_text = display.small_font.render(f"{config_state.pid_alt_d_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_d_text, (display.input_rects['pid_alt_d_gain'].x + 5, display.input_rects['pid_alt_d_gain'].y + 5))
+
+    current_y += 70
+
+    # Feed-forward status display
+    ff_azm_label = display.small_font.render("AZM FF:", True, (0, 0, 0))
+    display.menu_screen.blit(ff_azm_label, (display.sub_x + 490, current_y))
+    ff_azm_status = "ON" if config_state.feed_forward_azm_enabled else "OFF"
+    ff_azm_color = (0, 150, 0) if config_state.feed_forward_azm_enabled else (150, 0, 0)
+    ff_azm_status_text = display.small_font.render(ff_azm_status, True, ff_azm_color)
+    display.menu_screen.blit(ff_azm_status_text, (display.sub_x + 570, current_y))
+
+    ff_alt_label = display.small_font.render("ALT FF:", True, (0, 0, 0))
+    display.menu_screen.blit(ff_alt_label, (display.sub_x + 650, current_y))
+    ff_alt_status = "ON" if config_state.feed_forward_alt_enabled else "OFF"
+    ff_alt_color = (0, 150, 0) if config_state.feed_forward_alt_enabled else (150, 0, 0)
+    ff_alt_status_text = display.small_font.render(ff_alt_status, True, ff_alt_color)
+    display.menu_screen.blit(ff_alt_status_text, (display.sub_x + 730, current_y))
+
+    current_y += 30
+
+    # Focus highlights for PID fields
+    pid_focus_fields = ['pid_azm_p_gain', 'pid_azm_i_gain', 'pid_azm_d_gain',
+                       'pid_alt_p_gain', 'pid_alt_i_gain', 'pid_alt_d_gain']
+
+    for field in pid_focus_fields:
+        if config_state.focused_field == field and field in display.input_rects:
+            pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects[field], 2)
+            field_str = ""
+            if field == 'pid_azm_p_gain':
+                field_str = f"{config_state.pid_azm_p_gain:.3f}"
+            elif field == 'pid_azm_i_gain':
+                field_str = f"{config_state.pid_azm_i_gain:.3f}"
+            elif field == 'pid_azm_d_gain':
+                field_str = f"{config_state.pid_azm_d_gain:.3f}"
+            elif field == 'pid_alt_p_gain':
+                field_str = f"{config_state.pid_alt_p_gain:.3f}"
+            elif field == 'pid_alt_i_gain':
+                field_str = f"{config_state.pid_alt_i_gain:.3f}"
+            elif field == 'pid_alt_d_gain':
+                field_str = f"{config_state.pid_alt_d_gain:.3f}"
+
+            if field_str and config_state.focused_field in config_state.cursor_pos:
+                text_width, _ = display.small_font.size(field_str[:config_state.cursor_pos[config_state.focused_field]])
+                rect = display.input_rects[config_state.focused_field]
+                pygame.draw.line(display.menu_screen, (0, 0, 255),
+                               (rect.x + 5 + text_width, rect.y + 5),
+                               (rect.x + 5 + text_width, rect.y + 25), 2)
 
 
-def load_config_legacy(file_path=None):
-    """Legacy function for backward compatibility - returns dict."""
-    config_state = ConfigState()
-    config_state.load_from_file(file_path)
-    return config_state.get_config_dict()
+def handle_input(event, config_state):
+    """Updated handle_input that works directly with ConfigState object."""
+    if config_state.focused_field is None:
+        return
 
+    focused_field = config_state.focused_field
 
-def save_config(config):
-    """Legacy function for backward compatibility."""
-    if isinstance(config, ConfigState):
-        config.save_to_file()
+    # Get field value from config_state
+    if focused_field == "lat":
+        field_str = config_state.lat_str
+    elif focused_field == "lon":
+        field_str = config_state.lon_str
+    elif focused_field == "alt":
+        field_str = config_state.alt_str
+    elif focused_field == "elevation_mask":
+        field_str = config_state.elevation_mask_str
+    elif focused_field == "camera1_pixel_size":
+        field_str = str(config_state.camera_configs["camera1"]["pixel_size"])
+    elif focused_field == "camera1_array_size_diagonal":
+        field_str = str(config_state.camera_configs["camera1"]["array_size_diagonal"])
+    elif focused_field == "camera1_focal_length":
+        field_str = str(config_state.camera_configs["camera1"]["focal_length"])
+    elif focused_field == "camera1_alignment_rotation":
+        field_str = str(config_state.camera_configs["camera1"]["alignment_rotation"])
+    elif focused_field == "camera2_pixel_size":
+        field_str = str(config_state.camera_configs["camera2"]["pixel_size"])
+    elif focused_field == "camera2_array_size_diagonal":
+        field_str = str(config_state.camera_configs["camera2"]["array_size_diagonal"])
+    elif focused_field == "camera2_focal_length":
+        field_str = str(config_state.camera_configs["camera2"]["focal_length"])
+    elif focused_field == "camera1_gain":
+        field_str = str(config_state.camera_configs["camera1"]["gain"])
+    elif focused_field == "camera1_exposure":
+        field_str = str(config_state.camera_configs["camera1"]["exposure"])
+    elif focused_field == "camera2_gain":
+        field_str = str(config_state.camera_configs["camera2"]["gain"])
+    elif focused_field == "camera2_exposure":
+        field_str = str(config_state.camera_configs["camera2"]["exposure"])
+    elif focused_field == "camera2_alignment_rotation":
+        field_str = str(config_state.camera_configs["camera2"]["alignment_rotation"])
+    elif focused_field == "alignment_azimuth":
+        field_str = config_state.alignment_azimuth_str
+    elif focused_field == "alignment_elevation":
+        field_str = config_state.alignment_elevation_str
+    elif focused_field == "azm_offset":
+        field_str = config_state.azm_offset_str
+    elif focused_field == "alt_offset":
+        field_str = config_state.alt_offset_str
+    elif focused_field == "pid_azm_p_gain":
+        field_str = f"{config_state.pid_azm_p_gain:.3f}"
+    elif focused_field == "pid_azm_i_gain":
+        field_str = f"{config_state.pid_azm_i_gain:.3f}"
+    elif focused_field == "pid_azm_d_gain":
+        field_str = f"{config_state.pid_azm_d_gain:.3f}"
+    elif focused_field == "pid_alt_p_gain":
+        field_str = f"{config_state.pid_alt_p_gain:.3f}"
+    elif focused_field == "pid_alt_i_gain":
+        field_str = f"{config_state.pid_alt_i_gain:.3f}"
+    elif focused_field == "pid_alt_d_gain":
+        field_str = f"{config_state.pid_alt_d_gain:.3f}"
     else:
-        # Handle legacy dictionary format
-        with open("config.json", "w") as f:
-            json.dump(config, f)
+        return
+
+    mods = pygame.key.get_mods()
+
+    # Handle navigation and text editing keys
+    if event.key == pygame.K_LEFT:
+        if mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
+            config_state.cursor_pos[focused_field] = max(0, config_state.cursor_pos[focused_field] - 1)
+        else:
+            config_state.cursor_pos[focused_field] = max(0, config_state.cursor_pos[focused_field] - 1)
+            config_state.selection_start[focused_field] = None
+    elif event.key == pygame.K_RIGHT:
+        if mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
+            config_state.cursor_pos[focused_field] = min(len(field_str), config_state.cursor_pos[focused_field] + 1)
+        else:
+            config_state.cursor_pos[focused_field] = min(len(field_str), config_state.cursor_pos[focused_field] + 1)
+            config_state.selection_start[focused_field] = None
+    elif event.key == pygame.K_HOME:
+        if mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
+        config_state.cursor_pos[focused_field] = 0
+        if not mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = None
+    elif event.key == pygame.K_END:
+        if mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
+            config_state.cursor_pos[focused_field] = len(field_str)
+        if not mods & pygame.KMOD_SHIFT:
+            config_state.selection_start[focused_field] = None
+    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
+        start = min(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
+        end = max(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field] + 1 if event.key == pygame.K_DELETE else config_state.cursor_pos[focused_field]
+        if start < end:
+            field_str = field_str[:start] + field_str[end:]
+            config_state.cursor_pos[focused_field] = start
+            config_state.selection_start[focused_field] = None
+        elif event.key == pygame.K_BACKSPACE and config_state.cursor_pos[focused_field] > 0:
+            field_str = field_str[:config_state.cursor_pos[focused_field] - 1] + field_str[config_state.cursor_pos[focused_field]:]
+            config_state.cursor_pos[focused_field] -= 1
+            config_state.selection_start[focused_field] = None
+    elif event.key == pygame.K_RETURN:
+        config_state.focused_field = None
+    else:
+        char = event.unicode
+        if char.isdigit() or char in ['.', '-', '+']:
+            start = min(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
+            end = max(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
+            field_str = field_str[:start] + char + field_str[end:]
+            config_state.cursor_pos[focused_field] += 1
+            config_state.selection_start[focused_field] = None
+
+    # Update the appropriate field in config_state
+    if focused_field == "lat":
+        config_state.lat_str = field_str
+    elif focused_field == "lon":
+        config_state.lon_str = field_str
+    elif focused_field == "alt":
+        config_state.alt_str = field_str
+    elif focused_field == "elevation_mask":
+        config_state.elevation_mask_str = field_str
+    elif focused_field == "camera1_pixel_size":
+        try:
+            config_state.camera_configs["camera1"]["pixel_size"] = float(field_str) if field_str else 3.75
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_array_size_diagonal":
+        try:
+            config_state.camera_configs["camera1"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_focal_length":
+        try:
+            config_state.camera_configs["camera1"]["focal_length"] = float(field_str) if field_str else 25.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_pixel_size":
+        try:
+            config_state.camera_configs["camera2"]["pixel_size"] = float(field_str) if field_str else 3.75
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_array_size_diagonal":
+        try:
+            config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_alignment_rotation":
+        try:
+            config_state.camera_configs["camera1"]["alignment_rotation"] = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_pixel_size":
+        try:
+            config_state.camera_configs["camera2"]["pixel_size"] = float(field_str) if field_str else 3.75
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_array_size_diagonal":
+        try:
+            config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_focal_length":
+        try:
+            config_state.camera_configs["camera2"]["focal_length"] = float(field_str) if field_str else 25.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_gain":
+        try:
+            config_state.camera_configs["camera1"]["gain"] = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera1_exposure":
+        try:
+            config_state.camera_configs["camera1"]["exposure"] = float(field_str) if field_str else 10000.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_gain":
+        try:
+            config_state.camera_configs["camera2"]["gain"] = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_exposure":
+        try:
+            config_state.camera_configs["camera2"]["exposure"] = float(field_str) if field_str else 10000.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "camera2_alignment_rotation":
+        try:
+            config_state.camera_configs["camera2"]["alignment_rotation"] = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass  # Keep current value if invalid
+    elif focused_field == "alignment_azimuth":
+        config_state.alignment_azimuth_str = field_str
+    elif focused_field == "alignment_elevation":
+        config_state.alignment_elevation_str = field_str
+    elif focused_field == "azm_offset":
+        config_state.azm_offset_str = field_str
+    elif focused_field == "alt_offset":
+        config_state.alt_offset_str = field_str
+    elif focused_field == "pid_azm_p_gain":
+        try:
+            config_state.pid_azm_p_gain = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass
+    elif focused_field == "pid_azm_i_gain":
+        try:
+            config_state.pid_azm_i_gain = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass
+    elif focused_field == "pid_azm_d_gain":
+        try:
+            config_state.pid_azm_d_gain = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass
+    elif focused_field == "pid_alt_p_gain":
+        try:
+            config_state.pid_alt_p_gain = float(field_str) if field_str else 1.0
+        except ValueError:
+            pass
+    elif focused_field == "pid_alt_i_gain":
+        try:
+            config_state.pid_alt_i_gain = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass
+    elif focused_field == "pid_alt_d_gain":
+        try:
+            config_state.pid_alt_d_gain = float(field_str) if field_str else 0.0
+        except ValueError:
+            pass
 
 
 def draw_config_options(display, config_state):
@@ -281,7 +652,7 @@ def draw_config_options(display, config_state):
     azimuth_text = display.font.render(config_state.alignment_azimuth_str, True, (0, 0, 0))
     display.menu_screen.blit(azimuth_text, (display.input_rects['alignment_azimuth'].x + 5, display.input_rects['alignment_azimuth'].y + 5))
 
-    elevation_alignment_label = display.font.render("Elevation Alignment (deg):", True, (0, 0, 0))
+    elevation_alignment_label = display.font.render("Elevation Alignment (deg) (Eq mode):", True, (0, 0, 0))
     display.menu_screen.blit(elevation_alignment_label, (display.sub_x + 20, display.sub_y + 470))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_elevation'])
     elevation_alignment_text = display.font.render(config_state.alignment_elevation_str, True, (0, 0, 0))
@@ -547,6 +918,9 @@ def draw_config_options(display, config_state):
                         (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 5),
                         (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 25), 2)
 
+    # Draw PID configuration group (extends config options with PID controls)
+    draw_angle_groups(display, config_state)
+
     # Draw buttons and divider
     pygame.draw.line(display.menu_screen, (0, 0, 0), (display.sub_x, display.sub_y + display.sub_height - 60), (display.sub_x + display.sub_width, display.sub_y + display.sub_height - 60), 1)
     # Config mode buttons use display object properties
@@ -554,192 +928,24 @@ def draw_config_options(display, config_state):
     draw_button_with_objects(display, "load")
 
 
-def handle_input(event, config_state):
-    """Updated handle_input that works directly with ConfigState object."""
-    if config_state.focused_field is None:
-        return
+def load_config(file_path=None):
+    """Create and initialize ConfigState from file."""
+    config_state = ConfigState()
+    config_state.load_from_file(file_path)
+    return config_state
 
-    focused_field = config_state.focused_field
 
-    # Get field value from config_state
-    if focused_field == "lat":
-        field_str = config_state.lat_str
-    elif focused_field == "lon":
-        field_str = config_state.lon_str
-    elif focused_field == "alt":
-        field_str = config_state.alt_str
-    elif focused_field == "elevation_mask":
-        field_str = config_state.elevation_mask_str
-    elif focused_field == "camera1_pixel_size":
-        field_str = str(config_state.camera_configs["camera1"]["pixel_size"])
-    elif focused_field == "camera1_array_size_diagonal":
-        field_str = str(config_state.camera_configs["camera1"]["array_size_diagonal"])
-    elif focused_field == "camera1_focal_length":
-        field_str = str(config_state.camera_configs["camera1"]["focal_length"])
-    elif focused_field == "camera1_alignment_rotation":
-        field_str = str(config_state.camera_configs["camera1"]["alignment_rotation"])
-    elif focused_field == "camera2_pixel_size":
-        field_str = str(config_state.camera_configs["camera2"]["pixel_size"])
-    elif focused_field == "camera2_array_size_diagonal":
-        field_str = str(config_state.camera_configs["camera2"]["array_size_diagonal"])
-    elif focused_field == "camera2_focal_length":
-        field_str = str(config_state.camera_configs["camera2"]["focal_length"])
-    elif focused_field == "camera1_gain":
-        field_str = str(config_state.camera_configs["camera1"]["gain"])
-    elif focused_field == "camera1_exposure":
-        field_str = str(config_state.camera_configs["camera1"]["exposure"])
-    elif focused_field == "camera2_gain":
-        field_str = str(config_state.camera_configs["camera2"]["gain"])
-    elif focused_field == "camera2_exposure":
-        field_str = str(config_state.camera_configs["camera2"]["exposure"])
-    elif focused_field == "camera2_alignment_rotation":
-        field_str = str(config_state.camera_configs["camera2"]["alignment_rotation"])
-    elif focused_field == "alignment_azimuth":
-        field_str = config_state.alignment_azimuth_str
-    elif focused_field == "alignment_elevation":
-        field_str = config_state.alignment_elevation_str
-    elif focused_field == "azm_offset":
-        field_str = config_state.azm_offset_str
-    elif focused_field == "alt_offset":
-        field_str = config_state.alt_offset_str
+def load_config_legacy(file_path=None):
+    """Legacy function for backward compatibility."""
+    config_state = ConfigState()
+    config_state.load_from_file(file_path)
+    return config_state.get_config_dict()
+
+
+def save_config(config):
+    """Legacy function for backward compatibility."""
+    if isinstance(config, ConfigState):
+        config.save_to_file()
     else:
-        return
-
-    mods = pygame.key.get_mods()
-
-    # Handle navigation and text editing keys
-    if event.key == pygame.K_LEFT:
-        if mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
-            config_state.cursor_pos[focused_field] = max(0, config_state.cursor_pos[focused_field] - 1)
-        else:
-            config_state.cursor_pos[focused_field] = max(0, config_state.cursor_pos[focused_field] - 1)
-            config_state.selection_start[focused_field] = None
-    elif event.key == pygame.K_RIGHT:
-        if mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
-            config_state.cursor_pos[focused_field] = min(len(field_str), config_state.cursor_pos[focused_field] + 1)
-        else:
-            config_state.cursor_pos[focused_field] = min(len(field_str), config_state.cursor_pos[focused_field] + 1)
-            config_state.selection_start[focused_field] = None
-    elif event.key == pygame.K_HOME:
-        if mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
-        config_state.cursor_pos[focused_field] = 0
-        if not mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = None
-    elif event.key == pygame.K_END:
-        if mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = config_state.cursor_pos[focused_field] if config_state.selection_start[focused_field] is None else config_state.selection_start[focused_field]
-            config_state.cursor_pos[focused_field] = len(field_str)
-        if not mods & pygame.KMOD_SHIFT:
-            config_state.selection_start[focused_field] = None
-    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
-        start = min(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
-        end = max(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field] + 1 if event.key == pygame.K_DELETE else config_state.cursor_pos[focused_field]
-        if start < end:
-            field_str = field_str[:start] + field_str[end:]
-            config_state.cursor_pos[focused_field] = start
-            config_state.selection_start[focused_field] = None
-        elif event.key == pygame.K_BACKSPACE and config_state.cursor_pos[focused_field] > 0:
-            field_str = field_str[:config_state.cursor_pos[focused_field] - 1] + field_str[config_state.cursor_pos[focused_field]:]
-            config_state.cursor_pos[focused_field] -= 1
-            config_state.selection_start[focused_field] = None
-    elif event.key == pygame.K_RETURN:
-        config_state.focused_field = None
-    else:
-        char = event.unicode
-        if char.isdigit() or char in ['.', '-', '+']:
-            start = min(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
-            end = max(config_state.cursor_pos[focused_field], config_state.selection_start[focused_field]) if config_state.selection_start[focused_field] is not None else config_state.cursor_pos[focused_field]
-            field_str = field_str[:start] + char + field_str[end:]
-            config_state.cursor_pos[focused_field] += 1
-            config_state.selection_start[focused_field] = None
-
-    # Update the appropriate field in config_state
-    if focused_field == "lat":
-        config_state.lat_str = field_str
-    elif focused_field == "lon":
-        config_state.lon_str = field_str
-    elif focused_field == "alt":
-        config_state.alt_str = field_str
-    elif focused_field == "elevation_mask":
-        config_state.elevation_mask_str = field_str
-    elif focused_field == "camera1_pixel_size":
-        try:
-            config_state.camera_configs["camera1"]["pixel_size"] = float(field_str) if field_str else 3.75
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera1_array_size_diagonal":
-        try:
-            config_state.camera_configs["camera1"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera1_focal_length":
-        try:
-            config_state.camera_configs["camera1"]["focal_length"] = float(field_str) if field_str else 25.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_pixel_size":
-        try:
-            config_state.camera_configs["camera2"]["pixel_size"] = float(field_str) if field_str else 3.75
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_array_size_diagonal":
-        try:
-            config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera1_alignment_rotation":
-        try:
-            config_state.camera_configs["camera1"]["alignment_rotation"] = float(field_str) if field_str else 0.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_pixel_size":
-        try:
-            config_state.camera_configs["camera2"]["pixel_size"] = float(field_str) if field_str else 3.75
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_array_size_diagonal":
-        try:
-            config_state.camera_configs["camera2"]["array_size_diagonal"] = float(field_str) if field_str else 11.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_focal_length":
-        try:
-            config_state.camera_configs["camera2"]["focal_length"] = float(field_str) if field_str else 25.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera1_gain":
-        try:
-            config_state.camera_configs["camera1"]["gain"] = float(field_str) if field_str else 1.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera1_exposure":
-        try:
-            config_state.camera_configs["camera1"]["exposure"] = float(field_str) if field_str else 10000.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_gain":
-        try:
-            config_state.camera_configs["camera2"]["gain"] = float(field_str) if field_str else 1.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_exposure":
-        try:
-            config_state.camera_configs["camera2"]["exposure"] = float(field_str) if field_str else 10000.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "camera2_alignment_rotation":
-        try:
-            config_state.camera_configs["camera2"]["alignment_rotation"] = float(field_str) if field_str else 0.0
-        except ValueError:
-            pass  # Keep current value if invalid
-    elif focused_field == "alignment_azimuth":
-        config_state.alignment_azimuth_str = field_str
-    elif focused_field == "alignment_elevation":
-        config_state.alignment_elevation_str = field_str
-    elif focused_field == "azm_offset":
-        config_state.azm_offset_str = field_str
-    elif focused_field == "alt_offset":
-        config_state.alt_offset_str = field_str
+        with open("config.json", "w") as f:
+            json.dump(config, f)

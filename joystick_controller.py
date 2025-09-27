@@ -26,6 +26,10 @@ from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
 from utils import draw_button
 
+# Import PID controller and helper functions
+from control import create_pid_controllers, compute_mount_position_error
+from trajectory import interpolate_position_data_and_rates
+
 # PS4 Controller Button Labels (zero-indexed)
 BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
 
@@ -39,10 +43,18 @@ class JoystickModeState:
     Similar to TrackingVisState, this manages all joystick mode specific state.
     """
 
-    def __init__(self):
+    def __init__(self, tracking_vis_state=None, config_state=None, update_status_callback=None):
         # Initialize Pygame joystick subsystem
         pygame.joystick.init()
         print(f"Pygame joystick initialized: {pygame.joystick.get_count()} joysticks detected")
+
+        # Store global references for PROGRAM tracking mode
+        self.tracking_vis_state = tracking_vis_state
+        self.config_state = config_state
+        self.update_status_callback = update_status_callback
+
+        # Initialize mount mode from config
+        self.mount_mode = self.config_state.mount_mode if self.config_state else "AltAz"
 
         # Joystick state
         self.joysticks = {}  # Dict of active joysticks
@@ -51,7 +63,7 @@ class JoystickModeState:
         self.stopped = False  # Stop button state
 
         # Tracking mode state
-        self.tracking_mode = TrackingMode.RATE_CONTROL  # Default to current behavior
+        self.tracking_mode = TrackingMode.STANDBY  # Default to standby mode (user preference)
 
         # Telescope connection state
         self.telescope_connected = False
@@ -80,6 +92,28 @@ class JoystickModeState:
         self.current_alt = 0.0
         self.azm_display_str = "--"
         self.alt_display_str = "--"
+
+        # PID controllers for PROGRAM track mode
+        self.azm_pid = None
+        self.alt_pid = None
+        self.pid_last_update = 0.0
+
+        # Feed-forward and bias control state
+        self.feed_forward_azm_enabled = False
+        self.feed_forward_alt_enabled = False
+        self.bias_azm_deg = 0.0
+        self.bias_alt_deg = 0.0
+        self.bias_control_mode = "coarse"
+
+        # PID diagnostic state
+        self.azm_position_error = 0.0
+        self.alt_position_error = 0.0
+        self.azm_rate_error = 0.0
+        self.alt_rate_error = 0.0
+        self.azm_target_rate = 0.0
+        self.alt_target_rate = 0.0
+        self.azm_pid_output = 0.0
+        self.alt_pid_output = 0.0
 
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
@@ -233,9 +267,193 @@ class JoystickModeState:
         print(f"Tracking mode: {self.tracking_mode.name}")
 
     def program_track(self):
-        """Program track mode - stub implementation"""
-        # TODO: Implement program track mode
-        print("Program track mode - stub")
+        """Program track mode - implement satellite tracking with PID control"""
+        # Import required modules locally to avoid circular imports
+        import time
+        from transformations import AzAlt2AzEl, AzAlt2AzEl_AltAz
+
+        # Check if satellite is selected
+        if self.tracking_vis_state is None or self.tracking_vis_state.selected_satellite is None:
+            # No satellite selected - switch to STANDBY and send message
+            self.tracking_mode = TrackingMode.STANDBY
+            if self.update_status_callback:
+                self.update_status_callback("Select a satellite for PROGRAM tracking")
+            else:
+                print("PROGRAM TRACK: No satellite selected - switched to STANDBY mode")
+            return
+
+        # Ensure PID controllers are initialized
+        if self.azm_pid is None or self.alt_pid is None:
+            if self.config_state is None:
+                print("PROGRAM TRACK: Config state not available")
+                return
+            self.azm_pid, self.alt_pid = create_pid_controllers(self.config_state)
+            print("PROGRAM TRACK: PID controllers initialized")
+
+        # Update PID controller gains from config state in case they were changed in the UI
+        if self.azm_pid and self.alt_pid:
+            self.azm_pid.update_gains(
+                self.config_state.pid_azm_p_gain,
+                self.config_state.pid_azm_i_gain,
+                self.config_state.pid_azm_d_gain
+            )
+            self.alt_pid.update_gains(
+                self.config_state.pid_alt_p_gain,
+                self.config_state.pid_alt_i_gain,
+                self.config_state.pid_alt_d_gain
+            )
+
+        try:
+            # Get current mount position with offsets
+            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360
+            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360
+
+            # Apply offsets from config state
+            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
+            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
+            current_azm = current_azm_raw - offset_azm
+            current_alt = current_alt_raw - offset_alt
+
+            self.current_azm = current_azm
+            self.current_alt = current_alt
+
+            # Get target position from satellite trajectory
+            selected_sat = self.tracking_vis_state.selected_satellite
+            if self.tracking_vis_state and selected_sat in self.tracking_vis_state.satellite_trajectories:
+                # Interpolate current satellite position and rates
+                px, py, target_alt, dist, target_az_deg, az_rate, el_rate = interpolate_position_data_and_rates(
+                    self.tracking_vis_state.satellite_trajectories[selected_sat],
+                    self.tracking_vis_state.current_tt
+                )
+
+                if px is not None and target_az_deg is not None:
+                    target_el_deg = target_alt
+
+                    # Check if satellite is visible (above horizon)
+                    if target_el_deg <= 0:
+                        # Satellite is below horizon - drive to mask exit point and wait
+                        mask_exit_az, mask_exit_el = self._compute_mask_exit_point(current_azm, current_alt, target_az_deg, self.config_state)
+
+                        print(f"PROGRAM TRACK: Satellite below horizon. Driving to mask exit point: AZ={mask_exit_az:.1f}°, EL={mask_exit_el:.1f}°")
+
+                        # Compute position errors for driving to mask exit point
+                        az_error, el_error = compute_mount_position_error(
+                            self.config_state, current_azm, current_alt, mask_exit_az, mask_exit_el
+                        )
+
+                        # Use maximum rate to drive to mask exit point quickly
+                        if abs(az_error) > 1.0:  # Only move if error is significant
+                            az_rate_cmd = 9 if az_error > 0 else -9
+                        else:
+                            az_rate_cmd = 0
+
+                        if abs(el_error) > 1.0:
+                            el_rate_cmd = 9 if el_error > 0 else -9
+                        else:
+                            el_rate_cmd = 0
+
+                        # Apply rate commands to drive to mask exit point
+                        if self.telescope_connected and not self.stopped:
+                            self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                            self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+
+                        # Store diagnostic values
+                        self.azm_position_error = az_error
+                        self.alt_position_error = el_error
+                        self.azm_target_rate = 0.0
+                        self.alt_target_rate = 0.0
+
+                        return
+
+                    # Satellite is above horizon - use PID control for tracking
+                    # Apply bias corrections
+                    target_az_deg += self.bias_azm_deg
+                    target_el_deg += self.bias_alt_deg
+
+                    # Compute position errors using config state instance
+                    az_error, el_error = compute_mount_position_error(
+                        self.config_state, current_azm, current_alt, target_az_deg, target_el_deg
+                    )
+
+                    # Set feed-forward rates from trajectory
+                    if self.feed_forward_azm_enabled:
+                        self.azm_pid.set_feed_forward_rate(az_rate)
+                    if self.feed_forward_alt_enabled:
+                        self.alt_pid.set_feed_forward_rate(el_rate)
+
+                    # Update PID controllers
+                    current_time = time.time()
+                    az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(az_error, current_time - self.pid_last_update)
+                    el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(el_error, current_time - self.pid_last_update)
+                    self.pid_last_update = current_time
+
+                    # Store diagnostic values for display
+                    self.azm_position_error = az_error
+                    self.alt_position_error = el_error
+                    self.azm_rate_error = self.azm_pid.current_rate_error
+                    self.alt_rate_error = self.alt_pid.current_rate_error
+                    self.azm_target_rate = az_pid_output
+                    self.alt_target_rate = el_pid_output
+                    self.azm_pid_output = az_pid_output
+                    self.alt_pid_output = el_pid_output
+
+                    # Apply rate commands
+                    if self.telescope_connected and not self.stopped:
+                        # Map rate to signed discrete command
+                        az_command = az_rate_cmd if az_rate_cmd != 0 else 0
+                        el_command = el_rate_cmd if el_rate_cmd != 0 else 0
+
+                        # Send slew commands
+                        self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
+                        self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+
+                    # Debug output (throttled)
+                    if int(current_time) % 5 == 0:  # Every 5 seconds
+                        print(".2f")
+
+        except Exception as e:
+            print(f"PROGRAM TRACK: Error in tracking loop: {e}")
+
+    def _compute_mask_exit_point(self, current_azm, current_alt, target_az, config_state):
+        """
+        Compute the optimal mask exit point for tracking a satellite.
+
+        The mask exit point is typically the point on the horizon where the satellite
+        will first appear, allowing the telescope to position itself optimally
+        for when the satellite rises above the horizon.
+
+        Args:
+            current_azm: Current azimuth of mount (degrees)
+            current_alt: Current elevation of mount (degrees)
+            target_az: Target azimuth (degrees)
+            config_state: Configuration state with elevation mask
+
+        Returns:
+            tuple: (az_exit, el_exit) - azimuth and elevation of mask exit point
+        """
+        try:
+            # Get elevation mask from config
+            elevation_mask = float(config_state.elevation_mask_str) if hasattr(config_state, 'elevation_mask_str') else 10.0
+
+            # The mask exit point is typically at elevation = elevation_mask, azimuth = target_az
+            # This represents where the satellite will first appear above the horizon
+            az_exit = target_az
+            el_exit = elevation_mask
+
+            return az_exit, el_exit
+
+        except Exception as e:
+            print(f"PROGRAM TRACK: Error computing mask exit point: {e}")
+            # Fallback: return a safe default position
+            return 0.0, 10.0
+
+    def reset_program_tracking(self):
+        """Reset program tracking state"""
+        if self.azm_pid:
+            self.azm_pid.reset()
+        if self.alt_pid:
+            self.alt_pid.reset()
+        self.pid_last_update = 0.0
 
     def handoff_track(self):
         """Handoff track mode - stub implementation"""
@@ -307,19 +525,33 @@ class JoystickModeState:
                     print("Parking telescope to 0, 0...")
                     # Loop until parked
                     angle = 1
-                    while (angle - float(config_state.azm_offset_str)) > 1:
+                    while abs(angle - float(config_state.azm_offset_str)) > 1:
                         success = self.telescope_controller.hc_goto_fast(Targets.AZM, float(config_state.azm_offset_str), 0, 0)
                         print("AZM Park command sent")
                         time.sleep(0.1)
                         angle = self.telescope_controller.hc_get_position(Targets.AZM) * 360
                     angle = 1
-                    while (angle - float(config_state.alt_offset_str)) > 1: # keep trying until <1 degree
+                    while abs(angle - float(config_state.alt_offset_str)) > 1: # keep trying until <1 degree
                         success = self.telescope_controller.hc_goto_fast(Targets.ALT, float(config_state.alt_offset_str), 0, 0)
                         print("ALT Park command sent")
                         time.sleep(0.1)
                         angle = self.telescope_controller.hc_get_position(Targets.ALT) * 360
                 else:
                     print("Cannot park: telescope not connected")
+
+            elif event.button == 4:  # Share button for mount mode toggle
+                # Cycle through AltAz, Eq, and Passthrough modes
+                if self.mount_mode == "AltAz":
+                    self.mount_mode = "Eq"
+                elif self.mount_mode == "Eq":
+                    self.mount_mode = "Passthrough"
+                else:  # Passthrough or unknown
+                    self.mount_mode = "AltAz"
+
+                if self.config_state:
+                    self.config_state.mount_mode = self.mount_mode
+                print(f"Mount mode toggled to: {self.mount_mode}")
+                return  # Don't process any other buttons after handling mode toggle
 
             elif event.button == 8:  # RS button for forward tracking mode cycle
                 self.cycle_tracking_mode_forward()
@@ -328,6 +560,46 @@ class JoystickModeState:
             elif event.button == 15:  # Pad button for backward tracking mode cycle
                 self.cycle_tracking_mode_backward()
                 return  # Don't process any other buttons after handling mode cycle
+
+        elif event.type == pygame.JOYHATMOTION:
+            # Handle D-pad input for bias control
+            hat_x, hat_y = event.value
+
+            # Bias adjustment increment (coarse vs fine depending on L1 toggle)
+            step = 0.01 if self.bias_control_mode == "fine" else 0.1
+
+            # D-pad left/right for azimuth bias
+            if hat_x > 0:  # D-pad right
+                self.bias_azm_deg = max(-3.0, min(3.0, self.bias_azm_deg + step))
+            elif hat_x < 0:  # D-pad left
+                self.bias_azm_deg = max(-3.0, min(3.0, self.bias_azm_deg - step))
+
+            # D-pad up/down for elevation bias
+            if hat_y > 0:  # D-pad up
+                self.bias_alt_deg = max(-3.0, min(3.0, self.bias_alt_deg + step))
+            elif hat_y < 0:  # D-pad down
+                self.bias_alt_deg = max(-3.0, min(3.0, self.bias_alt_deg - step))
+
+        elif event.type == pygame.JOYBUTTONDOWN:
+            # Handle L1/R1 buttons if not already handled above (for bias mode toggle)
+            if event.button == 10:  # L1 button
+                self.bias_control_mode = "fine" if self.bias_control_mode == "coarse" else "coarse"
+                print(f"Bias control mode: {self.bias_control_mode}")
+                return
+            elif event.button == 11:  # R1 button - toggle feed-forward
+
+                # Toggle feed-forward for both axes
+                self.feed_forward_azm_enabled = not self.feed_forward_azm_enabled
+                self.feed_forward_alt_enabled = not self.feed_forward_alt_enabled
+
+                # Update PID controllers if they exist
+                if self.azm_pid:
+                    self.azm_pid.set_feed_forward_enabled(self.feed_forward_azm_enabled)
+                if self.alt_pid:
+                    self.alt_pid.set_feed_forward_enabled(self.feed_forward_alt_enabled)
+
+                print(f"Feed-forward AZ: {self.feed_forward_azm_enabled}, EL: {self.feed_forward_alt_enabled}")
+                return
 
         elif event.type == pygame.JOYAXISMOTION:
             # Update joystick axis state for display (this stays in process for all modes)
@@ -404,24 +676,28 @@ def render_position_display(display, joystick_state):
     status_render = display.tiny_font.render(status_text, True, status_color)
     display.menu_screen.blit(status_render, (x_start + 5, y_start + 2))
 
-    # Compact title below stop indicator
+    # Add mount mode indicator
+    mount_mode_text = display.tiny_font.render(f"Mount: {joystick_state.mount_mode}", True, (200, 200, 100))
+    display.menu_screen.blit(mount_mode_text, (x_start + 5, y_start + 15))
+
+    # Compact title below mount mode
     title_text = display.tiny_font.render("Position:", True, (255, 255, 255))
-    display.menu_screen.blit(title_text, (x_start + 5, y_start + 15))
+    display.menu_screen.blit(title_text, (x_start + 5, y_start + 27))
 
     # Compact AZM display
     azm_label_text = display.tiny_font.render("AZM", True, (255, 255, 255))
-    display.menu_screen.blit(azm_label_text, (x_start + 5, y_start + 27))
+    display.menu_screen.blit(azm_label_text, (x_start + 5, y_start + 39))
 
     # Use tiny font for values to fit in compact space
     azm_value_text = display.tiny_font.render(joystick_state.azm_display_str[:12], True, (0, 255, 0))
-    display.menu_screen.blit(azm_value_text, (x_start + 5, y_start + 37))
+    display.menu_screen.blit(azm_value_text, (x_start + 5, y_start + 49))
 
     # Compact ALT display
     alt_label_text = display.tiny_font.render("ALT", True, (255, 255, 255))
-    display.menu_screen.blit(alt_label_text, (x_start + 5, y_start + 47))
+    display.menu_screen.blit(alt_label_text, (x_start + 5, y_start + 59))
 
     alt_value_text = display.tiny_font.render(joystick_state.alt_display_str[:12], True, (0, 255, 0))
-    display.menu_screen.blit(alt_value_text, (x_start + 5, y_start + 57))
+    display.menu_screen.blit(alt_value_text, (x_start + 5, y_start + 69))
 
 # ==============================================================================
 # JOYSTICK MODE RENDERING FUNCTIONS
@@ -959,6 +1235,7 @@ def render_camera_feeds(display, joystick_state=None):
 
 def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_vis_state, config_state, current_tracking_surface):
     """Handle mouse events specific to joystick mode"""
+    mouse_pos = pygame.mouse.get_pos()
     if event.type == pygame.MOUSEBUTTONDOWN:
         pos = event.pos
 
@@ -1063,6 +1340,18 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             joystick_state.capture_button_rect.collidepoint(pos)):
             _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, current_tracking_surface)
 
+        # Handle bias control button clicks
+        if handle_bias_control_mouse_events(joystick_state, mouse_pos):
+            return True
+
+        # Handle feed-forward toggle button clicks
+        if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
+            return True
+
+        # Handle PID slider clicks
+        if handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
+            return True
+
 def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tracking_surface=None):
     """Handle capture toggle from UI or joystick"""
     from camera_manager import camera_manager
@@ -1089,3 +1378,405 @@ def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tra
             print("Capture started on all connected cameras")
         else:
             print("No cameras available for capture")
+
+def render_pid_diagnostics(display, joystick_state):
+    """
+    Render PID diagnostics display for both azimuth and elevation axes.
+    Shows position errors, rate errors, and target/command rates.
+    """
+    # Only show during PROGRAM track mode and when PID controllers exist
+    if (joystick_state.tracking_mode != TrackingMode.PROGRAM or
+        joystick_state.azm_pid is None or joystick_state.alt_pid is None):
+        return
+
+    # Position the PID diagnostics on the right side of positions display
+    x_start = display.sub_x + 280  # To the right of the position display
+    y_start = display.sub_y + 380 - 300  # Moved down 100 pixels
+    width = 240
+    height = 120
+
+    # Background rectangle for PID diagnostics
+    pygame.draw.rect(display.menu_screen, (50, 50, 50),
+                     (x_start, y_start, width, height))
+    pygame.draw.rect(display.menu_screen, (100, 100, 100),
+                     (x_start, y_start, width, height), 1)
+
+    # Title
+    title_text = display.small_font.render("PID Diagnostics", True, (255, 255, 255))
+    display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
+
+    # AZM Axis section
+    azm_title = display.tiny_font.render("AZIMUTH:", True, (255, 200, 0))
+    display.menu_screen.blit(azm_title, (x_start + 10, y_start + 20))
+
+    # Position error
+    pos_error_text = display.tiny_font.render(f"Az Error: {joystick_state.azm_position_error:+.2f}°", True, (255, 255, 255))
+    display.menu_screen.blit(pos_error_text, (x_start + 10, y_start + 35))
+
+    # Rate error
+    rate_error_text = display.tiny_font.render(f"Az Rate Error: {joystick_state.azm_rate_error:+.3f}", True, (255, 255, 255))
+    display.menu_screen.blit(rate_error_text, (x_start + 10, y_start + 50))
+
+    # Target rate
+    target_text = display.tiny_font.render(f"Az Target Rate: {joystick_state.azm_target_rate:+.2f}°/s", True, (200, 255, 200))
+    display.menu_screen.blit(target_text, (x_start + 10, y_start + 65))
+
+    # ALT Axis section
+    alt_title = display.tiny_font.render("ELEVATION:", True, (255, 200, 0))
+    display.menu_screen.blit(alt_title, (x_start + 125, y_start + 20))
+
+    # Position error
+    alt_pos_error_text = display.tiny_font.render(f"El Error: {joystick_state.alt_position_error:+.2f}°", True, (255, 255, 255))
+    display.menu_screen.blit(alt_pos_error_text, (x_start + 125, y_start + 35))
+
+    # Rate error
+    alt_rate_error_text = display.tiny_font.render(f"El Rate Error: {joystick_state.alt_rate_error:+.3f}", True, (255, 255, 255))
+    display.menu_screen.blit(alt_rate_error_text, (x_start + 125, y_start + 50))
+
+    # Target rate
+    alt_target_text = display.tiny_font.render(f"El Target Rate: {joystick_state.alt_target_rate:+.2f}°/s", True, (200, 255, 200))
+    display.menu_screen.blit(alt_target_text, (x_start + 125, y_start + 65))
+
+    # Feed-forward status
+    ff_azm_text = display.tiny_font.render(f"FF AZ: {joystick_state.feed_forward_azm_enabled}", True,
+                                           (0, 255, 0) if joystick_state.feed_forward_azm_enabled else (100, 100, 100))
+    display.menu_screen.blit(ff_azm_text, (x_start + 10, y_start + 85))
+
+    ff_alt_text = display.tiny_font.render(f"FF EL: {joystick_state.feed_forward_alt_enabled}", True,
+                                           (0, 255, 0) if joystick_state.feed_forward_alt_enabled else (100, 100, 100))
+    display.menu_screen.blit(ff_alt_text, (x_start + 125, y_start + 85))
+
+    # Bias display
+    bias_text = display.tiny_font.render(f"AZ: {joystick_state.bias_azm_deg:.1f}° EL: {joystick_state.bias_alt_deg:.1f}°", True, (150, 150, 255))
+    display.menu_screen.blit(bias_text, (x_start + 10, y_start + 100))
+
+def render_bias_control_grid(display, joystick_state):
+    """
+    Render visual grid for manual bias control with buttons and current values.
+    Positioned below PID diagnostics.
+    """
+    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
+        return
+
+    # Position below PID diagnostics
+    x_start = display.sub_x + 280
+    y_start = display.sub_y + 510 - 300  # Moved down 100 pixels
+    width = 240
+    height = 150
+
+    # Background rectangle
+    pygame.draw.rect(display.menu_screen, (60, 60, 80),
+                     (x_start, y_start, width, height))
+    pygame.draw.rect(display.menu_screen, (120, 120, 150),
+                     (x_start, y_start, width, height), 1)
+
+    # Title
+    title_text = display.small_font.render("Bias Control", True, (255, 255, 255))
+    display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
+
+    # Current bias mode indicator
+    mode_color = (100, 255, 100) if joystick_state.bias_control_mode == "coarse" else (255, 100, 100)
+    mode_text = display.tiny_font.render(f"Mode: {joystick_state.bias_control_mode.upper()}", True, mode_color)
+    display.menu_screen.blit(mode_text, (x_start + 10, y_start + 25))
+
+    # Current values display
+    current_values_text = display.tiny_font.render(f"AZ: {joystick_state.bias_azm_deg:.1f}° EL: {joystick_state.bias_alt_deg:.1f}°", True, (255, 255, 255))
+    display.menu_screen.blit(current_values_text, (x_start + 10, y_start + 40))
+
+    # Button grid for manual adjustment
+    button_size = 25
+    button_spacing = 8
+    grid_start_x = x_start + 20
+    grid_start_y = y_start + 60
+
+    # Button layout (arrow keys grid)
+    button_positions = [
+        ("← Az", grid_start_x, grid_start_y, (255, 150, 150)),                    # Left Arrow - Decrease AZM
+        ("↑ El", grid_start_x + button_size + button_spacing, grid_start_y, (150, 255, 150)),  # Up Arrow - Increase ALT
+        ("→ Az", grid_start_x + 2*(button_size + button_spacing), grid_start_y, (255, 150, 150)), # Right Arrow - Increase AZM
+        ("↓ El", grid_start_x + button_size + button_spacing, grid_start_y + button_size + button_spacing, (150, 255, 150))  # Down Arrow - Decrease ALT
+    ]
+
+    # Store button rects for mouse click handling
+    button_rects = []
+
+    # Draw buttons
+    for label, bx, by, color in button_positions:
+        button_rect = pygame.Rect(bx, by, button_size, button_size)
+        button_rects.append((label, button_rect))
+
+        # Check mouse hover
+        mouse_pos = pygame.mouse.get_pos()
+        hover = button_rect.collidepoint(mouse_pos)
+
+        # Draw button background
+        bg_color = tuple(min(255, c + 40) for c in color) if hover else color
+        pygame.draw.rect(display.menu_screen, bg_color, button_rect)
+        pygame.draw.rect(display.menu_screen, (200, 200, 200), button_rect, 1)
+
+        # Draw label
+        label_text = display.tiny_font.render(label, True, (0, 0, 0))
+        text_rect = label_text.get_rect(center=button_rect.center)
+        display.menu_screen.blit(label_text, text_rect)
+
+    # Store button rects in joystick state for mouse handling
+    joystick_state.bias_button_rects = button_rects
+
+def render_feed_forward_toggle_buttons(display, joystick_state):
+    """
+    Render feed-forward toggle buttons for AZ and EL axes.
+    Positioned to the side of bias control.
+    """
+    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
+        return
+
+    # Position to the right of bias control
+    x_start = display.sub_x + 530
+    y_start = display.sub_y + 480 - 400  # Moved up 400 pixels
+    button_width = 80
+    button_height = 30
+    button_spacing = 10
+
+    # AZ Feed-forward button
+    az_ff_rect = pygame.Rect(x_start, y_start, button_width, button_height)
+    mouse_pos = pygame.mouse.get_pos()
+    az_hover = az_ff_rect.collidepoint(mouse_pos)
+
+    az_color = (0, 150, 0) if joystick_state.feed_forward_azm_enabled else (100, 100, 100)
+    if az_hover:
+        az_color = tuple(min(255, c + 40) for c in az_color)
+
+    pygame.draw.rect(display.menu_screen, az_color, az_ff_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), az_ff_rect, 1)
+
+    az_text = display.tiny_font.render("FF AZ", True, (255, 255, 255))
+    text_rect = az_text.get_rect(center=az_ff_rect.center)
+    display.menu_screen.blit(az_text, text_rect)
+
+    # EL Feed-forward button
+    el_ff_rect = pygame.Rect(x_start, y_start + button_height + button_spacing, button_width, button_height)
+    el_hover = el_ff_rect.collidepoint(mouse_pos)
+
+    el_color = (0, 150, 0) if joystick_state.feed_forward_alt_enabled else (100, 100, 100)
+    if el_hover:
+        el_color = tuple(min(255, c + 40) for c in el_color)
+
+    pygame.draw.rect(display.menu_screen, el_color, el_ff_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), el_ff_rect, 1)
+
+    el_text = display.tiny_font.render("FF EL", True, (255, 255, 255))
+    text_rect = el_text.get_rect(center=el_ff_rect.center)
+    display.menu_screen.blit(el_text, text_rect)
+
+    # Disable All button
+    disable_rect = pygame.Rect(x_start, y_start + 2*(button_height + button_spacing), button_width, button_height)
+    disable_hover = disable_rect.collidepoint(mouse_pos)
+
+    disable_color = (150, 100, 100) if disable_hover else (120, 100, 100)
+    pygame.draw.rect(display.menu_screen, disable_color, disable_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), disable_rect, 1)
+
+    disable_all_text = display.tiny_font.render("FF OFF", True, (255, 255, 255))
+    text_rect = disable_all_text.get_rect(center=disable_rect.center)
+    display.menu_screen.blit(disable_all_text, text_rect)
+
+    # Store button rects for mouse click handling
+    joystick_state.ff_button_rects = [
+        (" ff_az", az_ff_rect),
+        (" ff_el", el_ff_rect),
+        (" ff_off", disable_rect)
+    ]
+
+def handle_bias_control_mouse_events(joystick_state, mouse_pos):
+    """
+    Handle mouse clicks on bias control buttons.
+    Called from main event loop when buttons are clicked.
+    """
+    if not hasattr(joystick_state, 'bias_button_rects'):
+        return False
+
+    step = 0.01 if joystick_state.bias_control_mode == "fine" else 0.1
+
+    for label, rect in joystick_state.bias_button_rects:
+        if rect.collidepoint(mouse_pos):
+            if "← Az" in label:
+                joystick_state.bias_azm_deg = max(-3.0, min(3.0, joystick_state.bias_azm_deg - step))
+                print(f"Bias control: AZ decreased by {step}° to {joystick_state.bias_azm_deg:.2f}°")
+            elif "→ Az" in label:
+                joystick_state.bias_azm_deg = max(-3.0, min(3.0, joystick_state.bias_azm_deg + step))
+                print(f"Bias control: AZ increased by {step}° to {joystick_state.bias_azm_deg:.2f}°")
+            elif "↑ El" in label:
+                joystick_state.bias_alt_deg = max(-3.0, min(3.0, joystick_state.bias_alt_deg + step))
+                print(f"Bias control: EL increased by {step}° to {joystick_state.bias_alt_deg:.2f}°")
+            elif "↓ El" in label:
+                joystick_state.bias_alt_deg = max(-3.0, min(3.0, joystick_state.bias_alt_deg - step))
+                print(f"Bias control: EL decreased by {step}° to {joystick_state.bias_alt_deg:.2f}°")
+            return True
+    return False
+
+def render_pid_gain_sliders(display, joystick_state):
+    """
+    Render PID gain sliders for adjusting P, I, D gains in joystick mode.
+    Positioned below the bias control grid.
+    """
+    # Only render when there's an active config_state
+    if not hasattr(joystick_state, 'config_state') or joystick_state.config_state is None:
+        return
+
+    config_state = joystick_state.config_state
+
+    # Position below bias control
+    x_start = display.sub_x + 280
+    y_start = display.sub_y + 660 - 300  # Adjusted for bias control position
+    width = 240
+    height = 120
+
+    # Background rectangle
+    pygame.draw.rect(display.menu_screen, (70, 70, 90),
+                     (x_start, y_start, width, height))
+    pygame.draw.rect(display.menu_screen, (140, 140, 170),
+                     (x_start, y_start, width, height), 1)
+
+    # Title
+    title_text = display.small_font.render("PID Gain Control", True, (255, 255, 255))
+    display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
+
+    # Create slider input rectangles if not already existing
+    if not hasattr(display, 'joystick_pid_rects'):
+        display.joystick_pid_rects = {
+            'pid_azm_p_gain': pygame.Rect(x_start + 60, y_start + 30, 60, 20),
+            'pid_azm_i_gain': pygame.Rect(x_start + 60, y_start + 55, 60, 20),
+            'pid_azm_d_gain': pygame.Rect(x_start + 60, y_start + 80, 60, 20),
+            'pid_alt_p_gain': pygame.Rect(x_start + 180, y_start + 30, 60, 20),
+            'pid_alt_i_gain': pygame.Rect(x_start + 180, y_start + 55, 60, 20),
+            'pid_alt_d_gain': pygame.Rect(x_start + 180, y_start + 80, 60, 20)
+        }
+
+    # AZM PID labels and inputs (left column)
+    azm_title = display.tiny_font.render("AZM:", True, (255, 200, 100))
+    display.menu_screen.blit(azm_title, (x_start + 10, y_start + 25))
+
+    # P gain
+    p_label = display.tiny_font.render("P:", True, (255, 255, 255))
+    display.menu_screen.blit(p_label, (x_start + 10, y_start + 35))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_p_gain'])
+    p_text = display.tiny_font.render(f"{config_state.pid_azm_p_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(p_text, (display.joystick_pid_rects['pid_azm_p_gain'].x + 3, display.joystick_pid_rects['pid_azm_p_gain'].y + 2))
+
+    # I gain
+    i_label = display.tiny_font.render("I:", True, (255, 255, 255))
+    display.menu_screen.blit(i_label, (x_start + 10, y_start + 60))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_i_gain'])
+    i_text = display.tiny_font.render(f"{config_state.pid_azm_i_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(i_text, (display.joystick_pid_rects['pid_azm_i_gain'].x + 3, display.joystick_pid_rects['pid_azm_i_gain'].y + 2))
+
+    # D gain
+    d_label = display.tiny_font.render("D:", True, (255, 255, 255))
+    display.menu_screen.blit(d_label, (x_start + 10, y_start + 85))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_d_gain'])
+    d_text = display.tiny_font.render(f"{config_state.pid_azm_d_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(d_text, (display.joystick_pid_rects['pid_azm_d_gain'].x + 3, display.joystick_pid_rects['pid_azm_d_gain'].y + 2))
+
+    # ALT PID labels and inputs (right column)
+    alt_title = display.tiny_font.render("ALT:", True, (255, 200, 100))
+    display.menu_screen.blit(alt_title, (x_start + 130, y_start + 25))
+
+    # P gain
+    alt_p_label = display.tiny_font.render("P:", True, (255, 255, 255))
+    display.menu_screen.blit(alt_p_label, (x_start + 130, y_start + 35))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_p_gain'])
+    alt_p_text = display.tiny_font.render(f"{config_state.pid_alt_p_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_p_text, (display.joystick_pid_rects['pid_alt_p_gain'].x + 3, display.joystick_pid_rects['pid_alt_p_gain'].y + 2))
+
+    # I gain
+    alt_i_label = display.tiny_font.render("I:", True, (255, 255, 255))
+    display.menu_screen.blit(alt_i_label, (x_start + 130, y_start + 60))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_i_gain'])
+    alt_i_text = display.tiny_font.render(f"{config_state.pid_alt_i_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_i_text, (display.joystick_pid_rects['pid_alt_i_gain'].x + 3, display.joystick_pid_rects['pid_alt_i_gain'].y + 2))
+
+    # D gain
+    alt_d_label = display.tiny_font.render("D:", True, (255, 255, 255))
+    display.menu_screen.blit(alt_d_label, (x_start + 130, y_start + 85))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_d_gain'])
+    alt_d_text = display.tiny_font.render(f"{config_state.pid_alt_d_gain:.3f}", True, (0, 0, 0))
+    display.menu_screen.blit(alt_d_text, (display.joystick_pid_rects['pid_alt_d_gain'].x + 3, display.joystick_pid_rects['pid_alt_d_gain'].y + 2))
+
+    # Focus highlights
+    for field, rect in display.joystick_pid_rects.items():
+        if hasattr(config_state, 'focused_field') and config_state.focused_field == field:
+            pygame.draw.rect(display.menu_screen, (0, 0, 255), rect, 2)
+            if hasattr(config_state, 'cursor_pos'):
+                field_display_str = ""
+                if field == 'pid_azm_p_gain':
+                    field_display_str = f"{config_state.pid_azm_p_gain:.3f}"
+                elif field == 'pid_azm_i_gain':
+                    field_display_str = f"{config_state.pid_azm_i_gain:.3f}"
+                elif field == 'pid_azm_d_gain':
+                    field_display_str = f"{config_state.pid_azm_d_gain:.3f}"
+                elif field == 'pid_alt_p_gain':
+                    field_display_str = f"{config_state.pid_alt_p_gain:.3f}"
+                elif field == 'pid_alt_i_gain':
+                    field_display_str = f"{config_state.pid_alt_i_gain:.3f}"
+                elif field == 'pid_alt_d_gain':
+                    field_display_str = f"{config_state.pid_alt_d_gain:.3f}"
+
+                if field_display_str and field in config_state.cursor_pos:
+                    text_width, _ = display.tiny_font.size(field_display_str[:config_state.cursor_pos[field]])
+                    pygame.draw.line(display.menu_screen, (0, 0, 255),
+                                   (rect.x + 5 + text_width, rect.y + 5),
+                                   (rect.x + 5 + text_width, rect.y + 20), 2)
+
+def handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
+    """
+    Handle mouse clicks on PID gain slider input fields.
+    """
+    if not hasattr(display, 'joystick_pid_rects') or not hasattr(joystick_state, 'config_state'):
+        return False
+
+    config_state = joystick_state.config_state
+
+    for field, rect in display.joystick_pid_rects.items():
+        if rect.collidepoint(mouse_pos):
+            config_state.focused_field = field
+            if hasattr(config_state, 'cursor_pos'):
+                config_state.cursor_pos[field] = 0
+            if hasattr(config_state, 'selection_start'):
+                config_state.selection_start[field] = None
+            return True
+
+    return False
+
+def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
+    """
+    Handle mouse clicks on feed-forward toggle buttons.
+    Called from main event loop when buttons are clicked.
+    """
+    if not hasattr(joystick_state, 'ff_button_rects'):
+        return False
+
+    for label, rect in joystick_state.ff_button_rects:
+        if rect.collidepoint(mouse_pos):
+            if " ff_az" in label:
+                # Toggle AZ feed-forward
+                joystick_state.feed_forward_azm_enabled = not joystick_state.feed_forward_azm_enabled
+                if joystick_state.azm_pid:
+                    joystick_state.azm_pid.set_feed_forward_enabled(joystick_state.feed_forward_azm_enabled)
+                print(f"FF AZ toggled: {joystick_state.feed_forward_azm_enabled}")
+            elif " ff_el" in label:
+                # Toggle EL feed-forward
+                joystick_state.feed_forward_alt_enabled = not joystick_state.feed_forward_alt_enabled
+                if joystick_state.alt_pid:
+                    joystick_state.alt_pid.set_feed_forward_enabled(joystick_state.feed_forward_alt_enabled)
+                print(f"FF EL toggled: {joystick_state.feed_forward_alt_enabled}")
+            elif " ff_off" in label:
+                # Disable all feed-forward
+                joystick_state.feed_forward_azm_enabled = False
+                joystick_state.feed_forward_alt_enabled = False
+                if joystick_state.azm_pid:
+                    joystick_state.azm_pid.set_feed_forward_enabled(False)
+                if joystick_state.alt_pid:
+                    joystick_state.alt_pid.set_feed_forward_enabled(False)
+                print("All feed-forward disabled")
+            return True
+    return False

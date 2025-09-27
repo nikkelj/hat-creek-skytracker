@@ -79,6 +79,7 @@ COMMANDS={
          }
 COMMAND_NAMES={value:key for key, value in COMMANDS.items()}
 
+# Rates are defined as fractions of a full revolution per second
 RATES = {
     0 : 0.0,
     1 : 1/(360*60),

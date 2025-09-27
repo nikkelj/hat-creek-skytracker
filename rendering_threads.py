@@ -794,11 +794,20 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                         camera_height_pixels=height_pixels
                     )
 
-                    # Transform telescope position to sky coordinates
-                    true_az, true_el = AzAlt2AzEl(
-                        current_azm, current_alt,
-                        alignment_azimuth, alignment_elevation
-                    )
+                    # Transform telescope position to sky coordinates based on mount mode
+                    mount_mode = getattr(self.config_state, 'mount_mode', 'Eq')
+                    if mount_mode == 'AltAz':
+                        from transformations import AzAlt2AzEl_AltAz
+                        true_az, true_el = AzAlt2AzEl_AltAz(
+                            current_azm, current_alt,
+                            alignment_azimuth
+                        )
+                    else:
+                        # Use full equatorial transformation for Eq mode
+                        true_az, true_el = AzAlt2AzEl(
+                            current_azm, current_alt,
+                            alignment_azimuth, alignment_elevation
+                        )
 
                     # Apply camera alignment rotation
                     az, el = apply_rotation_to_az_el(true_az, true_el, alignment_rotation)
@@ -1010,11 +1019,20 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         camera_height_pixels=height_pixels
                     )
 
-                    # Transform telescope position to sky coordinates
-                    true_az, true_el = AzAlt2AzEl(
-                        current_azm, current_alt,
-                        alignment_azimuth, alignment_elevation
-                    )
+                    # Transform telescope position to sky coordinates based on mount mode
+                    mount_mode = getattr(self.config_state, 'mount_mode', 'Eq')
+                    if mount_mode == 'AltAz':
+                        from transformations import AzAlt2AzEl_AltAz
+                        true_az, true_el = AzAlt2AzEl_AltAz(
+                            current_azm, current_alt,
+                            alignment_azimuth
+                        )
+                    else:
+                        # Use full equatorial transformation for Eq mode
+                        true_az, true_el = AzAlt2AzEl(
+                            current_azm, current_alt,
+                            alignment_azimuth, alignment_elevation
+                        )
 
                     # Apply camera alignment rotation
                     az, el = apply_rotation_to_az_el(true_az, true_el, alignment_rotation)

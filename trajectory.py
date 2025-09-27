@@ -199,8 +199,26 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
         # OPTIMIZATION 5: Pre-compute time-to-index mapping for faster interpolation
         times_array = time_vals.copy()
 
-        # OPTIMIZATION 6: Create trajectory data structure
-        trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords])
+        # Add rate calculations (degrees/second)
+        dt = times_array[1] - times_array[0]  # Time step in days
+        dt_seconds = dt * 86400.0  # Convert to seconds
+
+        # Calculate rates (finite differences)
+        az_rates_dps = np.zeros(len(times_array))
+        el_rates_dps = np.zeros(len(times_array))
+
+        for i in range(1, len(times_array) - 1):
+            az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
+            el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
+
+        # Handle endpoints with forward/backward differences
+        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
+        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
+        el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
+        el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
+
+        # OPTIMIZATION 6: Create trajectory data structure with rates
+        trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords, az_rates_dps, el_rates_dps])
         trajectory = trajectory_data.tolist()
 
         # OPTIMIZATION 7: Create arc segments (color will be determined during rendering)
@@ -265,18 +283,28 @@ def _create_arc_segments_simple(trajectory_data, start_time):
 
     return segments
 
-def interpolate_position(trajectory_data, current_tt):
-    if not trajectory_data[0]:  # Check if trajectory is empty
-        return None, None, None, None
+def interpolate_position_and_rates(trajectory_data, current_tt):
+    """
+    Interpolate satellite position and motion rates at a given time.
+
+    Args:
+        trajectory_data: Tuple of (trajectory, times_array)
+        current_tt: Current time in terrestrial time
+
+    Returns:
+        tuple: (px, py, alt, dist, az_rate_dps, el_rate_dps)
+    """
+    if not trajectory_data or not trajectory_data[0]:  # Check if trajectory is empty
+        return None, None, None, None, 0.0, 0.0
     trajectory, times_array = trajectory_data
     # Find the insertion point for current_tt
     idx = np.searchsorted(times_array, current_tt) - 1
     if idx < 0:
         # Before the first point, use the first point
-        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3]
+        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][6], trajectory[0][7]
     elif idx >= len(times_array) - 1:
         # After the last point, use the last point
-        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3]
+        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][6], trajectory[-1][7]
     else:
         # Linear interpolation between idx and idx+1
         t0 = times_array[idx]
@@ -284,11 +312,83 @@ def interpolate_position(trajectory_data, current_tt):
         fraction = (current_tt - t0) / (t1 - t0)
         px0, py0, alt0, dist0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3]
         px1, py1, alt1, dist1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3]
+        az_rate0, el_rate0 = trajectory[idx][6], trajectory[idx][7]
+        az_rate1, el_rate1 = trajectory[idx + 1][6], trajectory[idx + 1][7]
+
         px = px0 + fraction * (px1 - px0)
         py = py0 + fraction * (py1 - py0)
         alt = alt0 + fraction * (alt1 - alt0)
         dist = dist0 + fraction * (dist1 - dist0)
-        return px, py, alt, dist
+        az_rate = az_rate0 + fraction * (az_rate1 - az_rate0)
+        el_rate = el_rate0 + fraction * (el_rate1 - el_rate0)
+
+        return px, py, alt, dist, az_rate, el_rate
+
+def interpolate_position(trajectory_data, current_tt):
+    """
+    Legacy function that returns only position data.
+    """
+    px, py, alt, dist, *_ = interpolate_position_data_and_rates(trajectory_data, current_tt)
+    return px, py, alt, dist
+
+def interpolate_position_data_and_rates(trajectory_data, current_tt):
+    """
+    Parse trajectory data (either old 7-column or new 8-column format) and return position + rates.
+    Now returns azimuth (az_deg) as the 7th element for precise tracking.
+    """
+    if not trajectory_data or not trajectory_data[0]:
+        return None, None, None, None, None, 0.0, 0.0
+
+    trajectory, times_array = trajectory_data
+
+    # Handle both old format (time, alt, az, dist, px, py) and new format (with rates)
+    if len(trajectory[0]) == 6:  # Old format
+        idx = np.searchsorted(times_array, current_tt) - 1
+        if idx < 0:
+            return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][2], 0.0, 0.0
+        elif idx >= len(times_array) - 1:
+            return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][2], 0.0, 0.0
+
+        t0 = times_array[idx]
+        t1 = times_array[idx + 1]
+        fraction = (current_tt - t0) / (t1 - t0)
+        px0, py0, alt0, dist0, az0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3], trajectory[idx][2]
+        px1, py1, alt1, dist1, az1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3], trajectory[idx + 1][2]
+        px = px0 + fraction * (px1 - px0)
+        py = py0 + fraction * (py1 - py0)
+        alt = alt0 + fraction * (alt1 - alt0)
+        dist = dist0 + fraction * (dist1 - dist0)
+        az = az0 + fraction * (az1 - az0)
+        return px, py, alt, dist, az, 0.0, 0.0
+
+    elif len(trajectory[0]) == 8:  # New format with rates
+        idx = np.searchsorted(times_array, current_tt) - 1
+        if idx < 0:
+            return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][2], trajectory[0][6], trajectory[0][7]
+        elif idx >= len(times_array) - 1:
+            return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][2], trajectory[-1][6], trajectory[-1][7]
+
+        t0 = times_array[idx]
+        t1 = times_array[idx + 1]
+        fraction = (current_tt - t0) / (t1 - t0)
+        px0, py0, alt0, dist0, az0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3], trajectory[idx][2]
+        px1, py1, alt1, dist1, az1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3], trajectory[idx + 1][2]
+        az_rate0, el_rate0 = trajectory[idx][6], trajectory[idx][7]
+        az_rate1, el_rate1 = trajectory[idx + 1][6], trajectory[idx + 1][7]
+
+        px = px0 + fraction * (px1 - px0)
+        py = py0 + fraction * (py1 - py0)
+        alt = alt0 + fraction * (alt1 - alt0)
+        dist = dist0 + fraction * (dist1 - dist0)
+        az = az0 + fraction * (az1 - az0)
+        az_rate = az_rate0 + fraction * (az_rate1 - az_rate0)
+        el_rate = el_rate0 + fraction * (el_rate1 - el_rate0)
+
+        return px, py, alt, dist, az, az_rate, el_rate
+
+    else:
+        # Unknown format, fall back to old behavior
+        return None, None, None, None, None, 0.0, 0.0
 
 def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     """

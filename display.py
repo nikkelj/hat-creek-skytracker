@@ -96,6 +96,14 @@ class DisplaySetup:
             'azm_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 570, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'alt_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 650, self.INPUT_WIDTH, self.INPUT_HEIGHT),
 
+            # PID gain configuration input rectangles
+            'pid_azm_p_gain': pygame.Rect(self.sub_x + 520, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_azm_i_gain': pygame.Rect(self.sub_x + 630, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_azm_d_gain': pygame.Rect(self.sub_x + 740, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_alt_p_gain': pygame.Rect(self.sub_x + 520, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+            'pid_alt_i_gain': pygame.Rect(self.sub_x + 630, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+            'pid_alt_d_gain': pygame.Rect(self.sub_x + 740, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+
             # Camera configuration input rectangles
             'camera1_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 55, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'camera1_array_size_diagonal': pygame.Rect(self.sub_x + 250, self.sub_y + 110, self.INPUT_WIDTH, self.INPUT_HEIGHT),

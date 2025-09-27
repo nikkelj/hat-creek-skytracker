@@ -27,7 +27,7 @@ from config import load_config, handle_input, draw_config_options
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events
+from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 # Camera button initialization is now handled internally by camera_manager
@@ -106,10 +106,6 @@ print(f"Debug: Status - {'Starting TLE process...'}")
 global tracking_vis_state
 tracking_vis_state = TrackingVisState()
 
-# Joystick Mode State Management
-global joystick_mode_state
-joystick_mode_state = JoystickModeState()
-
 # Current tracking visualization surface for capture
 global current_tracking_surface
 current_tracking_surface = None
@@ -159,6 +155,10 @@ def update_status_callback(message):
     pygame.display.flip()
     pygame.time.wait(50)  # Brief pause to ensure display update
     print(f"Debug: Status - {message}")
+
+# Joystick Mode State Management (initialize after update_status_callback is defined)
+global joystick_mode_state
+joystick_mode_state = JoystickModeState(tracking_vis_state, config_state, update_status_callback)
 
 try:
     from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
@@ -281,6 +281,9 @@ while running:
                     fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
                     display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
 
+            # Update the current time in the state for use by other components (like PROGRAM tracking)
+            tracking_vis_state.current_tt = current_tt
+
             # Use state-direct mutation approach for satellite position updates
             # Only update positions if trajectories are available
             if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
@@ -315,6 +318,8 @@ while running:
                 running = False
             elif current_mode == "config_options" and config_state.focused_field:
                 handle_input(event, config_state)
+            elif current_mode == "joystick_loop" and (hasattr(joystick_mode_state, 'config_state') and joystick_mode_state.config_state.focused_field):
+                handle_input(event, joystick_mode_state.config_state)
             elif current_mode == "tracking_vis":
                 # Handle keyboard input for tracking visualization fields
                 from events import handle_tracking_vis_keyboard_events
@@ -597,13 +602,24 @@ while running:
             pass
 
         # Render connection controls and joystick status (not threaded)
-        from joystick_controller import render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds
         render_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)
         render_position_display(display, joystick_mode_state)
 
         # Render capture controls (progress indicator, capture button)
         render_capture_controls(display, joystick_mode_state)
+
+        # Render PID diagnostics
+        render_pid_diagnostics(display, joystick_mode_state)
+
+        # Render PID gain sliders (for real-time tuning)
+        render_pid_gain_sliders(display, joystick_mode_state)
+
+        # Render bias control grid
+        render_bias_control_grid(display, joystick_mode_state)
+
+        # Render feed-forward toggle buttons
+        render_feed_forward_toggle_buttons(display, joystick_mode_state)
 
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)

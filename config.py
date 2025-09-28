@@ -47,6 +47,12 @@ class ConfigState:
         # Mount mode configuration
         self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
 
+        # Hardware safety limits configuration (degrees)
+        self.azm_limit_min_str = "-180.0"
+        self.azm_limit_max_str = "180.0"
+        self.alt_limit_min_str = "-100.0"
+        self.alt_limit_max_str = "100.0"
+
         # System configuration
         self.buffer_size = 1000  # Circular buffer size (frames)
         self.image_format = "BMP"  # Capture image format (BMP/PNG)
@@ -77,6 +83,8 @@ class ConfigState:
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
             "azm_offset": 0, "alt_offset": 0,
+            "azm_limit_min": 0, "azm_limit_max": 0,
+            "alt_limit_min": 0, "alt_limit_max": 0,
             "pid_azm_p_gain": 0, "pid_azm_i_gain": 0, "pid_azm_d_gain": 0,
             "pid_alt_p_gain": 0, "pid_alt_i_gain": 0, "pid_alt_d_gain": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
@@ -88,6 +96,8 @@ class ConfigState:
             "lat": None, "lon": None, "alt": None, "elevation_mask": None,
             "alignment_azimuth": None, "alignment_elevation": None,
             "azm_offset": None, "alt_offset": None,
+            "azm_limit_min": None, "azm_limit_max": None,
+            "alt_limit_min": None, "alt_limit_max": None,
             "pid_azm_p_gain": None, "pid_azm_i_gain": None, "pid_azm_d_gain": None,
             "pid_alt_p_gain": None, "pid_alt_i_gain": None, "pid_alt_d_gain": None,
             "camera1_pixel_size": None, "camera1_array_size_diagonal": None, "camera1_focal_length": None, "camera1_alignment_rotation": None,
@@ -107,6 +117,10 @@ class ConfigState:
             "alignment_elevation": self.alignment_elevation_str,
             "azm_offset": self.azm_offset_str,
             "alt_offset": self.alt_offset_str,
+            "azm_limit_min": self.azm_limit_min_str,
+            "azm_limit_max": self.azm_limit_max_str,
+            "alt_limit_min": self.alt_limit_min_str,
+            "alt_limit_max": self.alt_limit_max_str,
             "camera_configs": self.camera_configs,
             "pid_azm_p_gain": self.pid_azm_p_gain,
             "pid_azm_i_gain": self.pid_azm_i_gain,
@@ -155,6 +169,12 @@ class ConfigState:
         # Load mount mode
         self.mount_mode = config_dict.get("mount_mode", self.mount_mode)
 
+        # Load hardware safety limits
+        self.azm_limit_min_str = config_dict.get("azm_limit_min", self.azm_limit_min_str)
+        self.azm_limit_max_str = config_dict.get("azm_limit_max", self.azm_limit_max_str)
+        self.alt_limit_min_str = config_dict.get("alt_limit_min", self.alt_limit_min_str)
+        self.alt_limit_max_str = config_dict.get("alt_limit_max", self.alt_limit_max_str)
+
         # Load camera configurations if present
         if "camera_configs" in config_dict:
             for camera_name, config_data in config_dict["camera_configs"].items():
@@ -183,6 +203,8 @@ class ConfigState:
             "lat": 0, "lon": 0, "alt": 0, "elevation_mask": 0,
             "alignment_azimuth": 0, "alignment_elevation": 0,
             "azm_offset": 0, "alt_offset": 0,
+            "azm_limit_min": 0, "azm_limit_max": 0,
+            "alt_limit_min": 0, "alt_limit_max": 0,
             "pid_azm_p_gain": 0, "pid_azm_i_gain": 0, "pid_azm_d_gain": 0,
             "pid_alt_p_gain": 0, "pid_alt_i_gain": 0, "pid_alt_d_gain": 0,
             "camera1_pixel_size": 0, "camera1_array_size_diagonal": 0, "camera1_focal_length": 0, "camera1_alignment_rotation": 0,
@@ -321,18 +343,18 @@ def draw_angle_groups(display, config_state):
 
     # Feed-forward status display
     ff_azm_label = display.small_font.render("AZM FF:", True, (0, 0, 0))
-    display.menu_screen.blit(ff_azm_label, (display.sub_x + 490, current_y))
+    display.menu_screen.blit(ff_azm_label, (display.sub_x + 480, current_y))
     ff_azm_status = "ON" if config_state.feed_forward_azm_enabled else "OFF"
     ff_azm_color = (0, 150, 0) if config_state.feed_forward_azm_enabled else (150, 0, 0)
     ff_azm_status_text = display.small_font.render(ff_azm_status, True, ff_azm_color)
-    display.menu_screen.blit(ff_azm_status_text, (display.sub_x + 570, current_y))
+    display.menu_screen.blit(ff_azm_status_text, (display.sub_x + 550, current_y))
 
     ff_alt_label = display.small_font.render("ALT FF:", True, (0, 0, 0))
-    display.menu_screen.blit(ff_alt_label, (display.sub_x + 650, current_y))
+    display.menu_screen.blit(ff_alt_label, (display.sub_x + 620, current_y))
     ff_alt_status = "ON" if config_state.feed_forward_alt_enabled else "OFF"
     ff_alt_color = (0, 150, 0) if config_state.feed_forward_alt_enabled else (150, 0, 0)
     ff_alt_status_text = display.small_font.render(ff_alt_status, True, ff_alt_color)
-    display.menu_screen.blit(ff_alt_status_text, (display.sub_x + 730, current_y))
+    display.menu_screen.blit(ff_alt_status_text, (display.sub_x + 690, current_y))
 
     current_y += 30
 
@@ -425,6 +447,14 @@ def handle_input(event, config_state):
         field_str = f"{config_state.pid_alt_i_gain:.3f}"
     elif focused_field == "pid_alt_d_gain":
         field_str = f"{config_state.pid_alt_d_gain:.3f}"
+    elif focused_field == "azm_limit_min":
+        field_str = config_state.azm_limit_min_str
+    elif focused_field == "azm_limit_max":
+        field_str = config_state.azm_limit_max_str
+    elif focused_field == "alt_limit_min":
+        field_str = config_state.alt_limit_min_str
+    elif focused_field == "alt_limit_max":
+        field_str = config_state.alt_limit_max_str
     else:
         return
 
@@ -596,6 +626,14 @@ def handle_input(event, config_state):
             config_state.pid_alt_d_gain = float(field_str) if field_str else 0.0
         except ValueError:
             pass
+    elif focused_field == "azm_limit_min":
+        config_state.azm_limit_min_str = field_str
+    elif focused_field == "azm_limit_max":
+        config_state.azm_limit_max_str = field_str
+    elif focused_field == "alt_limit_min":
+        config_state.alt_limit_min_str = field_str
+    elif focused_field == "alt_limit_max":
+        config_state.alt_limit_max_str = field_str
 
 
 def draw_config_options(display, config_state):
@@ -612,7 +650,7 @@ def draw_config_options(display, config_state):
         pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
 
     # Draw grouping box and label
-    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 720)
+    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 990)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
     group_label = display.font.render("Observer Location", True, (0, 0, 0))
     display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
@@ -669,6 +707,31 @@ def draw_config_options(display, config_state):
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_offset'])
     alt_offset_text = display.font.render(config_state.alt_offset_str, True, (0, 0, 0))
     display.menu_screen.blit(alt_offset_text, (display.input_rects['alt_offset'].x + 5, display.input_rects['alt_offset'].y + 5))
+
+    # Hardware safety limits
+    azm_limit_min_label = display.font.render("AZM Limit Min (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(azm_limit_min_label, (display.sub_x + 20, display.sub_y + 700))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_limit_min'])
+    azm_limit_min_text = display.font.render(config_state.azm_limit_min_str, True, (0, 0, 0))
+    display.menu_screen.blit(azm_limit_min_text, (display.input_rects['azm_limit_min'].x + 5, display.input_rects['azm_limit_min'].y + 5))
+
+    azm_limit_max_label = display.font.render("AZM Limit Max (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(azm_limit_max_label, (display.sub_x + 20, display.sub_y + 760))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_limit_max'])
+    azm_limit_max_text = display.font.render(config_state.azm_limit_max_str, True, (0, 0, 0))
+    display.menu_screen.blit(azm_limit_max_text, (display.input_rects['azm_limit_max'].x + 5, display.input_rects['azm_limit_max'].y + 5))
+
+    alt_limit_min_label = display.font.render("ALT Limit Min (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(alt_limit_min_label, (display.sub_x + 20, display.sub_y + 820))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_limit_min'])
+    alt_limit_min_text = display.font.render(config_state.alt_limit_min_str, True, (0, 0, 0))
+    display.menu_screen.blit(alt_limit_min_text, (display.input_rects['alt_limit_min'].x + 5, display.input_rects['alt_limit_min'].y + 5))
+
+    alt_limit_max_label = display.font.render("ALT Limit Max (deg):", True, (0, 0, 0))
+    display.menu_screen.blit(alt_limit_max_label, (display.sub_x + 20, display.sub_y + 880))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_limit_max'])
+    alt_limit_max_text = display.font.render(config_state.alt_limit_max_str, True, (0, 0, 0))
+    display.menu_screen.blit(alt_limit_max_text, (display.input_rects['alt_limit_max'].x + 5, display.input_rects['alt_limit_max'].y + 5))
 
     # Focus highlights for location fields
     if config_state.focused_field == "lat":
@@ -734,6 +797,39 @@ def draw_config_options(display, config_state):
             pygame.draw.line(display.menu_screen, (0, 0, 255),
                             (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 5),
                             (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 25), 2)
+
+    # Hardware safety limits focus highlights
+    if config_state.focused_field == "azm_limit_min":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_limit_min'], 2)
+        if config_state.focused_field == "azm_limit_min":
+            text_width, _ = display.font.size(config_state.azm_limit_min_str[:config_state.cursor_pos.get("azm_limit_min", 0)])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['azm_limit_min'].x + 5 + text_width, display.input_rects['azm_limit_min'].y + 5),
+                            (display.input_rects['azm_limit_min'].x + 5 + text_width, display.input_rects['azm_limit_min'].y + 25), 2)
+
+    if config_state.focused_field == "azm_limit_max":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_limit_max'], 2)
+        if config_state.focused_field == "azm_limit_max":
+            text_width, _ = display.font.size(config_state.azm_limit_max_str[:config_state.cursor_pos.get("azm_limit_max", 0)])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['azm_limit_max'].x + 5 + text_width, display.input_rects['azm_limit_max'].y + 5),
+                            (display.input_rects['azm_limit_max'].x + 5 + text_width, display.input_rects['azm_limit_max'].y + 25), 2)
+
+    if config_state.focused_field == "alt_limit_min":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_limit_min'], 2)
+        if config_state.focused_field == "alt_limit_min":
+            text_width, _ = display.font.size(config_state.alt_limit_min_str[:config_state.cursor_pos.get("alt_limit_min", 0)])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['alt_limit_min'].x + 5 + text_width, display.input_rects['alt_limit_min'].y + 5),
+                            (display.input_rects['alt_limit_min'].x + 5 + text_width, display.input_rects['alt_limit_min'].y + 25), 2)
+
+    if config_state.focused_field == "alt_limit_max":
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_limit_max'], 2)
+        if config_state.focused_field == "alt_limit_max":
+            text_width, _ = display.font.size(config_state.alt_limit_max_str[:config_state.cursor_pos.get("alt_limit_max", 0)])
+            pygame.draw.line(display.menu_screen, (0, 0, 255),
+                            (display.input_rects['alt_limit_max'].x + 5 + text_width, display.input_rects['alt_limit_max'].y + 5),
+                            (display.input_rects['alt_limit_max'].x + 5 + text_width, display.input_rects['alt_limit_max'].y + 25), 2)
 
     # Camera 1 configuration
     camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 380)

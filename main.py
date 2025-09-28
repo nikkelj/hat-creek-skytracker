@@ -420,7 +420,87 @@ while running:
 
             # Handle joystick mode events
             elif current_mode == "joystick_loop":
+                # Handle joystick mode mouse events except slider dragging
                 handle_joystick_mode_mouse_events(event, joystick_mode_state, display, tracking_vis_state, config_state, current_tracking_surface)
+
+
+        elif event.type == pygame.MOUSEMOTION:
+            if current_mode is None:
+                # Handle main menu hover states
+                for btn in display.buttons:
+                    display.button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
+            elif current_mode == "config_options":
+                display.button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
+                display.button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
+            elif current_mode == "sensor_calib":
+                # Camera slider hover states handled by modular camera code
+                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback)
+            elif current_mode == "tracking_vis":
+                display.button_states["clear_filters"]["hover"] = display.clear_filters_button.collidepoint(event.pos)
+                display.button_states["recompute"]["hover"] = display.recompute_button.collidepoint(event.pos)
+                display.button_states["reset"]["hover"] = display.reset_button.collidepoint(event.pos)
+                display.button_states["pause"]["hover"] = display.pause_button.collidepoint(event.pos)
+                display.button_states["play"]["hover"] = display.play_button.collidepoint(event.pos)
+                if tracking_vis_state.dragging_slider:
+                    display.slider_rect.x = max(display.scroll_bar_rect.x, min(event.pos[0] - display.slider_rect.width // 2, display.scroll_bar_rect.x + display.scroll_bar_rect.width - display.slider_rect.width))
+                for sat, (px, py, _, _) in tracking_vis_state.satellite_positions.items():
+                    if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
+                        tracking_vis_state.hovered_satellite = sat
+                        break
+            elif current_mode == "joystick_loop":
+                # Handle PID slider dragging in joystick mode
+                if event.buttons[0]:  # Left mouse button is pressed
+                    current_pos = event.pos
+
+                    # Check PID sliders for dragging
+                    if (hasattr(display, 'joystick_pid_slider_rects') and
+                        joystick_mode_state is not None and
+                        hasattr(joystick_mode_state, 'config_state') and
+                        joystick_mode_state.config_state is not None):
+
+                        # PID slider ranges and logarithmic scaling (5 orders of magnitude)
+                        PID_MAX_VALUE = 2.0
+                        PID_MIN_VALUE = 2.0 / 100000.0
+                        LOG_SCALE_FACTOR = 5.0  # 5 orders of magnitude
+
+                        for field, slider_rect in display.joystick_pid_slider_rects.items():
+                            if slider_rect.collidepoint(current_pos):
+                                SLIDER_WIDTH = 80
+                                relative_x = min(max(current_pos[0] - slider_rect.x, 0), SLIDER_WIDTH)
+                                slider_pos = relative_x / SLIDER_WIDTH  # 0-1 position
+
+                                # Calculate new value using 5 orders of magnitude scaling: value = min_val * 10^(pos * factor)
+                                new_value = PID_MIN_VALUE * math.pow(10, slider_pos * LOG_SCALE_FACTOR)
+                                new_value = max(PID_MIN_VALUE, min(PID_MAX_VALUE, new_value))
+
+                                # Update config value
+                                if field == 'pid_azm_p_gain':
+                                    joystick_mode_state.config_state.pid_azm_p_gain = round(new_value, 5)
+                                elif field == 'pid_azm_i_gain':
+                                    joystick_mode_state.config_state.pid_azm_i_gain = round(new_value, 5)
+                                elif field == 'pid_azm_d_gain':
+                                    joystick_mode_state.config_state.pid_azm_d_gain = round(new_value, 5)
+                                elif field == 'pid_alt_p_gain':
+                                    joystick_mode_state.config_state.pid_alt_p_gain = round(new_value, 5)
+                                elif field == 'pid_alt_i_gain':
+                                    joystick_mode_state.config_state.pid_alt_i_gain = round(new_value, 5)
+                                elif field == 'pid_alt_d_gain':
+                                    joystick_mode_state.config_state.pid_alt_d_gain = round(new_value, 5)
+
+                                # Update PID controllers if they exist
+                                if joystick_mode_state.azm_pid:
+                                    joystick_mode_state.azm_pid.update_gains(
+                                        joystick_mode_state.config_state.pid_azm_p_gain,
+                                        joystick_mode_state.config_state.pid_azm_i_gain,
+                                        joystick_mode_state.config_state.pid_azm_d_gain
+                                    )
+                                if joystick_mode_state.alt_pid:
+                                    joystick_mode_state.alt_pid.update_gains(
+                                        joystick_mode_state.config_state.pid_alt_p_gain,
+                                        joystick_mode_state.config_state.pid_alt_i_gain,
+                                        joystick_mode_state.config_state.pid_alt_d_gain
+                                    )
+                                break  # Only handle one slider at a time
 
 
         elif event.type == pygame.MOUSEMOTION:

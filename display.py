@@ -96,13 +96,19 @@ class DisplaySetup:
             'azm_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 570, self.INPUT_WIDTH, self.INPUT_HEIGHT),
             'alt_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 650, self.INPUT_WIDTH, self.INPUT_HEIGHT),
 
+            # Hardware safety limits input rectangles
+            'azm_limit_min': pygame.Rect(self.sub_x + 20, self.sub_y + 720, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'azm_limit_max': pygame.Rect(self.sub_x + 20, self.sub_y + 780, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'alt_limit_min': pygame.Rect(self.sub_x + 20, self.sub_y + 840, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+            'alt_limit_max': pygame.Rect(self.sub_x + 20, self.sub_y + 900, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+
             # PID gain configuration input rectangles
-            'pid_azm_p_gain': pygame.Rect(self.sub_x + 520, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_azm_i_gain': pygame.Rect(self.sub_x + 630, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_azm_d_gain': pygame.Rect(self.sub_x + 740, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_alt_p_gain': pygame.Rect(self.sub_x + 520, self.sub_y + 140, 90, self.INPUT_HEIGHT),
-            'pid_alt_i_gain': pygame.Rect(self.sub_x + 630, self.sub_y + 140, 90, self.INPUT_HEIGHT),
-            'pid_alt_d_gain': pygame.Rect(self.sub_x + 740, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+            'pid_azm_p_gain': pygame.Rect(self.sub_x + 480, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_azm_i_gain': pygame.Rect(self.sub_x + 590, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_azm_d_gain': pygame.Rect(self.sub_x + 700, self.sub_y + 70, 90, self.INPUT_HEIGHT),
+            'pid_alt_p_gain': pygame.Rect(self.sub_x + 480, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+            'pid_alt_i_gain': pygame.Rect(self.sub_x + 590, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+            'pid_alt_d_gain': pygame.Rect(self.sub_x + 700, self.sub_y + 140, 90, self.INPUT_HEIGHT),
 
             # Camera configuration input rectangles
             'camera1_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 55, self.INPUT_WIDTH, self.INPUT_HEIGHT),

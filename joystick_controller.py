@@ -211,7 +211,30 @@ class JoystickModeState:
             self.mti_track()
 
     def _handle_rate_control(self, joy):
-        """Handle the original rate control logic"""
+        """Handle the original rate control logic with hardware safety limits"""
+        # Get current position with safety limits
+        try:
+            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360.0
+            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360.0
+
+            # Apply offsets
+            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
+            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
+            current_azm = current_azm_raw - offset_azm
+            current_alt = current_alt_raw - offset_alt
+
+            # Get configured limits
+            azm_limit_min = float(self.config_state.azm_limit_min_str)
+            azm_limit_max = float(self.config_state.azm_limit_max_str)
+            alt_limit_min = float(self.config_state.alt_limit_min_str)
+            alt_limit_max = float(self.config_state.alt_limit_max_str)
+
+        except Exception as e:
+            # If we can't read position or limits, fall back to original behavior
+            print(f"Warning: Could not read telescope position for safety checks: {e}")
+            current_azm = current_alt = 0.0
+            azm_limit_min = azm_limit_max = alt_limit_min = alt_limit_max = float('inf')
+
         # Process axes 2 and 3 (PlayStation right stick)
         for i in [2, 3]:  # AZM and ALT axes
             if i >= joy.get_numaxes():
@@ -242,13 +265,41 @@ class JoystickModeState:
                 # Apply the original sign
                 rate *= 1 if axis_value > 0 else -1
 
-            # Send command
-            if i == 2:  # AZM
-                if rate != 0:
-                    self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
-            elif i == 3:  # ALT
-                if rate != 0:
-                    self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
+            # Hardware safety checks - prevent movement that would approach limits
+            safe_to_move = True
+            if rate > 0 and i == 2:  # Positive AZM rate
+                if current_azm >= azm_limit_max:
+                    safe_to_move = False
+                    self.tracking_mode = TrackingMode.STANDBY
+                    if self.update_status_callback:
+                        self.update_status_callback(f"AZM safety limit exceeded ({current_azm:.1f} >= {azm_limit_max}) - switched to STANDBY")
+            elif rate < 0 and i == 2:  # Negative AZM rate
+                if current_azm <= azm_limit_min:
+                    safe_to_move = False
+                    self.tracking_mode = TrackingMode.STANDBY
+                    if self.update_status_callback:
+                        self.update_status_callback(f"AZM safety limit exceeded ({current_azm:.1f} <= {azm_limit_min}) - switched to STANDBY")
+            elif rate > 0 and i == 3:  # Positive ALT rate
+                if current_alt >= alt_limit_max:
+                    safe_to_move = False
+                    self.tracking_mode = TrackingMode.STANDBY
+                    if self.update_status_callback:
+                        self.update_status_callback(f"ALT safety limit exceeded ({current_alt:.1f} >= {alt_limit_max}) - switched to STANDBY")
+            elif rate < 0 and i == 3:  # Negative ALT rate
+                if current_alt <= alt_limit_min:
+                    safe_to_move = False
+                    self.tracking_mode = TrackingMode.STANDBY
+                    if self.update_status_callback:
+                        self.update_status_callback(f"ALT safety limit exceeded ({current_alt:.1f} <= {alt_limit_min}) - switched to STANDBY")
+
+            # Send command only if safe
+            if safe_to_move:
+                if i == 2:  # AZM
+                    if rate != 0:
+                        self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
+                elif i == 3:  # ALT
+                    if rate != 0:
+                        self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
 
     def cycle_tracking_mode_forward(self):
         """Cycle to the next tracking mode in forward sequence"""
@@ -304,6 +355,12 @@ class JoystickModeState:
             )
 
         try:
+            # Get configured safety limits
+            azm_limit_min = float(self.config_state.azm_limit_min_str)
+            azm_limit_max = float(self.config_state.azm_limit_max_str)
+            alt_limit_min = float(self.config_state.alt_limit_min_str)
+            alt_limit_max = float(self.config_state.alt_limit_max_str)
+
             # Get current mount position with offsets
             current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360
             current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360
@@ -366,6 +423,16 @@ class JoystickModeState:
                         return
 
                     # Satellite is above horizon - use PID control for tracking
+                    # Check hardware safety limits against target position first
+                    # If target exceeds limits, abort tracking immediately
+                    if (target_az_deg > azm_limit_max or target_az_deg < azm_limit_min or
+                        target_el_deg > alt_limit_max or target_el_deg < alt_limit_min):
+                        self.tracking_mode = TrackingMode.STANDBY
+                        target_info = f"AZ:{target_az_deg:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° EL:{target_el_deg:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}°"
+                        if self.update_status_callback:
+                            self.update_status_callback(f"Satellite target ({target_info}) exceeds safety limits - switched to STANDBY")
+                        return
+
                     # Apply bias corrections
                     target_az_deg += self.bias_azm_deg
                     target_el_deg += self.bias_alt_deg
@@ -1629,7 +1696,7 @@ def render_pid_gain_sliders(display, joystick_state):
     x_start = display.sub_x + 280
     y_start = display.sub_y + 660 - 300  # Adjusted for bias control position
     width = 240
-    height = 120
+    height = 180  # Increased height for sliders
 
     # Background rectangle
     pygame.draw.rect(display.menu_screen, (70, 70, 90),
@@ -1641,66 +1708,151 @@ def render_pid_gain_sliders(display, joystick_state):
     title_text = display.small_font.render("PID Gain Control", True, (255, 255, 255))
     display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
 
-    # Create slider input rectangles if not already existing
+    # Define PID gain ranges (similar to camera settings)
+    PID_GAIN_RANGE = (0.0, 2.0)  # From 0 to 2.0
+    SLIDER_WIDTH = 80  # Width for each PID slider
+
+    # Mouse position for hover detection
+    mouse_pos = pygame.mouse.get_pos()
+
+    # PID gain range for logarithmic sliders spanning 5 orders of magnitude (0.00002 to 2.0)
+    PID_MAX_VALUE = 2.0
+    PID_MIN_VALUE = 2.0 / 100000.0  # 5 orders of magnitude: 2.0e-5
+    LOG_SCALE_FACTOR = 5.0  # 5 orders of magnitude
+    LOG_SCALE_OFFSET = PID_MIN_VALUE  # Start just above zero
+
+    # Create slider input rectangles and slider track rectangles if not already existing
     if not hasattr(display, 'joystick_pid_rects'):
         display.joystick_pid_rects = {
-            'pid_azm_p_gain': pygame.Rect(x_start + 60, y_start + 30, 60, 20),
-            'pid_azm_i_gain': pygame.Rect(x_start + 60, y_start + 55, 60, 20),
-            'pid_azm_d_gain': pygame.Rect(x_start + 60, y_start + 80, 60, 20),
-            'pid_alt_p_gain': pygame.Rect(x_start + 180, y_start + 30, 60, 20),
-            'pid_alt_i_gain': pygame.Rect(x_start + 180, y_start + 55, 60, 20),
-            'pid_alt_d_gain': pygame.Rect(x_start + 180, y_start + 80, 60, 20)
+            'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 30, 60, 20),  # Moved 10 pixels left
+            'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 65, 60, 20),  # Increased spacing
+            'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 100, 60, 20), # More spacing
+            'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 30, 60, 20),  # Moved 10 pixels left
+            'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 65, 60, 20),  # Increased spacing
+            'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 100, 60, 20), # More spacing
+        }
+
+    # Create slider track rectangles if not existing
+    if not hasattr(display, 'joystick_pid_slider_rects'):
+        display.joystick_pid_slider_rects = {
+            'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 55, SLIDER_WIDTH, 5),  # 5 pixels after edit box
+            'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 90, SLIDER_WIDTH, 5),  # 5 pixels after edit box
+            'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 125, SLIDER_WIDTH, 5), # 5 pixels after edit box
+            'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 55, SLIDER_WIDTH, 5),  # 5 pixels after edit box
+            'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 90, SLIDER_WIDTH, 5),  # 5 pixels after edit box
+            'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 125, SLIDER_WIDTH, 5), # 5 pixels after edit box
         }
 
     # AZM PID labels and inputs (left column)
     azm_title = display.tiny_font.render("AZM:", True, (255, 200, 100))
-    display.menu_screen.blit(azm_title, (x_start + 10, y_start + 25))
+    display.menu_screen.blit(azm_title, (x_start, y_start + 20))
 
     # P gain
     p_label = display.tiny_font.render("P:", True, (255, 255, 255))
-    display.menu_screen.blit(p_label, (x_start + 10, y_start + 35))
+    display.menu_screen.blit(p_label, (x_start, y_start + 30))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_p_gain'])
-    p_text = display.tiny_font.render(f"{config_state.pid_azm_p_gain:.3f}", True, (0, 0, 0))
+    p_value = getattr(config_state, 'pid_azm_p_gain', 0.0)
+    p_text = display.tiny_font.render(f"{p_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(p_text, (display.joystick_pid_rects['pid_azm_p_gain'].x + 3, display.joystick_pid_rects['pid_azm_p_gain'].y + 2))
+
+    # P slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_azm_p_gain'])
+    # Position calculation: log10(value / min_val) / log10(max_val / min_val)
+    log_position = math.log10(max(p_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_azm_p_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_azm_p_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_azm_p_gain'].y - 3, 6, 11))
 
     # I gain
     i_label = display.tiny_font.render("I:", True, (255, 255, 255))
-    display.menu_screen.blit(i_label, (x_start + 10, y_start + 60))
+    display.menu_screen.blit(i_label, (x_start, y_start + 65))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_i_gain'])
-    i_text = display.tiny_font.render(f"{config_state.pid_azm_i_gain:.3f}", True, (0, 0, 0))
+    i_value = getattr(config_state, 'pid_azm_i_gain', 0.0)
+    i_text = display.tiny_font.render(f"{i_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(i_text, (display.joystick_pid_rects['pid_azm_i_gain'].x + 3, display.joystick_pid_rects['pid_azm_i_gain'].y + 2))
+
+    # I slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_azm_i_gain'])
+    log_position = math.log10(max(i_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_azm_i_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_azm_i_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_azm_i_gain'].y - 3, 6, 11))
 
     # D gain
     d_label = display.tiny_font.render("D:", True, (255, 255, 255))
-    display.menu_screen.blit(d_label, (x_start + 10, y_start + 85))
+    display.menu_screen.blit(d_label, (x_start, y_start + 105))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_azm_d_gain'])
-    d_text = display.tiny_font.render(f"{config_state.pid_azm_d_gain:.3f}", True, (0, 0, 0))
+    d_value = getattr(config_state, 'pid_azm_d_gain', 0.0)
+    d_text = display.tiny_font.render(f"{d_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(d_text, (display.joystick_pid_rects['pid_azm_d_gain'].x + 3, display.joystick_pid_rects['pid_azm_d_gain'].y + 2))
+
+    # D slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_azm_d_gain'])
+    log_position = math.log10(max(d_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_azm_d_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_azm_d_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_azm_d_gain'].y - 3, 6, 11))
 
     # ALT PID labels and inputs (right column)
     alt_title = display.tiny_font.render("ALT:", True, (255, 200, 100))
-    display.menu_screen.blit(alt_title, (x_start + 130, y_start + 25))
+    display.menu_screen.blit(alt_title, (x_start + 120, y_start + 20))
 
     # P gain
     alt_p_label = display.tiny_font.render("P:", True, (255, 255, 255))
-    display.menu_screen.blit(alt_p_label, (x_start + 130, y_start + 35))
+    display.menu_screen.blit(alt_p_label, (x_start + 120, y_start + 30))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_p_gain'])
-    alt_p_text = display.tiny_font.render(f"{config_state.pid_alt_p_gain:.3f}", True, (0, 0, 0))
+    alt_p_value = getattr(config_state, 'pid_alt_p_gain', 0.0)
+    alt_p_text = display.tiny_font.render(f"{alt_p_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(alt_p_text, (display.joystick_pid_rects['pid_alt_p_gain'].x + 3, display.joystick_pid_rects['pid_alt_p_gain'].y + 2))
+
+    # P slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_alt_p_gain'])
+    log_position = math.log10(max(alt_p_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_alt_p_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_alt_p_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_alt_p_gain'].y - 3, 6, 11))
 
     # I gain
     alt_i_label = display.tiny_font.render("I:", True, (255, 255, 255))
-    display.menu_screen.blit(alt_i_label, (x_start + 130, y_start + 60))
+    display.menu_screen.blit(alt_i_label, (x_start + 120, y_start + 65))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_i_gain'])
-    alt_i_text = display.tiny_font.render(f"{config_state.pid_alt_i_gain:.3f}", True, (0, 0, 0))
+    alt_i_value = getattr(config_state, 'pid_alt_i_gain', 0.0)
+    alt_i_text = display.tiny_font.render(f"{alt_i_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(alt_i_text, (display.joystick_pid_rects['pid_alt_i_gain'].x + 3, display.joystick_pid_rects['pid_alt_i_gain'].y + 2))
+
+    # I slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_alt_i_gain'])
+    log_position = math.log10(max(alt_i_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_alt_i_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_alt_i_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_alt_i_gain'].y - 3, 6, 11))
 
     # D gain
     alt_d_label = display.tiny_font.render("D:", True, (255, 255, 255))
-    display.menu_screen.blit(alt_d_label, (x_start + 130, y_start + 85))
+    display.menu_screen.blit(alt_d_label, (x_start + 120, y_start + 105))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), display.joystick_pid_rects['pid_alt_d_gain'])
-    alt_d_text = display.tiny_font.render(f"{config_state.pid_alt_d_gain:.3f}", True, (0, 0, 0))
+    alt_d_value = getattr(config_state, 'pid_alt_d_gain', 0.0)
+    alt_d_text = display.tiny_font.render(f"{alt_d_value:.5f}", True, (0, 0, 0))
     display.menu_screen.blit(alt_d_text, (display.joystick_pid_rects['pid_alt_d_gain'].x + 3, display.joystick_pid_rects['pid_alt_d_gain'].y + 2))
+
+    # D slider - LOGARITHMIC SCALING (5 orders of magnitude)
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), display.joystick_pid_slider_rects['pid_alt_d_gain'])
+    log_position = math.log10(max(alt_d_value, PID_MIN_VALUE) / PID_MIN_VALUE) / LOG_SCALE_FACTOR
+    slider_ratio = min(1.0, max(0.0, log_position))
+    handle_x = display.joystick_pid_slider_rects['pid_alt_d_gain'].x + int(slider_ratio * SLIDER_WIDTH)
+    hover = pygame.Rect(handle_x - 3, display.joystick_pid_slider_rects['pid_alt_d_gain'].y - 3, 6, 11).collidepoint(mouse_pos)
+    handle_color = (255, 0, 0) if hover else (200, 0, 0)
+    pygame.draw.rect(display.menu_screen, handle_color, (handle_x - 3, display.joystick_pid_slider_rects['pid_alt_d_gain'].y - 3, 6, 11))
 
     # Focus highlights
     for field, rect in display.joystick_pid_rects.items():
@@ -1709,17 +1861,17 @@ def render_pid_gain_sliders(display, joystick_state):
             if hasattr(config_state, 'cursor_pos'):
                 field_display_str = ""
                 if field == 'pid_azm_p_gain':
-                    field_display_str = f"{config_state.pid_azm_p_gain:.3f}"
+                    field_display_str = f"{p_value:.5f}"
                 elif field == 'pid_azm_i_gain':
-                    field_display_str = f"{config_state.pid_azm_i_gain:.3f}"
+                    field_display_str = f"{i_value:.5f}"
                 elif field == 'pid_azm_d_gain':
-                    field_display_str = f"{config_state.pid_azm_d_gain:.3f}"
+                    field_display_str = f"{d_value:.5f}"
                 elif field == 'pid_alt_p_gain':
-                    field_display_str = f"{config_state.pid_alt_p_gain:.3f}"
+                    field_display_str = f"{alt_p_value:.5f}"
                 elif field == 'pid_alt_i_gain':
-                    field_display_str = f"{config_state.pid_alt_i_gain:.3f}"
+                    field_display_str = f"{alt_i_value:.5f}"
                 elif field == 'pid_alt_d_gain':
-                    field_display_str = f"{config_state.pid_alt_d_gain:.3f}"
+                    field_display_str = f"{alt_d_value:.5f}"
 
                 if field_display_str and field in config_state.cursor_pos:
                     text_width, _ = display.tiny_font.size(field_display_str[:config_state.cursor_pos[field]])

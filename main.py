@@ -22,7 +22,7 @@ except Exception as e:
     ASI_AVAILABLE = False
     asi = None
 from utils import draw_menu_button, draw_button_with_objects
-from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table
+from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
 from config import load_config, handle_input, draw_config_options
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
@@ -213,6 +213,10 @@ while running:
             update_status_callback("Recomputing trajectories...")
             precompute_trajectories(tracking_vis_state, observer, ts, display, update_status_callback, center_time, duration_minutes)
 
+            # Load launch trajectories after recomputing satellite trajectories
+            launch_trajectories = read_launch_trajectories("./launches", display, update_status_callback)
+            tracking_vis_state.launch_trajectories = launch_trajectories
+
             # Build satellite pass table (filtered for current visibility + upcoming passes)
             build_satellite_pass_table(tracking_vis_state, elevation_mask_deg=float(config_state.elevation_mask_str or 10.0), ts=ts)
 
@@ -248,6 +252,10 @@ while running:
         tracking_vis_state.scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"
 
         precompute_trajectories(tracking_vis_state, observer, ts, display, update_status_callback)
+
+        # Load launch trajectories after recomputing satellite trajectories
+        launch_trajectories = read_launch_trajectories("./launches", display, update_status_callback)
+        tracking_vis_state.launch_trajectories = launch_trajectories
 
         # Build satellite pass table (filtered for current visibility + upcoming passes)
         build_satellite_pass_table(tracking_vis_state, elevation_mask_deg=float(config_state.elevation_mask_str or 10.0), ts=ts)
@@ -288,6 +296,10 @@ while running:
             # Only update positions if trajectories are available
             if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
                 update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+
+            # Update launch positions if any launch trajectories are loaded
+            if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:
+                update_launch_positions(tracking_vis_state, current_tt)
 
         last_update_time = current_time
 
@@ -441,6 +453,7 @@ while running:
                 display.button_states["reset"]["hover"] = display.reset_button.collidepoint(event.pos)
                 display.button_states["pause"]["hover"] = display.pause_button.collidepoint(event.pos)
                 display.button_states["play"]["hover"] = display.play_button.collidepoint(event.pos)
+                display.button_states["launch"]["hover"] = display.launch_button.collidepoint(event.pos)
                 if tracking_vis_state.dragging_slider:
                     display.slider_rect.x = max(display.scroll_bar_rect.x, min(event.pos[0] - display.slider_rect.width // 2, display.scroll_bar_rect.x + display.scroll_bar_rect.width - display.slider_rect.width))
                 for sat, (px, py, _, _) in tracking_vis_state.satellite_positions.items():
@@ -544,6 +557,7 @@ while running:
                 display.button_states["reset"]["clicked"] = False
                 display.button_states["pause"]["clicked"] = False
                 display.button_states["play"]["clicked"] = False
+                display.button_states["launch"]["clicked"] = False
                 # Reset dragging state
                 if tracking_vis_state.dragging_slider and tracking_vis_state.paused:
                     fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
@@ -616,6 +630,21 @@ while running:
         draw_button_with_objects(display, "recompute")
         # Draw Reset Button
         draw_button_with_objects(display, "reset")
+        # Draw Launch Button (only if a launch is selected)
+        if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
+            # Display launch elapsed time above button
+            if hasattr(tracking_vis_state, 'launch_start_time') and tracking_vis_state.launch_start_time and tracking_vis_state.launch_launched:
+                # Convert TT difference to seconds for display
+                elapsed_seconds = (ts.now().tt - tracking_vis_state.launch_start_time) * 86400  # TT is in days, convert to seconds
+                elapsed_text = f"{elapsed_seconds:.1f}s"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (0, 255, 0))  # Green text
+                display.menu_screen.blit(elapsed_surface, (display.launch_button.x + display.launch_button.width // 2 - elapsed_surface.get_width() // 2, display.launch_button.y - 20))
+            else:
+                # Show T-0 if launch selected but not launched
+                elapsed_text = "T-0"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (255, 255, 255))  # White text
+                display.menu_screen.blit(elapsed_surface, (display.launch_button.x + display.launch_button.width // 2 - elapsed_surface.get_width() // 2, display.launch_button.y - 20))
+            draw_button_with_objects(display, "launch", tracking_vis_state.launch_launched)
         # Draw Center Time Input
         pygame.draw.rect(display.menu_screen, (255, 255, 255), display.center_time_rect)
         if tracking_vis_state.focused_field == 'center_time':

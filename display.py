@@ -140,6 +140,7 @@ class DisplaySetup:
         self.slider_rect = pygame.Rect(self.sub_x + self.sub_width // 2 - self.radius, self.sub_y + self.sub_height - 35, 20, 10)
         self.pause_button = pygame.Rect(self.sub_x + self.sub_width // 2 + self.radius + 10, self.sub_y + self.sub_height - 45, 60, 30)
         self.play_button = pygame.Rect(self.sub_x + self.sub_width // 2 + self.radius + 80, self.sub_y + self.sub_height - 45, 60, 30)
+        self.launch_button = pygame.Rect(self.sub_x + self.sub_width // 2 - self.radius - 80, self.sub_y + self.sub_height - 45, 70, 30)
         self.legend_x = self.sub_x + self.sub_width - 170
         self.legend_y = self.sub_y + self.sub_height - 160
 
@@ -164,7 +165,7 @@ class DisplaySetup:
         # Initialize button states for all buttons
         for btn in self.buttons:
             self.button_states[btn["mode"]] = {"hover": False, "clicked": False}
-        for mode in ["save", "load", "clear_filters", "recompute", "reset", "pause", "play"]:
+        for mode in ["save", "load", "clear_filters", "recompute", "reset", "pause", "play", "launch"]:
             self.button_states[mode] = {"hover": False, "clicked": False}
 
         # Initialize camera-specific button states

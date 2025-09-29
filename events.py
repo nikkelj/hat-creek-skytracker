@@ -201,6 +201,20 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
         state.reset_input_fields()
         return True
 
+    elif display.launch_button.collidepoint(pos) and hasattr(state, 'selected_launch') and state.selected_launch:
+        button_states["launch"]["clicked"] = True
+        # Toggle launch visualization
+        if state.launch_launched:
+            # Turn off launch visualization and reset to start
+            state.launch_launched = False
+            state.launch_start_time = None
+        else:
+            # Start launch visualization from current time
+            from skyfield.api import load
+            state.launch_launched = True
+            state.launch_start_time = load.timescale().now().tt
+        return True
+
     # Check pass table clicks
     if hasattr(state.pass_table_clickable_areas, '__iter__') and state.pass_table_clickable_areas:
         for area_type, index, rect in state.pass_table_clickable_areas:
@@ -219,6 +233,21 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
                             state.table_sort_reverse = [False] * len(state.table_sort_reverse)
                             state.table_sort_reverse[index] = True
                         return True
+                elif area_type == 'launch':
+                    # Handle launch trajectory selection
+                    launch_name = index
+                    if state.selected_launch == launch_name:
+                        # Clicking again deselects the launch
+                        state.selected_launch = None
+                        state.launch_launched = False
+                        state.launch_start_time = None
+                    else:
+                        # Select new launch and deselect satellite
+                        state.selected_launch = launch_name
+                        state.selected_satellite = None
+                        state.launch_launched = False
+                        state.launch_start_time = None
+                    return True
                 break
 
     # Satellite selection - if no table click

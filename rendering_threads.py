@@ -575,6 +575,99 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
                 # Only render labels for selected/selected satellites to reduce rendering overhead
                 surface.blit(label_surface, (int(draw_px + 5), int(draw_py)))
 
+def draw_launch_trajectory_on_surface(surface, state, current_tt, display_bounds, mode=PolarPlotMode.FULL_SCREEN):
+    """Draw selected launch trajectory on surface."""
+    if not hasattr(state, 'selected_launch') or not state.selected_launch:
+        return
+
+    launch_name = state.selected_launch
+    if launch_name not in state.launch_trajectories:
+        return
+
+    # Get arc segments for the launch trajectory
+    arc_key = launch_name + '_arcs'
+    if arc_key not in state.launch_trajectories:
+        return
+
+    arc_segments = state.launch_trajectories[arc_key]
+
+    # Draw arc segments
+    for start_x, start_y, end_x, end_y, color in arc_segments:
+        # Apply coordinate transformation based on mode
+        if mode == PolarPlotMode.FULL_SCREEN:
+            # screen to surface: subtract display origin
+            draw_x0 = start_x - display_bounds['sub_x']
+            draw_y0 = start_y - display_bounds['sub_y']
+            draw_x1 = end_x - display_bounds['sub_x']
+            draw_y1 = end_y - display_bounds['sub_y']
+        elif mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            # Transform through the same process as original quadrant code
+            full_center_x = display_bounds['sub_x'] + display_bounds['sub_width'] // 2
+            full_center_y = display_bounds['sub_y'] + display_bounds['sub_height'] // 2
+
+            # Transform relative to full screen center
+            rel_x0 = start_x - full_center_x
+            rel_y0 = start_y - full_center_y
+            rel_x1 = end_x - full_center_x
+            rel_y1 = end_y - full_center_y
+
+            # Apply quadrant scaling factor (0.45 as in original display.py)
+            scale_factor = 0.45
+            rel_x0 *= scale_factor
+            rel_y0 *= scale_factor
+            rel_x1 *= scale_factor
+            rel_y1 *= scale_factor
+
+            # Center in quadrant surface
+            surface_center_x = surface.get_width() // 2
+            surface_center_y = surface.get_height() // 2
+            draw_x0 = surface_center_x + rel_x0
+            draw_y0 = surface_center_y + rel_y0
+            draw_x1 = surface_center_x + rel_x1
+            draw_y1 = surface_center_y + rel_y1
+
+        # Draw the arc segment
+        pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 2)  # Thicker line for launches
+
+def draw_launch_position_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN):
+    """Draw selected launch position marker on surface."""
+    if not hasattr(state, 'selected_launch') or not state.selected_launch:
+        return
+
+    launch_name = state.selected_launch
+    if not hasattr(state, 'launch_positions') or launch_name not in state.launch_positions:
+        return
+
+    px, py, alt, dist = state.launch_positions[launch_name]
+
+    # Convert to surface coordinates
+    if mode == PolarPlotMode.FULL_SCREEN:
+        draw_px = px - display_bounds['sub_x']
+        draw_py = py - display_bounds['sub_y']
+    elif mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        full_center_x = display_bounds['sub_x'] + display_bounds['sub_width'] // 2
+        full_center_y = display_bounds['sub_y'] + display_bounds['sub_height'] // 2
+
+        rel_x = px - full_center_x
+        rel_y = py - full_center_y
+
+        scale_factor = 0.45
+        rel_x *= scale_factor
+        rel_y *= scale_factor
+
+        surface_center_x = surface.get_width() // 2
+        surface_center_y = surface.get_height() // 2
+        draw_px = surface_center_x + rel_x
+        draw_py = surface_center_y + rel_y
+
+    # Draw launch position with distinctive cyan color (cross marker)
+    marker_size = 6
+    # Draw cross
+    pygame.draw.line(surface, (0, 255, 255), (draw_px - marker_size, draw_py), (draw_px + marker_size, draw_py), 3)
+    pygame.draw.line(surface, (0, 255, 255), (draw_px, draw_py - marker_size), (draw_px, draw_py + marker_size), 3)
+    # Draw circle outline
+    pygame.draw.circle(surface, (0, 255, 255), (int(draw_px), int(draw_py)), marker_size + 2, 2)
+
 class RenderMode(Enum):
     FULL_SCREEN = "full_screen"
     UPPER_RIGHT_QUADRANT = "upper_right_quadrant"
@@ -715,12 +808,21 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     # Compute camera FOV data
                     self.compute_camera_fov_data()
 
+                    # Update launch positions for current timestamp (critical for launch visualization)
+                    if hasattr(self.tracking_vis_state, 'launch_trajectories') and self.tracking_vis_state.launch_trajectories:
+                        from trajectory import update_launch_positions
+                        update_launch_positions(self.tracking_vis_state, current_tt)
+
                     # Draw polar plot background first
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.FULL_SCREEN)
                     # Now draw FOV boxes
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, None)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
+                    # Draw launch trajectory if one is selected
+                    draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, display_bounds, PolarPlotMode.FULL_SCREEN)
+                    # Draw launch position marker
+                    draw_launch_position_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN)
                 else:
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))
@@ -938,12 +1040,21 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     # Compute camera FOV data
                     self.compute_camera_fov_data()
 
+                    # Update launch positions for current timestamp (critical for launch visualization)
+                    if hasattr(self.tracking_vis_state, 'launch_trajectories') and self.tracking_vis_state.launch_trajectories:
+                        from trajectory import update_launch_positions
+                        update_launch_positions(self.tracking_vis_state, current_tt)
+
                     # Draw polar plot background first
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
                     # Now draw FOV boxes
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, None)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+                    # Draw launch trajectory if one is selected
+                    draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT)
+                    # Draw launch position marker
+                    draw_launch_position_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT)
 
                     # Draw satellite details panel after satellites
                     draw_details_on_surface(self.surface, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)

@@ -105,6 +105,13 @@ class TrackingVisState:
         self.alignment_azimuth = 266.0
         self.alignment_elevation = 34.874
 
+        # Launch trajectory state
+        self.launch_trajectories = {}    # launch_name -> (trajectory_data, times_array)
+        self.launch_arc_segments = {}    # launch_name -> arc_segments
+        self.selected_launch = None      # Currently selected launch name
+        self.launch_launched = False     # Whether launch visualization is running
+        self.launch_start_time = None    # When launch was started (timestamp for tracking relative time)
+
         # Camera FOV intermediate parameters storage
         self.camera_fov_params = {
             'camera1': {},
@@ -573,18 +580,34 @@ def draw_satellite_pass_table(display, state):
     """
     Draw the satellite pass table in the lower left corner.
     State-direct mutation function that modifies state.pass_table_clickable_areas directly.
+    Includes launch trajectories below satellite passes.
     """
-    if not state.satellite_pass_table:
+    if not state.satellite_pass_table and (not hasattr(state, 'launch_trajectories') or not state.launch_trajectories):
         state.pass_table_clickable_areas = []
         return
 
-    # Table positioning and dimensions
-    table_x = display.sub_x + 10
-    table_y = display.sub_y + display.sub_height - 370  # Position above the status messages and controls, moved up 50 pixels
-    table_width = 374  # Sum of column widths (354px) + margin (20px)
-    table_height = 316  # Increased by ~2 rows to accommodate taller border
+    # Table dimensions and positioning
+    table_width = 354  # Reduced by 20 pixels
     row_height = 18
     header_height = 25
+
+    # Position satellite passes table above status messages (moved up to avoid overlap)
+    sat_table_y = display.sub_y + display.sub_height - 280
+    sat_table_height = 160  # Smaller height for satellite table alone
+
+    # Launch trajectories table goes above satellite table
+    launch_table_y = display.sub_y + display.sub_height - 550  # Positioned above satellite passes
+    launch_table_height = 260  # Enough height for launches plus satellites
+
+    # Use launch table position if we have launches, otherwise use satellite-only position
+    if hasattr(state, 'launch_trajectories') and state.launch_trajectories:
+        table_x = display.sub_x + 10
+        table_y = launch_table_y
+        table_height = launch_table_height
+    else:
+        table_x = display.sub_x + 10
+        table_y = sat_table_y
+        table_height = sat_table_height
 
     # Background
     pygame.draw.rect(display.menu_screen, (40, 40, 40), (table_x, table_y, table_width, table_height))
@@ -620,8 +643,11 @@ def draw_satellite_pass_table(display, state):
         pygame.draw.rect(display.menu_screen, (150, 150, 150), header_rect, 1)
         state.pass_table_clickable_areas.append(('header', i, header_rect))
 
-    # Draw table rows
+    # Draw satellite pass table rows
     row_y = header_y + header_height - 5
+    sat_rows_drawn = 0
+
+    # Draw satellite pass rows
     for row_idx, pass_entry in enumerate(state.satellite_pass_table[:15]):  # Limit to 15 rows maximum
         # Alternate row colors
         if row_idx % 2 == 0:
@@ -660,6 +686,95 @@ def draw_satellite_pass_table(display, state):
     # Add info text about sorting in title row, right-justified
     sort_index = state.table_sort_keys.index(True) if state.table_sort_keys and True in state.table_sort_keys else 3
     sort_order = 'Desc' if state.table_sort_reverse and sort_index < len(state.table_sort_reverse) and state.table_sort_reverse[sort_index] else 'Asc'
+    # Draw launch trajectories table section (below satellite passes)
+    launch_row_start_y = row_y + 10  # Small gap between sections
+
+    # Draw separator line between satellite and launch sections
+    if hasattr(state, 'launch_trajectories') and state.launch_trajectories:
+        separator_y = row_y + 5
+        pygame.draw.line(display.menu_screen, (100, 100, 100), (table_x + 10, separator_y), (table_x + table_width - 10, separator_y), 1)
+
+        # Launch section header
+        launch_header_y = separator_y + 5
+        launch_title_text = "Launch Trajectories"
+        launch_title_surface = display.small_font.render(launch_title_text, True, (200, 200, 255))  # Light blue for launches
+        display.menu_screen.blit(launch_title_surface, (table_x + 5, launch_header_y))
+
+        # Draw launch trajectory rows
+        launch_row_y = launch_header_y + row_height
+        total_rows_drawn = sat_rows_drawn
+
+        # Get launch trajectories sorted by name for consistent ordering
+        launch_names = sorted(state.launch_trajectories.keys())
+        if '_arcs' in launch_names:
+            launch_names.remove('_arcs')  # Remove arc segments key
+
+        # Build launch entries similar to satellite entries
+        for launch_name in launch_names:
+            if launch_name.endswith('_arcs'):
+                continue
+
+            # Check if we have space for more rows
+            if total_rows_drawn >= PASS_TABLE_MAX_ROWS:
+                break
+
+            # Create launch entry dictionary
+            launch_entry = {
+                'name': launch_name,
+                'type': 'launch'
+            }
+
+            # Alternate row colors for launch rows (different from satellite rows)
+            if total_rows_drawn % 2 == 0:
+                row_bg_color = (55, 45, 55)  # Slightly purple-tinted
+            else:
+                row_bg_color = (45, 35, 45)  # Darker purple-tinted
+
+            # Highlight selected launch
+            if state.selected_launch == launch_name:
+                row_bg_color = (100, 80, 120)  # Purple highlight for selected launch
+
+            # Draw row background
+            pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, launch_row_y, table_width - 6, row_height))
+
+            # Draw launch cell contents
+            launch_name_clean = launch_name.rstrip('.csv')[:20] if launch_name.endswith('.csv') else launch_name[:20]
+
+            # Get trajectory info for additional columns
+            if launch_name in state.launch_trajectories:
+                trajectory_data, times_array = state.launch_trajectories[launch_name]
+                if times_array.size > 0:
+                    duration = times_array[-1] - times_array[0]
+                    max_alt = max([point[1] for point in trajectory_data] + [0])
+                else:
+                    duration = 0
+                    max_alt = 0
+            else:
+                duration = 0
+                max_alt = 0
+
+            cell_values = [
+                launch_name_clean,                    # Name
+                "LAUNCH",                           # NORAD ID equivalent (placeholder)
+                f"{max_alt:.0f}°",                  # Max elevation equivalent (showing max altitude for launch)
+                f"{duration:.0f}s",                 # Duration instead of time
+                "--:--"                             # No closest time for launches
+            ]
+
+            for col_idx, value in enumerate(cell_values):
+                # Draw cell text
+                color = (255, 255, 220) if col_idx == 0 else (255, 255, 255)  # Lighter color for launch names
+                value_surface = display.small_font.render(value, True, color)
+                display.menu_screen.blit(value_surface, (col_x_positions[col_idx], launch_row_y + 2))
+
+            # Add row clickable area for launch selection
+            launch_row_rect = pygame.Rect(table_x + 3, launch_row_y, table_width - 6, row_height)
+            pygame.draw.rect(display.menu_screen, (100, 100, 100), launch_row_rect, 1)
+            state.pass_table_clickable_areas.append(('launch', launch_name, launch_row_rect))
+
+            launch_row_y += row_height
+            total_rows_drawn += 1
+
     info_text = f"Sorted by: {['Name', 'NORAD', 'Az', 'Max El', 'Closest'][sort_index]} ({sort_order})"
     info_surface = display.small_font.render(info_text, True, (180, 180, 180))
     info_x = table_x + table_width - info_surface.get_width() - 5  # Right-justified

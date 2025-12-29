@@ -318,10 +318,19 @@ class JoystickModeState:
         print(f"Tracking mode: {self.tracking_mode.name}")
 
     def program_track(self):
-        """Program track mode - implement satellite tracking with PID control"""
+        """Program track mode - implement launch or satellite tracking with PID control"""
         # Import required modules locally to avoid circular imports
         import time
-        from transformations import AzAlt2AzEl, AzAlt2AzEl_AltAz
+
+        # Priority: Check for actively launched launch first
+        if (self.tracking_vis_state and
+            hasattr(self.tracking_vis_state, 'selected_launch') and
+            self.tracking_vis_state.selected_launch and
+            hasattr(self.tracking_vis_state, 'launch_launched') and
+            self.tracking_vis_state.launch_launched):
+
+            # Launch is actively tracking - follow launch trajectory
+            return self._program_track_launch()
 
         # Check if satellite is selected
         if self.tracking_vis_state is None or self.tracking_vis_state.selected_satellite is None:
@@ -480,6 +489,169 @@ class JoystickModeState:
 
         except Exception as e:
             print(f"PROGRAM TRACK: Error in tracking loop: {e}")
+
+    def _program_track_launch(self):
+        """Program track mode - implement launch trajectory tracking with PID control"""
+        # Import required modules locally to avoid circular imports
+        import time
+
+        # Ensure PID controllers are initialized
+        if self.azm_pid is None or self.alt_pid is None:
+            if self.config_state is None:
+                print("LAUNCH TRACK: Config state not available")
+                return
+            self.azm_pid, self.alt_pid = create_pid_controllers(self.config_state)
+            print("LAUNCH TRACK: PID controllers initialized")
+
+        # Update PID controller gains from config state in case they were changed in the UI
+        if self.azm_pid and self.alt_pid:
+            self.azm_pid.update_gains(
+                self.config_state.pid_azm_p_gain,
+                self.config_state.pid_azm_i_gain,
+                self.config_state.pid_azm_d_gain
+            )
+            self.alt_pid.update_gains(
+                self.config_state.pid_alt_p_gain,
+                self.config_state.pid_alt_i_gain,
+                self.config_state.pid_alt_d_gain
+            )
+
+        try:
+            # Get configured safety limits
+            azm_limit_min = float(self.config_state.azm_limit_min_str)
+            azm_limit_max = float(self.config_state.azm_limit_max_str)
+            alt_limit_min = float(self.config_state.alt_limit_min_str)
+            alt_limit_max = float(self.config_state.alt_limit_max_str)
+
+            # Get current mount position with offsets
+            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360
+            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360
+
+            # Apply offsets from config state
+            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
+            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
+            current_azm = current_azm_raw - offset_azm
+            current_alt = current_alt_raw - offset_alt
+
+            self.current_azm = current_azm
+            self.current_alt = current_alt
+
+            # Get launch trajectory data
+            launch_name = self.tracking_vis_state.selected_launch
+            if not launch_name or launch_name not in self.tracking_vis_state.launch_trajectories:
+                print(f"LAUNCH TRACK: Launch '{launch_name}' not found in trajectories")
+                self.tracking_mode = TrackingMode.STANDBY
+                return
+
+            px, py, alt, dist, az_deg, az_rate_dps, el_rate_dps = interpolate_position_data_and_rates(
+                self.tracking_vis_state.launch_trajectories[launch_name],
+                self.tracking_vis_state.current_tt,
+                self.tracking_vis_state.launch_start_time,
+                self.tracking_vis_state.launch_launched
+            )
+
+            if px is None or az_deg is None:
+                print(f"LAUNCH TRACK: Could not interpolate launch position for '{launch_name}'")
+                self.tracking_mode = TrackingMode.STANDBY
+                if self.update_status_callback:
+                    self.update_status_callback(f"Launch '{launch_name}' tracking failed - switched to STANDBY")
+                return
+
+            target_el_deg = alt
+
+            # Check if launch is visible (above horizon)
+            if target_el_deg <= 0:
+                # Launch below horizon - drive to horizon mask point
+                mask_exit_az, mask_exit_el = self._compute_mask_exit_point(current_azm, current_alt, az_deg, self.config_state)
+
+                print(f"LAUNCH TRACK: Launch below horizon. Driving to mask exit point: AZ={mask_exit_az:.1f}°, EL={mask_exit_el:.1f}°")
+
+                # Compute position errors for driving to mask exit point
+                az_error, el_error = compute_mount_position_error(
+                    self.config_state, current_azm, current_alt, mask_exit_az, mask_exit_el
+                )
+
+                # Use maximum rate to drive to mask exit point quickly
+                if abs(az_error) > 1.0:  # Only move if error is significant
+                    az_rate_cmd = 9 if az_error > 0 else -9
+                else:
+                    az_rate_cmd = 0
+
+                if abs(el_error) > 1.0:
+                    el_rate_cmd = 9 if el_error > 0 else -9
+                else:
+                    el_rate_cmd = 0
+
+                # Apply rate commands to drive to mask exit point
+                if self.telescope_connected and not self.stopped:
+                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+
+                # Store diagnostic values
+                self.azm_position_error = az_error
+                self.alt_position_error = el_error
+                self.azm_target_rate = 0.0
+                self.alt_target_rate = 0.0
+
+                return
+
+            # Launch is above horizon - use PID control for tracking
+            # Check hardware safety limits against target position first
+            if (az_deg > azm_limit_max or az_deg < azm_limit_min or
+                target_el_deg > alt_limit_max or target_el_deg < alt_limit_min):
+                self.tracking_mode = TrackingMode.STANDBY
+                target_info = f"AZ:{az_deg:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° EL:{target_el_deg:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}°"
+                if self.update_status_callback:
+                    self.update_status_callback(f"Launch target ({target_info}) exceeds safety limits - switched to STANDBY")
+                return
+
+            # Apply bias corrections
+            az_deg += self.bias_azm_deg
+            target_el_deg += self.bias_alt_deg
+
+            # Compute position errors using config state instance
+            az_error, el_error = compute_mount_position_error(
+                self.config_state, current_azm, current_alt, az_deg, target_el_deg
+            )
+
+            # Set feed-forward rates from launch trajectory
+            if self.feed_forward_azm_enabled:
+                self.azm_pid.set_feed_forward_rate(az_rate_dps)
+            if self.feed_forward_alt_enabled:
+                self.alt_pid.set_feed_forward_rate(el_rate_dps)
+
+            # Update PID controllers
+            current_time = time.time()
+            az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(az_error, current_time - self.pid_last_update)
+            el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(el_error, current_time - self.pid_last_update)
+            self.pid_last_update = current_time
+
+            # Store diagnostic values for display
+            self.azm_position_error = az_error
+            self.alt_position_error = el_error
+            self.azm_rate_error = self.azm_pid.current_rate_error
+            self.alt_rate_error = self.alt_pid.current_rate_error
+            self.azm_target_rate = az_pid_output
+            self.alt_target_rate = el_pid_output
+            self.azm_pid_output = az_pid_output
+            self.alt_pid_output = el_pid_output
+
+            # Apply rate commands
+            if self.telescope_connected and not self.stopped:
+                # Map rate to signed discrete command
+                az_command = az_rate_cmd if az_rate_cmd != 0 else 0
+                el_command = el_rate_cmd if el_rate_cmd != 0 else 0
+
+                # Send slew commands
+                self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
+                self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+
+            # Debug output (throttled)
+            if int(current_time) % 5 == 0:  # Every 5 seconds
+                print(f"LAUNCH TRACK: {launch_name} | AZ:{current_azm:.2f}→{az_deg:.2f}({az_error:+.2f}) | EL:{current_alt:.2f}→{target_el_deg:.2f}({el_error:+.2f}) | CMD AZ:{az_command} EL:{el_command}")
+
+        except Exception as e:
+            print(f"LAUNCH TRACK: Error in tracking loop: {e}")
 
     def _compute_mask_exit_point(self, current_azm, current_alt, target_az, config_state):
         """

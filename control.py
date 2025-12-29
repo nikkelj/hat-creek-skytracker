@@ -271,7 +271,8 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
         target_azm_deg, target_alt_deg = AzEl2AzAlt_AltAz(
             target_az_deg,
             target_el_deg,
-            float(config_state.alignment_azimuth_str)
+            float(config_state.alignment_azimuth_str),
+            float(config_state.alignment_elevation_str)
         )
     elif mount_mode == 'Passthrough':
         # Import here to avoid circular import
@@ -285,15 +286,16 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
     else:
         # Use full equatorial transformation for Eq mode
         # Import here to avoid circular import
-        from transformations import AzEl2AzAlt
+        from transformations import local_elev_az_to_telescope #AzEl2AzAlt
+        local_elev_az_to_telescope(target_el_deg, target_az_deg, lat_deg=float(config_state.alignment_elevation_str))
 
-        # Convert target sky position to mount coordinates
-        target_azm_deg, target_alt_deg = AzEl2AzAlt(
-            target_az_deg,
-            target_el_deg,
-            float(config_state.alignment_azimuth_str),
-            float(config_state.alignment_elevation_str)
-        )
+        # Convert target sky position to mount coordinates 
+        # target_azm_deg, target_alt_deg = AzEl2AzAlt(
+        #    target_az_deg,
+        #    target_el_deg,
+        #    float(config_state.alignment_azimuth_str),
+        #    float(config_state.alignment_elevation_str)
+        #)
 
     # Compute error in mount coordinates
     azm_error_deg = target_azm_deg - current_azm_deg

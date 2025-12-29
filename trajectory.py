@@ -331,7 +331,7 @@ def interpolate_position(trajectory_data, current_tt):
     px, py, alt, dist, *_ = interpolate_position_data_and_rates(trajectory_data, current_tt)
     return px, py, alt, dist
 
-def interpolate_position_data_and_rates(trajectory_data, current_tt):
+def interpolate_position_data_and_rates(trajectory_data, current_tt, launch_tt=0, launched=False):
     """
     Parse trajectory data (either old 7-column or new 8-column format) and return position + rates.
     Now returns azimuth (az_deg) as the 7th element for precise tracking.
@@ -340,6 +340,12 @@ def interpolate_position_data_and_rates(trajectory_data, current_tt):
         return None, None, None, None, None, 0.0, 0.0
 
     trajectory, times_array = trajectory_data
+    
+    # Relative indexing adjustment for repeated launches
+    if launched:
+        t0_0 = times_array[0] # base t0 (when file was loaded or selected)
+        dt0 = launch_tt - t0_0
+        current_tt = current_tt - dt0
 
     # Handle both old format (time, alt, az, dist, px, py) and new format (with rates)
     if len(trajectory[0]) == 6:  # Old format

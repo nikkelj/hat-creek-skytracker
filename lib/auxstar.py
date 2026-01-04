@@ -7,11 +7,7 @@ https://raw.githubusercontent.com/jochym/nexstar-evo/master/nsevo/nexstarevo.py
 """
 
 import argparse
-import sys
 import serial
-import warnings
-import datetime
-import pytz
 import struct
 import time
 from enum import Enum
@@ -24,6 +20,7 @@ class Targets(Enum):
     HCPLUS = 0x0d
     AZM = 0x10
     ALT = 0x11
+    FOCUS = 0x12
     APP = 0x20
     GPS = 0xb0
     UKN2 = 0xb4
@@ -38,6 +35,8 @@ class Control(Enum):
     APP = 0x20
     
 # Command set, defined by command:(id, expected command bytes including msgid, expected response bytes)
+# Focus motor: https://www.cloudynights.com/topic/750060-celestron-mototfocus-command-interface/
+# https://indilib.org/forum/general/4470-celestron-motorised-focuser-is-it-supported-in-ekos-yet.html
 COMMANDS={
           'MC_GET_POSITION':(0x01, 1, 3),
           'MC_GOTO_FAST':(0x02, 4, 0),
@@ -64,6 +63,7 @@ COMMANDS={
           'MC_MAXRATE_ENABLED':(0x23, 1, 0),
           'MC_MOVE_POS':(0x24, 2, 0),
           'MC_MOVE_NEG':(0x25, 2, 0),
+          'FOC_GET_HS_POSITIONS':(0x2c, 2, 8), # returns 2 32-bit uints containing low and high limits
           'MC_ENABLE_CORDWRAP':(0x38, 1, 0),
           'MC_DISABLE_CORDWRAP':(0x39, 1, 0),
           'MC_SET_CORDWRAP_POS':(0x3a, 4, 0),
@@ -79,6 +79,7 @@ COMMANDS={
          }
 COMMAND_NAMES={value:key for key, value in COMMANDS.items()}
 
+# Rates are defined as fractions of a full revolution per second
 RATES = {
     0 : 0.0,
     1 : 1/(360*60),
@@ -107,18 +108,18 @@ def f2dms(f):
     ss=(d-dd-mm/60)*3600
     return s*dd,mm,ss
 
-def dms2f(dd,mm,ss, sign):
+def dms2f(dd,mm,ss, sign=1):
     """Convert degrees, minutes, seconds to floating point fraction of full rotation
 
     Args:
         dd (float): Degrees
         mm (float): Minutes
         ss (float): Seconds
+        sign (int): Sign of the input angle (-1 or 1)
         
     Returns:
-        float: fraction of full rotation
+        float: signed fraction of full rotation
     """
-    sign = 1 if dd > 360 else -1
     assert dd < 360
     assert mm < 60
     assert ss < 60
@@ -139,6 +140,11 @@ def repr_pos(alt,azm):
 
 def repr_angle(a):
     return u'%03d°%02d\'%04.1f"' % f2dms(a)
+
+def format_angle_compact(angle):
+    """Format angle as compact DMS string without degree symbol"""
+    d, m, s = f2dms(angle)
+    return f"{d:3d}°{m:02d}'{s:04.1f}\""
 
 def unpack_int3(d):
     return struct.unpack('!i',b'\x00'+d[:3])[0]/2**24
@@ -184,6 +190,7 @@ class NexstarHandController:
         self._device = device
         self.alt = 0
         self.azm = 0
+        self.focus = 0
 
     @property
     def device(self):
@@ -238,6 +245,8 @@ class NexstarHandController:
             self.alt = result
         if target == Targets.AZM:
             self.azm = result
+        if target == Targets.FOCUS:
+            self.focus = result
         return result
 
     def hc_goto_fast(self, target, dd, mm, ss):
@@ -245,42 +254,40 @@ class NexstarHandController:
 
         Args:
             target (int): Target device id for command
-            dd (float): Target position degrees
-            mm (float): Target position minutes
-            ss (float): Target position seconds
+            dd (float): Target position degrees (can be signed)
+            mm (float): Target position minutes (can be signed)
+            ss (float): Target position seconds (can be signed)
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
-        fofr = pack_int3(dms2f(dd,mm,ss))
+        fofr = pack_int3(dms2f(dd,mm,ss, 1)) # Signed fraction of full rotation
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0], fofr, COMMANDS['MC_GOTO_FAST'][2])
+        request = '50{:02x}{:02x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_GOTO_FAST'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_GOTO_FAST'][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
 
     def hc_set_position(self, target, dd, mm, ss):
         """Goto position at normal rate
 
         Args:
             target (int): Target device id for command
-            dd (float): Target position degrees
-            mm (float): Target position minutes
-            ss (float): Target position seconds
+            dd (float): Target position degrees (can be signed)
+            mm (float): Target position minutes (can be signed)
+            ss (float): Target position seconds (can be signed)
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
-        fofr = pack_int3(dms2f(dd,mm,ss))
+        fofr = pack_int3(dms2f(dd,mm,ss, 1))
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0], fofr, COMMANDS['MC_SET_POSITION'][2])
+        request = '50{:02x}{:02x}{:02x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_SET_POSITION'][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS['MC_SET_POSITION'][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_set_guide_rate(self, target, rate, sidereal=False, solar=False, lunar=False):
         """Set guide rate
@@ -290,7 +297,7 @@ class NexstarHandController:
             rate (float): Guide rate (TODO: units???), sign-only if sidereal/solar/lunar
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_SET_POS_GUIDERATE' if rate > 0 else 'MC_SET_NEG_GUIDERATE'
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
@@ -306,8 +313,7 @@ class NexstarHandController:
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = unpack_int3(binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_slew_fixed(self, target, rate):
         """Move axis. Axis will keep moving until a stop is sent!
@@ -317,15 +323,14 @@ class NexstarHandController:
             rate (int): Rate step, where 0 = stop, 1 to 9 = positive, -1 to -9 = negative
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_MOVE_POS' if rate >= 0 else 'MC_MOVE_NEG'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], abs(rate), COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = ''.join(format(x, '02x') for x in binary_response)
-        return result
+        return binary_response == b'#'
     
     def hc_set_backlash(self, target, backlash):
         """Set backlash, +/- 0-99
@@ -335,31 +340,30 @@ class NexstarHandController:
             backlash (int): Backlash setting, from +/- 0-99
 
         Returns:
-            int: ack
+            boolean: True for success, False for failure
         """
         cmd = 'MC_SET_POS_BACKLASH' if backlash >= 0 else 'MC_SET_NEG_BACKLASH'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], backlash, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         self._write_binary(binary)
         binary_response = self._read_binary(COMMANDS[cmd][2]+1)
-        result = ''.join(format(x, '02x') for x in binary_response)
-        return result
+        return binary_response == b'#'
 
 def status_report(controller):
-
-    tz = pytz.timezone('US/Pacific')
 
     alt_version = controller.hc_get_version(target=Targets.ALT)
     azm_version = controller.hc_get_version(target=Targets.AZM)
     hc_version = controller.hc_get_version(target=Targets.HC)
-    print("ALT version ............................. : {}".format(alt_version))
-    print("AZM version ............................. : {}".format(azm_version))
-    print("HC version ............................. : {}".format(hc_version))
+    print(f"ALT version ............................. : {alt_version}")
+    print(f"AZM version ............................. : {azm_version}")
+    print(f"HC version ............................. : {hc_version}")
     
     alt = controller.hc_get_position(target=Targets.ALT)
     azm = controller.hc_get_position(target=Targets.AZM)
-    print("ALT ............................. : {}".format(repr_angle(alt)))
-    print("AZM ............................. : {}".format(repr_angle(azm)))
+    focus = controller.hc_get_position(target=Targets.FOCUS)
+    print(f"ALT ............................. : {repr_angle(alt)}")
+    print(f"AZM ............................. : {repr_angle(azm)}")
+    print(f"FOCUS ............................. : {repr_angle(focus)}")
 
 def main():
     """Provide a basic CLI"""
@@ -378,7 +382,11 @@ def main():
         status_report(controller)
         print('Slewing ALT...')
         controller.hc_slew_fixed(Targets.ALT, 9)
+        time.sleep(1)
+        print('Slewing AZM...')
         controller.hc_slew_fixed(Targets.AZM, 9)
+        print('Slewing FOCUS...')
+        
         #controller.slew(NexstarDeviceId.ALT_DEC_MOTOR, +0.001)
         time.sleep(3)
         print('Stopping...')

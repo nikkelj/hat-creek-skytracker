@@ -7,238 +7,315 @@ import pygame
 from pygame.locals import *
 import math
 
-# Remove duplicate status_callback function - should import from main or make global
 
-# Combined button states dictionary for all UI elements
-button_states = {
-    # Main menu buttons
-    "save": {"hover": False, "clicked": False},
-    "load": {"hover": False, "clicked": False},
-    "clear_filters": {"hover": False, "clicked": False},
-    "recompute": {"hover": False, "clicked": False},
-    "reset": {"hover": False, "clicked": False},
-    "pause": {"hover": False, "clicked": False},
-    "play": {"hover": False, "clicked": False},
-    # Camera control buttons
-    "camera1_connect": {"hover": False, "clicked": False},
-    "camera2_connect": {"hover": False, "clicked": False},
-    "camera1_disconnect": {"hover": False, "clicked": False},
-    "camera2_disconnect": {"hover": False, "clicked": False},
-    "camera1_gain_slider": {"hover": False, "clicked": False},
-    "camera2_gain_slider": {"hover": False, "clicked": False},
-    "camera1_exposure_slider": {"hover": False, "clicked": False},
-    "camera2_exposure_slider": {"hover": False, "clicked": False},
-}
 
-# Define missing camera slider rectangles
-CAMERA1_GAIN_SLIDER_RECT = pygame.Rect(300, 50, 200, 20)
-CAMERA2_GAIN_SLIDER_RECT = pygame.Rect(300, 120, 200, 20)
-CAMERA1_EXPOSURE_SLIDER_RECT = pygame.Rect(300, 200, 200, 20)
-CAMERA2_EXPOSURE_SLIDER_RECT = pygame.Rect(300, 270, 200, 20)
 
-# Camera connection status flags
-camera1_connected = False
-camera2_connected = False
+
+def handle_tracking_vis_keyboard_events(event, state):
+    """Handle keyboard events for tracking visualization mode text input fields.
+    Modifies state object directly instead of returning updates."""
+
+    if state.focused_field is None:
+        return
+
+    # Get current field value
+    focused_field = state.focused_field
+
+    if focused_field == "filter":
+        field_str = state.filter_text
+    elif focused_field == "filter_above_alt":
+        field_str = state.filter_above_alt_text
+    elif focused_field == "filter_below_alt":
+        field_str = state.filter_below_alt_text
+    elif focused_field == "center_time":
+        field_str = state.center_time_str
+    elif focused_field == "duration":
+        field_str = state.duration_str
+    else:
+        return
+
+    mods = pygame.key.get_mods()
+
+    # Handle navigation and text editing keys
+    if event.key == pygame.K_LEFT:
+        if mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = state.cursor_pos[focused_field] if state.selection_start[focused_field] is None else state.selection_start[focused_field]
+            state.cursor_pos[focused_field] = max(0, state.cursor_pos[focused_field] - 1)
+        else:
+            state.cursor_pos[focused_field] = max(0, state.cursor_pos[focused_field] - 1)
+            state.selection_start[focused_field] = None
+
+    elif event.key == pygame.K_RIGHT:
+        if mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = state.cursor_pos[focused_field] if state.selection_start[focused_field] is None else state.selection_start[focused_field]
+            state.cursor_pos[focused_field] = min(len(field_str), state.cursor_pos[focused_field] + 1)
+        else:
+            state.cursor_pos[focused_field] = min(len(field_str), state.cursor_pos[focused_field] + 1)
+            state.selection_start[focused_field] = None
+
+    elif event.key == pygame.K_HOME:
+        if mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = state.cursor_pos[focused_field] if state.selection_start[focused_field] is None else state.selection_start[focused_field]
+        state.cursor_pos[focused_field] = 0
+        if not mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = None
+
+    elif event.key == pygame.K_END:
+        if mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = state.cursor_pos[focused_field] if state.selection_start[focused_field] is None else state.selection_start[focused_field]
+        state.cursor_pos[focused_field] = len(field_str)
+        if not mods & pygame.KMOD_SHIFT:
+            state.selection_start[focused_field] = None
+
+    elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE):
+        start = min(state.cursor_pos[focused_field], state.selection_start[focused_field]) if state.selection_start[focused_field] is not None else state.cursor_pos[focused_field]
+        end = max(state.cursor_pos[focused_field], state.selection_start[focused_field]) if state.selection_start[focused_field] is not None else state.cursor_pos[focused_field] + 1 if event.key == pygame.K_DELETE else state.cursor_pos[focused_field]
+        if start < end:
+            field_str = field_str[:start] + field_str[end:]
+            state.cursor_pos[focused_field] = start
+            state.selection_start[focused_field] = None
+        elif event.key == pygame.K_BACKSPACE and state.cursor_pos[focused_field] > 0:
+            field_str = field_str[:state.cursor_pos[focused_field] - 1] + field_str[state.cursor_pos[focused_field]:]
+            state.cursor_pos[focused_field] -= 1
+            state.selection_start[focused_field] = None
+
+        # Update the appropriate field
+        if focused_field == "filter":
+            state.filter_text = field_str
+        elif focused_field == "filter_above_alt":
+            state.filter_above_alt_text = field_str
+        elif focused_field == "filter_below_alt":
+            state.filter_below_alt_text = field_str
+        elif focused_field == "center_time":
+            state.center_time_str = field_str
+        elif focused_field == "duration":
+            state.duration_str = field_str
+
+    elif event.key == pygame.K_RETURN:
+        state.focused_field = None
+        # Note: we don't clear selection_start for focused_field here since focused_field is now None
+
+    # Handle character input
+    else:
+        char = event.unicode
+        allowed_chars_map = {
+            "filter": lambda c: c.isalnum() or c in [' ', '-', '_'],
+            "filter_above_alt": lambda c: c.isdigit() or c in ['.', '-'],
+            "filter_below_alt": lambda c: c.isdigit() or c in ['.', '-'],
+            "center_time": lambda c: c.isalnum() or c in ['-', ':', 'T', 'Z', '.'],
+            "duration": lambda c: c.isdigit()
+        }
+
+        if allowed_chars_map.get(focused_field, lambda c: False)(char):
+            start = min(state.cursor_pos[focused_field], state.selection_start[focused_field]) if state.selection_start[focused_field] is not None else state.cursor_pos[focused_field]
+            end = max(state.cursor_pos[focused_field], state.selection_start[focused_field]) if state.selection_start[focused_field] is not None else state.cursor_pos[focused_field]
+            field_str = field_str[:start] + char + field_str[end:]
+            state.cursor_pos[focused_field] += 1
+            state.selection_start[focused_field] = None
+
+            # Update the appropriate field
+            if focused_field == "filter":
+                state.filter_text = field_str
+            elif focused_field == "filter_above_alt":
+                state.filter_above_alt_text = field_str
+            elif focused_field == "filter_below_alt":
+                state.filter_below_alt_text = field_str
+            elif focused_field == "center_time":
+                state.center_time_str = field_str
+            elif focused_field == "duration":
+                state.duration_str = field_str
+
+
+def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_states):
+    """Updated mouse event handler that works with TrackingVisState object."""
+
+    updates = {}
+
+    # Handle button clicks - updated to use state attributes
+    if display.clear_filters_button.collidepoint(pos):
+        button_states["clear_filters"]["clicked"] = True
+        state.filter_text = ""
+        state.filter_above_alt_text = ""
+        state.filter_below_alt_text = ""
+        state.cursor_pos.update({"filter": 0, "filter_above_alt": 0, "filter_below_alt": 0})
+        state.selection_start.update({"filter": None, "filter_above_alt": None, "filter_below_alt": None})
+        state.selected_satellite = None
+        return True  # Return True to indicate state was updated
+
+    elif display.pause_button.collidepoint(pos):
+        button_states["pause"]["clicked"] = True
+        state.paused = True
+        # Import ts at the module level for pause functionality
+        from skyfield.api import load
+        state.paused_tt = load.timescale().now().tt
+        return True
+
+    elif display.play_button.collidepoint(pos):
+        button_states["play"]["clicked"] = True
+        state.paused = False
+        state.paused_tt = None
+        return True
+
+    elif display.scroll_bar_rect.collidepoint(pos):
+        state.dragging_slider = True
+        state.scroll_start = pos[0]
+        return True
+
+    elif display.filter_rect.collidepoint(pos):
+        state.focused_field = 'filter'
+        state.cursor_pos['filter'] = len(state.filter_text)
+        state.selection_start['filter'] = None
+        return True
+
+    elif display.filter_above_alt_rect.collidepoint(pos):
+        state.focused_field = 'filter_above_alt'
+        state.cursor_pos['filter_above_alt'] = len(state.filter_above_alt_text)
+        state.selection_start['filter_above_alt'] = None
+        return True
+
+    elif display.filter_below_alt_rect.collidepoint(pos):
+        state.focused_field = 'filter_below_alt'
+        state.cursor_pos['filter_below_alt'] = len(state.filter_below_alt_text)
+        state.selection_start['filter_below_alt'] = None
+        return True
+
+    elif display.center_time_rect.collidepoint(pos):
+        state.focused_field = 'center_time'
+        state.cursor_pos['center_time'] = len(state.center_time_str)
+        state.selection_start['center_time'] = None
+        return True
+
+    elif display.duration_rect.collidepoint(pos):
+        state.focused_field = 'duration'
+        state.cursor_pos['duration'] = len(state.duration_str)
+        state.selection_start['duration'] = None
+        return True
+
+    elif display.recompute_button.collidepoint(pos):
+        button_states["recompute"]["clicked"] = True
+        state.recompute_triggered = True
+        return True
+
+    elif display.reset_button.collidepoint(pos):
+        button_states["reset"]["clicked"] = True
+        state.reset_input_fields()
+        return True
+
+    elif display.launch_button.collidepoint(pos) and hasattr(state, 'selected_launch') and state.selected_launch:
+        button_states["launch"]["clicked"] = True
+        # Toggle launch visualization
+        if state.launch_launched:
+            # Turn off launch visualization and reset to start
+            state.launch_launched = False
+            state.launch_start_time = None
+        else:
+            # Start launch visualization from current time
+            from skyfield.api import load
+            state.launch_launched = True
+            state.launch_start_time = load.timescale().now().tt
+        return True
+
+    # Check pass table clicks
+    if hasattr(state.pass_table_clickable_areas, '__iter__') and state.pass_table_clickable_areas:
+        for area_type, index, rect in state.pass_table_clickable_areas:
+            if rect.collidepoint(pos):
+                if area_type == 'row' and state.satellite_pass_table and index < len(state.satellite_pass_table):
+                    state.selected_satellite = state.satellite_pass_table[index]['satellite']
+                    return True
+                elif area_type == 'header':
+                    # Sort by column
+                    if state.table_sort_keys and index < len(state.table_sort_keys):
+                        if state.table_sort_keys[index]:
+                            state.table_sort_reverse[index] = not state.table_sort_reverse[index]
+                        else:
+                            state.table_sort_keys = [False] * len(state.table_sort_keys)
+                            state.table_sort_keys[index] = True
+                            state.table_sort_reverse = [False] * len(state.table_sort_reverse)
+                            state.table_sort_reverse[index] = True
+                        return True
+                elif area_type == 'launch':
+                    # Handle launch trajectory selection
+                    launch_name = index
+                    if state.selected_launch == launch_name:
+                        # Clicking again deselects the launch
+                        state.selected_launch = None
+                        state.launch_launched = False
+                        state.launch_start_time = None
+                    else:
+                        # Select new launch and deselect satellite
+                        state.selected_launch = launch_name
+                        state.selected_satellite = None
+                        state.launch_launched = False
+                        state.launch_start_time = None
+                    return True
+                break
+
+    # Satellite selection - if no table click
+    if state.selected_satellite and state.satellite_positions.get(state.selected_satellite):
+        px, py, _, _ = state.satellite_positions[state.selected_satellite]
+        if math.hypot(px - pos[0], py - pos[1]) < 10:
+            state.selected_satellite = None
+            return True
+
+    # Select new satellite
+    for sat, (px, py, _, _) in state.satellite_positions.items():
+        if math.hypot(px - pos[0], py - pos[1]) < 10:
+            state.selected_satellite = sat
+            return True
+
+    return False
+
+
+def handle_tracking_vis_hover_events(event, pos, display, button_states, satellite_positions):
+    """Handle mouse motion/hover events for tracking visualization mode."""
+
+    updates = {}
+
+    # Update button hover states
+    button_hover_map = {
+        "clear_filters": display.clear_filters_button,
+        "recompute": display.recompute_button,
+        "reset": display.reset_button,
+        "pause": display.pause_button,
+        "play": display.play_button
+    }
+
+    for button_name, button_rect in button_hover_map.items():
+        updates[f"{button_name}_hover"] = button_rect.collidepoint(pos)
+
+    # Update hovered satellite
+    hovered_satellite = None
+    for sat, (px, py, _, _) in satellite_positions.items():
+        if math.hypot(px - pos[0], py - pos[1]) < 10:
+            hovered_satellite = sat
+            break
+
+    updates["hovered_satellite"] = hovered_satellite
+    return updates
+
 
 def handle_main_menu_events(event, buttons, current_mode):
-    """Handle main menu button click events."""
+    """Handle main menu navigation events for switching between application modes.
+    Returns the new mode to switch to, or "exit" to quit, or current_mode if no change."""
+
+    # Only handle MOUSEBUTTONDOWN events
+    if event.type != pygame.MOUSEBUTTONDOWN:
+        return current_mode
+
     pos = event.pos
+
+    # Check each button for collision
     for btn in buttons:
         if btn["rect"].collidepoint(pos):
-            return btn["mode"]
+            mode = btn["mode"]
+
+            if mode == "exit":
+                return "exit"
+            else:
+                return mode  # Return the new mode to switch to
+
+    # No button clicked
     return current_mode
 
-def handle_config_events(event, pos, input_rects, save_button, load_button,
-    lat_str, lon_str, alt_str, elevation_mask_str,
-    focused_field, cursor_pos, selection_start,
-    button_states):
-    """Handle configuration mode events - extracted from main event loop."""
-    if save_button.collidepoint(pos):
-        button_states["save"]["clicked"] = True
-        from config import save_config
-        config_data = {
-            "lat": lat_str,
-            "lon": lon_str,
-            "alt": alt_str,
-            "elevation_mask": elevation_mask_str
-        }
-        save_config(config_data)
-        return {"status": "Configuration saved"}
-
-    elif load_button.collidepoint(pos):
-        button_states["load"]["clicked"] = True
-        from config import load_config
-        config_data = load_config()
-        return {
-            "lat_str": config_data["lat"],
-            "lon_str": config_data["lon"],
-            "alt_str": config_data["alt"],
-            "elevation_mask_str": config_data["elevation_mask"],
-            "status": "Configuration loaded"
-        }
-
-    elif event.type == pygame.MOUSEBUTTONDOWN:
-        # Handle input field selection
-        for field_name, rect in input_rects.items():
-            if rect.collidepoint(pos):
-                focused_field = field_name
-                cursor_pos[field_name] = len(eval(f"{field_name}_str"))
-                selection_start[field_name] = None
-                return {"focused_field": field_name, "status": f"Selected {field_name} input"}
-
-    return None
-
-def handle_sensor_calib_events(event, pos, button_states):
-    """Handle sensor calibration mode events - extracted from main event loop."""
-    result = None
-
-    if event.type == pygame.MOUSEBUTTONDOWN:
-        # Check camera control buttons
-        if hasattr(pos, '__iter__'):  # Ensure pos is valid
-            # Camera connection buttons
-            camera1_connect_rect = pygame.Rect(10, 10, 120, 30)
-            camera1_disconnect_rect = pygame.Rect(10, 50, 120, 30)
-            camera2_connect_rect = pygame.Rect(10, 100, 120, 30)
-            camera2_disconnect_rect = pygame.Rect(10, 140, 120, 30)
-
-            if str(pos) and len(str(pos).strip()) > 2:  # Basic validation
-                if camera1_connect_rect.collidepoint(pos):
-                    button_states["camera1_connect"]["clicked"] = True
-                    global camera1_connected
-                    camera1_connected = True
-                    result = {"status": "Camera 1 connected", "action": "connect_camera1"}
-                elif camera1_disconnect_rect.collidepoint(pos):
-                    button_states["camera1_disconnect"]["clicked"] = True
-                    camera1_connected = False
-                    result = {"status": "Camera 1 disconnected", "action": "disconnect_camera1"}
-                elif camera2_connect_rect.collidepoint(pos):
-                    button_states["camera2_connect"]["clicked"] = True
-                    global camera2_connected
-                    camera2_connected = True
-                    result = {"status": "Camera 2 connected", "action": "connect_camera2"}
-                elif camera2_disconnect_rect.collidepoint(pos):
-                    button_states["camera2_disconnect"]["clicked"] = True
-                    camera2_connected = False
-                    result = {"status": "Camera 2 disconnected", "action": "disconnect_camera2"}
-
-                # Handle slider interactions (simplified)
-                elif CAMERA1_GAIN_SLIDER_RECT.collidepoint(pos):
-                    button_states["camera1_gain_slider"]["clicked"] = True
-                    result = {"status": "Camera 1 gain slider clicked", "action": "adjust_gain_camera1"}
-                elif CAMERA2_GAIN_SLIDER_RECT.collidepoint(pos):
-                    button_states["camera2_gain_slider"]["clicked"] = True
-                    result = {"status": "Camera 2 gain slider clicked", "action": "adjust_gain_camera2"}
-                elif CAMERA1_EXPOSURE_SLIDER_RECT.collidepoint(pos):
-                    button_states["camera1_exposure_slider"]["clicked"] = True
-                    result = {"status": "Camera 1 exposure slider clicked", "action": "adjust_exposure_camera1"}
-                elif CAMERA2_EXPOSURE_SLIDER_RECT.collidepoint(pos):
-                    button_states["camera2_exposure_slider"]["clicked"] = True
-                    result = {"status": "Camera 2 exposure slider clicked", "action": "adjust_exposure_camera2"}
-
-    elif event.type == pygame.MOUSEMOTION:
-        # Handle hover states
-        camera1_connect_rect = pygame.Rect(10, 10, 120, 30)
-        camera2_connect_rect = pygame.Rect(10, 100, 120, 30)
-        camera1_disconnect_rect = pygame.Rect(10, 50, 120, 30)
-        camera2_disconnect_rect = pygame.Rect(10, 140, 120, 30)
-
-        button_states["camera1_connect"]["hover"] = camera1_connect_rect.collidepoint(event.pos)
-        button_states["camera1_disconnect"]["hover"] = camera1_disconnect_rect.collidepoint(event.pos)
-        button_states["camera2_connect"]["hover"] = camera2_connect_rect.collidepoint(event.pos)
-        button_states["camera2_disconnect"]["hover"] = camera2_disconnect_rect.collidepoint(event.pos)
-        button_states["camera1_gain_slider"]["hover"] = CAMERA1_GAIN_SLIDER_RECT.collidepoint(event.pos)
-        button_states["camera2_gain_slider"]["hover"] = CAMERA2_GAIN_SLIDER_RECT.collidepoint(event.pos)
-        button_states["camera1_exposure_slider"]["hover"] = CAMERA1_EXPOSURE_SLIDER_RECT.collidepoint(event.pos)
-        button_states["camera2_exposure_slider"]["hover"] = CAMERA2_EXPOSURE_SLIDER_RECT.collidepoint(event.pos)
-
-    return result
-
-def handle_tracking_vis_events(event, pos, clear_filters_button, pause_button, play_button,
-    center_time_rect, duration_rect, filter_rect, filter_above_alt_rect,
-    filter_below_alt_rect, scroll_bar_rect, recompute_button, reset_button,
-    focused_field, cursor_pos, selection_start, paused, paused_tt,
-    button_states, filter_text, filter_above_alt_text, filter_below_alt_text,
-    satellite_pass_table):
-    """Handle tracking visualization mode events - extracted from main event loop."""
-
-    if clear_filters_button.collidepoint(pos):
-        button_states["clear_filters"]["clicked"] = True
-        filter_text = ""
-        filter_above_alt_text = ""
-        filter_below_alt_text = ""
-        cursor_pos["filter"] = 0
-        cursor_pos["filter_above_alt"] = 0
-        cursor_pos["filter_below_alt"] = 0
-        selection_start["filter"] = None
-        selection_start["filter_above_alt"] = None
-        selection_start["filter_below_alt"] = None
-        return {
-            "action": "clear_filters",
-            "filter_text": "",
-            "filter_above_alt_text": "",
-            "filter_below_alt_text": ""
-        }
-
-    elif pause_button.collidepoint(pos):
-        button_states["pause"]["clicked"] = True
-        paused = True
-        paused_tt = None  # Will be set when ts.now().tt is available
-        return {
-            "action": "pause",
-            "paused": True
-        }
-
-    elif play_button.collidepoint(pos):
-        button_states["play"]["clicked"] = True
-        paused = False
-        paused_tt = None
-        return {
-            "action": "play",
-            "paused": False
-        }
-
-    elif scroll_bar_rect.collidepoint(pos):
-        # Scroll bar interaction would be handled here
-        return {"action": "drag_slider_start"}
-
-    elif filter_rect.collidepoint(pos):
-        focused_field = 'filter'
-        cursor_pos['filter'] = len(filter_text)
-        selection_start['filter'] = None
-        return {"action": "focus_field", "field": "filter"}
-
-    elif filter_above_alt_rect.collidepoint(pos):
-        focused_field = 'filter_above_alt'
-        cursor_pos['filter_above_alt'] = len(filter_above_alt_text)
-        selection_start['filter_above_alt'] = None
-        return {"action": "focus_field", "field": "filter_above_alt"}
-
-    elif filter_below_alt_rect.collidepoint(pos):
-        focused_field = 'filter_below_alt'
-        cursor_pos['filter_below_alt'] = len(filter_below_alt_text)
-        selection_start['filter_below_alt'] = None
-        return {"action": "focus_field", "field": "filter_below_alt"}
-
-    elif center_time_rect.collidepoint(pos):
-        focused_field = 'center_time'
-        cursor_pos['center_time'] = len(center_time_str) if 'center_time_str' in globals() else 0
-        selection_start['center_time'] = None
-        return {"action": "focus_field", "field": "center_time"}
-
-    elif duration_rect.collidepoint(pos):
-        focused_field = 'duration'
-        cursor_pos['duration'] = len(duration_str) if 'duration_str' in globals() else 0
-        selection_start['duration'] = None
-        return {"action": "focus_field", "field": "duration"}
-
-    elif recompute_button.collidepoint(pos):
-        button_states["recompute"]["clicked"] = True
-        return {"action": "recompute"}
-
-    elif reset_button.collidepoint(pos):
-        button_states["reset"]["clicked"] = True
-        return {"action": "reset"}
-
-    return None
 
 # Additional event handling functions can be added here

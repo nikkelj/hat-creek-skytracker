@@ -118,18 +118,19 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
 
     return visible_satellites
 
-def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, sub_height, satellite_labels, update_status_callback=None, center_time=None, duration_minutes=15):
-    """Optimized trajectory computation with caching, reduced resolution, vectorization, and visibility filtering"""
+def precompute_trajectories(state, observer, ts, display, update_status_callback=None, center_time=None, duration_minutes=15):
+    """Optimized trajectory computation with caching, reduced resolution, vectorization, and visibility filtering.
+    Modifies state object directly with trajectories and arc segments."""
 
     # OPTIMIZATION 8: Filter satellites by potential visibility first (potentially 2-10x speedup)
     visible_satellites = _filter_satellites_by_visibility(
-        satellites, observer, ts, center_time, duration_minutes, elevation_mask_deg=10.0, update_status_callback=update_status_callback
+        state.satellites, observer, ts, center_time, duration_minutes, elevation_mask_deg=10.0, update_status_callback=update_status_callback
     )
 
     # Setup constants
-    cx = sub_x + sub_width // 2
-    cy = sub_y + sub_height // 2
-    radius = min(sub_width, sub_height) // 2 - 50
+    cx = display.sub_x + display.sub_width // 2
+    cy = display.sub_y + display.sub_height // 2
+    radius = min(display.sub_width, display.sub_height) // 2 - 50
 
     # Get global sun ephemeris if not already loaded
     global SUN_EPHEMERIS_CACHE
@@ -153,7 +154,7 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
     satellites_in_label_dict = 0
 
     for sat in visible_satellites:
-        if sat in satellite_labels:
+        if sat in state.satellite_labels:
             satellites_in_label_dict += 1
             # Create cache key based on satellite ID and time range
             sat_model = getattr(sat, 'model', None)
@@ -164,8 +165,8 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
                 satellites_to_compute.append((sat, cache_key))
 
     total_sats = len(satellites_to_compute)
-    trajectories = {}
-    arc_segments = {}
+    state.satellite_trajectories = {}
+    state.satellite_arc_segments = {}
 
     if update_status_callback:
         update_status_callback(f"Computing optimized trajectories for {total_sats}/{satellites_in_label_dict} satellites...")
@@ -198,8 +199,26 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
         # OPTIMIZATION 5: Pre-compute time-to-index mapping for faster interpolation
         times_array = time_vals.copy()
 
-        # OPTIMIZATION 6: Create trajectory data structure
-        trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords])
+        # Add rate calculations (degrees/second)
+        dt = times_array[1] - times_array[0]  # Time step in days
+        dt_seconds = dt * 86400.0  # Convert to seconds
+
+        # Calculate rates (finite differences)
+        az_rates_dps = np.zeros(len(times_array))
+        el_rates_dps = np.zeros(len(times_array))
+
+        for i in range(1, len(times_array) - 1):
+            az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
+            el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
+
+        # Handle endpoints with forward/backward differences
+        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
+        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
+        el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
+        el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
+
+        # OPTIMIZATION 6: Create trajectory data structure with rates
+        trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords, az_rates_dps, el_rates_dps])
         trajectory = trajectory_data.tolist()
 
         # OPTIMIZATION 7: Create arc segments (color will be determined during rendering)
@@ -208,8 +227,8 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
         # Cache the computed trajectory
         TRAJECTORY_CACHE[cache_key] = (trajectory, times_array, segments)
 
-        trajectories[sat] = (trajectory, times_array)
-        arc_segments[sat] = segments
+        state.satellite_trajectories[sat] = (trajectory, times_array)
+        state.satellite_arc_segments[sat] = segments
 
         # Progress update
         if update_status_callback and processed_count % TRAJECTORY_COMPUTE_BATCH_SIZE == 0 and processed_count > 0:
@@ -217,22 +236,20 @@ def precompute_trajectories(satellites, observer, ts, sub_x, sub_y, sub_width, s
 
     # Load cached trajectories for satellites that don't need recomputation
     cache_hits = 0
-    for sat in satellites:
-        if sat in satellite_labels:
+    for sat in state.satellites:
+        if sat in state.satellite_labels:
             sat_model = getattr(sat, 'model', None)
             sat_id = getattr(sat_model, 'satnum_str', str(sat)) if sat_model else str(sat)
             cache_key = f"{sat_id}_{t0.tt:.6f}_{t1.tt:.6f}"
 
             if cache_key in TRAJECTORY_CACHE:
                 cached_data = TRAJECTORY_CACHE[cache_key]
-                trajectories[sat] = (cached_data[0], cached_data[1])
-                arc_segments[sat] = cached_data[2]
+                state.satellite_trajectories[sat] = (cached_data[0], cached_data[1])
+                state.satellite_arc_segments[sat] = cached_data[2]
                 cache_hits += 1
 
     if cache_hits > 0:
         print(f"DEBUG: Trajectory optimization: {cache_hits} satellites loaded from cache")
-
-    return trajectories, arc_segments
 
 def _create_arc_segments_simple(trajectory_data, start_time):
     """Create arc segments with simple time-based color coding"""
@@ -266,18 +283,28 @@ def _create_arc_segments_simple(trajectory_data, start_time):
 
     return segments
 
-def interpolate_position(trajectory_data, current_tt):
-    if not trajectory_data[0]:  # Check if trajectory is empty
-        return None, None, None, None
+def interpolate_position_and_rates(trajectory_data, current_tt):
+    """
+    Interpolate satellite position and motion rates at a given time.
+
+    Args:
+        trajectory_data: Tuple of (trajectory, times_array)
+        current_tt: Current time in terrestrial time
+
+    Returns:
+        tuple: (px, py, alt, dist, az_rate_dps, el_rate_dps)
+    """
+    if not trajectory_data or not trajectory_data[0]:  # Check if trajectory is empty
+        return None, None, None, None, 0.0, 0.0
     trajectory, times_array = trajectory_data
     # Find the insertion point for current_tt
     idx = np.searchsorted(times_array, current_tt) - 1
     if idx < 0:
         # Before the first point, use the first point
-        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3]
+        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][6], trajectory[0][7]
     elif idx >= len(times_array) - 1:
         # After the last point, use the last point
-        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3]
+        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][6], trajectory[-1][7]
     else:
         # Linear interpolation between idx and idx+1
         t0 = times_array[idx]
@@ -285,11 +312,121 @@ def interpolate_position(trajectory_data, current_tt):
         fraction = (current_tt - t0) / (t1 - t0)
         px0, py0, alt0, dist0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3]
         px1, py1, alt1, dist1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3]
+        az_rate0, el_rate0 = trajectory[idx][6], trajectory[idx][7]
+        az_rate1, el_rate1 = trajectory[idx + 1][6], trajectory[idx + 1][7]
+
         px = px0 + fraction * (px1 - px0)
         py = py0 + fraction * (py1 - py0)
         alt = alt0 + fraction * (alt1 - alt0)
         dist = dist0 + fraction * (dist1 - dist0)
-        return px, py, alt, dist
+        az_rate = az_rate0 + fraction * (az_rate1 - az_rate0)
+        el_rate = el_rate0 + fraction * (el_rate1 - el_rate0)
+
+        return px, py, alt, dist, az_rate, el_rate
+
+def interpolate_position(trajectory_data, current_tt):
+    """
+    Legacy function that returns only position data.
+    """
+    px, py, alt, dist, *_ = interpolate_position_data_and_rates(trajectory_data, current_tt)
+    return px, py, alt, dist
+
+def interpolate_position_data_and_rates(trajectory_data, current_tt, launch_tt=0, launched=False):
+    """
+    Parse trajectory data (either old 7-column or new 8-column format) and return position + rates.
+    Now returns azimuth (az_deg) as the 7th element for precise tracking.
+    """
+    if not trajectory_data or not trajectory_data[0]:
+        return None, None, None, None, None, 0.0, 0.0
+
+    trajectory, times_array = trajectory_data
+    
+    # Relative indexing adjustment for repeated launches
+    if launched:
+        t0_0 = times_array[0] # base t0 (when file was loaded or selected)
+        dt0 = launch_tt - t0_0
+        current_tt = current_tt - dt0
+
+    # Handle both old format (time, alt, az, dist, px, py) and new format (with rates)
+    if len(trajectory[0]) == 6:  # Old format
+        idx = np.searchsorted(times_array, current_tt) - 1
+        if idx < 0:
+            return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][2], 0.0, 0.0
+        elif idx >= len(times_array) - 1:
+            return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][2], 0.0, 0.0
+
+        t0 = times_array[idx]
+        t1 = times_array[idx + 1]
+        fraction = (current_tt - t0) / (t1 - t0)
+        px0, py0, alt0, dist0, az0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3], trajectory[idx][2]
+        px1, py1, alt1, dist1, az1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3], trajectory[idx + 1][2]
+        px = px0 + fraction * (px1 - px0)
+        py = py0 + fraction * (py1 - py0)
+        alt = alt0 + fraction * (alt1 - alt0)
+        dist = dist0 + fraction * (dist1 - dist0)
+        az = az0 + fraction * (az1 - az0)
+        return px, py, alt, dist, az, 0.0, 0.0
+
+    elif len(trajectory[0]) == 8:  # New format with rates
+        idx = np.searchsorted(times_array, current_tt) - 1
+        if idx < 0:
+            return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][2], trajectory[0][6], trajectory[0][7]
+        elif idx >= len(times_array) - 1:
+            return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3], trajectory[-1][2], trajectory[-1][6], trajectory[-1][7]
+
+        t0 = times_array[idx]
+        t1 = times_array[idx + 1]
+        fraction = (current_tt - t0) / (t1 - t0)
+        px0, py0, alt0, dist0, az0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3], trajectory[idx][2]
+        px1, py1, alt1, dist1, az1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3], trajectory[idx + 1][2]
+        az_rate0, el_rate0 = trajectory[idx][6], trajectory[idx][7]
+        az_rate1, el_rate1 = trajectory[idx + 1][6], trajectory[idx + 1][7]
+
+        px = px0 + fraction * (px1 - px0)
+        py = py0 + fraction * (py1 - py0)
+        alt = alt0 + fraction * (alt1 - alt0)
+        dist = dist0 + fraction * (dist1 - dist0)
+        az = az0 + fraction * (az1 - az0)
+        az_rate = az_rate0 + fraction * (az_rate1 - az_rate0)
+        el_rate = el_rate0 + fraction * (el_rate1 - el_rate0)
+
+        return px, py, alt, dist, az, az_rate, el_rate
+
+    else:
+        # Unknown format, fall back to old behavior
+        return None, None, None, None, None, 0.0, 0.0
+
+def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
+    """
+    Update satellite positions for the current timestamp with filtering.
+    Modifies state object directly with updated satellite_positions dictionary.
+    """
+    state.satellite_positions = {}
+
+    # Always handle all satellites with filtering (don't exclude other satellites when one is selected)
+    for sat in state.satellites:
+        if sat in state.satellite_trajectories:
+            px, py, alt, dist = interpolate_position(state.satellite_trajectories[sat], current_tt)
+            if px is not None and alt > elevation_mask_deg:
+                # Apply filters
+                include_sat = True
+                if state.filter_text:
+                    include_sat = state.filter_text.lower() in sat.name.lower() or state.filter_text in sat.model.satnum_str
+                if state.filter_above_alt_text:
+                    try:
+                        alt_filter = float(state.filter_above_alt_text)
+                        include_sat = include_sat and state.satellite_mean_altitudes[sat] >= alt_filter
+                    except ValueError:
+                        include_sat = False
+                if state.filter_below_alt_text:
+                    try:
+                        alt_filter = float(state.filter_below_alt_text)
+                        include_sat = include_sat and state.satellite_mean_altitudes[sat] <= alt_filter
+                    except ValueError:
+                        include_sat = False
+
+                if include_sat:
+                    state.satellite_positions[sat] = (px, py, alt, dist)
 
 def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """
@@ -354,11 +491,11 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
         'is_visible': np.any(visible_points)
     }
 
-def build_satellite_pass_table(satellite_trajectories, satellites, satellite_labels, elevation_mask_deg=10.0, max_rows=20, ts=None, current_satellite_positions=None):
+def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=None):
     """
     Build pass table data from all satellite trajectories.
     Only includes satellites that are currently in view OR will be in view soon (future closest approach).
-    Returns sorted list of pass data (default: max elevation descending).
+    Modifies state object directly with sorted satellite pass table.
     """
     pass_entries = []
 
@@ -366,9 +503,9 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
     current_datetime = datetime.now(timezone.utc)
     current_local = current_datetime.astimezone()
 
-    for sat in satellites:
-        if sat in satellite_trajectories and sat in satellite_labels:
-            pass_data = extract_pass_data_from_trajectory(satellite_trajectories[sat], sat, satellite_labels, elevation_mask_deg, ts)
+    for sat in state.satellites:
+        if sat in state.satellite_trajectories and sat in state.satellite_labels:
+            pass_data = extract_pass_data_from_trajectory(state.satellite_trajectories[sat], sat, state.satellite_labels, elevation_mask_deg, ts)
             if pass_data and pass_data['is_visible']:
                 # Filter for satellites that are either:
                 # 1. Currently in view (checked against satellite_positions)
@@ -376,7 +513,7 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                 include_in_table = False
 
                 # Check if satellite is currently in view
-                if current_satellite_positions and sat in current_satellite_positions:
+                if state.satellite_positions and sat in state.satellite_positions:
                     include_in_table = True
                 else:
                     # Check if the closest approach time is in the future
@@ -384,7 +521,7 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                     if closest_time_str != '--:--':
                         try:
                             # Convert time string back to local time for comparison
-                            h, m = map(int, closest_time_str.split(':'))
+                            h, m = map(int, closest_time_str.split(':'))                                                            
                             closest_datetime = current_local.replace(hour=h, minute=m, second=0, microsecond=0)
 
                             # Handle case where closest time is before current time (next day)
@@ -407,11 +544,93 @@ def build_satellite_pass_table(satellite_trajectories, satellites, satellite_lab
                 if include_in_table:
                     pass_entries.append(pass_data)
 
-    # Sort by max elevation descending by default
-    pass_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+    # Apply state-based filtering (text filter + altitude filters + sort)
+    filtered_entries = []
+    for entry in pass_entries:
+        # Text filtering
+        text_match = True
+        if state.filter_text:
+            satellite_name = entry['satellite'].name.lower() if entry['satellite'] and hasattr(entry['satellite'], 'name') else ""
+            satellite_norad = entry['satellite'].model.satnum_str if entry['satellite'] and hasattr(entry['satellite'], 'model') and hasattr(entry['satellite'].model, 'satnum_str') else ""
+            text_match = (
+                state.filter_text.lower() in satellite_name or
+                state.filter_text in satellite_norad
+            )
 
-    # Limit to max_rows
-    return pass_entries[:max_rows]
+        # Above altitude filtering
+        above_alt_match = True
+        if state.filter_above_alt_text:
+            try:
+                alt_filter = float(state.filter_above_alt_text)
+                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
+                above_alt_match = satellite_altitude >= alt_filter
+            except (ValueError, TypeError):
+                above_alt_match = False
+
+        # Below altitude filtering
+        below_alt_match = True
+        if state.filter_below_alt_text:
+            try:
+                alt_filter = float(state.filter_below_alt_text)
+                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
+                below_alt_match = satellite_altitude <= alt_filter
+            except (ValueError, TypeError):
+                below_alt_match = False
+
+        # Include entry if all filters pass
+        if text_match and above_alt_match and below_alt_match:
+            filtered_entries.append(entry)
+
+    # Apply state-based sorting
+    if state.table_sort_keys and len(state.table_sort_keys) > 0:
+        # Multi-column sorting based on state's sort configuration
+        # Find the active column
+        active_column = None
+        reverse_sort = False
+        for i, is_active in enumerate(state.table_sort_keys):
+            if is_active:
+                active_column = i
+                reverse_sort = state.table_sort_reverse[i] if state.table_sort_reverse and len(state.table_sort_reverse) > i else False
+                break
+
+        if active_column is not None:
+            column_mapping = {
+                0: 'name',
+                1: 'norad_id',
+                2: 'azimuth_at_max',
+                3: 'max_elevation',
+                4: 'closest_approach_time'
+            }
+
+            sort_key = column_mapping.get(active_column, 'max_elevation')
+
+            if sort_key == 'name':
+                filtered_entries.sort(key=lambda x: x['name'], reverse=reverse_sort)
+            elif sort_key == 'norad_id':
+                filtered_entries.sort(key=lambda x: x['norad_id'], reverse=reverse_sort)
+            elif sort_key == 'azimuth_at_max':
+                filtered_entries.sort(key=lambda x: x['azimuth_at_max'], reverse=reverse_sort)
+            elif sort_key == 'max_elevation':
+                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=reverse_sort)
+            elif sort_key == 'closest_approach_time':
+                def time_sort_key(x):
+                    time_str = x['closest_approach_time']
+                    if time_str == '--:--':
+                        return '23:59'  # Put unknown times at the end
+                    return time_str
+                filtered_entries.sort(key=time_sort_key, reverse=reverse_sort)
+            else:
+                # Default sort by max elevation descending
+                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+        else:
+            # Default sort by max elevation descending
+            filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+    else:
+        # Default sort by max elevation descending
+        filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
+
+    # Limit to max_rows and update state directly
+    state.satellite_pass_table = filtered_entries[:max_rows]
 
 def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
     """
@@ -488,3 +707,277 @@ def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
         return sorted(pass_table, key=time_sort_key, reverse=reverse)
     else:
         return pass_table
+
+def read_launch_trajectories(launches_dir="./launches", display=None, update_status_callback=None):
+    """
+    Read all launch trajectory CSV files from the specified directory.
+    Files are sorted by creation time (newest first) and parsed into trajectory format.
+    Returns a dictionary of launch_name -> (trajectory_data, times_array)
+    """
+    import os
+    import csv
+    from datetime import datetime, timezone
+
+    launch_trajectories = {}
+
+    if not os.path.exists(launches_dir):
+        if update_status_callback:
+            update_status_callback(f"Launch directory '{launches_dir}' not found")
+        return launch_trajectories
+
+    # Get all CSV files and sort by creation time (newest first)
+    csv_files = [f for f in os.listdir(launches_dir) if f.endswith('.csv')]
+    if not csv_files:
+        if update_status_callback:
+            update_status_callback("No launch CSV files found")
+        return launch_trajectories
+
+    # Sort by creation time (newest first)
+    csv_files_with_times = []
+    for csv_file in csv_files:
+        filepath = os.path.join(launches_dir, csv_file)
+        try:
+            # Use modification time as approximation of creation time
+            mod_time = os.path.getmtime(filepath)
+            csv_files_with_times.append((csv_file, mod_time))
+        except OSError:
+            # If we can't get mod time, put at end
+            csv_files_with_times.append((csv_file, 0))
+
+    # Sort by time (newest first)
+    csv_files_with_times.sort(key=lambda x: x[1], reverse=True)
+
+    if update_status_callback:
+        update_status_callback(f"Reading {len(csv_files)} launch trajectory files...")
+
+    success_count = 0
+    for csv_file, _ in csv_files_with_times:
+        filepath = os.path.join(launches_dir, csv_file)
+
+        try:
+            # Read CSV data
+            times_seconds = []
+            elevations_deg = []
+            azimuths_deg = []
+            ranges_km = []
+
+            with open(filepath, 'r', newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    try:
+                        # Convert time from seconds to absolute Skyfield time starting from current time
+                        time_sec = float(row['time'])
+                        elevation = float(row['elevationDegs'])
+                        azimuth = float(row['azimuthDegs'])
+                        range_km = float(row['rangeKm'])
+
+                        times_seconds.append(time_sec)
+                        elevations_deg.append(elevation)
+                        azimuths_deg.append(azimuth)
+                        ranges_km.append(range_km)
+
+                    except (KeyError, ValueError) as e:
+                        # Skip malformed rows
+                        continue
+
+            if not times_seconds:
+                if update_status_callback:
+                    update_status_callback(f"No valid data in {csv_file}, skipping")
+                continue
+
+            # Convert to trajectory format matching satellite trajectories:
+            # [time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords, az_rates_dps, el_rates_dps]
+
+            # Convert times to Skyfield terrestrial time starting from current time
+            current_tt = load.timescale().now().tt
+            times_tt = []
+            for time_sec in times_seconds:
+                # Convert relative time to absolute TT starting from now
+                abs_tt = current_tt + time_sec / 86400.0  # Convert seconds to days
+                times_tt.append(abs_tt)
+
+            times_array = np.array(times_tt)
+            alt_deg = np.array(elevations_deg)
+            az_deg = np.array(azimuths_deg)
+            dist_km = np.array(ranges_km)
+
+            # Calculate pixel coordinates (polar plot coordinates)
+            # Use display info if available, otherwise use default values
+            if display:
+                cx = display.sub_x + display.sub_width // 2
+                cy = display.sub_y + display.sub_height // 2
+                radius = min(display.sub_width, display.sub_height) // 2 - 50
+            else:
+                # Default values for when display is not available
+                cx = 400  # Approximate center
+                cy = 300  # Approximate center
+                radius = 300  # Approximate radius
+
+            # Convert to pixel coordinates
+            az_rad = np.radians(az_deg % 360)
+            polar_radius = (90 - alt_deg) / 90 * radius
+            px_coords = cx + polar_radius * np.sin(az_rad)
+            py_coords = cy - polar_radius * np.cos(az_rad)
+
+            # Calculate rates (azimuth and elevation rates in degrees/second)
+            dt_seconds = 1.0  # Assume 1-second intervals (may need adjustment based on actual data spacing)
+
+            az_rates_dps = np.zeros(len(times_array))
+            el_rates_dps = np.zeros(len(times_array))
+
+            for i in range(1, len(times_array) - 1):
+                # Use central differences for better accuracy
+                actual_dt = (times_tt[i+1] - times_tt[i-1]) * 86400  # Time step in seconds
+                if actual_dt > 0:
+                    az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / actual_dt
+                    el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / actual_dt
+
+            # Handle endpoints with forward/backward differences
+            if len(times_array) > 1:
+                actual_dt_end = (times_tt[1] - times_tt[0]) * 86400
+                actual_dt_start = (times_tt[-1] - times_tt[-2]) * 86400
+
+                if actual_dt_end > 0:
+                    az_rates_dps[0] = (az_deg[1] - az_deg[0]) / actual_dt_end
+                    el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / actual_dt_end
+
+                if actual_dt_start > 0:
+                    az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / actual_dt_start
+                    el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / actual_dt_start
+
+            # Create trajectory data array
+            trajectory_data = np.column_stack([
+                times_array,      # time_vals (TT)
+                alt_deg,          # alt_deg
+                az_deg,           # az_deg
+                dist_km,          # dist_km
+                px_coords,        # px_coords
+                py_coords,        # py_coords
+                az_rates_dps,     # az_rates_dps
+                el_rates_dps      # el_rates_dps
+            ]).tolist()
+
+            # Create arc segments (similar to satellite trajectory rendering)
+            segments = _create_launch_arc_segments(trajectory_data, current_tt)
+
+            # Store in launch_trajectories dict
+            launch_name = csv_file[:-4]  # Remove .csv extension
+            launch_trajectories[launch_name] = (trajectory_data, times_array)
+
+            # Also store arc segments separately
+            launch_trajectories[launch_name + '_arcs'] = segments
+
+            success_count += 1
+            if update_status_callback:
+                update_status_callback(f"Loaded launch trajectory: {launch_name}")
+
+        except Exception as e:
+            if update_status_callback:
+                update_status_callback(f"Error reading {csv_file}: {e}")
+            continue
+
+    if update_status_callback:
+        update_status_callback(f"Successfully loaded {success_count}/{len(csv_files)} launch trajectories")
+
+    return launch_trajectories
+
+def _create_launch_arc_segments(trajectory_data, start_time):
+    """Create arc segments for launch trajectories (similar to satellite arcs)"""
+    if len(trajectory_data) < 2:
+        return []
+
+    # Unpack trajectory data
+    times = np.array([row[0] for row in trajectory_data])
+    alts = np.array([row[1] for row in trajectory_data])
+    px = np.array([row[4] for row in trajectory_data[:-1]])  # Start positions
+    py = np.array([row[5] for row in trajectory_data[:-1]])
+    px_next = np.array([row[4] for row in trajectory_data[1:]])  # End positions
+    py_next = np.array([row[5] for row in trajectory_data[1:]])
+
+    # Create masks for segments that are above horizon
+    above_horizon = (alts[:-1] > 0) | (alts[1:] > 0)
+
+    if not above_horizon.any():
+        return []
+
+    # Create segments with cyan/white color scheme for launches
+    segments = []
+    for i in range(len(trajectory_data) - 1):
+        if above_horizon[i]:
+            is_future = times[i] > start_time
+            color = (0, 255, 255) if is_future else (128, 128, 128)  # Cyan for future, gray for past
+            segments.append((px[i], py[i], px_next[i], py_next[i], color))
+
+    return segments
+
+def update_launch_positions(state, current_tt):
+    """
+    Update launch positions based on current time and launch state.
+    Modifies state object with launch_positions dictionary.
+    """
+    state.launch_positions = {}  # launch_name -> (px, py, alt, dist)
+
+    if not state.launch_trajectories:
+        return
+
+    for launch_name, trajectory_data in state.launch_trajectories.items():
+        if launch_name.endswith('_arcs'):
+            continue  # Skip arc segment data
+
+        trajectory, times_array = trajectory_data
+
+        if not trajectory:
+            continue
+
+        # For launches, behavior depends on whether it's launched or not
+        if state.selected_launch == launch_name:
+            if state.launch_launched and state.launch_start_time is not None:
+                # Launched: advance with real time starting from trajectory beginning
+                # Both launch_start_time and current_tt are in TT format (days)
+                launch_tt = times_array[0] + (current_tt - state.launch_start_time)
+            else:
+                # Not launched: pinned at T-0
+                launch_tt = times_array[0]  # Use first point (T-0)
+        else:
+            # Not selected: use current time for display purposes
+            launch_tt = current_tt
+
+        # Interpolate position at the desired time
+        px, py, alt, dist = interpolate_launch_position(trajectory_data, launch_tt)
+
+        if px is not None and alt > 0:  # Only show if above horizon
+            state.launch_positions[launch_name] = (px, py, alt, dist)
+
+def interpolate_launch_position(trajectory_data, current_tt):
+    """
+    Interpolate launch position at a given time (launch-relative or absolute).
+    Returns (px, py, alt, dist)
+    """
+    if not trajectory_data or not trajectory_data[0]:
+        return None, None, None, None
+
+    trajectory, times_array = trajectory_data
+
+    # Find the insertion point for current_tt
+    idx = np.searchsorted(times_array, current_tt) - 1
+    if idx < 0:
+        # Before the first point, use the first point (T-0)
+        return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3]
+    elif idx >= len(times_array) - 1:
+        # After the last point, use the last point
+        return trajectory[-1][4], trajectory[-1][5], trajectory[-1][1], trajectory[-1][3]
+    else:
+        # Linear interpolation between idx and idx+1
+        t0 = times_array[idx]
+        t1 = times_array[idx + 1]
+        fraction = (current_tt - t0) / (t1 - t0)
+
+        px0, py0, alt0, dist0 = trajectory[idx][4], trajectory[idx][5], trajectory[idx][1], trajectory[idx][3]
+        px1, py1, alt1, dist1 = trajectory[idx + 1][4], trajectory[idx + 1][5], trajectory[idx + 1][1], trajectory[idx + 1][3]
+
+        px = px0 + fraction * (px1 - px0)
+        py = py0 + fraction * (py1 - py0)
+        alt = alt0 + fraction * (alt1 - alt0)
+        dist = dist0 + fraction * (dist1 - dist0)
+
+        return px, py, alt, dist

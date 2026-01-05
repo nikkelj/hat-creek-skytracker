@@ -710,6 +710,33 @@ while running:
             # This handles timing when switching modes or if thread isn't ready yet
             pass
 
+        # Draw Launch Button in joystick mode (only if a launch is selected)
+        # Position at lower left of the upper right quadrant
+        if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
+            # Create joystick launch button rectangle (lower left of upper right quadrant)
+            joystick_launch_button = pygame.Rect(
+                display.sub_x + display.sub_width // 2 + 10,  # Left edge of quadrant + margin
+                display.sub_y + display.sub_height // 2 - 45,  # Bottom of quadrant - button height - margin
+                70, 30  # Same size as main launch button
+            )
+
+            # Display launch elapsed time above button
+            if hasattr(tracking_vis_state, 'launch_start_time') and tracking_vis_state.launch_start_time and tracking_vis_state.launch_launched:
+                # Convert TT difference to seconds for display
+                elapsed_seconds = (ts.now().tt - tracking_vis_state.launch_start_time) * 86400  # TT is in days, convert to seconds
+                elapsed_text = f"{elapsed_seconds:.1f}s"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (0, 255, 0))  # Green text
+                display.menu_screen.blit(elapsed_surface, (joystick_launch_button.x + joystick_launch_button.width // 2 - elapsed_surface.get_width() // 2, joystick_launch_button.y - 20))
+            else:
+                # Show T-0 if launch selected but not launched
+                elapsed_text = "T-0"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (255, 255, 255))  # White text
+                display.menu_screen.blit(elapsed_surface, (joystick_launch_button.x + joystick_launch_button.width // 2 - elapsed_surface.get_width() // 2, joystick_launch_button.y - 20))
+
+            # Store the joystick launch button for event handling
+            display.joystick_launch_button = joystick_launch_button
+            draw_button_with_objects(display, "launch", tracking_vis_state.launch_launched, joystick_launch_button)
+
         # Render connection controls and joystick status (not threaded)
         render_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)

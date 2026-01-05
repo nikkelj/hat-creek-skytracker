@@ -1587,6 +1587,25 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
             return True
 
+        # Handle joystick launch button clicks
+        if (hasattr(display, 'joystick_launch_button') and
+            display.joystick_launch_button and
+            display.joystick_launch_button.collidepoint(pos)):
+            # Handle launch button click - same logic as main tracking mode
+            if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
+                if tracking_vis_state.launch_launched:
+                    # Turn off launch visualization and reset to start
+                    tracking_vis_state.launch_launched = False
+                    tracking_vis_state.launch_start_time = None
+                    print("Launch visualization stopped")
+                else:
+                    # Start launch visualization from current time
+                    from skyfield.api import load
+                    tracking_vis_state.launch_launched = True
+                    tracking_vis_state.launch_start_time = load.timescale().now().tt
+                    print(f"Launch visualization started for {tracking_vis_state.selected_launch}")
+                return True
+
         # Handle PID slider clicks
         if handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
             return True

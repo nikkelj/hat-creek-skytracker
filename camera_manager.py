@@ -33,6 +33,8 @@ class CameraState:
         self.gain = 1
         self.exposure = 10000  # 10ms default
         self.alignment_rotation = alignment_rotation  # Degrees, positive = counter-clockwise
+        self.gamma = 0.1  # Gamma correction value
+        self.gamma_enabled = False  # Gamma correction toggle
 
         # Performance tracking
         self.fps = 0.0
@@ -228,6 +230,8 @@ class CameraManager:
             # Update camera settings from config after thread start
             camera.gain = int(float(config_state.camera_configs[f"camera{camera.index + 1}"]["gain"]))
             camera.exposure = int(float(config_state.camera_configs[f"camera{camera.index + 1}"]["exposure"]))
+            camera.gamma = float(config_state.camera_configs[f"camera{camera.index + 1}"]["gamma"])
+            camera.gamma_enabled = bool(config_state.camera_configs[f"camera{camera.index + 1}"]["gamma_enabled"])
 
             # Apply settings to camera if connected
             if camera.cap:
@@ -391,6 +395,39 @@ roi_sizes = [
 roi_label_texts = ["1.0", ".5", ".25", ".125", ".063", ".032"]
 
 # ==============================================================================
+# GAMMA CORRECTION FUNCTIONS
+# ==============================================================================
+
+def apply_gamma_correction(surface, gamma):
+    """Apply gamma correction to a pygame surface and return the corrected surface"""
+    if surface is None or gamma <= 0:
+        return surface
+
+    try:
+        # Convert pygame surface to numpy array
+        # Use pygame.surfarray to get the pixel array
+        pixel_array = pygame.surfarray.array3d(surface)
+
+        # Apply gamma correction to each channel
+        # Create lookup table for gamma correction
+        lookUpTable = np.empty((1, 256), np.uint8)
+        for i in range(256):
+            lookUpTable[0, i] = np.clip(np.power(i / 255.0, gamma) * 255.0, 0, 255)
+
+        # Apply lookup table to each color channel
+        corrected_array = lookUpTable[0][pixel_array]
+
+        # Create new surface from corrected array
+        corrected_surface = pygame.surfarray.make_surface(corrected_array)
+
+        return corrected_surface
+
+    except Exception as e:
+        # If gamma correction fails, return original surface
+        print(f"Gamma correction failed: {e}")
+        return surface
+
+# ==============================================================================
 # CAMERA INITIALIZATION
 # ==============================================================================
 
@@ -542,8 +579,13 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
         # Original separate camera display logic
         if camera1.connected and camera1.frame is not None:
             try:
+                # Apply gamma correction if enabled
+                camera1_frame_processed = camera1.frame
+                if camera1.gamma_enabled:
+                    camera1_frame_processed = apply_gamma_correction(camera1.frame, camera1.gamma)
+
                 # Resize camera frame to fit left half
-                camera1_frame_display = pygame.transform.scale(camera1.frame, (cam_display_width, cam_display_height))
+                camera1_frame_display = pygame.transform.scale(camera1_frame_processed, (cam_display_width, cam_display_height))
 
                 # Apply alignment rotation to camera 1 image - keep centered and crop corners
                 if camera1.alignment_rotation != 0.0:
@@ -639,8 +681,13 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
     if not combined_view_active:
         if camera2_connected and camera2.frame is not None:
             try:
+                # Apply gamma correction if enabled
+                camera2_frame_processed = camera2.frame
+                if camera2.gamma_enabled:
+                    camera2_frame_processed = apply_gamma_correction(camera2.frame, camera2.gamma)
+
                 # Resize camera frame to fit right half
-                camera2_frame_display = pygame.transform.scale(camera2.frame, (cam_display_width, cam_display_height))
+                camera2_frame_display = pygame.transform.scale(camera2_frame_processed, (cam_display_width, cam_display_height))
 
                 # Apply alignment rotation to camera 2 image - keep centered and crop corners
                 if camera2.alignment_rotation != 0.0:
@@ -887,6 +934,37 @@ def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_h
             label_text = tiny_font.render(f"Exp: {exp_val}", True, (255, 255, 255))
             menu_screen.blit(label_text, (slider_x, slider_y + 20))
 
+        # Camera 1 Gamma Slider - positioned below exposure slider
+        slider_x = sub_x + 750
+        slider_y = sub_y + 20
+        slider_color = (150, 150, 150)  # Different color for gamma slider
+        pygame.draw.rect(menu_screen, slider_color, (slider_x, slider_y, 120, 5))
+
+        # Handle position - gamma range 0.01 to 2.0
+        gamma_ratio = (camera1.gamma - 0.01) / (2.0 - 0.01)
+        gamma_ratio = max(0.0, min(1.0, gamma_ratio))
+        handle_x = slider_x + int(gamma_ratio * 120)
+        camera_manager.button_states["camera1_gamma_slider"] = camera_manager.button_states.get("camera1_gamma_slider", {"hover": False, "dragging": False})
+        camera_manager.button_states["camera1_gamma_slider"]["hover"] = pygame.Rect(handle_x - 5, slider_y - 5, 10, 15).collidepoint(mouse_pos)
+        handle_color = (150, 150, 255) if camera_manager.button_states["camera1_gamma_slider"]["hover"] else (200, 200, 255)
+        pygame.draw.rect(menu_screen, handle_color, (handle_x - 5, slider_y - 5, 10, 15))
+
+        # Label
+        label_text = tiny_font.render(f"Gamma: {camera1.gamma:.2f}", True, (255, 255, 255))
+        menu_screen.blit(label_text, (slider_x, slider_y + 20))
+
+        # Gamma toggle button next to gamma slider
+        gamma_toggle_rect = pygame.Rect(slider_x + 130, slider_y - 5, 40, 15)
+        camera_manager.button_states["camera1_gamma_toggle"] = camera_manager.button_states.get("camera1_gamma_toggle", {"hover": False, "clicked": False})
+        camera_manager.button_states["camera1_gamma_toggle"]["hover"] = gamma_toggle_rect.collidepoint(mouse_pos)
+        toggle_color = (0, 150, 0) if camera1.gamma_enabled else (150, 0, 0)  # Green if enabled, red if disabled
+        if camera_manager.button_states["camera1_gamma_toggle"]["hover"]:
+            toggle_color = tuple(min(255, c + 50) for c in toggle_color)  # Brighten on hover
+        pygame.draw.rect(menu_screen, toggle_color, gamma_toggle_rect)
+        toggle_text = tiny_font.render("ON" if camera1.gamma_enabled else "OFF", True, (255, 255, 255))
+        text_rect = toggle_text.get_rect(center=gamma_toggle_rect.center)
+        menu_screen.blit(toggle_text, text_rect)
+
     if camera2.connected:
         # Camera 2 Gain Slider - positioned below camera display on right side
         if camera2.prop:
@@ -1103,7 +1181,7 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             camera_manager.connect_camera(1, update_status_callback)
         elif camera2_disconnect_rect.collidepoint(pos) and camera2.connected:
             camera_manager.disconnect_camera(1, update_status_callback)
-        # Check gain/exposure sliders - entire slider track is clickable for easier interaction
+        # Check gain/exposure/gamma sliders - entire slider track is clickable for easier interaction
         if camera1.connected:
             # Camera 1 Gain Slider track detection
             camera1_gain_track_rect = pygame.Rect(display.sub_x + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
@@ -1114,6 +1192,16 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             camera1_exposure_track_rect = pygame.Rect(display.sub_x + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             if camera1_exposure_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_exposure_slider"]["dragging"] = True
+
+            # Camera 1 Gamma Slider track detection
+            camera1_gamma_track_rect = pygame.Rect(display.sub_x + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            if camera1_gamma_track_rect.collidepoint(pos):
+                camera_manager.button_states["camera1_gamma_slider"]["dragging"] = True
+
+            # Camera 1 Gamma Toggle button detection
+            camera1_gamma_toggle_rect = pygame.Rect(display.sub_x + 880, display.sub_y + 10, 40, 15)
+            if camera1_gamma_toggle_rect.collidepoint(pos):
+                camera_manager.cameras[0].gamma_enabled = not camera_manager.cameras[0].gamma_enabled
 
         if camera2.connected:
             # Camera 2 Gain Slider track detection
@@ -1269,17 +1357,21 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
         save_button_rect = pygame.Rect(display.sub_x + display.sub_width - 120, button_y, 100, 25)
 
         if reset_button_rect.collidepoint(pos):
-            # Reset alignment_rotation, gain, and exposure to config file defaults using passed config_state
+            # Reset alignment_rotation, gain, exposure, gamma, and gamma_enabled to config file defaults using passed config_state
             if config_state:
                 # Reset Camera 1 settings to config defaults
                 camera_manager.cameras[0].alignment_rotation = float(config_state.get_camera_alignment_rotation("camera1") or 0.0)
                 camera_manager.cameras[0].gain = int(float(config_state.get_camera_gain("camera1") or 1))
                 camera_manager.cameras[0].exposure = int(float(config_state.get_camera_exposure("camera1") or 10000))
+                camera_manager.cameras[0].gamma = float(config_state.camera_configs["camera1"].get("gamma", 0.1))
+                camera_manager.cameras[0].gamma_enabled = bool(config_state.camera_configs["camera1"].get("gamma_enabled", False))
 
                 # Reset Camera 2 settings to config defaults
                 camera_manager.cameras[1].alignment_rotation = float(config_state.get_camera_alignment_rotation("camera2") or 0.0)
                 camera_manager.cameras[1].gain = int(float(config_state.get_camera_gain("camera2") or 1))
                 camera_manager.cameras[1].exposure = int(float(config_state.get_camera_exposure("camera2") or 10000))
+                camera_manager.cameras[1].gamma = float(config_state.camera_configs["camera2"].get("gamma", 0.1))
+                camera_manager.cameras[1].gamma_enabled = bool(config_state.camera_configs["camera2"].get("gamma_enabled", False))
 
                 # Apply settings to connected cameras
                 if camera1.connected and camera1.cap:
@@ -1297,16 +1389,20 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
                     update_status_callback("Error: Config state not available")
 
         elif save_button_rect.collidepoint(pos):
-            # Save current alignment_rotation, gain, and exposure values to config file using passed config_state
+            # Save current alignment_rotation, gain, exposure, gamma, and gamma_enabled values to config file using passed config_state
             if config_state:
                 # Update config with current values
                 config_state.camera_configs["camera1"]["alignment_rotation"] = camera_manager.cameras[0].alignment_rotation
                 config_state.camera_configs["camera1"]["gain"] = camera_manager.cameras[0].gain
                 config_state.camera_configs["camera1"]["exposure"] = camera_manager.cameras[0].exposure
+                config_state.camera_configs["camera1"]["gamma"] = camera_manager.cameras[0].gamma
+                config_state.camera_configs["camera1"]["gamma_enabled"] = camera_manager.cameras[0].gamma_enabled
 
                 config_state.camera_configs["camera2"]["alignment_rotation"] = camera_manager.cameras[1].alignment_rotation
                 config_state.camera_configs["camera2"]["gain"] = camera_manager.cameras[1].gain
                 config_state.camera_configs["camera2"]["exposure"] = camera_manager.cameras[1].exposure
+                config_state.camera_configs["camera2"]["gamma"] = camera_manager.cameras[1].gamma
+                config_state.camera_configs["camera2"]["gamma_enabled"] = camera_manager.cameras[1].gamma_enabled
 
                 # Save to file
                 config_state.save_to_file()
@@ -1354,6 +1450,19 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
                     else:
                         new_exposure = max_exp
                     camera_manager.set_camera_exposure(0, new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
+
+                # Check if mouse is over Camera 1 Gamma Slider track
+                camera1_gamma_track_rect = pygame.Rect(display.sub_x + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+                if camera1_gamma_track_rect.collidepoint(current_pos):
+                    slider_x = display.sub_x + 750
+                    slider_width = 120
+                    gamma_min = 0.01
+                    gamma_max = 2.0
+                    relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
+                    slider_pos = relative_x / slider_width  # 0-1 position along slider
+                    new_gamma = gamma_min + slider_pos * (gamma_max - gamma_min)
+                    new_gamma = max(gamma_min, min(gamma_max, new_gamma))
+                    camera_manager.cameras[0].gamma = round(new_gamma, 2)  # Round to 2 decimal places
 
             if camera2.connected:
                 # Check if mouse is over Camera 2 Gain Slider track

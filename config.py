@@ -65,7 +65,9 @@ class ConfigState:
                 "focal_length": 25.0,  # mm
                 "alignment_rotation": 0.0,  # degrees
                 "gain": 1.0,  # unitless
-                "exposure": 10000.0  # microseconds
+                "exposure": 10000.0,  # microseconds
+                "gamma": 0.1,  # gamma correction value
+                "gamma_enabled": False  # gamma correction toggle
             },
             "camera2": {
                 "pixel_size": 3.75,  # μm
@@ -73,7 +75,9 @@ class ConfigState:
                 "focal_length": 25.0,  # mm
                 "alignment_rotation": 0.0,  # degrees
                 "gain": 1.0,  # unitless
-                "exposure": 10000.0  # microseconds
+                "exposure": 10000.0,  # microseconds
+                "gamma": 0.1,  # gamma correction value
+                "gamma_enabled": False  # gamma correction toggle
             }
         }
 
@@ -189,7 +193,9 @@ class ConfigState:
             "focal_length": 25.0,
             "alignment_rotation": 0.0,
             "gain": 1.0,
-            "exposure": 10000.0
+            "exposure": 10000.0,
+            "gamma": 0.1,
+            "gamma_enabled": False
         }
 
         for camera_name in self.camera_configs:

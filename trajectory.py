@@ -367,7 +367,7 @@ def interpolate_position_data_and_rates(trajectory_data, current_tt, launch_tt=0
         az = az0 + fraction * (az1 - az0)
         return px, py, alt, dist, az, 0.0, 0.0
 
-    elif len(trajectory[0]) == 8:  # New format with rates
+    elif len(trajectory[0]) >= 8:  # New format with rates
         idx = np.searchsorted(times_array, current_tt) - 1
         if idx < 0:
             return trajectory[0][4], trajectory[0][5], trajectory[0][1], trajectory[0][3], trajectory[0][2], trajectory[0][6], trajectory[0][7]

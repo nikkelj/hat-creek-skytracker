@@ -691,6 +691,7 @@ class VisualizationRenderingThread(threading.Thread):
             self.surface = pygame.Surface((display.sub_width // 2, display.sub_height // 2))
 
         self.latest_surface = None
+        self.surface_lock = threading.Condition()  # guards the latest_surface handoff
         self.running = True
         self.last_render_time = 0
         self.render_count = 0
@@ -706,6 +707,19 @@ class VisualizationRenderingThread(threading.Thread):
             with self.surface_lock:
                 return self.latest_surface
         return self.latest_surface
+
+    def _publish_surface(self):
+        """Publish a complete snapshot of the just-rendered frame.
+
+        The render loop clears and redraws self.surface in place every frame, so
+        handing consumers a *reference* to it lets the main thread blit a frame
+        that is mid-clear or mid-draw -> flicker. We copy the surface only after
+        all drawing for the frame is finished, and swap the published reference
+        under the lock, so consumers always receive a whole, stable frame.
+        """
+        snapshot = self.surface.copy()
+        with self.surface_lock:
+            self.latest_surface = snapshot
 
     def calculate_fps(self):
         """Calculate current rendering FPS."""
@@ -830,8 +844,9 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                 # For other overlay elements, we could add simplified versions
                 # For now, just core polar plot and satellites to avoid complexity
 
-                # Update latest surface reference (no locks needed)
-                self.latest_surface = self.surface
+                # Publish a complete snapshot so the main loop never blits a
+                # half-cleared / half-drawn frame (root cause of viz flicker).
+                self._publish_surface()
                 self.last_render_time = current_time
                 self.render_count += 1
 
@@ -1064,8 +1079,9 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     # No satellite data available, just clear and skip rendering
                     self.surface.fill((0, 0, 0))
 
-                # Update latest surface reference (no locks needed)
-                self.latest_surface = self.surface
+                # Publish a complete snapshot so the main loop never blits a
+                # half-cleared / half-drawn frame (root cause of viz flicker).
+                self._publish_surface()
                 self.last_render_time = current_time
                 self.render_count += 1
 

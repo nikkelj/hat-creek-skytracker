@@ -38,6 +38,7 @@ class PIDController:
         # PID state
         self.integral_error = 0.0
         self.previous_error = 0.0
+        self.previous_measurement = None  # for derivative-on-measurement
         self.last_update_time = None
 
         # Feed-forward state
@@ -57,6 +58,7 @@ class PIDController:
         """Reset PID controller state."""
         self.integral_error = 0.0
         self.previous_error = 0.0
+        self.previous_measurement = None
         self.last_update_time = None
 
     def update_gains(self, p_gain, i_gain, d_gain):
@@ -66,9 +68,17 @@ class PIDController:
         self.d_gain = d_gain
 
     def set_feed_forward_rate(self, feed_forward_rate_deg_per_sec):
-        """Set the current feed-forward rate from trajectory tracking."""
+        """Set the current feed-forward rate from trajectory tracking.
+
+        The PID output and the discrete RATES table are expressed in
+        revolutions/second, but trajectory rates arrive in degrees/second.
+        Convert here (1 rev = 360 deg) so the feed-forward term shares the same
+        units as the feedback output. Without this conversion the feed-forward
+        contribution is ~360x too large and immediately saturates the rate
+        command, which is why feed-forward tracking was previously unusable.
+        """
         if self.feed_forward_enabled:
-            self.current_feed_forward_rate = feed_forward_rate_deg_per_sec
+            self.current_feed_forward_rate = feed_forward_rate_deg_per_sec / 360.0
         else:
             self.current_feed_forward_rate = 0.0
 
@@ -78,13 +88,18 @@ class PIDController:
         if not enabled:
             self.current_feed_forward_rate = 0.0
 
-    def compute_pid_output(self, error_degrees, dt_seconds):
+    def compute_pid_output(self, error_degrees, dt_seconds, measurement_degrees=None):
         """
         Compute PID output for given error with optional feed-forward.
 
         Args:
             error_degrees: Position error in degrees
             dt_seconds: Time since last update (for integral/derivative)
+            measurement_degrees: Current measured position in degrees. When
+                provided, the derivative term is taken on the measurement
+                instead of the error. This avoids the "derivative kick" spike
+                that occurs when the setpoint (or feed-forward) changes, which
+                is common when tracking a moving trajectory.
 
         Returns:
             tuple: (pid_output, discrete_rate) - discrete_rate is signed (-9 to +9)
@@ -98,27 +113,46 @@ class PIDController:
         # Proportional term
         p_term = self.p_gain * error_degrees
 
-        # Integral term (with anti-windup)
-        self.integral_error += error_degrees * dt_seconds
-        self.integral_error = np.clip(self.integral_error, -100, 100)  # Anti-windup
-        i_term = self.i_gain * self.integral_error
-
-        # Derivative term
-        if dt_seconds > 0:
-            d_term = self.d_gain * (error_degrees - self.previous_error) / dt_seconds
+        # Derivative term: on measurement when available (no derivative kick),
+        # otherwise on error (legacy behavior).
+        if measurement_degrees is not None:
+            if self.previous_measurement is None:
+                d_term = 0.0
+            else:
+                delta = measurement_degrees - self.previous_measurement
+                # AZM wraps at 360 deg; keep the delta on the short arc so a
+                # 0<->360 crossing doesn't produce a spurious derivative spike.
+                if self.axis_name == "AZM":
+                    delta = (delta + 180.0) % 360.0 - 180.0
+                d_term = -self.d_gain * delta / dt_seconds
+            self.previous_measurement = measurement_degrees
         else:
-            d_term = 0.0
+            d_term = self.d_gain * (error_degrees - self.previous_error) / dt_seconds
 
         self.previous_error = error_degrees
 
-        # PID feedback output
+        # Integral term with conditional-integration anti-windup. We tentatively
+        # accumulate, compute the output, and if the command is saturated *and*
+        # the error would push it further into saturation, we roll back this
+        # cycle's accumulation so the integrator cannot wind up against the rate
+        # ceiling.
+        self.integral_error += error_degrees * dt_seconds
+        self.integral_error = np.clip(self.integral_error, -100, 100)
+        i_term = self.i_gain * self.integral_error
+
         pid_feedback_output = p_term + i_term + d_term
+        total_output = pid_feedback_output + self.current_feed_forward_rate
+
+        max_rate = RATES[self.max_rate]  # saturation threshold (rev/sec)
+        if abs(total_output) > max_rate and np.sign(error_degrees) == np.sign(total_output):
+            self.integral_error -= error_degrees * dt_seconds
+            self.integral_error = np.clip(self.integral_error, -100, 100)
+            i_term = self.i_gain * self.integral_error
+            pid_feedback_output = p_term + i_term + d_term
+            total_output = pid_feedback_output + self.current_feed_forward_rate
 
         # Store feedback components for display
         self.current_feedback_output = pid_feedback_output
-
-        # Add feed-forward if enabled
-        total_output = pid_feedback_output + self.current_feed_forward_rate
 
         # Store diagnostic values for display
         self.current_position_error = error_degrees
@@ -193,13 +227,15 @@ class PIDController:
         max_correction_per_cycle = RATES[self.max_rate] * dt_seconds
         return max_correction_per_cycle
 
-    def get_current_rates(self, error_degrees, dt_seconds=0.1):
+    def get_current_rates(self, error_degrees, dt_seconds=0.1, measurement_degrees=None):
         """
         Get current PID output and discrete rate for this control cycle.
 
         Args:
             error_degrees: Current position error in degrees
             dt_seconds: Time since last update
+            measurement_degrees: Current measured position (enables
+                derivative-on-measurement; see compute_pid_output)
 
         Returns:
             tuple: (pid_output_deg_per_sec, discrete_rate)
@@ -214,7 +250,9 @@ class PIDController:
 
         self.last_update_time = current_time
 
-        pid_output, discrete_rate = self.compute_pid_output(error_degrees, dt_seconds)
+        pid_output, discrete_rate = self.compute_pid_output(
+            error_degrees, dt_seconds, measurement_degrees=measurement_degrees
+        )
 
         return pid_output, discrete_rate
 

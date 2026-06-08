@@ -30,6 +30,7 @@ from camera_manager import camera_manager, render_sensor_calibration, render_cam
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
+from mount_control import MountControlThread
 # Camera button initialization is now handled internally by camera_manager
 from events import *
 
@@ -159,6 +160,14 @@ def update_status_callback(message):
 # Joystick Mode State Management (initialize after update_status_callback is defined)
 global joystick_mode_state
 joystick_mode_state = JoystickModeState(tracking_vis_state, config_state, update_status_callback)
+
+# Dedicated real-time mount control thread. Owns all serial traffic to the
+# mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
+# from this render loop. It no-ops while the telescope is disconnected.
+global mount_control_thread
+mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+mount_control_thread.start()
+print("Mount control thread started.")
 
 try:
     from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
@@ -760,53 +769,10 @@ while running:
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)
 
-        # Update joystick tracking control and position polling
-        if joystick_mode_state.telescope_connected:
-            joystick_mode_state.tracking_control()
-
-            # Poll current position at 10 Hz for display
-            try:
-                if hasattr(joystick_mode_state.telescope_controller, 'hc_get_position'):
-                    # Measure polling frequency
-                    position_poll_count += 1
-                    current_poll_time = time.time()
-
-                    # Time AZM call
-                    azm_start = perf_counter()
-                    joystick_mode_state.current_azm = joystick_mode_state.telescope_controller.hc_get_position(Targets.AZM) * 360.0 - float(config_state.azm_offset_str)
-                    azm_duration = (perf_counter() - azm_start) * 1000  # Convert to milliseconds
-
-                    # Time ALT call
-                    alt_start = perf_counter()
-                    joystick_mode_state.current_alt = joystick_mode_state.telescope_controller.hc_get_position(Targets.ALT) * 360.0 - float(config_state.alt_offset_str)
-                    alt_duration = (perf_counter() - alt_start) * 1000  # Convert to milliseconds
-
-                    # Update frequency and timing report every second
-                    if current_poll_time - position_poll_start_time >= 1.0:
-                        elapsed = current_poll_time - position_poll_start_time
-                        position_poll_frequency = position_poll_count / elapsed
-                        position_poll_count = 0
-                        position_poll_start_time = current_poll_time
-                        print(f"Telescope polling: {position_poll_frequency:.1f} Hz | AZM: {azm_duration:.1f}ms | ALT: {alt_duration:.1f}ms | Total: {azm_duration + alt_duration:.1f}ms")
-
-                    # Format for display (convert degrees back to fractions for proper DMS formatting)
-                    from lib.auxstar import f2dms, format_angle_compact
-                    azm_fraction = joystick_mode_state.current_azm / 360.0
-                    alt_fraction = joystick_mode_state.current_alt / 360.0
-                    azm_d, azm_m, azm_s = f2dms(azm_fraction)
-                    alt_d, alt_m, alt_s = f2dms(alt_fraction)
-                    joystick_mode_state.azm_display_str = f"{azm_d:3d}°{azm_m:02d}'{azm_s:04.1f}\""
-                    joystick_mode_state.alt_display_str = f"{alt_d:3d}°{alt_m:02d}'{alt_s:04.1f}\""
-
-                    # Sync to tracking visualization state
-                    tracking_vis_state.telescope_azimuth = joystick_mode_state.current_azm
-                    tracking_vis_state.telescope_altitude = joystick_mode_state.current_alt
-            except Exception as e:
-                # On polling error, maintain previous values or show error
-                if not joystick_mode_state.azm_display_str == "--":
-                    joystick_mode_state.azm_display_str = "ERROR"
-                    joystick_mode_state.alt_display_str = "ERROR"
-                print(f"Position polling error: {e}. Are you sure the mount is powered?")
+        # Mount control and position polling run on MountControlThread
+        # (see mount_control.py), decoupled from this render loop. The thread
+        # populates joystick_mode_state.current_azm/current_alt and the display
+        # strings, which the rendering code above reads.
 
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
@@ -829,6 +795,13 @@ while running:
     clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness
 
 pygame.quit()
+
+# Stop the mount control thread first so the mount is commanded to a stop
+# before we tear anything else down.
+print("Shutting down mount control thread...")
+if mount_control_thread:
+    mount_control_thread.stop()
+    mount_control_thread.join(timeout=2.0)
 
 # Clean up rendering threads
 print("Shutting down rendering threads...")

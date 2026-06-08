@@ -9,8 +9,18 @@ https://raw.githubusercontent.com/jochym/nexstar-evo/master/nsevo/nexstarevo.py
 import argparse
 import serial
 import struct
+import threading
 import time
 from enum import Enum
+
+
+class SerialCommError(IOError):
+    """Raised when a mount transaction returns a short/timed-out response.
+
+    Callers (notably the control thread) should treat this as 'skip this
+    cycle' rather than letting the failure stall the loop.
+    """
+    pass
 
 class Targets(Enum):
     ANY = 0x00
@@ -179,15 +189,21 @@ class NexstarHandController:
                     bytesize         = serial.EIGHTBITS,
                     parity           = serial.PARITY_NONE,
                     stopbits         = serial.STOPBITS_ONE,
-                    timeout          = 3.500,
+                    # Short timeouts: a missing response must never stall the
+                    # control loop for seconds. A timed-out read is reported as
+                    # a SerialCommError and the cycle is skipped/stopped.
+                    timeout          = 0.25,
                     xonxoff          = False,
                     rtscts           = False,
-                    writeTimeout     = 3.500,
+                    writeTimeout     = 0.25,
                     dsrdtr           = False,
                     interCharTimeout = None
                 )
 
         self._device = device
+        # Serializes every write+read transaction so the control thread and the
+        # UI thread can never interleave bytes on the wire.
+        self._lock = threading.RLock()
         self.alt = 0
         self.azm = 0
         self.focus = 0
@@ -197,7 +213,8 @@ class NexstarHandController:
         return self._device
 
     def close(self):
-        return self._device.close()
+        with self._lock:
+            return self._device.close()
 
     def _write_binary(self, request):
         return self._device.write(request)
@@ -207,6 +224,28 @@ class NexstarHandController:
         response = self._device.read(expected_response_length)
 
         return response
+
+    def _transact(self, request, expected_response_length):
+        """Atomically write a request and read its full response.
+
+        Holds the device lock for the whole round-trip and validates that the
+        complete response arrived. On a short/timed-out read the input buffer
+        is flushed (so the next command starts on a clean stream) and a
+        SerialCommError is raised.
+        """
+        with self._lock:
+            self._device.write(request)
+            response = self._device.read(expected_response_length)
+            if len(response) < expected_response_length:
+                try:
+                    self._device.reset_input_buffer()
+                except Exception:
+                    pass
+                raise SerialCommError(
+                    f"Short read: got {len(response)} of "
+                    f"{expected_response_length} bytes"
+                )
+            return response
 
     ################################## Public API ##########################################
     def hc_get_version(self, target):
@@ -221,8 +260,7 @@ class NexstarHandController:
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
         request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_VER'][1], target.value, COMMANDS['MC_GET_VER'][0], COMMANDS['MC_GET_VER'][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS['MC_GET_VER'][2]+1)
+        binary_response = self._transact(binary, COMMANDS['MC_GET_VER'][2]+1)
         result = ''.join(format(x, '02x') for x in binary_response[0:-1])
         return result
 
@@ -238,8 +276,7 @@ class NexstarHandController:
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
         request = '50{:02x}{:02x}{:02x}000000{:02x}'.format(COMMANDS['MC_GET_POSITION'][1], target.value, COMMANDS['MC_GET_POSITION'][0], COMMANDS['MC_GET_POSITION'][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS['MC_GET_POSITION'][2]+1)
+        binary_response = self._transact(binary, COMMANDS['MC_GET_POSITION'][2]+1)
         result = unpack_int3(binary_response)
         if target == Targets.ALT:
             self.alt = result
@@ -265,8 +302,7 @@ class NexstarHandController:
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
         request = '50{:02x}{:02x}{:02x}'.format(COMMANDS['MC_GOTO_FAST'][1], target.value, COMMANDS['MC_GOTO_FAST'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_GOTO_FAST'][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS['MC_GOTO_FAST'][2]+1)
+        binary_response = self._transact(binary, COMMANDS['MC_GOTO_FAST'][2]+1)
         return binary_response == b'#'
 
     def hc_set_position(self, target, dd, mm, ss):
@@ -285,8 +321,7 @@ class NexstarHandController:
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
         request = '50{:02x}{:02x}{:02x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_SET_POSITION'][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS['MC_SET_POSITION'][2]+1)
+        binary_response = self._transact(binary, COMMANDS['MC_SET_POSITION'][2]+1)
         return binary_response == b'#'
     
     def hc_set_guide_rate(self, target, rate, sidereal=False, solar=False, lunar=False):
@@ -311,8 +346,7 @@ class NexstarHandController:
             packed_rate = pack_int3(rate)
             request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], packed_rate, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS[cmd][2]+1)
+        binary_response = self._transact(binary, COMMANDS[cmd][2]+1)
         return binary_response == b'#'
     
     def hc_slew_fixed(self, target, rate):
@@ -328,8 +362,7 @@ class NexstarHandController:
         cmd = 'MC_MOVE_POS' if rate >= 0 else 'MC_MOVE_NEG'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], abs(rate), COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS[cmd][2]+1)
+        binary_response = self._transact(binary, COMMANDS[cmd][2]+1)
         return binary_response == b'#'
     
     def hc_set_backlash(self, target, backlash):
@@ -345,8 +378,7 @@ class NexstarHandController:
         cmd = 'MC_SET_POS_BACKLASH' if backlash >= 0 else 'MC_SET_NEG_BACKLASH'
         request = '50{:02x}{:02x}{:02x}{:02x}0000{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], backlash, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
-        self._write_binary(binary)
-        binary_response = self._read_binary(COMMANDS[cmd][2]+1)
+        binary_response = self._transact(binary, COMMANDS[cmd][2]+1)
         return binary_response == b'#'
 
 def status_report(controller):

@@ -29,6 +29,7 @@ from utils import draw_button
 # Import PID controller and helper functions
 from control import create_pid_controllers, compute_mount_position_error
 from trajectory import interpolate_position_data_and_rates
+from hotspot import detect_hotspot, pixel_offset_to_angles
 
 # PS4 Controller Button Labels (zero-indexed)
 BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
@@ -103,6 +104,18 @@ class JoystickModeState:
         # One-shot guard so STANDBY sends a single stop on entry rather than
         # re-commanding zero every cycle (and never leaves a residual slew).
         self._standby_motion_stopped = False
+
+        # Tracks the last dispatched mode so we can run per-mode entry logic.
+        self._prev_dispatch_mode = None
+
+        # HOTSPOT (closed-loop optical) tracker state
+        self.hotspot_gate_center = None      # (cx, cy) in image px once locked
+        self.hotspot_acquired = False
+        self.hotspot_miss_count = 0
+        self.hotspot_last_detection_time = 0.0
+        self.hotspot_snr = 0.0               # diagnostics
+        self.hotspot_centroid = None
+        self.hotspot_status = ""
 
         # PID controllers for PROGRAM track mode
         self.azm_pid = None
@@ -208,6 +221,12 @@ class JoystickModeState:
         # mode, so re-entering STANDBY will again issue a single stop.
         if self.tracking_mode != TrackingMode.STANDBY:
             self._standby_motion_stopped = False
+
+        # Run per-mode entry logic on a mode transition.
+        if self.tracking_mode != self._prev_dispatch_mode:
+            if self.tracking_mode == TrackingMode.HOTSPOT:
+                self._enter_hotspot_mode()
+            self._prev_dispatch_mode = self.tracking_mode
 
         # Dispatch to appropriate tracking method based on mode
         if self.tracking_mode == TrackingMode.STANDBY:
@@ -756,10 +775,158 @@ class JoystickModeState:
         # TODO: Implement handoff track mode
         print("Handoff track mode - stub")
 
+    def _enter_hotspot_mode(self):
+        """Reset state when HOTSPOT is engaged (handed off from another mode)."""
+        self.hotspot_gate_center = None      # force a full-frame acquisition
+        self.hotspot_acquired = False
+        self.hotspot_miss_count = 0
+        self.hotspot_last_detection_time = 0.0
+        self.hotspot_centroid = None
+        self.hotspot_snr = 0.0
+        if self.azm_pid:
+            self.azm_pid.reset()
+        if self.alt_pid:
+            self.alt_pid.reset()
+        self.pid_last_update = time.time()
+        self.hotspot_status = "acquiring"
+        print("HOTSPOT: engaged - acquiring...")
+
     def hotspot_track(self):
-        """Hotspot track mode - stub implementation"""
-        # TODO: Implement hotspot track mode
-        print("Hotspot track mode - stub")
+        """Closed-loop optical tracker: lock onto the brightest ('hot') object in
+        the camera frame and drive the mount to keep it centered.
+
+        Intended as a hand-off target once PROGRAM track has the object in frame.
+        On loss of lock it coasts briefly, then falls back to PROGRAM track.
+        Best for bright objects (rockets, aircraft); dim satellites amid streaking
+        stars need a different mode.
+        """
+        cfg = self.config_state
+
+        # Ensure PID controllers exist (shared with PROGRAM track).
+        if self.azm_pid is None or self.alt_pid is None:
+            if cfg is None:
+                print("HOTSPOT: config state not available")
+                return
+            self.azm_pid, self.alt_pid = create_pid_controllers(cfg)
+        self.azm_pid.update_gains(cfg.pid_azm_p_gain, cfg.pid_azm_i_gain, cfg.pid_azm_d_gain)
+        self.alt_pid.update_gains(cfg.pid_alt_p_gain, cfg.pid_alt_i_gain, cfg.pid_alt_d_gain)
+
+        # Grab the latest raw frame from the configured tracking camera.
+        cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
+        camera = camera_manager.get_camera(cam_index)
+        raw = None
+        if camera is not None and getattr(camera, 'thread', None) is not None:
+            raw = camera.thread.get_latest_raw()
+
+        # Mount position cached by the control thread this cycle.
+        current_azm = self.current_azm
+        current_alt = self.current_alt
+
+        # Safety: abort to STANDBY if the mount is outside configured limits.
+        try:
+            azm_min = float(cfg.azm_limit_min_str); azm_max = float(cfg.azm_limit_max_str)
+            alt_min = float(cfg.alt_limit_min_str); alt_max = float(cfg.alt_limit_max_str)
+            if not (azm_min <= current_azm <= azm_max and alt_min <= current_alt <= alt_max):
+                self._hotspot_stop_motion()
+                self.tracking_mode = TrackingMode.STANDBY
+                if self.update_status_callback:
+                    self.update_status_callback("HOTSPOT: mount at safety limit - switched to STANDBY")
+                return
+        except (ValueError, AttributeError):
+            pass
+
+        detection = None
+        if raw is not None:
+            gate_center = self.hotspot_gate_center
+            gate_radius = int(getattr(cfg, 'hotspot_gate_radius', 120)) if gate_center else None
+            try:
+                detection = detect_hotspot(
+                    raw,
+                    gate_center=gate_center,
+                    gate_radius=gate_radius,
+                    snr_threshold=float(getattr(cfg, 'hotspot_snr_threshold', 5.0)),
+                )
+            except Exception as e:
+                print(f"HOTSPOT: detection error: {e}")
+                detection = None
+
+        now = time.time()
+
+        if detection is not None:
+            # Pixel error of the object from boresight (image center).
+            h, w = raw.shape[:2]
+            dx = detection.cx - (w / 2.0)
+            dy = detection.cy - (h / 2.0)
+
+            cam_name = f"camera{cam_index + 1}"
+            az_error, el_error = pixel_offset_to_angles(
+                dx, dy,
+                pixel_size_um=float(cfg.get_camera_pixel_size(cam_name)),
+                focal_length_mm=float(cfg.get_camera_focal_length(cam_name)),
+                rotation_deg=float(cfg.get_camera_alignment_rotation(cam_name)),
+                el_deg=current_alt,
+                x_sign=float(getattr(cfg, 'hotspot_x_sign', 1.0)),
+                y_sign=float(getattr(cfg, 'hotspot_y_sign', -1.0)),
+            )
+
+            # Drive the mount to null the optical error using the shared PID.
+            current_time = now
+            az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
+                az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+            el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
+                el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
+            self.pid_last_update = current_time
+
+            # Update lock state and diagnostics.
+            self.hotspot_gate_center = (detection.cx, detection.cy)
+            self.hotspot_centroid = (detection.cx, detection.cy)
+            self.hotspot_snr = detection.snr
+            self.hotspot_acquired = True
+            self.hotspot_miss_count = 0
+            self.hotspot_last_detection_time = now
+            self.hotspot_status = "locked"
+            self.azm_position_error = az_error
+            self.alt_position_error = el_error
+            self.azm_target_rate = az_pid_output
+            self.alt_target_rate = el_pid_output
+
+            if self.telescope_connected and not self.stopped:
+                try:
+                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                except Exception as e:
+                    print(f"HOTSPOT: error sending slew commands: {e}")
+            return
+
+        # No detection this cycle.
+        self.hotspot_miss_count += 1
+        coast_time = float(getattr(cfg, 'hotspot_coast_time_sec', 1.0))
+        elapsed = (now - self.hotspot_last_detection_time) if self.hotspot_acquired else float('inf')
+
+        if self.hotspot_acquired and elapsed < coast_time:
+            # Coast: leave the last continuous slew running so a brief dropout
+            # (cloud, frame glitch) doesn't jerk the mount.
+            self.hotspot_status = "coasting"
+            return
+
+        # Lock lost (or never acquired within the coast window): stop and hand
+        # back to PROGRAM track per configured behavior.
+        self._hotspot_stop_motion()
+        self.hotspot_acquired = False
+        self.hotspot_gate_center = None
+        self.hotspot_status = "lost"
+        self.tracking_mode = TrackingMode.PROGRAM
+        if self.update_status_callback:
+            self.update_status_callback("HOTSPOT: lost lock - falling back to PROGRAM track")
+
+    def _hotspot_stop_motion(self):
+        """Best-effort stop of both axes."""
+        if self.telescope_connected and self.telescope_controller is not None:
+            try:
+                self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
+                self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+            except Exception as e:
+                print(f"HOTSPOT: error stopping motion: {e}")
 
     def mti_track(self):
         """MTI track mode - stub implementation"""

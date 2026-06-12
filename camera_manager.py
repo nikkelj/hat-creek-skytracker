@@ -266,6 +266,10 @@ class CameraManager:
 
     def get_num_cameras(self):
         """Get number of cameras available"""
+        # In simulation, report the sim cameras so UI features that gate on
+        # camera availability (e.g. the joystick-loop camera feeds) work.
+        if self.simulator is not None and self.simulator.sim_enabled():
+            return len(self.cameras)
         try:
             return asi.get_num_cameras()
         except:

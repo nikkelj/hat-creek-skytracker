@@ -44,6 +44,25 @@ capture.
 **Hardware simulator** (see below) — run the entire tracking loop without any
 physical hardware present.
 
+## Screens
+
+**Tracking Vis** — annotated polar sky plot with the selected object's orbit,
+orbital elements, camera FOV footprints, and a scrollable pass table.
+
+![Tracking Vis](doc/screenshots/tracking_vis.png)
+
+**Joystick Loop** — the operational screen: live camera feeds (with boresight
+crosshairs), a polar-plot quadrant, mount connection/position status, tracking
+mode, and PID diagnostics. Shown here in simulation with the mount and both
+cameras connected.
+
+![Joystick Loop](doc/screenshots/joystick_loop.png)
+
+**Sensor Calibration** — both camera feeds side by side with gain / exposure /
+alignment-rotation / ROI controls for co-boresighting the guide and main cameras.
+
+![Sensor Calibration](doc/screenshots/sensor_calib.png)
+
 ## Hardware Interfaces
 
 - **Celestron NexStar AUX** (primary; implemented in `lib/auxstar.py`)

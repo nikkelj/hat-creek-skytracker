@@ -24,6 +24,7 @@ except Exception as e:
 from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
 from config import load_config, handle_input, draw_config_options
+from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
@@ -31,6 +32,7 @@ from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_ev
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 from mount_control import MountControlThread
+from simulator import HardwareSimulator
 # Camera button initialization is now handled internally by camera_manager
 from events import *
 
@@ -160,6 +162,15 @@ def update_status_callback(message):
 # Joystick Mode State Management (initialize after update_status_callback is defined)
 global joystick_mode_state
 joystick_mode_state = JoystickModeState(tracking_vis_state, config_state, update_status_callback)
+
+# Hardware simulator (mount + cameras). Inert unless sim_config.enabled; when
+# enabled, connect_telescope / connect_camera hand back simulated devices so the
+# whole tracking loop can run without physical hardware.
+global hardware_sim
+hardware_sim = HardwareSimulator(config_state, tracking_vis_state, ts)
+joystick_mode_state.hardware_sim = hardware_sim
+camera_manager.simulator = hardware_sim
+print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
 
 # Dedicated real-time mount control thread. Owns all serial traffic to the
 # mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
@@ -427,6 +438,10 @@ while running:
                         config_state.selection_start[field_name] = None
                         break
 
+            # Hardware Sim screen: toggle / steppers / save-load
+            elif current_mode == "hw_sim":
+                handle_hw_sim_click(pos, display, config_state, hardware_sim, status_messages)
+
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
                 try:
@@ -599,6 +614,8 @@ while running:
     viz_surface = None
     if current_mode == "config_options":
         draw_config_options(display, config_state)
+    elif current_mode == "hw_sim":
+        draw_hw_sim_options(display, config_state, hardware_sim)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         # Only clear if we don't have a thread surface (initial loading)
         # This prevents washing away the displayed surface while thread is rendering

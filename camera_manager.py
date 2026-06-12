@@ -72,6 +72,10 @@ class CameraManager:
         self.cameras = []  # Dynamic list to support any number of cameras
         self.initialize_cameras(num_cameras)
 
+        # Hardware simulator (set by main.py). When set and enabled, connect_camera
+        # produces synthetic frames through a duck-typed SimCap instead of ASI.
+        self.simulator = None
+
         # Screening/layout settings
         self.CAMERA_CONNECT_BUTTONS = [None] * num_cameras
         self.CAMERA_DISCONNECT_BUTTONS = [None] * num_cameras
@@ -156,6 +160,21 @@ class CameraManager:
         if camera.connected:
             if update_status_callback:
                 update_status_callback(f"Camera {camera_index+1} already connected")
+            return True
+
+        # Simulation: back the camera with a duck-typed SimCap so the normal
+        # CameraThread pipeline renders synthetic frames.
+        if self.simulator is not None and self.simulator.sim_enabled():
+            from simulator import SimCap
+            camera.cap = SimCap(camera.index, self.simulator)
+            camera.prop = camera.cap.get_camera_property()
+            camera.cap.set_image_type(asi.ASI_IMG_RAW8)
+            camera.connected = True
+            camera.width_res = camera.prop.get('MaxWidth', 960)
+            camera.height_res = camera.prop.get('MaxHeight', 720)
+            self._start_camera_thread(camera)
+            if update_status_callback:
+                update_status_callback(f"Camera {camera_index+1} connected (SIMULATED): {camera.width_res}x{camera.height_res}")
             return True
 
         try:

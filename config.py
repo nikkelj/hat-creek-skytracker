@@ -56,6 +56,26 @@ class ConfigState:
         self.hotspot_x_sign = 1.0           # per-axis sign calibration (set on hardware)
         self.hotspot_y_sign = -1.0
 
+        # Hardware simulator configuration (mount + camera sim). enabled=False
+        # leaves all real-hardware behavior unchanged.
+        self.sim_config = {
+            "enabled": False,
+            "cam_width": 960,            # sim sensor resolution (px)
+            "cam_height": 720,
+            "mount_misalignment_az_deg": 0.0,   # encoder bias vs true sky
+            "mount_misalignment_el_deg": 0.0,
+            "mount_encoder_noise_deg": 0.0,     # per-read uniform noise bound
+            "mount_rate_noise_dps": 0.0,        # slew rate jitter (1-sigma)
+            "cam2_offset_rotation_deg": 0.0,    # inter-camera misalignment
+            "cam2_offset_x_px": 0.0,
+            "cam2_offset_y_px": 0.0,
+            "star_density": 300,                # stars sprinkled over the sky
+            "background_level": 6.0,
+            "read_noise": 2.0,
+            "target_brightness": 200.0,
+            "seed": 1234,
+        }
+
         # Mount mode configuration
         self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
 
@@ -156,6 +176,7 @@ class ConfigState:
             "hotspot_coast_time_sec": self.hotspot_coast_time_sec,
             "hotspot_x_sign": self.hotspot_x_sign,
             "hotspot_y_sign": self.hotspot_y_sign,
+            "sim_config": self.sim_config,
             "mount_mode": self.mount_mode
         }
 
@@ -196,6 +217,10 @@ class ConfigState:
         self.hotspot_coast_time_sec = config_dict.get("hotspot_coast_time_sec", self.hotspot_coast_time_sec)
         self.hotspot_x_sign = config_dict.get("hotspot_x_sign", self.hotspot_x_sign)
         self.hotspot_y_sign = config_dict.get("hotspot_y_sign", self.hotspot_y_sign)
+
+        # Merge hardware simulator settings (keep defaults for missing keys)
+        if "sim_config" in config_dict and isinstance(config_dict["sim_config"], dict):
+            self.sim_config.update(config_dict["sim_config"])
         self.bias_control_mode = config_dict.get("bias_control_mode", self.bias_control_mode)
 
         # Load mount mode

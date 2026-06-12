@@ -72,6 +72,10 @@ class JoystickModeState:
         self.selected_port = None
         self.available_ports = []
 
+        # Hardware simulator (set by main.py); when sim is enabled the connect
+        # calls below hand back the sim mount instead of a real serial controller.
+        self.hardware_sim = None
+
         # UI state
         self.connect_button_hover = False
         self.disconnect_button_hover = False
@@ -172,7 +176,14 @@ class JoystickModeState:
             self.selected_port = self.available_ports[0]['device']
 
     def connect_telescope(self):
-        """Connect to telescope via serial port"""
+        """Connect to telescope via serial port (or the sim mount in sim mode)."""
+        # Simulation: hand back the sim mount, no serial port required.
+        if self.hardware_sim is not None and self.hardware_sim.sim_enabled():
+            self.telescope_controller = self.hardware_sim.mount
+            self.telescope_connected = True
+            print("Connected to SIMULATED telescope")
+            return True
+
         if not self.selected_port:
             return False
 

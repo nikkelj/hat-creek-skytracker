@@ -33,6 +33,9 @@ that owns hardware.
 | 1 | NexStar `Mount` protocol (`lib/auxstar.py`) | `protocol.rs`, `sim.rs` | golden bytes + **byte-identical** to `NexstarHandController` wire output; byte-level `SimResponder` closes a slew→position loop |
 | 2 | `PidController` (`control.py`) | `pid.rs` | 9 mirrored unit tests + **step-for-step** parity over 400 cycles × 6 configs (output to 1e-9, discrete rate exact) |
 | 3 | Hotspot detection + geometry (`hotspot.py`) | `hotspot.rs` | 8 mirrored unit tests + **sub-pixel** parity (<0.05px) with the real numpy detector across noisy/color/gated frames; geometry to 1e-9. Crosses image data zero-copy via `PyReadonlyArray2`. |
+| 5 | Coordinate transforms (`transformations.py`) | `transforms.rs` | 6 unit tests + full parity sweep incl. the scipy `AzAlt2AzEl` path (Rodrigues port) and numpy NaN-propagation; `sky_to_mount` gives the loop its per-cycle transform. |
+| 4a | Control loop logic + threaded loop (`tracking_control`, `mount_control.py`) | `controller.rs`, `core_loop.rs` | pure `step()` (11 tests: all modes, hotspot lock/coast/loss/limit) + closed-loop convergence, moving-setpoint tracking, poll-fault skip, threaded spawn/stop against the byte-level sim (4 tests). |
+| 4b | PyO3 loop adapter | `python_bindings.rs` (`SimCoreLoop`) | Python drives the full message-passing surface; 6 tests close the loop from Python with no hardware. |
 
 Both also added a capability the Python side lacked: a **byte-level** simulated
 mount. The Python `SimMount` duck-types the controller at the method level and
@@ -62,21 +65,40 @@ Installed for the experiment: VS Build Tools (C++ workload, MSVC 14.44), rustup
 Build Tools uninstall) if the experiment is abandoned — and the whole thing
 lives on a branch.
 
-## Open questions / what's NOT yet proven
+## What remains — the hardware-integration boundary
 
-- **The loop refactor (step 4) is the real cost.** Porting `mount_control.py`'s
-  loop means converting `tracking_control()`'s shared-mutable-`state` access
-  into explicit command/snapshot message-passing. That's design work, not
-  translation — and it's where the effort actually lives.
-- **skyfield stays Python.** No intent to port the astronomy; the Rust loop
-  consumes setpoints Python computes. Coordinate-transform correctness remains a
-  Python concern.
+Everything verifiable in software is done. What's left genuinely needs the
+mount + camera + joystick on the bench, so it was deliberately stopped at the
+sim boundary:
 
-## Recommendation (interim)
+1. **A real serial `Transport`** (the `serialport` crate) so the loop can own a
+   physical port. Small; mirrors `LoopbackTransport`. Untestable without the
+   mount.
+2. **A real-port `CoreLoop` PyO3 class** — identical setters/snapshot to
+   `SimCoreLoop`, but opens a port and runs the background thread.
+3. **Wiring into `joystick_controller.py` behind a flag** (`use_rust_core_loop`,
+   default off): push inputs each UI tick (mode/gains/limits/offsets from config;
+   `rate_cmd` from the existing joystick mapping; PROGRAM setpoint `(az,el,ff)`
+   from the skyfield trajectory + mask-exit logic; frame from `camera_manager`),
+   read `snapshot()` for display, and apply `requested_mode`.
+4. **Sign-convention + closed-loop validation on hardware.** The sim converges
+   by construction (memory notes flag that real-hardware `x_sign`/`y_sign`
+   calibration can't be validated in sim); the Rust loop carries the same
+   parameters, so it's no worse off than the Python loop today.
 
-The hypothesis is holding: the high-value, hard-real-time pieces port to Rust
-faithfully and cheaply, validated by the existing suite. The decision to commit
-to the full split should hinge on step 4 (the loop/message-passing refactor),
-since that — not the language port — is the genuine investment. Steps 1–3 are
-low-regret either way: they're independently useful, fully tested, and isolated
-on a branch.
+skyfield stays Python (the loop consumes setpoints it computes); the mask-exit
+and satellite-selection logic in `program_track` stays Python and feeds the
+setpoint.
+
+## Recommendation
+
+The original hypothesis held all the way through: every real-time, hardware-
+adjacent module ports to Rust faithfully and cheaply, validated against the
+existing Python — including the loop itself, which closes against the simulator
+from both Rust and Python. The genuine remaining cost is not Rust but the live
+wiring + on-mount calibration, which is normal integration work and is cleanly
+gated behind a flag so the current Python path stays the default until proven.
+
+Net: the full Rust-core / Python-shell split is demonstrated end to end in
+software. Promoting it to the live hardware path is a contained, flag-gated
+integration step — not a rewrite risk.

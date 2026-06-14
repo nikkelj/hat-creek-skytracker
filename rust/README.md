@@ -18,23 +18,34 @@ hardware.
 |-------|------|
 | Protocol encoding (byte-faithful port) | `skytracker_core/src/protocol.rs` |
 | `Mount<Transport>` + byte-level `SimResponder` + loopback | `skytracker_core/src/sim.rs` |
+| `PidController` (port of `control.py`) | `skytracker_core/src/pid.rs` |
+| Hotspot detect + geometry (port of `hotspot.py`) | `skytracker_core/src/hotspot.rs` |
+| Coordinate transforms (port of `transformations.py`) | `skytracker_core/src/transforms.rs` |
+| Control-loop decision logic (pure) | `skytracker_core/src/controller.rs` |
+| Threaded fixed-rate loop (port of `mount_control.py`) | `skytracker_core/src/core_loop.rs` |
 | PyO3 bindings (`extension-module` feature) | `skytracker_core/src/python_bindings.rs` |
-| Rust golden-byte + closed-loop tests | `skytracker_core/tests/encoding.rs` |
-| Cross-language byte-parity test | `../test_rust_mount_parity.py` |
+| Rust unit + integration tests | `skytracker_core/tests/*.rs` |
+| Cross-language parity tests | `../test_rust_*.py` |
 
 ## Build & test
 
 Prerequisites: Rust (MSVC toolchain) + `maturin` in the `track` conda env.
 
 ```sh
-# Pure-Rust tests (no Python needed): golden bytes + sim closed loop
+# Pure-Rust tests (no Python needed): protocol, pid, hotspot, transforms,
+# controller, and closed-loop integration against the byte-level sim.
 cd rust/skytracker_core
 cargo test
 
-# Build the extension into the active env, then run cross-language parity
+# Build the extension into the active env, then run cross-language parity +
+# the Python-driven control loop.
 maturin develop --release
 cd ../..
 python test_rust_mount_parity.py
+python test_rust_pid_parity.py
+python test_rust_hotspot_parity.py
+python test_rust_transforms_parity.py
+python test_rust_core_loop.py
 ```
 
 ## What "parity" means here
@@ -45,9 +56,11 @@ bytes the Rust encoders produce — for `get_position`, `get_version`,
 `slew_fixed` (both signs), and `goto_fast`. So the port is verified against the
 actual Python wire output, not a hand-copied spec.
 
-## Next steps (not yet done)
+## Status
 
-2. Port `control.py::PIDController`; validate against `test_pid_control.py`.
-3. Port `hotspot.py::detect_hotspot`; validate against `test_hotspot.py`.
-4. Move the `mount_control.py` fixed-rate loop into a Rust thread owning
-   Mount+PID; Python pushes setpoints (from skyfield) and pulls snapshots.
+Steps 1–5 are complete and validated in software (see `FINDINGS.md`): protocol,
+PID, hotspot, transforms, and the control loop — the loop closes against the
+byte-level sim from both Rust and Python. What remains is the hardware-
+integration boundary (a real serial `Transport`, a real-port `CoreLoop`, and
+flag-gated wiring into `joystick_controller.py`), which needs the mount on the
+bench; see the "What remains" section of `FINDINGS.md`.

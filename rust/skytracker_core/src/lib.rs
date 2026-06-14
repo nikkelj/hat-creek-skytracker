@@ -5,6 +5,7 @@
 //! (`sim`) so the full encode -> transact -> parse loop can be exercised with no
 //! hardware. The `extension-module` feature adds the PyO3 bindings.
 
+pub mod pid;
 pub mod protocol;
 pub mod sim;
 

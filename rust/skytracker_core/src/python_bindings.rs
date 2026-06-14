@@ -8,6 +8,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::pid::PidController as CorePid;
 use crate::protocol;
 use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder};
 
@@ -86,6 +87,79 @@ impl SimMount {
     }
 }
 
+/// PID controller. Port of `control.py::PIDController`; same constructor
+/// defaults and `compute_pid_output` semantics.
+#[pyclass]
+struct PidController {
+    inner: CorePid,
+}
+
+#[pymethods]
+impl PidController {
+    #[new]
+    #[pyo3(signature = (p_gain = 1.0, i_gain = 0.0, d_gain = 0.0, axis_name = String::new(), feed_forward_enabled = false))]
+    fn new(
+        p_gain: f64,
+        i_gain: f64,
+        d_gain: f64,
+        axis_name: String,
+        feed_forward_enabled: bool,
+    ) -> Self {
+        PidController {
+            inner: CorePid::new(p_gain, i_gain, d_gain, axis_name, feed_forward_enabled),
+        }
+    }
+
+    #[pyo3(signature = (error_degrees, dt_seconds, measurement_degrees = None))]
+    fn compute_pid_output(
+        &mut self,
+        error_degrees: f64,
+        dt_seconds: f64,
+        measurement_degrees: Option<f64>,
+    ) -> (f64, i32) {
+        self.inner
+            .compute_pid_output(error_degrees, dt_seconds, measurement_degrees)
+    }
+
+    fn set_feed_forward_rate(&mut self, feed_forward_rate_deg_per_sec: f64) {
+        self.inner
+            .set_feed_forward_rate(feed_forward_rate_deg_per_sec);
+    }
+
+    fn set_feed_forward_enabled(&mut self, enabled: bool) {
+        self.inner.set_feed_forward_enabled(enabled);
+    }
+
+    fn update_gains(&mut self, p_gain: f64, i_gain: f64, d_gain: f64) {
+        self.inner.update_gains(p_gain, i_gain, d_gain);
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    #[getter]
+    fn integral_error(&self) -> f64 {
+        self.inner.integral_error
+    }
+    #[getter]
+    fn previous_error(&self) -> f64 {
+        self.inner.previous_error
+    }
+    #[getter]
+    fn current_feed_forward_rate(&self) -> f64 {
+        self.inner.current_feed_forward_rate
+    }
+    #[getter]
+    fn current_pid_output(&self) -> f64 {
+        self.inner.current_pid_output
+    }
+    #[getter]
+    fn current_position_error(&self) -> f64 {
+        self.inner.current_position_error
+    }
+}
+
 #[pymodule]
 fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -95,6 +169,7 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pack_int3, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_int3, m)?)?;
     m.add_class::<SimMount>()?;
+    m.add_class::<PidController>()?;
 
     // Device target ids, so Python can pass them without re-deriving the map.
     m.add("ANY", protocol::targets::ANY)?;

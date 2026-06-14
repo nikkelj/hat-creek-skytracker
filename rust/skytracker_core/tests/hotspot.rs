@@ -5,13 +5,13 @@
 use ndarray::Array2;
 use skytracker_core::hotspot::{detect_hotspot, pixel_offset_to_angles};
 
-/// Noiseless gaussian blob over a flat background.
-fn gaussian(w: usize, h: usize, cx: f64, cy: f64, amp: f64, sigma: f64, bg: f64) -> Array2<f64> {
-    let mut a = Array2::<f64>::zeros((h, w));
+/// Noiseless gaussian blob over a flat background (f32, like a camera frame).
+fn gaussian(w: usize, h: usize, cx: f64, cy: f64, amp: f64, sigma: f64, bg: f64) -> Array2<f32> {
+    let mut a = Array2::<f32>::zeros((h, w));
     for y in 0..h {
         for x in 0..w {
             let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
-            a[[y, x]] = bg + amp * (-(r2) / (2.0 * sigma * sigma)).exp();
+            a[[y, x]] = (bg + amp * (-(r2) / (2.0 * sigma * sigma)).exp()) as f32;
         }
     }
     a
@@ -29,13 +29,13 @@ fn centroid_near_truth() {
 #[test]
 fn flat_field_returns_none() {
     // Constant field: mad=0, std=0 -> noise=1, snr=0 < threshold -> None.
-    let img = Array2::<f64>::from_elem((200, 200), 10.0);
+    let img = Array2::<f32>::from_elem((200, 200), 10.0);
     assert!(detect_hotspot(&img.view(), None, 5.0, 12, 0.5, 3).is_none());
 }
 
 #[test]
 fn single_hot_pixel_rejected() {
-    let mut img = Array2::<f64>::from_elem((128, 128), 10.0);
+    let mut img = Array2::<f32>::from_elem((128, 128), 10.0);
     img[[64, 80]] = 5000.0;
     assert!(detect_hotspot(&img.view(), None, 5.0, 12, 0.5, 3).is_none());
 }

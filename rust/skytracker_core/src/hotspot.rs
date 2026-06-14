@@ -21,19 +21,25 @@ pub struct Detection {
     pub n_pixels: usize,
 }
 
-/// Median of a slice (numpy convention: mean of the two central values for even
-/// length). Operates on a copy; input is left unmodified.
-fn median(values: &[f64]) -> f64 {
-    let mut v: Vec<f64> = values.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+/// Median (numpy convention: mean of the two central values for even length),
+/// computed in O(n) via selection and IN PLACE (the buffer is reordered). We
+/// own the scratch buffers at the call sites, so reordering is fine — and this
+/// avoids the O(n log n) full sort that made the naive port slower than numpy.
+fn median_inplace(v: &mut [f64]) -> f64 {
     let n = v.len();
     if n == 0 {
         return 0.0;
     }
+    let mid = n / 2;
+    v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
     if n % 2 == 1 {
-        v[n / 2]
+        v[mid]
     } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
+        // After selection, v[..mid] all <= v[mid]; the (mid-1)-th order
+        // statistic is the max of that lower partition.
+        let hi = v[mid];
+        let lo = v[..mid].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        0.5 * (lo + hi)
     }
 }
 
@@ -50,7 +56,7 @@ fn std_pop(values: &[f64]) -> f64 {
 
 /// 3x3 box blur with edge replication, matching `_smooth3` (np.pad mode="edge"
 /// then 3x3 sum / 9). Edge replication == clamping the sample indices.
-fn smooth3(region: &ArrayView2<f64>) -> Vec<f64> {
+fn smooth3(region: &ArrayView2<f32>) -> Vec<f64> {
     let h = region.nrows() as isize;
     let w = region.ncols() as isize;
     let clamp = |i: isize, n: isize| -> usize { i.max(0).min(n - 1) as usize };
@@ -60,7 +66,7 @@ fn smooth3(region: &ArrayView2<f64>) -> Vec<f64> {
             let mut s = 0.0;
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    s += region[[clamp(y + dy, h), clamp(x + dx, w)]];
+                    s += region[[clamp(y + dy, h), clamp(x + dx, w)]] as f64;
                 }
             }
             out[(y * w + x) as usize] = s / 9.0;
@@ -74,7 +80,7 @@ fn smooth3(region: &ArrayView2<f64>) -> Vec<f64> {
 /// `gate`: optional (cx, cy, radius) in full-image pixels to restrict the search.
 #[allow(clippy::too_many_arguments)]
 pub fn detect_hotspot(
-    img: &ArrayView2<f64>,
+    img: &ArrayView2<f32>,
     gate: Option<(f64, f64, f64)>,
     snr_threshold: f64,
     centroid_radius: usize,
@@ -105,15 +111,17 @@ pub fn detect_hotspot(
     let region = img.slice(ndarray::s![y0..y1, x0..x1]);
     let rh = region.nrows();
     let rw = region.ncols();
-    let flat: Vec<f64> = region.iter().copied().collect();
+    // Scratch buffer (f32 -> f64). Reordered in place by the median; we don't
+    // need its order afterwards (abs-dev and std are order-independent).
+    let mut flat: Vec<f64> = region.iter().map(|&v| v as f64).collect();
     if flat.is_empty() {
         return None;
     }
 
-    // Robust background / noise (median / MAD) over the region.
-    let background = median(&flat);
-    let abs_dev: Vec<f64> = flat.iter().map(|x| (x - background).abs()).collect();
-    let mad = median(&abs_dev);
+    // Robust background / noise (median / MAD) over the region. O(n) selection.
+    let background = median_inplace(&mut flat);
+    let mut abs_dev: Vec<f64> = flat.iter().map(|x| (x - background).abs()).collect();
+    let mad = median_inplace(&mut abs_dev);
     let noise = if mad > 0.0 {
         1.4826 * mad
     } else {
@@ -137,7 +145,7 @@ pub fn detect_hotspot(
     }
     let ry = arg / rw;
     let rx = arg % rw;
-    let peak = region[[ry, rx]];
+    let peak = region[[ry, rx]] as f64;
 
     let snr = (peak - background) / noise;
     if snr < snr_threshold {
@@ -159,7 +167,7 @@ pub fn detect_hotspot(
     let mut sum_yw = 0.0_f64;
     for yy in wy0..wy1 {
         for xx in wx0..wx1 {
-            let val = region[[yy, xx]];
+            let val = region[[yy, xx]] as f64;
             if val >= thresh {
                 n += 1;
                 let weight = val - background;

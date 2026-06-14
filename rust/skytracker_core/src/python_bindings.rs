@@ -261,13 +261,12 @@ fn detect_hotspot(
     half_max_fraction: f64,
     min_pixels: usize,
 ) -> Option<Detection> {
-    let view = image.as_array();
-    let shape = view.shape();
-    let (h, w) = (shape[0], shape[1]);
-    let mut a = ndarray::Array2::<f64>::zeros((h, w));
-    for ((i, j), v) in view.indexed_iter() {
-        a[[i, j]] = *v as f64;
-    }
+    let arr = image.as_array();
+    let (h, w) = (arr.shape()[0], arr.shape()[1]);
+    // One contiguous f32 copy (decouples this crate's ndarray version from the
+    // numpy crate's and normalizes layout). Detection then works in f32.
+    let buf: Vec<f32> = arr.iter().copied().collect();
+    let view = ndarray::ArrayView2::from_shape((h, w), &buf).ok()?;
 
     let gate = match (gate_center, gate_radius) {
         (Some((gx, gy)), Some(r)) => Some((gx, gy, r)),
@@ -275,7 +274,7 @@ fn detect_hotspot(
     };
 
     core_hotspot::detect_hotspot(
-        &a.view(),
+        &view,
         gate,
         snr_threshold,
         centroid_radius,

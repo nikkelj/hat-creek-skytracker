@@ -319,13 +319,13 @@ impl LoopState {
 
         // Detect on this cycle's frame (if any).
         let detection: Option<Detection> = frame.and_then(|f| {
-            let view =
-                ndarray::ArrayView2::from_shape((f.h, f.w), f.data.as_slice()).ok()?;
-            let view64 = view.mapv(|v| v as f64);
+            // Zero-copy f32 view straight over the frame buffer (the loop's hot
+            // path — no per-cycle conversion or allocation).
+            let view = ndarray::ArrayView2::from_shape((f.h, f.w), f.data.as_slice()).ok()?;
             let gate = self
                 .hotspot_gate_center
                 .map(|(cx, cy)| (cx, cy, hp.gate_radius));
-            hotspot::detect_hotspot(&view64.view(), gate, hp.snr_threshold, 12, 0.5, 3)
+            hotspot::detect_hotspot(&view, gate, hp.snr_threshold, 12, 0.5, 3)
         });
 
         if let Some(det) = detection {

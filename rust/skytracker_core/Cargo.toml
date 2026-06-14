@@ -17,9 +17,11 @@ crate-type = ["cdylib", "rlib"]
 # protocol/sim/pid/hotspot logic tests run without a Python interpreter.
 pyo3 = { version = "0.22", optional = true }
 numpy = { version = "0.22", optional = true }
+# serialport backs the real hardware Transport; only needed for the extension.
+serialport = { version = "4.5", optional = true }
 # ndarray is used by the pure-Rust hotspot core, so it is a default dependency.
 ndarray = "0.16"
 
 [features]
 default = []
-extension-module = ["dep:pyo3", "dep:numpy", "pyo3/extension-module"]
+extension-module = ["dep:pyo3", "dep:numpy", "dep:serialport", "pyo3/extension-module"]

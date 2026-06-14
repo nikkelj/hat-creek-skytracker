@@ -241,6 +241,10 @@ impl CoreLoop {
 
 impl Drop for CoreLoop {
     fn drop(&mut self) {
-        self.stop();
+        // Signal stop but do NOT join here. When the transport is the Python
+        // mount bridge, the loop thread needs the GIL to finish its cycle;
+        // joining while the GIL is held (e.g. during GC) would deadlock.
+        // Explicit `stop()` joins with the GIL released (see the PyO3 wrapper).
+        self.shared.stop.store(true, Ordering::Relaxed);
     }
 }

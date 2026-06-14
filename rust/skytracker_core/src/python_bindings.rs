@@ -15,12 +15,13 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-use crate::controller::{Frame, Inputs, LoopState, Mode, Setpoint};
-use crate::core_loop::{run_cycle, Command, Shared};
+use crate::controller::{Frame, HotspotParams, Inputs, LoopState, Mode, Setpoint};
+use crate::core_loop::{run_cycle, Command, CoreLoop as ThreadedLoop, Shared};
 use crate::hotspot as core_hotspot;
 use crate::pid::PidController as CorePid;
 use crate::protocol;
-use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder};
+use crate::serial::SerialTransport;
+use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder, Transport};
 use crate::transforms::{self as core_tf, MountMode};
 
 fn parse_mode(s: &str) -> PyResult<Mode> {
@@ -585,6 +586,334 @@ impl SimCoreLoop {
     }
 }
 
+// --- shared input/output helpers (used by both SimCoreLoop and CoreLoop) ---
+
+fn h_set_connected(sh: &Shared, v: bool) {
+    sh.inputs.lock().unwrap().connected = v;
+}
+fn h_set_stopped(sh: &Shared, v: bool) {
+    sh.inputs.lock().unwrap().stopped = v;
+}
+fn h_set_mode(sh: &Shared, s: &str) -> PyResult<()> {
+    sh.inputs.lock().unwrap().mode = parse_mode(s)?;
+    Ok(())
+}
+fn h_set_gains(sh: &Shared, ap: f64, ai: f64, ad: f64, lp: f64, li: f64, ld: f64) {
+    let mut i = sh.inputs.lock().unwrap();
+    i.azm_gains = (ap, ai, ad);
+    i.alt_gains = (lp, li, ld);
+}
+fn h_set_limits(sh: &Shared, amin: f64, amax: f64, lmin: f64, lmax: f64) {
+    let mut i = sh.inputs.lock().unwrap();
+    i.azm_limit = (amin, amax);
+    i.alt_limit = (lmin, lmax);
+}
+fn h_set_offsets(sh: &Shared, azm: f64, alt: f64) {
+    sh.inputs.lock().unwrap().offsets = (azm, alt);
+}
+fn h_set_rate_cmd(sh: &Shared, azm: i32, alt: i32) {
+    sh.inputs.lock().unwrap().rate_cmd = (azm, alt);
+}
+fn h_set_mount_mode(sh: &Shared, s: &str) -> PyResult<()> {
+    sh.inputs.lock().unwrap().mount_mode = parse_mount_mode(s)?;
+    Ok(())
+}
+fn h_set_alignment(sh: &Shared, az: f64, el: f64) {
+    let mut i = sh.inputs.lock().unwrap();
+    i.alignment_az = az;
+    i.alignment_el = el;
+}
+fn h_set_setpoint(sh: &Shared, az: f64, el: f64, ff_az: f64, ff_el: f64) {
+    sh.inputs.lock().unwrap().setpoint = Some(Setpoint {
+        az_deg: az,
+        el_deg: el,
+        ff_az_dps: ff_az,
+        ff_el_dps: ff_el,
+    });
+}
+fn h_clear_setpoint(sh: &Shared) {
+    sh.inputs.lock().unwrap().setpoint = None;
+}
+fn h_set_ff_enabled(sh: &Shared, azm: bool, alt: bool) {
+    let mut i = sh.inputs.lock().unwrap();
+    i.ff_azm_enabled = azm;
+    i.ff_alt_enabled = alt;
+}
+#[allow(clippy::too_many_arguments)]
+fn h_set_hotspot_params(
+    sh: &Shared,
+    snr: f64,
+    gate: f64,
+    coast: f64,
+    xs: f64,
+    ys: f64,
+    px: f64,
+    fl: f64,
+    rot: f64,
+) {
+    sh.inputs.lock().unwrap().hotspot = HotspotParams {
+        snr_threshold: snr,
+        gate_radius: gate,
+        coast_time_s: coast,
+        x_sign: xs,
+        y_sign: ys,
+        pixel_size_um: px,
+        focal_length_mm: fl,
+        rotation_deg: rot,
+    };
+}
+fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>) {
+    let view = image.as_array();
+    let (h, w) = (view.shape()[0], view.shape()[1]);
+    let mut data = Vec::with_capacity(h * w);
+    for i in 0..h {
+        for j in 0..w {
+            data.push(view[[i, j]]);
+        }
+    }
+    *sh.frame.lock().unwrap() = Some(Arc::new(Frame {
+        data: Arc::new(data),
+        h,
+        w,
+        seq,
+    }));
+}
+fn h_submit(sh: &Shared, cmd: Command) {
+    sh.commands.lock().unwrap().push_back(cmd);
+}
+fn h_drain_status(sh: &Shared) -> Vec<String> {
+    std::mem::take(&mut sh.outputs.lock().unwrap().status_msgs)
+}
+fn h_snapshot<'py>(py: Python<'py>, sh: &Shared) -> Bound<'py, PyDict> {
+    let o = sh.outputs.lock().unwrap();
+    let d = PyDict::new_bound(py);
+    let _ = d.set_item("azm", o.azm);
+    let _ = d.set_item("alt", o.alt);
+    let _ = d.set_item("azm_raw", o.azm_raw);
+    let _ = d.set_item("alt_raw", o.alt_raw);
+    let _ = d.set_item("fresh", o.fresh);
+    let _ = d.set_item("azm_error", o.azm_error);
+    let _ = d.set_item("alt_error", o.alt_error);
+    let _ = d.set_item("azm_rate_cmd", o.azm_rate_cmd);
+    let _ = d.set_item("alt_rate_cmd", o.alt_rate_cmd);
+    let _ = d.set_item("azm_pid_output", o.azm_pid_output);
+    let _ = d.set_item("alt_pid_output", o.alt_pid_output);
+    let _ = d.set_item("hotspot_acquired", o.hotspot_acquired);
+    let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
+    let _ = d.set_item("hotspot_snr", o.hotspot_snr);
+    let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+    let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
+    let _ = d.set_item("status_msgs", o.status_msgs.clone());
+    let _ = d.set_item("actual_hz", o.actual_hz);
+    let _ = d.set_item("cycle_ms", o.cycle_ms);
+    d
+}
+
+/// Transport that bridges to a Python mount object (e.g. simulator.SimMount):
+/// decodes each 8-byte 'P' request and calls the object's `hc_*` methods,
+/// encoding the reply. Lets the Rust loop drive the existing HW simulator for
+/// in-UI validation. Acquires the GIL per call (acceptable in sim mode); the
+/// real hardware path uses `SerialTransport` and never touches Python.
+struct PyMountTransport {
+    mount: Py<PyAny>,
+    azm: Py<PyAny>,
+    alt: Py<PyAny>,
+    focus: Py<PyAny>,
+    pending: std::collections::VecDeque<u8>,
+}
+
+impl PyMountTransport {
+    fn new(py: Python<'_>, mount: Py<PyAny>) -> PyResult<Self> {
+        let targets = py.import_bound("lib.auxstar")?.getattr("Targets")?;
+        Ok(PyMountTransport {
+            mount,
+            azm: targets.getattr("AZM")?.unbind(),
+            alt: targets.getattr("ALT")?.unbind(),
+            focus: targets.getattr("FOCUS")?.unbind(),
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+}
+
+impl Transport for PyMountTransport {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        if data.len() < 8 || data[0] != 0x50 {
+            return Ok(());
+        }
+        let dest = data[2];
+        let msg_id = data[3];
+        let d = [data[4], data[5], data[6]];
+        let resp_len = data[7] as usize;
+
+        let resp: Vec<u8> = Python::with_gil(|py| {
+            let mount = self.mount.bind(py);
+            let target = match dest {
+                0x11 => self.alt.bind(py),
+                0x12 => self.focus.bind(py),
+                _ => self.azm.bind(py),
+            };
+            if msg_id == protocol::MC_GET_POSITION.0 {
+                let frac: f64 = mount
+                    .call_method1("hc_get_position", (target,))
+                    .and_then(|r| r.extract())
+                    .unwrap_or(0.0);
+                let mut v = protocol::pack_int3(frac).to_vec();
+                v.push(b'#');
+                v
+            } else if msg_id == protocol::MC_MOVE_POS.0 || msg_id == protocol::MC_MOVE_NEG.0 {
+                let sign = if msg_id == protocol::MC_MOVE_POS.0 { 1 } else { -1 };
+                let rate = sign * (d[0] as i32);
+                let _ = mount.call_method1("hc_slew_fixed", (target, rate));
+                vec![b'#']
+            } else if msg_id == protocol::MC_GOTO_FAST.0 {
+                let deg = protocol::unpack_int3(&d) * 360.0;
+                let _ = mount.call_method1("hc_goto_fast", (target, deg, 0.0_f64, 0.0_f64));
+                vec![b'#']
+            } else {
+                let mut v = vec![0u8; resp_len];
+                v.push(b'#');
+                v
+            }
+        });
+        self.pending.extend(resp);
+        Ok(())
+    }
+
+    fn read(&mut self, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            match self.pending.pop_front() {
+                Some(b) => out.push(b),
+                None => break,
+            }
+        }
+        out
+    }
+}
+
+/// Threaded control loop for real use: owns a background thread driving either a
+/// serial port (`open_serial`) or a Python mount object (`wrap_mount`, for the
+/// HW simulator). Same push/snapshot surface as `SimCoreLoop`.
+#[pyclass]
+struct CoreLoop {
+    inner: ThreadedLoop,
+    frame_seq: u64,
+}
+
+#[pymethods]
+impl CoreLoop {
+    #[staticmethod]
+    #[pyo3(signature = (port, target_hz = 15.0))]
+    fn open_serial(port: &str, target_hz: f64) -> PyResult<Self> {
+        let st = SerialTransport::open(port, 9600, 250)
+            .map_err(|e| PyIOError::new_err(format!("open {port}: {e}")))?;
+        let boxed: Box<dyn Transport + Send> = Box::new(st);
+        let mut inputs = Inputs::default();
+        inputs.connected = true;
+        let shared = Shared::new(inputs);
+        let inner = ThreadedLoop::spawn(Mount::new(boxed), shared, target_hz);
+        Ok(CoreLoop { inner, frame_seq: 0 })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (mount, target_hz = 15.0))]
+    fn wrap_mount(py: Python<'_>, mount: Py<PyAny>, target_hz: f64) -> PyResult<Self> {
+        let pt = PyMountTransport::new(py, mount)?;
+        let boxed: Box<dyn Transport + Send> = Box::new(pt);
+        let mut inputs = Inputs::default();
+        inputs.connected = true;
+        let shared = Shared::new(inputs);
+        let inner = ThreadedLoop::spawn(Mount::new(boxed), shared, target_hz);
+        Ok(CoreLoop { inner, frame_seq: 0 })
+    }
+
+    fn set_connected(&self, v: bool) {
+        h_set_connected(self.inner.shared(), v);
+    }
+    fn set_stopped(&self, v: bool) {
+        h_set_stopped(self.inner.shared(), v);
+    }
+    fn set_mode(&self, mode: &str) -> PyResult<()> {
+        h_set_mode(self.inner.shared(), mode)
+    }
+    fn set_gains(&self, ap: f64, ai: f64, ad: f64, lp: f64, li: f64, ld: f64) {
+        h_set_gains(self.inner.shared(), ap, ai, ad, lp, li, ld);
+    }
+    fn set_limits(&self, amin: f64, amax: f64, lmin: f64, lmax: f64) {
+        h_set_limits(self.inner.shared(), amin, amax, lmin, lmax);
+    }
+    fn set_offsets(&self, azm: f64, alt: f64) {
+        h_set_offsets(self.inner.shared(), azm, alt);
+    }
+    fn set_rate_cmd(&self, azm: i32, alt: i32) {
+        h_set_rate_cmd(self.inner.shared(), azm, alt);
+    }
+    fn set_mount_mode(&self, mode: &str) -> PyResult<()> {
+        h_set_mount_mode(self.inner.shared(), mode)
+    }
+    fn set_alignment(&self, az: f64, el: f64) {
+        h_set_alignment(self.inner.shared(), az, el);
+    }
+    #[pyo3(signature = (az_deg, el_deg, ff_az_dps = 0.0, ff_el_dps = 0.0))]
+    fn set_setpoint(&self, az_deg: f64, el_deg: f64, ff_az_dps: f64, ff_el_dps: f64) {
+        h_set_setpoint(self.inner.shared(), az_deg, el_deg, ff_az_dps, ff_el_dps);
+    }
+    fn clear_setpoint(&self) {
+        h_clear_setpoint(self.inner.shared());
+    }
+    fn set_ff_enabled(&self, azm: bool, alt: bool) {
+        h_set_ff_enabled(self.inner.shared(), azm, alt);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn set_hotspot_params(
+        &self,
+        snr_threshold: f64,
+        gate_radius: f64,
+        coast_time_s: f64,
+        x_sign: f64,
+        y_sign: f64,
+        pixel_size_um: f64,
+        focal_length_mm: f64,
+        rotation_deg: f64,
+    ) {
+        h_set_hotspot_params(
+            self.inner.shared(),
+            snr_threshold,
+            gate_radius,
+            coast_time_s,
+            x_sign,
+            y_sign,
+            pixel_size_um,
+            focal_length_mm,
+            rotation_deg,
+        );
+    }
+    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
+        self.frame_seq += 1;
+        h_push_frame(self.inner.shared(), self.frame_seq, image);
+    }
+    fn submit_stop(&self) {
+        h_submit(self.inner.shared(), Command::Stop);
+    }
+    fn submit_slew(&self, azm: i32, alt: i32) {
+        h_submit(self.inner.shared(), Command::Slew { azm, alt });
+    }
+    fn submit_goto(&self, azm_deg: f64, alt_deg: f64) {
+        h_submit(self.inner.shared(), Command::GotoMount { azm_deg, alt_deg });
+    }
+    fn snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        h_snapshot(py, self.inner.shared())
+    }
+    fn drain_status(&self) -> Vec<String> {
+        h_drain_status(self.inner.shared())
+    }
+    /// Stop the loop thread. Releases the GIL during the join so a Python-mount
+    /// bridge loop (which needs the GIL each cycle) can't deadlock.
+    fn stop(&mut self, py: Python<'_>) {
+        py.allow_threads(|| self.inner.stop());
+    }
+}
+
 #[pymodule]
 fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -610,6 +939,7 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PidController>()?;
     m.add_class::<Detection>()?;
     m.add_class::<SimCoreLoop>()?;
+    m.add_class::<CoreLoop>()?;
 
     // Device target ids, so Python can pass them without re-deriving the map.
     m.add("ANY", protocol::targets::ANY)?;

@@ -33,12 +33,24 @@ impl std::fmt::Display for MountError {
 }
 impl std::error::Error for MountError {}
 
-/// Anything that can carry a NexStar transaction (a real serial port, or the
-/// in-memory loopback below).
+/// Anything that can carry a NexStar transaction (a real serial port, the
+/// in-memory loopback below, or a bridge to a Python mount object).
 pub trait Transport {
     fn write(&mut self, data: &[u8]) -> std::io::Result<()>;
     /// Return up to `n` bytes. Fewer than `n` signals a short/timed-out read.
     fn read(&mut self, n: usize) -> Vec<u8>;
+}
+
+/// Lets `Mount<Box<dyn Transport + Send>>` hold any transport behind a trait
+/// object, so a single loop type can drive a real serial port OR a Python
+/// sim-mount bridge chosen at runtime.
+impl Transport for Box<dyn Transport + Send> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        (**self).write(data)
+    }
+    fn read(&mut self, n: usize) -> Vec<u8> {
+        (**self).read(n)
+    }
 }
 
 /// High-level mount API over any transport. Mirrors the used subset of

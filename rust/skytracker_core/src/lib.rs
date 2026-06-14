@@ -10,6 +10,8 @@ pub mod core_loop;
 pub mod hotspot;
 pub mod pid;
 pub mod protocol;
+#[cfg(feature = "extension-module")]
+pub mod serial;
 pub mod sim;
 pub mod transforms;
 

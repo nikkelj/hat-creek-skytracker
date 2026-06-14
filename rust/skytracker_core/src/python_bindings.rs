@@ -4,6 +4,10 @@
 //! class that wraps `Mount<LoopbackTransport>` and matches the method-level API
 //! of `simulator.SimMount`, so it can later be swapped into the control loop.
 
+// Several exported functions deliberately mirror the Python API names
+// (AzAlt2AzEl, etc.) so they are drop-in from Python.
+#![allow(non_snake_case)]
+
 use numpy::PyReadonlyArray2;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
@@ -13,6 +17,7 @@ use crate::hotspot as core_hotspot;
 use crate::pid::PidController as CorePid;
 use crate::protocol;
 use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder};
+use crate::transforms as core_tf;
 
 fn to_pyerr(e: MountError) -> PyErr {
     PyIOError::new_err(e.to_string())
@@ -286,6 +291,67 @@ fn pixel_offset_to_angles(
     )
 }
 
+// --- coordinate transforms (port of transformations.py) ---
+
+#[pyfunction]
+fn cartesian_from_az_el(az_deg: f64, el_deg: f64) -> (f64, f64, f64) {
+    let v = core_tf::cartesian_from_az_el(az_deg, el_deg);
+    (v[0], v[1], v[2])
+}
+
+#[pyfunction]
+fn az_el_from_cartesian(x: f64, y: f64, z: f64) -> (f64, f64) {
+    core_tf::az_el_from_cartesian(&[x, y, z])
+}
+
+#[pyfunction]
+fn AzAlt2AzEl(azm: f64, alt: f64, alignment_azimuth: f64, alignment_elevation: f64) -> (f64, f64) {
+    core_tf::az_alt_to_az_el(azm, alt, alignment_azimuth, alignment_elevation)
+}
+
+#[pyfunction]
+fn apply_rotation_to_az_el(az: f64, el: f64, rotation_angle: f64) -> (f64, f64) {
+    core_tf::apply_rotation_to_az_el(az, el, rotation_angle)
+}
+
+#[pyfunction]
+fn AzAlt2AzEl_AltAz(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
+    core_tf::az_alt_to_az_el_altaz(azm, alt, alignment_azimuth)
+}
+
+#[pyfunction]
+fn AzEl2AzAlt_AltAz(az: f64, el: f64, alignment_azimuth: f64, alignment_elevation: f64) -> (f64, f64) {
+    core_tf::az_el_to_az_alt_altaz(az, el, alignment_azimuth, alignment_elevation)
+}
+
+#[pyfunction]
+fn AzAlt2AzEl_Passthrough(azm: f64, alt: f64) -> (f64, f64) {
+    core_tf::az_alt_to_az_el_passthrough(azm, alt)
+}
+
+#[pyfunction]
+fn AzEl2AzAlt_Passthrough(az: f64, el: f64) -> (f64, f64) {
+    core_tf::az_el_to_az_alt_passthrough(az, el)
+}
+
+#[pyfunction]
+#[pyo3(signature = (alt_tel_deg, az_tel_deg, lat_deg = 45.0))]
+fn telescope_to_local_elev_az(alt_tel_deg: f64, az_tel_deg: f64, lat_deg: f64) -> (f64, f64) {
+    core_tf::telescope_to_local_elev_az(alt_tel_deg, az_tel_deg, lat_deg)
+}
+
+#[pyfunction]
+#[pyo3(signature = (el_local_deg, az_local_deg, lat_deg = 45.0))]
+fn local_elev_az_to_telescope(el_local_deg: f64, az_local_deg: f64, lat_deg: f64) -> (f64, f64) {
+    core_tf::local_elev_az_to_telescope(el_local_deg, az_local_deg, lat_deg)
+}
+
+#[pyfunction]
+#[pyo3(signature = (el_deg, az_deg, lat_deg = 45.0, lst_hours = 17.89))]
+fn altaz_local_to_radec(el_deg: f64, az_deg: f64, lat_deg: f64, lst_hours: f64) -> (f64, f64) {
+    core_tf::altaz_local_to_radec(el_deg, az_deg, lat_deg, lst_hours)
+}
+
 #[pymodule]
 fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -296,6 +362,17 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(unpack_int3, m)?)?;
     m.add_function(wrap_pyfunction!(detect_hotspot, m)?)?;
     m.add_function(wrap_pyfunction!(pixel_offset_to_angles, m)?)?;
+    m.add_function(wrap_pyfunction!(cartesian_from_az_el, m)?)?;
+    m.add_function(wrap_pyfunction!(az_el_from_cartesian, m)?)?;
+    m.add_function(wrap_pyfunction!(AzAlt2AzEl, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_rotation_to_az_el, m)?)?;
+    m.add_function(wrap_pyfunction!(AzAlt2AzEl_AltAz, m)?)?;
+    m.add_function(wrap_pyfunction!(AzEl2AzAlt_AltAz, m)?)?;
+    m.add_function(wrap_pyfunction!(AzAlt2AzEl_Passthrough, m)?)?;
+    m.add_function(wrap_pyfunction!(AzEl2AzAlt_Passthrough, m)?)?;
+    m.add_function(wrap_pyfunction!(telescope_to_local_elev_az, m)?)?;
+    m.add_function(wrap_pyfunction!(local_elev_az_to_telescope, m)?)?;
+    m.add_function(wrap_pyfunction!(altaz_local_to_radec, m)?)?;
     m.add_class::<SimMount>()?;
     m.add_class::<PidController>()?;
     m.add_class::<Detection>()?;

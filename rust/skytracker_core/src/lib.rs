@@ -9,6 +9,7 @@ pub mod hotspot;
 pub mod pid;
 pub mod protocol;
 pub mod sim;
+pub mod transforms;
 
 #[cfg(feature = "extension-module")]
 mod python_bindings;

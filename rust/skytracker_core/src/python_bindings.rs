@@ -8,16 +8,56 @@
 // (AzAlt2AzEl, etc.) so they are drop-in from Python.
 #![allow(non_snake_case)]
 
+use std::sync::Arc;
+
 use numpy::PyReadonlyArray2;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
+use crate::controller::{Frame, Inputs, LoopState, Mode, Setpoint};
+use crate::core_loop::{run_cycle, Command, Shared};
 use crate::hotspot as core_hotspot;
 use crate::pid::PidController as CorePid;
 use crate::protocol;
 use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder};
-use crate::transforms as core_tf;
+use crate::transforms::{self as core_tf, MountMode};
+
+fn parse_mode(s: &str) -> PyResult<Mode> {
+    match s.to_ascii_lowercase().as_str() {
+        "standby" => Ok(Mode::Standby),
+        "rate" | "rate_control" => Ok(Mode::Rate),
+        "program" => Ok(Mode::Program),
+        "handoff" => Ok(Mode::Handoff),
+        "hotspot" => Ok(Mode::Hotspot),
+        "mti" => Ok(Mode::Mti),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown mode: {other}"
+        ))),
+    }
+}
+
+fn mode_str(m: Mode) -> &'static str {
+    match m {
+        Mode::Standby => "standby",
+        Mode::Rate => "rate",
+        Mode::Program => "program",
+        Mode::Handoff => "handoff",
+        Mode::Hotspot => "hotspot",
+        Mode::Mti => "mti",
+    }
+}
+
+fn parse_mount_mode(s: &str) -> PyResult<MountMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "altaz" => Ok(MountMode::AltAz),
+        "passthrough" => Ok(MountMode::Passthrough),
+        "eq" => Ok(MountMode::Eq),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown mount mode: {other}"
+        ))),
+    }
+}
 
 fn to_pyerr(e: MountError) -> PyErr {
     PyIOError::new_err(e.to_string())
@@ -352,6 +392,199 @@ fn altaz_local_to_radec(el_deg: f64, az_deg: f64, lat_deg: f64, lst_hours: f64) 
     core_tf::altaz_local_to_radec(el_deg, az_deg, lat_deg, lst_hours)
 }
 
+/// Deterministic, sim-backed control loop for driving/validating the loop from
+/// Python with no hardware. Wraps `Mount<LoopbackTransport>` (the byte-level
+/// sim) + `LoopState`; Python pushes inputs/frames via setters and advances the
+/// loop with `step(dt)`, exactly mirroring how the real threaded loop is fed.
+///
+/// The real hardware loop (serial transport + background thread) is the same
+/// `core_loop::CoreLoop` already validated in Rust; this class exposes the
+/// message-passing surface from Python.
+#[pyclass]
+struct SimCoreLoop {
+    mount: Mount<LoopbackTransport>,
+    state: LoopState,
+    shared: Arc<Shared>,
+    now: f64,
+    frame_seq: u64,
+}
+
+#[pymethods]
+impl SimCoreLoop {
+    #[new]
+    #[pyo3(signature = (az0_deg = 0.0, el0_deg = 0.0))]
+    fn new(az0_deg: f64, el0_deg: f64) -> Self {
+        let mut inputs = Inputs::default();
+        inputs.connected = true;
+        SimCoreLoop {
+            mount: Mount::new(LoopbackTransport::new(SimResponder::new_manual(az0_deg, el0_deg))),
+            state: LoopState::new(),
+            shared: Shared::new(inputs),
+            now: 0.0,
+            frame_seq: 0,
+        }
+    }
+
+    fn set_connected(&self, v: bool) {
+        self.shared.inputs.lock().unwrap().connected = v;
+    }
+    fn set_stopped(&self, v: bool) {
+        self.shared.inputs.lock().unwrap().stopped = v;
+    }
+    fn set_mode(&self, mode: &str) -> PyResult<()> {
+        self.shared.inputs.lock().unwrap().mode = parse_mode(mode)?;
+        Ok(())
+    }
+    fn set_gains(&self, azm_p: f64, azm_i: f64, azm_d: f64, alt_p: f64, alt_i: f64, alt_d: f64) {
+        let mut i = self.shared.inputs.lock().unwrap();
+        i.azm_gains = (azm_p, azm_i, azm_d);
+        i.alt_gains = (alt_p, alt_i, alt_d);
+    }
+    fn set_limits(&self, azm_min: f64, azm_max: f64, alt_min: f64, alt_max: f64) {
+        let mut i = self.shared.inputs.lock().unwrap();
+        i.azm_limit = (azm_min, azm_max);
+        i.alt_limit = (alt_min, alt_max);
+    }
+    fn set_offsets(&self, azm: f64, alt: f64) {
+        self.shared.inputs.lock().unwrap().offsets = (azm, alt);
+    }
+    fn set_rate_cmd(&self, azm: i32, alt: i32) {
+        self.shared.inputs.lock().unwrap().rate_cmd = (azm, alt);
+    }
+    fn set_mount_mode(&self, mode: &str) -> PyResult<()> {
+        self.shared.inputs.lock().unwrap().mount_mode = parse_mount_mode(mode)?;
+        Ok(())
+    }
+    fn set_alignment(&self, az: f64, el: f64) {
+        let mut i = self.shared.inputs.lock().unwrap();
+        i.alignment_az = az;
+        i.alignment_el = el;
+    }
+    #[pyo3(signature = (az_deg, el_deg, ff_az_dps = 0.0, ff_el_dps = 0.0))]
+    fn set_setpoint(&self, az_deg: f64, el_deg: f64, ff_az_dps: f64, ff_el_dps: f64) {
+        self.shared.inputs.lock().unwrap().setpoint = Some(Setpoint {
+            az_deg,
+            el_deg,
+            ff_az_dps,
+            ff_el_dps,
+        });
+    }
+    fn clear_setpoint(&self) {
+        self.shared.inputs.lock().unwrap().setpoint = None;
+    }
+    fn set_ff_enabled(&self, azm: bool, alt: bool) {
+        let mut i = self.shared.inputs.lock().unwrap();
+        i.ff_azm_enabled = azm;
+        i.ff_alt_enabled = alt;
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn set_hotspot_params(
+        &self,
+        snr_threshold: f64,
+        gate_radius: f64,
+        coast_time_s: f64,
+        x_sign: f64,
+        y_sign: f64,
+        pixel_size_um: f64,
+        focal_length_mm: f64,
+        rotation_deg: f64,
+    ) {
+        self.shared.inputs.lock().unwrap().hotspot = crate::controller::HotspotParams {
+            snr_threshold,
+            gate_radius,
+            coast_time_s,
+            x_sign,
+            y_sign,
+            pixel_size_um,
+            focal_length_mm,
+            rotation_deg,
+        };
+    }
+
+    /// Publish a frame (2D float32 intensity map) for HOTSPOT mode.
+    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
+        let view = image.as_array();
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        let mut data = Vec::with_capacity(h * w);
+        for i in 0..h {
+            for j in 0..w {
+                data.push(view[[i, j]]);
+            }
+        }
+        self.frame_seq += 1;
+        *self.shared.frame.lock().unwrap() = Some(Arc::new(Frame {
+            data: Arc::new(data),
+            h,
+            w,
+            seq: self.frame_seq,
+        }));
+    }
+
+    fn submit_stop(&self) {
+        self.shared.commands.lock().unwrap().push_back(Command::Stop);
+    }
+    fn submit_slew(&self, azm: i32, alt: i32) {
+        self.shared
+            .commands
+            .lock()
+            .unwrap()
+            .push_back(Command::Slew { azm, alt });
+    }
+    fn submit_goto(&self, azm_deg: f64, alt_deg: f64) {
+        self.shared
+            .commands
+            .lock()
+            .unwrap()
+            .push_back(Command::GotoMount { azm_deg, alt_deg });
+    }
+
+    /// Advance the simulated clock by `dt` seconds and run one control cycle.
+    fn step(&mut self, dt: f64) {
+        self.now += dt;
+        self.mount.io.responder.advance_time(dt);
+        run_cycle(&mut self.mount, &mut self.state, &self.shared, self.now);
+    }
+
+    /// True simulated pointing (for test inspection).
+    #[getter]
+    fn az_true_deg(&self) -> f64 {
+        self.mount.io.responder.az_true_deg
+    }
+    #[getter]
+    fn el_true_deg(&self) -> f64 {
+        self.mount.io.responder.el_true_deg
+    }
+
+    /// Current output snapshot as a dict (the UI's read surface).
+    fn snapshot<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        let o = self.shared.outputs.lock().unwrap();
+        let d = PyDict::new_bound(py);
+        let _ = d.set_item("azm", o.azm);
+        let _ = d.set_item("alt", o.alt);
+        let _ = d.set_item("azm_raw", o.azm_raw);
+        let _ = d.set_item("alt_raw", o.alt_raw);
+        let _ = d.set_item("fresh", o.fresh);
+        let _ = d.set_item("azm_error", o.azm_error);
+        let _ = d.set_item("alt_error", o.alt_error);
+        let _ = d.set_item("azm_rate_cmd", o.azm_rate_cmd);
+        let _ = d.set_item("alt_rate_cmd", o.alt_rate_cmd);
+        let _ = d.set_item("azm_pid_output", o.azm_pid_output);
+        let _ = d.set_item("alt_pid_output", o.alt_pid_output);
+        let _ = d.set_item("hotspot_acquired", o.hotspot_acquired);
+        let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
+        let _ = d.set_item("hotspot_snr", o.hotspot_snr);
+        let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+        let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
+        let _ = d.set_item("status_msgs", o.status_msgs.clone());
+        d
+    }
+
+    /// Drain and return the accumulated status messages.
+    fn drain_status(&self) -> Vec<String> {
+        std::mem::take(&mut self.shared.outputs.lock().unwrap().status_msgs)
+    }
+}
+
 #[pymodule]
 fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -376,6 +609,7 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SimMount>()?;
     m.add_class::<PidController>()?;
     m.add_class::<Detection>()?;
+    m.add_class::<SimCoreLoop>()?;
 
     // Device target ids, so Python can pass them without re-deriving the map.
     m.add("ANY", protocol::targets::ANY)?;

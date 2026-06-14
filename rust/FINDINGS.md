@@ -32,6 +32,7 @@ that owns hardware.
 |------|--------|-----------|--------------|
 | 1 | NexStar `Mount` protocol (`lib/auxstar.py`) | `protocol.rs`, `sim.rs` | golden bytes + **byte-identical** to `NexstarHandController` wire output; byte-level `SimResponder` closes a slew→position loop |
 | 2 | `PidController` (`control.py`) | `pid.rs` | 9 mirrored unit tests + **step-for-step** parity over 400 cycles × 6 configs (output to 1e-9, discrete rate exact) |
+| 3 | Hotspot detection + geometry (`hotspot.py`) | `hotspot.rs` | 8 mirrored unit tests + **sub-pixel** parity (<0.05px) with the real numpy detector across noisy/color/gated frames; geometry to 1e-9. Crosses image data zero-copy via `PyReadonlyArray2`. |
 
 Both also added a capability the Python side lacked: a **byte-level** simulated
 mount. The Python `SimMount` duck-types the controller at the method level and
@@ -46,6 +47,10 @@ can, which makes the port testable end-to-end with no hardware.
 - **The FFI seam is comfortable.** PyO3 + maturin build cleanly against Anaconda
   CPython 3.11 (MSVC toolchain — no ABI friction). Scalars, bytes, and small
   classes cross the boundary with no ceremony.
+- **The numpy boundary works (step 3).** Image frames cross zero-copy via
+  `PyReadonlyArray2`; the Rust detector matches numpy to sub-pixel accuracy. The
+  remaining float32-vs-f64 reduction differences are negligible (<0.05px) and
+  could be eliminated entirely by reducing in f32 if ever needed.
 - **`cargo test` stays Python-free.** pyo3 is an optional dependency gated behind
   the `extension-module` feature, so pure-Rust logic tests run without an
   interpreter; the cross-language tests skip cleanly if the wheel isn't built.
@@ -59,9 +64,6 @@ lives on a branch.
 
 ## Open questions / what's NOT yet proven
 
-- **The numpy boundary (step 3).** `hotspot.py` is the first port that moves
-  image data across the FFI (zero-copy `PyReadonlyArray`). Different dimension
-  of risk than scalars.
 - **The loop refactor (step 4) is the real cost.** Porting `mount_control.py`'s
   loop means converting `tracking_control()`'s shared-mutable-`state` access
   into explicit command/snapshot message-passing. That's design work, not

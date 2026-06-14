@@ -1,0 +1,22 @@
+[package]
+name = "skytracker_core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core for the Hat Creek Skytracker (experiment: Rust-core / Python-shell split)"
+license = "MIT"
+
+[lib]
+name = "skytracker_core"
+# cdylib: the Python extension module (built by maturin).
+# rlib:   so `cargo test` can exercise the pure-Rust protocol/sim modules.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# pyo3 is OPTIONAL and only pulled in for the extension-module build. This keeps
+# `cargo test` pure Rust with zero libpython linkage, so the protocol/sim unit
+# tests run without a Python interpreter present.
+pyo3 = { version = "0.22", optional = true }
+
+[features]
+default = []
+extension-module = ["dep:pyo3", "pyo3/extension-module"]

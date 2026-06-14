@@ -35,6 +35,10 @@ class ConfigState:
         self.pid_alt_i_gain = 0.0
         self.pid_alt_d_gain = 0.0
 
+        # Seconds to lead the trajectory target by, compensating read/command
+        # transport latency. 0 disables leading. Tune on hardware.
+        self.pid_lead_time_sec = 0.0
+
         # Feed-forward configuration
         self.feed_forward_azm_enabled = False
         self.feed_forward_alt_enabled = False
@@ -43,6 +47,34 @@ class ConfigState:
         self.bias_azm_deg = 0.0  # Bias in azimuth direction (degrees)
         self.bias_alt_deg = 0.0  # Bias in elevation direction (degrees)
         self.bias_control_mode = "coarse"  # "coarse" or "fine" movement mode
+
+        # Hotspot (closed-loop optical) tracker configuration
+        self.hotspot_camera_index = 0       # which camera feeds the loop (0 = finder/wide)
+        self.hotspot_snr_threshold = 5.0    # min (peak-bg)/noise to accept a detection
+        self.hotspot_gate_radius = 120      # tracking-gate half-size in pixels once locked
+        self.hotspot_coast_time_sec = 1.0   # coast this long on loss before falling back
+        self.hotspot_x_sign = 1.0           # per-axis sign calibration (set on hardware)
+        self.hotspot_y_sign = -1.0
+
+        # Hardware simulator configuration (mount + camera sim). enabled=False
+        # leaves all real-hardware behavior unchanged.
+        self.sim_config = {
+            "enabled": False,
+            "cam_width": 960,            # sim sensor resolution (px)
+            "cam_height": 720,
+            "mount_misalignment_az_deg": 0.0,   # encoder bias vs true sky
+            "mount_misalignment_el_deg": 0.0,
+            "mount_encoder_noise_deg": 0.0,     # per-read uniform noise bound
+            "mount_rate_noise_dps": 0.0,        # slew rate jitter (1-sigma)
+            "cam2_offset_rotation_deg": 0.0,    # inter-camera misalignment
+            "cam2_offset_x_px": 0.0,
+            "cam2_offset_y_px": 0.0,
+            "star_density": 300,                # stars sprinkled over the sky
+            "background_level": 6.0,
+            "read_noise": 2.0,
+            "target_brightness": 200.0,
+            "seed": 1234,
+        }
 
         # Mount mode configuration
         self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
@@ -65,7 +97,9 @@ class ConfigState:
                 "focal_length": 25.0,  # mm
                 "alignment_rotation": 0.0,  # degrees
                 "gain": 1.0,  # unitless
-                "exposure": 10000.0  # microseconds
+                "exposure": 10000.0,  # microseconds
+                "gamma": 0.1,  # gamma correction value
+                "gamma_enabled": False  # gamma correction toggle
             },
             "camera2": {
                 "pixel_size": 3.75,  # μm
@@ -73,7 +107,9 @@ class ConfigState:
                 "focal_length": 25.0,  # mm
                 "alignment_rotation": 0.0,  # degrees
                 "gain": 1.0,  # unitless
-                "exposure": 10000.0  # microseconds
+                "exposure": 10000.0,  # microseconds
+                "gamma": 0.1,  # gamma correction value
+                "gamma_enabled": False  # gamma correction toggle
             }
         }
 
@@ -128,11 +164,19 @@ class ConfigState:
             "pid_alt_p_gain": self.pid_alt_p_gain,
             "pid_alt_i_gain": self.pid_alt_i_gain,
             "pid_alt_d_gain": self.pid_alt_d_gain,
+            "pid_lead_time_sec": self.pid_lead_time_sec,
             "feed_forward_azm_enabled": self.feed_forward_azm_enabled,
             "feed_forward_alt_enabled": self.feed_forward_alt_enabled,
             "bias_azm_deg": self.bias_azm_deg,
             "bias_alt_deg": self.bias_alt_deg,
             "bias_control_mode": self.bias_control_mode,
+            "hotspot_camera_index": self.hotspot_camera_index,
+            "hotspot_snr_threshold": self.hotspot_snr_threshold,
+            "hotspot_gate_radius": self.hotspot_gate_radius,
+            "hotspot_coast_time_sec": self.hotspot_coast_time_sec,
+            "hotspot_x_sign": self.hotspot_x_sign,
+            "hotspot_y_sign": self.hotspot_y_sign,
+            "sim_config": self.sim_config,
             "mount_mode": self.mount_mode
         }
 
@@ -158,12 +202,25 @@ class ConfigState:
         self.pid_alt_p_gain = config_dict.get("pid_alt_p_gain", self.pid_alt_p_gain)
         self.pid_alt_i_gain = config_dict.get("pid_alt_i_gain", self.pid_alt_i_gain)
         self.pid_alt_d_gain = config_dict.get("pid_alt_d_gain", self.pid_alt_d_gain)
+        self.pid_lead_time_sec = config_dict.get("pid_lead_time_sec", self.pid_lead_time_sec)
 
         # Load feed-forward and bias control settings
         self.feed_forward_azm_enabled = config_dict.get("feed_forward_azm_enabled", self.feed_forward_azm_enabled)
         self.feed_forward_alt_enabled = config_dict.get("feed_forward_alt_enabled", self.feed_forward_alt_enabled)
         self.bias_azm_deg = config_dict.get("bias_azm_deg", self.bias_azm_deg)
         self.bias_alt_deg = config_dict.get("bias_alt_deg", self.bias_alt_deg)
+
+        # Load hotspot tracker settings
+        self.hotspot_camera_index = config_dict.get("hotspot_camera_index", self.hotspot_camera_index)
+        self.hotspot_snr_threshold = config_dict.get("hotspot_snr_threshold", self.hotspot_snr_threshold)
+        self.hotspot_gate_radius = config_dict.get("hotspot_gate_radius", self.hotspot_gate_radius)
+        self.hotspot_coast_time_sec = config_dict.get("hotspot_coast_time_sec", self.hotspot_coast_time_sec)
+        self.hotspot_x_sign = config_dict.get("hotspot_x_sign", self.hotspot_x_sign)
+        self.hotspot_y_sign = config_dict.get("hotspot_y_sign", self.hotspot_y_sign)
+
+        # Merge hardware simulator settings (keep defaults for missing keys)
+        if "sim_config" in config_dict and isinstance(config_dict["sim_config"], dict):
+            self.sim_config.update(config_dict["sim_config"])
         self.bias_control_mode = config_dict.get("bias_control_mode", self.bias_control_mode)
 
         # Load mount mode
@@ -189,7 +246,9 @@ class ConfigState:
             "focal_length": 25.0,
             "alignment_rotation": 0.0,
             "gain": 1.0,
-            "exposure": 10000.0
+            "exposure": 10000.0,
+            "gamma": 0.1,
+            "gamma_enabled": False
         }
 
         for camera_name in self.camera_configs:

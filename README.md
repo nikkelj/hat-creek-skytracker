@@ -1,78 +1,160 @@
-# hat-creek-skytracker
-An autotracker for select telescopes.
+# Hat Creek Skytracker
 
-# Libraries Utilized
+An optical tracker for select telescopes — a single-operator application for
+finding, acquiring, tracking, and collecting imagery of space and airborne
+objects (satellites, rockets, aircraft) from stationary or mobile platforms.
 
-A list of libraries utlilized, to give some sense of the foundation in use.
+It pairs a Celestron NexStar mount with one or two cameras (a wide "finder/guide"
+camera and a narrow long-focal-length camera) and provides a fast, game-like UI
+with selectable tracking modes, real-time closed-loop control, and labeled data
+capture.
 
-- SkyField
-- Astropy
-- Pandas
-- Numpy, Scipy
-- OpenCV
-- Tetra
+![Main menu](doc/screenshots/main_menu.png)
 
-# Hardaware Interfaces Supported
+## Current Capabilities
 
-- Meade LX200 classic interface
-- Celestron NexStar AUX interface
+**Tracking modes** (cycle through them from the Joystick Loop):
+- **STANDBY** — poll/display mount position only.
+- **RATE_CONTROL** — manual joystick slewing with hardware safety limits.
+- **PROGRAM** — automatically follow a TLE satellite pass or an imported launch
+  trajectory, using interpolated angular position + rates.
+- **HOTSPOT** — closed-loop *optical* tracker: detect the brightest ("hot")
+  object in the camera frame and drive the mount to keep it centered. Intended
+  as an operator hand-off once PROGRAM track has the object in frame (rockets,
+  aircraft). Coasts briefly on a dropout, then falls back to PROGRAM.
+- **HANDOFF / MTI** — reserved for future work (e.g. dim satellites amid
+  streaking stars, which need a different detection approach than HOTSPOT).
 
-# Goals
+**Real-time control architecture**
+- A dedicated **mount control thread** runs the read → PID → command cycle at a
+  fixed cadence, fully decoupled from the pygame render loop, so rendering jitter
+  and blocking serial I/O can't stall mount commands.
+- **Hardened serial layer**: every NexStar AUX transaction is locked and uses a
+  short timeout; a missing/short response is reported and the cycle is skipped
+  instead of freezing the loop (which previously let an axis run open-loop).
+- **PID controller** with trajectory **feed-forward**, **derivative-on-measurement**
+  (no derivative kick), and **conditional-integration anti-windup**.
 
-- Don't replace or re-create everything that SkyTrack can do. Avoid duplication, and focus on creating new capabilities that go beyond it in some niche areas.
-- Provide a high quality toolset for finding, acquiring, tracking, and collecting on space objects from stationary or mobile platforms
-- Provide a rich, snappy, video game-like UI with modes and prototypes to drive that operation
-    - I became tired of and limited by alt-tabbing between too many GUI programs that lack automation-API features to go deeper
-    - I need one set of cooperating tools, making optimal use of screen real-estate in good coordination, that lets me set up for and run a selected opportunity, provide insight into what can be achieved by the optical system for this opportunity for the selected object, and then actually run the pass, collect data for the opportunity, and properly label it with all relevant information for later use and post-processing.
-    - The experience of tracking satellites should become fun, like a video game, such that even a child could be taught to run it and enjoy the experience.
-- JSON Config File and Config Options UI
-    - Fixed site location
-    - Desired screen layout
-        - Enumeration of plots created
-        - Plot sizes
-        - Plot UL corner locations
-    - Enumeration of available hardware interfaces and relation to driver classes
-    - Selection of hardware interface
-    - Definition of sensor parameters
-        - Array size
-        - Pixel size
-    - Pointer to sensor orientation config file
-- UI #1: Visibility and Pass Setup 
-    - Detailed fact-extraction, from a few different perspectives.
-    - A lot of great software already exists for finding visibilities. We'll let them continue to do that job.
-        - Heavens-above.com
-        - SkyTrack
-        - KStars
-        - Various apps
-    - Here, we focus on extracting relevant facts for a known opportunity, and providing better sitaware and summary than existing tools
-    - Produce a high quality annotated live sky plot that is richer than others available
-    - Accept live annotation interactions in the plot for the operator to use to take notes
-    - Generation of an angular-ephemeris file for the pass, for use in interpolated time-correlation to imagery
-    - Acceptance of a PVT ephemeris file and optional covariance to augment TLE ephemeris
-    - Plot and annotate the difference between TLE and Ephemeris-based trajectories on a sky plot
-    - Plot and annotate the optical system capability on the sky plot
-    - Update this singular plot in real-time as the opportunity progresses
-- UI #2: Sensor-to-mount orientation calibration
-    - Provide a CLI that runs a two-sensor calibration
-    - Provide a simple UI to assist with co-boresighting a guide scope to the main scope against a guide star
-    - Provide a simple two-axis calibration against the star to determine sensor rotations with respect to RA/DEC axes, with guidance to co-align both sensors if desired.
-    - Output sensor rotations, angular step-change calibrations, and sensor details into main and guide config files.
-- UI #3: Joystick Loop with Manual Track, Program Track, Moving Object Search, Acquisition, Tracking, and Auto-labeled Capture
-    - Provide a manual joystick loop with rich controls that branches to sub-modes
-    - Provide simple programmed following of a TLE trajectory via available hardware interfaces
-    - Provide, alternately, a programmed following of an ephemeris trajectory via available hardware interfaces
-    - Provide object search while following a programmed trajectory
-    - Provide object search while staring, alternatively
-    - Provide transition to tracking of a detected object
-    - Provide a simple tracked-object tracker, with track "files" (we'll use dictiontaries)
-    - Provide hand-picked object selection/override via click-in-image
-    - Provide labeled data acquisition as a .png series, with accompanying .json file for each frame containing
-        - UTC time
-        - Mount az / el
-        - Mount rate
-        - Detected object centroid
-    - Provide capture controls, and joystick integration that allows us to control and direct image/metadata capture easily during a pass, without flipping to other UIs, or wasting too much disk space, which gets painful to manage.
-- UI #4: Post Processing UI that provides quick-look and post-processing features
-    - It is always a race to post a good shot after an event. You can have the best shot in the world, but if you're a day late, it won't be seen.
-    - There are too many tools required to produce a useful product currently
-    - In this tool, we integrate a few of those key functions, and speed them up for ease of use
+**Imaging & visualization**
+- Threaded camera capture (ZWO ASI) with a large circular buffer and
+  microsecond-precision UTC timestamps; labeled `.png` + per-frame metadata capture.
+- Real-time annotated polar sky plot, satellite pass tables, and camera FOV
+  overlays. Render threads publish complete, double-buffered frames (no flicker).
+
+**Hardware simulator** (see below) — run the entire tracking loop without any
+physical hardware present.
+
+## Screens
+
+**Tracking Vis** — annotated polar sky plot with the selected object's orbit,
+orbital elements, camera FOV footprints, and a scrollable pass table.
+
+![Tracking Vis](doc/screenshots/tracking_vis.png)
+
+**Joystick Loop** — the operational screen: live camera feeds (with boresight
+crosshairs), a polar-plot quadrant, mount connection/position status, tracking
+mode, and PID diagnostics. Shown here in simulation with the mount and both
+cameras connected.
+
+![Joystick Loop](doc/screenshots/joystick_loop.png)
+
+**Sensor Calibration** — both camera feeds side by side with gain / exposure /
+alignment-rotation / ROI controls for co-boresighting the guide and main cameras.
+
+![Sensor Calibration](doc/screenshots/sensor_calib.png)
+
+## Hardware Interfaces
+
+- **Celestron NexStar AUX** (primary; implemented in `lib/auxstar.py`)
+- **Meade LX200 classic** (legacy interface)
+
+## Technologies
+
+- **Python 3.11** (conda environment `track`)
+- **pygame** — UI, input, and rendering
+- **NumPy / SciPy** — control math, detection, geometry
+- **OpenCV** — image handling
+- **Skyfield / sgp4** — TLE propagation and astrometry
+- **pandas** — pass/data tables
+- **pyserial** — NexStar AUX serial protocol
+- **zwoasi** — ZWO ASI camera SDK bindings
+- **plotly** — post-processing/plots
+
+## Hardware Simulator
+
+To hone the user experience and develop the control/acquisition algorithms
+without the bulky hardware, the app includes software simulators for the mount
+and both cameras. Enable it from the **HW Sim** screen (off by default — when
+off, real-hardware behavior is unchanged):
+
+![Hardware Sim screen](doc/screenshots/hw_sim.png)
+
+- **Sim mount** integrates the same rate commands the control loop issues into a
+  true pointing, and reports an encoder position with injectable **initial
+  misalignment** and **noise** — so offset calibration and the closed loop have
+  something real to fight.
+- **Sim cameras** render synthetic imagery of whatever is being tracked, given
+  the mount's true pointing and the camera geometry, with injectable
+  **inter-camera rotation + image-plane misalignment** (what co-boresight
+  calibration is meant to solve). Frames flow through the *same* capture pipeline
+  the real cameras use.
+- A **launch** renders as a hot plume; a **live-TLE satellite** renders as a small
+  dot in the wide cam and a rough **Starlink V2 Mini** in the narrow cam, over a
+  **star field that streaks** with mount motion.
+
+| Wide / guide cam (satellite dot among streaking stars) | Narrow cam (Starlink V2 Mini) |
+| --- | --- |
+| ![wide cam](doc/screenshots/sim_wide_satellite.png) | ![narrow cam](doc/screenshots/sim_narrow_v2mini.png) |
+
+The simulator closes the loop entirely in software: sim mount pointing → sim
+camera render → hot-spot detection → PID → rate command → sim mount moves. This
+makes it possible to demonstrate a full hand-off-and-track sequence at a desk.
+
+## Configuration
+
+Site, optics, PID gains, safety limits, hot-spot, and simulator parameters live
+in `config.json` and are editable from the **Config Options** and **HW Sim**
+screens.
+
+![Config options](doc/screenshots/config_options.png)
+
+## Testing
+
+The control/detection/simulation logic is covered by headless unit tests (run
+under the `track` env), including a sim-in-the-loop test that asserts the hot-spot
+loop drives a simulated object to frame center:
+
+```
+python test_serial_transact.py        # serial transaction layer (lock, timeouts)
+python test_pid_control.py             # PID: feed-forward units, anti-windup, derivative
+python test_render_buffer.py           # render double-buffering (no flicker)
+python test_hotspot.py                 # hot-spot detection + pixel->angle geometry
+python test_hotspot_integration.py     # HOTSPOT acquire / coast / fallback
+python test_simulator.py               # sim mount dynamics, geometry, sim-in-the-loop
+python test_hw_sim_ui.py               # HW Sim panel logic
+```
+
+## Project Goals & Roadmap
+
+The longer-term vision is one set of cooperating, automation-friendly tools that
+make running an optical pass fun and fast — so even a child could run it — rather
+than alt-tabbing between many GUI programs.
+
+- **Visibility & pass setup** — rich, annotated live sky plots; extract relevant
+  facts for a known opportunity; overlay optical-system capability; ingest a PVT
+  ephemeris + covariance to augment TLE; annotate TLE-vs-ephemeris differences.
+- **Sensor-to-mount calibration** — guided two-sensor co-boresight against a
+  guide star; solve sensor rotations and step calibrations into config.
+- **Joystick loop** — manual track, program track, moving-object search,
+  acquisition, tracked-object handoff, click-in-image selection, and labeled
+  capture (UTC, mount az/el, rate, centroid per frame).
+- **Post-processing** — quick-look and product generation to get a good shot
+  posted fast.
+
+We deliberately don't try to re-create everything existing tools (Heavens-Above,
+SkyTrack, KStars, etc.) already do well — the focus is the niche capabilities
+that go beyond them.
+
+## License
+
+See [LICENSE](LICENSE).

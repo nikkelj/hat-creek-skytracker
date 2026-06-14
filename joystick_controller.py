@@ -29,6 +29,7 @@ from utils import draw_button
 # Import PID controller and helper functions
 from control import create_pid_controllers, compute_mount_position_error
 from trajectory import interpolate_position_data_and_rates
+from hotspot import detect_hotspot, pixel_offset_to_angles
 
 # PS4 Controller Button Labels (zero-indexed)
 BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
@@ -71,6 +72,10 @@ class JoystickModeState:
         self.selected_port = None
         self.available_ports = []
 
+        # Hardware simulator (set by main.py); when sim is enabled the connect
+        # calls below hand back the sim mount instead of a real serial controller.
+        self.hardware_sim = None
+
         # UI state
         self.connect_button_hover = False
         self.disconnect_button_hover = False
@@ -87,11 +92,34 @@ class JoystickModeState:
         self.capture_status = ""
         self.capture_button_rect = None
 
-        # Telescope position tracking for display
+        # Telescope position tracking for display.
+        # current_azm/current_alt are offset-applied degrees; the *_raw values
+        # are pre-offset. These are populated once per cycle by the
+        # MountControlThread and reused by the tracking handlers below so that
+        # each control cycle reads the mount position exactly once.
         self.current_azm = 0.0
         self.current_alt = 0.0
+        self.current_azm_raw = 0.0
+        self.current_alt_raw = 0.0
+        self.position_fresh = False
         self.azm_display_str = "--"
         self.alt_display_str = "--"
+
+        # One-shot guard so STANDBY sends a single stop on entry rather than
+        # re-commanding zero every cycle (and never leaves a residual slew).
+        self._standby_motion_stopped = False
+
+        # Tracks the last dispatched mode so we can run per-mode entry logic.
+        self._prev_dispatch_mode = None
+
+        # HOTSPOT (closed-loop optical) tracker state
+        self.hotspot_gate_center = None      # (cx, cy) in image px once locked
+        self.hotspot_acquired = False
+        self.hotspot_miss_count = 0
+        self.hotspot_last_detection_time = 0.0
+        self.hotspot_snr = 0.0               # diagnostics
+        self.hotspot_centroid = None
+        self.hotspot_status = ""
 
         # PID controllers for PROGRAM track mode
         self.azm_pid = None
@@ -148,7 +176,14 @@ class JoystickModeState:
             self.selected_port = self.available_ports[0]['device']
 
     def connect_telescope(self):
-        """Connect to telescope via serial port"""
+        """Connect to telescope via serial port (or the sim mount in sim mode)."""
+        # Simulation: hand back the sim mount, no serial port required.
+        if self.hardware_sim is not None and self.hardware_sim.sim_enabled():
+            self.telescope_controller = self.hardware_sim.mount
+            self.telescope_connected = True
+            print("Connected to SIMULATED telescope")
+            return True
+
         if not self.selected_port:
             return False
 
@@ -186,14 +221,36 @@ class JoystickModeState:
 
         # Universal stop check - stop movement in any mode when stopped
         if self.stopped:
-            self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
-            self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+            try:
+                self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
+                self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+            except Exception as e:
+                print(f"Error sending stop commands: {e}")
             return
+
+        # Reset the STANDBY one-shot stop guard whenever we are in any active
+        # mode, so re-entering STANDBY will again issue a single stop.
+        if self.tracking_mode != TrackingMode.STANDBY:
+            self._standby_motion_stopped = False
+
+        # Run per-mode entry logic on a mode transition.
+        if self.tracking_mode != self._prev_dispatch_mode:
+            if self.tracking_mode == TrackingMode.HOTSPOT:
+                self._enter_hotspot_mode()
+            self._prev_dispatch_mode = self.tracking_mode
 
         # Dispatch to appropriate tracking method based on mode
         if self.tracking_mode == TrackingMode.STANDBY:
-            # STANDBY: No rate control, just position polling
-            pass
+            # STANDBY: no rate control. Position polling happens in the control
+            # thread. Send a single stop on entry so any residual slew from a
+            # prior mode (e.g. a safety-limit trip) is halted, then stay quiet.
+            if not self._standby_motion_stopped:
+                try:
+                    self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
+                    self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+                except Exception as e:
+                    print(f"Error sending STANDBY stop commands: {e}")
+                self._standby_motion_stopped = True
         elif self.tracking_mode == TrackingMode.RATE_CONTROL:
             # RATE_CONTROL: Current joystick control logic
             self._handle_rate_control(joy)
@@ -212,27 +269,20 @@ class JoystickModeState:
 
     def _handle_rate_control(self, joy):
         """Handle the original rate control logic with hardware safety limits"""
-        # Get current position with safety limits
+        # Use the position cached by the control thread this cycle (already
+        # offset-applied) instead of re-reading the serial port.
+        current_azm = self.current_azm
+        current_alt = self.current_alt
+
+        # Get configured limits
         try:
-            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360.0
-            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360.0
-
-            # Apply offsets
-            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
-            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
-            current_azm = current_azm_raw - offset_azm
-            current_alt = current_alt_raw - offset_alt
-
-            # Get configured limits
             azm_limit_min = float(self.config_state.azm_limit_min_str)
             azm_limit_max = float(self.config_state.azm_limit_max_str)
             alt_limit_min = float(self.config_state.alt_limit_min_str)
             alt_limit_max = float(self.config_state.alt_limit_max_str)
-
         except Exception as e:
-            # If we can't read position or limits, fall back to original behavior
-            print(f"Warning: Could not read telescope position for safety checks: {e}")
-            current_azm = current_alt = 0.0
+            # If limits are unparseable, disable limit gating (original behavior)
+            print(f"Warning: Could not read telescope limits for safety checks: {e}")
             azm_limit_min = azm_limit_max = alt_limit_min = alt_limit_max = float('inf')
 
         # Process axes 2 and 3 (PlayStation right stick)
@@ -294,12 +344,28 @@ class JoystickModeState:
 
             # Send command only if safe
             if safe_to_move:
-                if i == 2:  # AZM
-                    if rate != 0:
-                        self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
-                elif i == 3:  # ALT
-                    if rate != 0:
-                        self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
+                try:
+                    if i == 2:  # AZM
+                        if rate != 0:
+                            success = self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
+                            if not success:
+                                print(f"Warning: AZM slew command failed (rate={rate})")
+                    elif i == 3:  # ALT
+                        if rate != 0:
+                            success = self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
+                            if not success:
+                                print(f"Warning: ALT slew command failed (rate={rate})")
+                except Exception as e:
+                    print(f"Error sending slew command: {e}")
+                    # Try to reconnect or handle the error
+                    if "serial" in str(e).lower() or "timeout" in str(e).lower():
+                        print("Serial communication error detected. Attempting to reconnect...")
+                        try:
+                            self.disconnect_telescope()
+                            time.sleep(0.1)
+                            self.connect_telescope()
+                        except Exception as reconnect_e:
+                            print(f"Failed to reconnect: {reconnect_e}")
 
     def cycle_tracking_mode_forward(self):
         """Cycle to the next tracking mode in forward sequence"""
@@ -370,18 +436,10 @@ class JoystickModeState:
             alt_limit_min = float(self.config_state.alt_limit_min_str)
             alt_limit_max = float(self.config_state.alt_limit_max_str)
 
-            # Get current mount position with offsets
-            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360
-            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360
-
-            # Apply offsets from config state
-            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
-            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
-            current_azm = current_azm_raw - offset_azm
-            current_alt = current_alt_raw - offset_alt
-
-            self.current_azm = current_azm
-            self.current_alt = current_alt
+            # Use the position cached by the control thread this cycle (already
+            # offset-applied) instead of re-reading the serial port.
+            current_azm = self.current_azm
+            current_alt = self.current_alt
 
             # Get target position from satellite trajectory
             selected_sat = self.tracking_vis_state.selected_satellite
@@ -420,8 +478,11 @@ class JoystickModeState:
 
                         # Apply rate commands to drive to mask exit point
                         if self.telescope_connected and not self.stopped:
-                            self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
-                            self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                            try:
+                                self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                                self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                            except Exception as e:
+                                print(f"Error sending mask exit commands: {e}")
 
                         # Store diagnostic values
                         self.azm_position_error = az_error
@@ -442,6 +503,15 @@ class JoystickModeState:
                             self.update_status_callback(f"Satellite target ({target_info}) exceeds safety limits - switched to STANDBY")
                         return
 
+                    # Lead the target by a configurable time to compensate for
+                    # read/command transport latency (the target keeps moving
+                    # while we poll position and issue commands). Uses the
+                    # interpolated trajectory rates (deg/sec). Defaults to 0.
+                    lead_s = float(getattr(self.config_state, 'pid_lead_time_sec', 0.0) or 0.0)
+                    if lead_s > 0.0:
+                        target_az_deg += az_rate * lead_s
+                        target_el_deg += el_rate * lead_s
+
                     # Apply bias corrections
                     target_az_deg += self.bias_azm_deg
                     target_el_deg += self.bias_alt_deg
@@ -459,8 +529,10 @@ class JoystickModeState:
 
                     # Update PID controllers
                     current_time = time.time()
-                    az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(az_error, current_time - self.pid_last_update)
-                    el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(el_error, current_time - self.pid_last_update)
+                    az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
+                        az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+                    el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
+                        el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
                     self.pid_last_update = current_time
 
                     # Store diagnostic values for display
@@ -473,19 +545,25 @@ class JoystickModeState:
                     self.azm_pid_output = az_pid_output
                     self.alt_pid_output = el_pid_output
 
+                    # Map rate to signed discrete command
+                    az_command = az_rate_cmd if az_rate_cmd != 0 else 0
+                    el_command = el_rate_cmd if el_rate_cmd != 0 else 0
+
                     # Apply rate commands
                     if self.telescope_connected and not self.stopped:
-                        # Map rate to signed discrete command
-                        az_command = az_rate_cmd if az_rate_cmd != 0 else 0
-                        el_command = el_rate_cmd if el_rate_cmd != 0 else 0
-
                         # Send slew commands
-                        self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
-                        self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                        try:
+                            self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
+                            self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                        except Exception as e:
+                            print(f"Error sending satellite tracking commands: {e}")
 
                     # Debug output (throttled)
                     if int(current_time) % 5 == 0:  # Every 5 seconds
-                        print(".2f")
+                        print(f"PROGRAM TRACK: {selected_sat} | "
+                              f"AZ:{current_azm:.2f}→{target_az_deg:.2f}({az_error:+.2f}) | "
+                              f"EL:{current_alt:.2f}→{target_el_deg:.2f}({el_error:+.2f}) | "
+                              f"CMD AZ:{az_command} EL:{el_command}")
 
         except Exception as e:
             print(f"PROGRAM TRACK: Error in tracking loop: {e}")
@@ -523,18 +601,10 @@ class JoystickModeState:
             alt_limit_min = float(self.config_state.alt_limit_min_str)
             alt_limit_max = float(self.config_state.alt_limit_max_str)
 
-            # Get current mount position with offsets
-            current_azm_raw = self.telescope_controller.hc_get_position(Targets.AZM) * 360
-            current_alt_raw = self.telescope_controller.hc_get_position(Targets.ALT) * 360
-
-            # Apply offsets from config state
-            offset_azm = float(self.config_state.azm_offset_str) if hasattr(self.config_state, 'azm_offset_str') else 0.0
-            offset_alt = float(self.config_state.alt_offset_str) if hasattr(self.config_state, 'alt_offset_str') else 0.0
-            current_azm = current_azm_raw - offset_azm
-            current_alt = current_alt_raw - offset_alt
-
-            self.current_azm = current_azm
-            self.current_alt = current_alt
+            # Use the position cached by the control thread this cycle (already
+            # offset-applied) instead of re-reading the serial port.
+            current_azm = self.current_azm
+            current_alt = self.current_alt
 
             # Get launch trajectory data
             launch_name = self.tracking_vis_state.selected_launch
@@ -584,8 +654,11 @@ class JoystickModeState:
 
                 # Apply rate commands to drive to mask exit point
                 if self.telescope_connected and not self.stopped:
-                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
-                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                    try:
+                        self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                        self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                    except Exception as e:
+                        print(f"Error sending launch mask exit commands: {e}")
 
                 # Store diagnostic values
                 self.azm_position_error = az_error
@@ -605,6 +678,15 @@ class JoystickModeState:
                     self.update_status_callback(f"Launch target ({target_info}) exceeds safety limits - switched to STANDBY")
                 return
 
+            # Lead the target by a configurable time to compensate for
+            # read/command transport latency (the target keeps moving while we
+            # poll position and issue commands). Uses the interpolated
+            # trajectory rates (deg/sec). Defaults to 0.
+            lead_s = float(getattr(self.config_state, 'pid_lead_time_sec', 0.0) or 0.0)
+            if lead_s > 0.0:
+                az_deg += az_rate_dps * lead_s
+                target_el_deg += el_rate_dps * lead_s
+
             # Apply bias corrections
             az_deg += self.bias_azm_deg
             target_el_deg += self.bias_alt_deg
@@ -622,8 +704,10 @@ class JoystickModeState:
 
             # Update PID controllers
             current_time = time.time()
-            az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(az_error, current_time - self.pid_last_update)
-            el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(el_error, current_time - self.pid_last_update)
+            az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
+                az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+            el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
+                el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
             self.pid_last_update = current_time
 
             # Store diagnostic values for display
@@ -636,15 +720,18 @@ class JoystickModeState:
             self.azm_pid_output = az_pid_output
             self.alt_pid_output = el_pid_output
 
+            # Map rate to signed discrete command
+            az_command = az_rate_cmd if az_rate_cmd != 0 else 0
+            el_command = el_rate_cmd if el_rate_cmd != 0 else 0
+
             # Apply rate commands
             if self.telescope_connected and not self.stopped:
-                # Map rate to signed discrete command
-                az_command = az_rate_cmd if az_rate_cmd != 0 else 0
-                el_command = el_rate_cmd if el_rate_cmd != 0 else 0
-
                 # Send slew commands
-                self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
-                self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                try:
+                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
+                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                except Exception as e:
+                    print(f"Error sending launch tracking commands: {e}")
 
             # Debug output (throttled)
             if int(current_time) % 5 == 0:  # Every 5 seconds
@@ -699,10 +786,158 @@ class JoystickModeState:
         # TODO: Implement handoff track mode
         print("Handoff track mode - stub")
 
+    def _enter_hotspot_mode(self):
+        """Reset state when HOTSPOT is engaged (handed off from another mode)."""
+        self.hotspot_gate_center = None      # force a full-frame acquisition
+        self.hotspot_acquired = False
+        self.hotspot_miss_count = 0
+        self.hotspot_last_detection_time = 0.0
+        self.hotspot_centroid = None
+        self.hotspot_snr = 0.0
+        if self.azm_pid:
+            self.azm_pid.reset()
+        if self.alt_pid:
+            self.alt_pid.reset()
+        self.pid_last_update = time.time()
+        self.hotspot_status = "acquiring"
+        print("HOTSPOT: engaged - acquiring...")
+
     def hotspot_track(self):
-        """Hotspot track mode - stub implementation"""
-        # TODO: Implement hotspot track mode
-        print("Hotspot track mode - stub")
+        """Closed-loop optical tracker: lock onto the brightest ('hot') object in
+        the camera frame and drive the mount to keep it centered.
+
+        Intended as a hand-off target once PROGRAM track has the object in frame.
+        On loss of lock it coasts briefly, then falls back to PROGRAM track.
+        Best for bright objects (rockets, aircraft); dim satellites amid streaking
+        stars need a different mode.
+        """
+        cfg = self.config_state
+
+        # Ensure PID controllers exist (shared with PROGRAM track).
+        if self.azm_pid is None or self.alt_pid is None:
+            if cfg is None:
+                print("HOTSPOT: config state not available")
+                return
+            self.azm_pid, self.alt_pid = create_pid_controllers(cfg)
+        self.azm_pid.update_gains(cfg.pid_azm_p_gain, cfg.pid_azm_i_gain, cfg.pid_azm_d_gain)
+        self.alt_pid.update_gains(cfg.pid_alt_p_gain, cfg.pid_alt_i_gain, cfg.pid_alt_d_gain)
+
+        # Grab the latest raw frame from the configured tracking camera.
+        cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
+        camera = camera_manager.get_camera(cam_index)
+        raw = None
+        if camera is not None and getattr(camera, 'thread', None) is not None:
+            raw = camera.thread.get_latest_raw()
+
+        # Mount position cached by the control thread this cycle.
+        current_azm = self.current_azm
+        current_alt = self.current_alt
+
+        # Safety: abort to STANDBY if the mount is outside configured limits.
+        try:
+            azm_min = float(cfg.azm_limit_min_str); azm_max = float(cfg.azm_limit_max_str)
+            alt_min = float(cfg.alt_limit_min_str); alt_max = float(cfg.alt_limit_max_str)
+            if not (azm_min <= current_azm <= azm_max and alt_min <= current_alt <= alt_max):
+                self._hotspot_stop_motion()
+                self.tracking_mode = TrackingMode.STANDBY
+                if self.update_status_callback:
+                    self.update_status_callback("HOTSPOT: mount at safety limit - switched to STANDBY")
+                return
+        except (ValueError, AttributeError):
+            pass
+
+        detection = None
+        if raw is not None:
+            gate_center = self.hotspot_gate_center
+            gate_radius = int(getattr(cfg, 'hotspot_gate_radius', 120)) if gate_center else None
+            try:
+                detection = detect_hotspot(
+                    raw,
+                    gate_center=gate_center,
+                    gate_radius=gate_radius,
+                    snr_threshold=float(getattr(cfg, 'hotspot_snr_threshold', 5.0)),
+                )
+            except Exception as e:
+                print(f"HOTSPOT: detection error: {e}")
+                detection = None
+
+        now = time.time()
+
+        if detection is not None:
+            # Pixel error of the object from boresight (image center).
+            h, w = raw.shape[:2]
+            dx = detection.cx - (w / 2.0)
+            dy = detection.cy - (h / 2.0)
+
+            cam_name = f"camera{cam_index + 1}"
+            az_error, el_error = pixel_offset_to_angles(
+                dx, dy,
+                pixel_size_um=float(cfg.get_camera_pixel_size(cam_name)),
+                focal_length_mm=float(cfg.get_camera_focal_length(cam_name)),
+                rotation_deg=float(cfg.get_camera_alignment_rotation(cam_name)),
+                el_deg=current_alt,
+                x_sign=float(getattr(cfg, 'hotspot_x_sign', 1.0)),
+                y_sign=float(getattr(cfg, 'hotspot_y_sign', -1.0)),
+            )
+
+            # Drive the mount to null the optical error using the shared PID.
+            current_time = now
+            az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
+                az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+            el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
+                el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
+            self.pid_last_update = current_time
+
+            # Update lock state and diagnostics.
+            self.hotspot_gate_center = (detection.cx, detection.cy)
+            self.hotspot_centroid = (detection.cx, detection.cy)
+            self.hotspot_snr = detection.snr
+            self.hotspot_acquired = True
+            self.hotspot_miss_count = 0
+            self.hotspot_last_detection_time = now
+            self.hotspot_status = "locked"
+            self.azm_position_error = az_error
+            self.alt_position_error = el_error
+            self.azm_target_rate = az_pid_output
+            self.alt_target_rate = el_pid_output
+
+            if self.telescope_connected and not self.stopped:
+                try:
+                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
+                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                except Exception as e:
+                    print(f"HOTSPOT: error sending slew commands: {e}")
+            return
+
+        # No detection this cycle.
+        self.hotspot_miss_count += 1
+        coast_time = float(getattr(cfg, 'hotspot_coast_time_sec', 1.0))
+        elapsed = (now - self.hotspot_last_detection_time) if self.hotspot_acquired else float('inf')
+
+        if self.hotspot_acquired and elapsed < coast_time:
+            # Coast: leave the last continuous slew running so a brief dropout
+            # (cloud, frame glitch) doesn't jerk the mount.
+            self.hotspot_status = "coasting"
+            return
+
+        # Lock lost (or never acquired within the coast window): stop and hand
+        # back to PROGRAM track per configured behavior.
+        self._hotspot_stop_motion()
+        self.hotspot_acquired = False
+        self.hotspot_gate_center = None
+        self.hotspot_status = "lost"
+        self.tracking_mode = TrackingMode.PROGRAM
+        if self.update_status_callback:
+            self.update_status_callback("HOTSPOT: lost lock - falling back to PROGRAM track")
+
+    def _hotspot_stop_motion(self):
+        """Best-effort stop of both axes."""
+        if self.telescope_connected and self.telescope_controller is not None:
+            try:
+                self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
+                self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+            except Exception as e:
+                print(f"HOTSPOT: error stopping motion: {e}")
 
     def mti_track(self):
         """MTI track mode - stub implementation"""
@@ -1586,6 +1821,25 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         # Handle feed-forward toggle button clicks
         if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
             return True
+
+        # Handle joystick launch button clicks
+        if (hasattr(display, 'joystick_launch_button') and
+            display.joystick_launch_button and
+            display.joystick_launch_button.collidepoint(pos)):
+            # Handle launch button click - same logic as main tracking mode
+            if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
+                if tracking_vis_state.launch_launched:
+                    # Turn off launch visualization and reset to start
+                    tracking_vis_state.launch_launched = False
+                    tracking_vis_state.launch_start_time = None
+                    print("Launch visualization stopped")
+                else:
+                    # Start launch visualization from current time
+                    from skyfield.api import load
+                    tracking_vis_state.launch_launched = True
+                    tracking_vis_state.launch_start_time = load.timescale().now().tt
+                    print(f"Launch visualization started for {tracking_vis_state.selected_launch}")
+                return True
 
         # Handle PID slider clicks
         if handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):

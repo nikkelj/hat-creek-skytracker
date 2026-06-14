@@ -24,12 +24,15 @@ except Exception as e:
 from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
 from config import load_config, handle_input, draw_config_options
+from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
+from mount_control import MountControlThread
+from simulator import HardwareSimulator
 # Camera button initialization is now handled internally by camera_manager
 from events import *
 
@@ -159,6 +162,23 @@ def update_status_callback(message):
 # Joystick Mode State Management (initialize after update_status_callback is defined)
 global joystick_mode_state
 joystick_mode_state = JoystickModeState(tracking_vis_state, config_state, update_status_callback)
+
+# Hardware simulator (mount + cameras). Inert unless sim_config.enabled; when
+# enabled, connect_telescope / connect_camera hand back simulated devices so the
+# whole tracking loop can run without physical hardware.
+global hardware_sim
+hardware_sim = HardwareSimulator(config_state, tracking_vis_state, ts)
+joystick_mode_state.hardware_sim = hardware_sim
+camera_manager.simulator = hardware_sim
+print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
+
+# Dedicated real-time mount control thread. Owns all serial traffic to the
+# mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
+# from this render loop. It no-ops while the telescope is disconnected.
+global mount_control_thread
+mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+mount_control_thread.start()
+print("Mount control thread started.")
 
 try:
     from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
@@ -418,6 +438,10 @@ while running:
                         config_state.selection_start[field_name] = None
                         break
 
+            # Hardware Sim screen: toggle / steppers / save-load
+            elif current_mode == "hw_sim":
+                handle_hw_sim_click(pos, display, config_state, hardware_sim, status_messages)
+
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
                 try:
@@ -590,6 +614,8 @@ while running:
     viz_surface = None
     if current_mode == "config_options":
         draw_config_options(display, config_state)
+    elif current_mode == "hw_sim":
+        draw_hw_sim_options(display, config_state, hardware_sim)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         # Only clear if we don't have a thread surface (initial loading)
         # This prevents washing away the displayed surface while thread is rendering
@@ -710,6 +736,33 @@ while running:
             # This handles timing when switching modes or if thread isn't ready yet
             pass
 
+        # Draw Launch Button in joystick mode (only if a launch is selected)
+        # Position at lower left of the upper right quadrant
+        if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
+            # Create joystick launch button rectangle (lower left of upper right quadrant)
+            joystick_launch_button = pygame.Rect(
+                display.sub_x + display.sub_width // 2 + 10,  # Left edge of quadrant + margin
+                display.sub_y + display.sub_height // 2 - 45,  # Bottom of quadrant - button height - margin
+                70, 30  # Same size as main launch button
+            )
+
+            # Display launch elapsed time above button
+            if hasattr(tracking_vis_state, 'launch_start_time') and tracking_vis_state.launch_start_time and tracking_vis_state.launch_launched:
+                # Convert TT difference to seconds for display
+                elapsed_seconds = (ts.now().tt - tracking_vis_state.launch_start_time) * 86400  # TT is in days, convert to seconds
+                elapsed_text = f"{elapsed_seconds:.1f}s"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (0, 255, 0))  # Green text
+                display.menu_screen.blit(elapsed_surface, (joystick_launch_button.x + joystick_launch_button.width // 2 - elapsed_surface.get_width() // 2, joystick_launch_button.y - 20))
+            else:
+                # Show T-0 if launch selected but not launched
+                elapsed_text = "T-0"
+                elapsed_surface = display.small_font.render(elapsed_text, True, (255, 255, 255))  # White text
+                display.menu_screen.blit(elapsed_surface, (joystick_launch_button.x + joystick_launch_button.width // 2 - elapsed_surface.get_width() // 2, joystick_launch_button.y - 20))
+
+            # Store the joystick launch button for event handling
+            display.joystick_launch_button = joystick_launch_button
+            draw_button_with_objects(display, "launch", tracking_vis_state.launch_launched, joystick_launch_button)
+
         # Render connection controls and joystick status (not threaded)
         render_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)
@@ -733,53 +786,10 @@ while running:
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)
 
-        # Update joystick tracking control and position polling
-        if joystick_mode_state.telescope_connected:
-            joystick_mode_state.tracking_control()
-
-            # Poll current position at 10 Hz for display
-            try:
-                if hasattr(joystick_mode_state.telescope_controller, 'hc_get_position'):
-                    # Measure polling frequency
-                    position_poll_count += 1
-                    current_poll_time = time.time()
-
-                    # Time AZM call
-                    azm_start = perf_counter()
-                    joystick_mode_state.current_azm = joystick_mode_state.telescope_controller.hc_get_position(Targets.AZM) * 360.0 - float(config_state.azm_offset_str)
-                    azm_duration = (perf_counter() - azm_start) * 1000  # Convert to milliseconds
-
-                    # Time ALT call
-                    alt_start = perf_counter()
-                    joystick_mode_state.current_alt = joystick_mode_state.telescope_controller.hc_get_position(Targets.ALT) * 360.0 - float(config_state.alt_offset_str)
-                    alt_duration = (perf_counter() - alt_start) * 1000  # Convert to milliseconds
-
-                    # Update frequency and timing report every second
-                    if current_poll_time - position_poll_start_time >= 1.0:
-                        elapsed = current_poll_time - position_poll_start_time
-                        position_poll_frequency = position_poll_count / elapsed
-                        position_poll_count = 0
-                        position_poll_start_time = current_poll_time
-                        print(f"Telescope polling: {position_poll_frequency:.1f} Hz | AZM: {azm_duration:.1f}ms | ALT: {alt_duration:.1f}ms | Total: {azm_duration + alt_duration:.1f}ms")
-
-                    # Format for display (convert degrees back to fractions for proper DMS formatting)
-                    from lib.auxstar import f2dms, format_angle_compact
-                    azm_fraction = joystick_mode_state.current_azm / 360.0
-                    alt_fraction = joystick_mode_state.current_alt / 360.0
-                    azm_d, azm_m, azm_s = f2dms(azm_fraction)
-                    alt_d, alt_m, alt_s = f2dms(alt_fraction)
-                    joystick_mode_state.azm_display_str = f"{azm_d:3d}°{azm_m:02d}'{azm_s:04.1f}\""
-                    joystick_mode_state.alt_display_str = f"{alt_d:3d}°{alt_m:02d}'{alt_s:04.1f}\""
-
-                    # Sync to tracking visualization state
-                    tracking_vis_state.telescope_azimuth = joystick_mode_state.current_azm
-                    tracking_vis_state.telescope_altitude = joystick_mode_state.current_alt
-            except Exception as e:
-                # On polling error, maintain previous values or show error
-                if not joystick_mode_state.azm_display_str == "--":
-                    joystick_mode_state.azm_display_str = "ERROR"
-                    joystick_mode_state.alt_display_str = "ERROR"
-                print(f"Position polling error: {e}. Are you sure the mount is powered?")
+        # Mount control and position polling run on MountControlThread
+        # (see mount_control.py), decoupled from this render loop. The thread
+        # populates joystick_mode_state.current_azm/current_alt and the display
+        # strings, which the rendering code above reads.
 
     elif current_mode == "post_process":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
@@ -802,6 +812,13 @@ while running:
     clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness
 
 pygame.quit()
+
+# Stop the mount control thread first so the mount is commanded to a stop
+# before we tear anything else down.
+print("Shutting down mount control thread...")
+if mount_control_thread:
+    mount_control_thread.stop()
+    mount_control_thread.join(timeout=2.0)
 
 # Clean up rendering threads
 print("Shutting down rendering threads...")

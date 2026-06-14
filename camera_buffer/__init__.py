@@ -65,6 +65,11 @@ class CameraThread(threading.Thread):
         # Provide direct buffer access for UI
         self.latest_frame = None
 
+        # Latest raw numpy frame (mono HxW or color HxWx3), kept for the
+        # hot-spot detector which needs full-bit-depth intensity, not the
+        # RGB pygame Surface used for display.
+        self.latest_raw = None
+
         # MEMORY OPTIMIZATION: Pre-allocate frame data structure
         self._frame_data_template = {
             'frame': None,
@@ -87,6 +92,10 @@ class CameraThread(threading.Thread):
     def get_latest_frame(self):
         """Get the most recent frame - no locks, just return the reference"""
         return self.latest_frame
+
+    def get_latest_raw(self):
+        """Get the most recent raw numpy frame for detection (or None)."""
+        return self.latest_raw
 
     def get_buffer_fps(self):
         """Get current buffer FPS"""
@@ -337,6 +346,8 @@ class CameraThread(threading.Thread):
 
                 # Only handle frames that exist and are not timed out
                 if raw_frame is not None and raw_frame.size > 0 and capture_process_time < self.capture_timeout:
+                    # Keep the raw frame available for the hot-spot detector.
+                    self.latest_raw = raw_frame
                     # Process frame - minimal error handling
                     surface = self._process_raw_frame(raw_frame)
                     if surface is not None:

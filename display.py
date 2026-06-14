@@ -158,8 +158,9 @@ class DisplaySetup:
             {"rect": pygame.Rect(10, 110, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Joystick Loop", "mode": "joystick_loop"},
             {"rect": pygame.Rect(10, 160, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Post Process", "mode": "post_process"},
             {"rect": pygame.Rect(10, 210, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Config Options", "mode": "config_options"},
-            {"rect": pygame.Rect(10, 260, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
-            {"rect": pygame.Rect(10, 310, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
+            {"rect": pygame.Rect(10, 260, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "HW Sim", "mode": "hw_sim"},
+            {"rect": pygame.Rect(10, 310, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
+            {"rect": pygame.Rect(10, 360, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
         ]
 
         # Initialize button states for all buttons

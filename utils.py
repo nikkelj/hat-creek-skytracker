@@ -64,43 +64,44 @@ def create_negative_image(original_image):
             negative.set_at((x, y), (255 - r, 255 - g, 255 - b, a))
     return negative
 
-def draw_button_with_objects(display, button_type, launch_launched=None):
+def draw_button_with_objects(display, button_type, launch_launched=None, custom_rect=None):
     """
     State-direct mutation function for drawing buttons using display object properties.
     Takes display object and button_type string to access appropriate properties.
     Launch_launched parameter used to determine launch button color.
+    custom_rect parameter allows drawing the same button type at a different location.
     """
     # Get button properties based on type
     if button_type == "save":
-        rect = display.save_button
+        rect = custom_rect if custom_rect else display.save_button
         text = "Save"
         state = display.button_states["save"]
     elif button_type == "load":
-        rect = display.load_button
+        rect = custom_rect if custom_rect else display.load_button
         text = "Load"
         state = display.button_states["load"]
     elif button_type == "clear_filters":
-        rect = display.clear_filters_button
+        rect = custom_rect if custom_rect else display.clear_filters_button
         text = "Clear Filters"
         state = display.button_states["clear_filters"]
     elif button_type == "pause":
-        rect = display.pause_button
+        rect = custom_rect if custom_rect else display.pause_button
         text = "Pause"
         state = display.button_states["pause"]
     elif button_type == "play":
-        rect = display.play_button
+        rect = custom_rect if custom_rect else display.play_button
         text = "Play"
         state = display.button_states["play"]
     elif button_type == "recompute":
-        rect = display.recompute_button
+        rect = custom_rect if custom_rect else display.recompute_button
         text = "Update Traj"
         state = display.button_states["recompute"]
     elif button_type == "reset":
-        rect = display.reset_button
+        rect = custom_rect if custom_rect else display.reset_button
         text = "Reset"
         state = display.button_states["reset"]
     elif button_type == "launch":
-        rect = display.launch_button
+        rect = custom_rect if custom_rect else display.launch_button
         text = "Launch!"
         state = display.button_states["launch"]
         # Launch button changes color based on launch_launched state

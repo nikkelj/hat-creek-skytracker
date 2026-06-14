@@ -4,10 +4,12 @@
 //! class that wraps `Mount<LoopbackTransport>` and matches the method-level API
 //! of `simulator.SimMount`, so it can later be swapped into the control loop.
 
+use numpy::PyReadonlyArray2;
 use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::hotspot as core_hotspot;
 use crate::pid::PidController as CorePid;
 use crate::protocol;
 use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder};
@@ -160,6 +162,130 @@ impl PidController {
     }
 }
 
+/// Result of a successful hot-spot detection (image pixel coordinates).
+/// Mirrors `hotspot.Detection`.
+#[pyclass]
+#[derive(Clone)]
+struct Detection {
+    #[pyo3(get)]
+    cx: f64,
+    #[pyo3(get)]
+    cy: f64,
+    #[pyo3(get)]
+    peak: f64,
+    #[pyo3(get)]
+    background: f64,
+    #[pyo3(get)]
+    noise: f64,
+    #[pyo3(get)]
+    snr: f64,
+    #[pyo3(get)]
+    n_pixels: usize,
+}
+
+#[pymethods]
+impl Detection {
+    fn __repr__(&self) -> String {
+        format!(
+            "Detection(cx={:.2}, cy={:.2}, snr={:.1}, n={})",
+            self.cx, self.cy, self.snr, self.n_pixels
+        )
+    }
+}
+
+/// Detect the brightest compact hot spot. Mirrors `hotspot.detect_hotspot`.
+/// `image` must be a 2D float32 intensity map (apply `hotspot.to_intensity`
+/// first for color/mono camera frames).
+#[pyfunction]
+#[pyo3(signature = (
+    image,
+    gate_center = None,
+    gate_radius = None,
+    snr_threshold = 5.0,
+    centroid_radius = 12,
+    half_max_fraction = 0.5,
+    min_pixels = 3
+))]
+fn detect_hotspot(
+    image: PyReadonlyArray2<'_, f32>,
+    gate_center: Option<(f64, f64)>,
+    gate_radius: Option<f64>,
+    snr_threshold: f64,
+    centroid_radius: usize,
+    half_max_fraction: f64,
+    min_pixels: usize,
+) -> Option<Detection> {
+    let view = image.as_array();
+    let shape = view.shape();
+    let (h, w) = (shape[0], shape[1]);
+    let mut a = ndarray::Array2::<f64>::zeros((h, w));
+    for ((i, j), v) in view.indexed_iter() {
+        a[[i, j]] = *v as f64;
+    }
+
+    let gate = match (gate_center, gate_radius) {
+        (Some((gx, gy)), Some(r)) => Some((gx, gy, r)),
+        _ => None,
+    };
+
+    core_hotspot::detect_hotspot(
+        &a.view(),
+        gate,
+        snr_threshold,
+        centroid_radius,
+        half_max_fraction,
+        min_pixels,
+    )
+    .map(|d| Detection {
+        cx: d.cx,
+        cy: d.cy,
+        peak: d.peak,
+        background: d.background,
+        noise: d.noise,
+        snr: d.snr,
+        n_pixels: d.n_pixels,
+    })
+}
+
+/// Pixel offset -> (az_error_deg, el_error_deg). Mirrors
+/// `hotspot.pixel_offset_to_angles`.
+#[pyfunction]
+#[pyo3(signature = (
+    dx_pix,
+    dy_pix,
+    pixel_size_um,
+    focal_length_mm,
+    rotation_deg = 0.0,
+    el_deg = 0.0,
+    x_sign = 1.0,
+    y_sign = -1.0,
+    apply_cos_el = true
+))]
+#[allow(clippy::too_many_arguments)]
+fn pixel_offset_to_angles(
+    dx_pix: f64,
+    dy_pix: f64,
+    pixel_size_um: f64,
+    focal_length_mm: f64,
+    rotation_deg: f64,
+    el_deg: f64,
+    x_sign: f64,
+    y_sign: f64,
+    apply_cos_el: bool,
+) -> (f64, f64) {
+    core_hotspot::pixel_offset_to_angles(
+        dx_pix,
+        dy_pix,
+        pixel_size_um,
+        focal_length_mm,
+        rotation_deg,
+        el_deg,
+        x_sign,
+        y_sign,
+        apply_cos_el,
+    )
+}
+
 #[pymodule]
 fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -168,8 +294,11 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_goto_fast, m)?)?;
     m.add_function(wrap_pyfunction!(pack_int3, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_int3, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_hotspot, m)?)?;
+    m.add_function(wrap_pyfunction!(pixel_offset_to_angles, m)?)?;
     m.add_class::<SimMount>()?;
     m.add_class::<PidController>()?;
+    m.add_class::<Detection>()?;
 
     // Device target ids, so Python can pass them without re-deriving the map.
     m.add("ANY", protocol::targets::ANY)?;

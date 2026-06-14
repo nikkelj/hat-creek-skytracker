@@ -12,11 +12,14 @@ name = "skytracker_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# pyo3 is OPTIONAL and only pulled in for the extension-module build. This keeps
-# `cargo test` pure Rust with zero libpython linkage, so the protocol/sim unit
-# tests run without a Python interpreter present.
+# pyo3 + numpy are OPTIONAL and only pulled in for the extension-module build.
+# This keeps `cargo test` pure Rust with zero libpython linkage, so the
+# protocol/sim/pid/hotspot logic tests run without a Python interpreter.
 pyo3 = { version = "0.22", optional = true }
+numpy = { version = "0.22", optional = true }
+# ndarray is used by the pure-Rust hotspot core, so it is a default dependency.
+ndarray = "0.16"
 
 [features]
 default = []
-extension-module = ["dep:pyo3", "pyo3/extension-module"]
+extension-module = ["dep:pyo3", "dep:numpy", "pyo3/extension-module"]

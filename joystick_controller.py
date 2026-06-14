@@ -38,6 +38,21 @@ BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1
 # JOYSTICK MODE STATE CLASS
 # ==============================================================================
 
+def axis_to_rate(axis_value):
+    """Map a (tared) joystick axis value to a discrete rate (-9..=9).
+
+    0 = stop; |rate| ramps from 1 at the deadband edge to 9 by ~0.9 deflection.
+    Extracted from the RATE_CONTROL handler so the Rust-core-loop adapter pushes
+    exactly the same mapping (single source of truth).
+    """
+    axis_value = max(-1.0, min(1.0, axis_value))
+    if abs(axis_value) < 0.01:  # deadband
+        return 0
+    normalized = min((abs(axis_value) - 0.01) / (0.9 - 0.01), 1.0)
+    rate = max(1, min(9, int(math.ceil(normalized * 9))))
+    return rate * (1 if axis_value > 0 else -1)
+
+
 class JoystickModeState:
     """
     Encapsulates all state for joystick mode, following state-direct object mutation pattern.
@@ -299,21 +314,7 @@ class JoystickModeState:
 
             # Map to telescope rates (-9 to 9)
             # Clamp values to avoid extreme movements
-            axis_value = max(-1.0, min(1.0, axis_value))
-
-            # Convert to rate (0 = stop, 1-9 positive, -1 to -9 negative)
-            if abs(axis_value) < 0.01:  # Much smaller deadband: 0.01
-                rate = 0
-            else:
-                # Scale to achieve maximum rate at >0.9 instead of corners
-                # Map 0.01 to 0.9 range to 0 to 9 rate range
-                normalized = (abs(axis_value) - 0.01) / (0.9 - 0.01)
-                # Clamp to ensure we never go over maximum (for axes that can hit >0.9 in corner)
-                normalized = min(normalized, 1.0)
-                rate = int(math.ceil(normalized * 9))  # Use ceil to ensure we can reach max rate
-                rate = max(1, min(9, rate))  # Ensure positive rates start at 1
-                # Apply the original sign
-                rate *= 1 if axis_value > 0 else -1
+            rate = axis_to_rate(axis_value)
 
             # Hardware safety checks - prevent movement that would approach limits
             safe_to_move = True

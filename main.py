@@ -176,7 +176,24 @@ print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
 # mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
 # from this render loop. It no-ops while the telescope is disconnected.
 global mount_control_thread
-mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+# Experiment: optionally run the control loop in Rust (skytracker_core) via the
+# RustCoreLoopAdapter, behind a flag (default off). Enable with
+# config_state.use_rust_core_loop = True or env SKYTRACKER_RUST_LOOP=1.
+import os as _os
+_use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
+    _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")
+)
+if _use_rust_loop:
+    try:
+        from rust_loop_adapter import RustCoreLoopAdapter
+        _hz = int(getattr(config_state, "rust_core_loop_hz", 15))
+        mount_control_thread = RustCoreLoopAdapter(joystick_mode_state, config_state, target_hz=_hz)
+        print("Using RUST core control loop (skytracker_core).")
+    except Exception as _e:
+        print(f"Rust core loop unavailable ({_e}); falling back to MountControlThread.")
+        mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+else:
+    mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
 mount_control_thread.start()
 print("Mount control thread started.")
 

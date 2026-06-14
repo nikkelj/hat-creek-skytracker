@@ -65,30 +65,37 @@ Installed for the experiment: VS Build Tools (C++ workload, MSVC 14.44), rustup
 Build Tools uninstall) if the experiment is abandoned — and the whole thing
 lives on a branch.
 
-## What remains — the hardware-integration boundary
+## Hardware integration — built, pending on-bench validation
 
-Everything verifiable in software is done. What's left genuinely needs the
-mount + camera + joystick on the bench, so it was deliberately stopped at the
-sim boundary:
+Items 1–3 below are now done and validated in software; see
+`STEP4_INTEGRATION.md`. What's left is interactive validation on the mount and
+in the HW-sim UI (item 4), which by nature can't be done headlessly.
 
-1. **A real serial `Transport`** (the `serialport` crate) so the loop can own a
-   physical port. Small; mirrors `LoopbackTransport`. Untestable without the
-   mount.
-2. **A real-port `CoreLoop` PyO3 class** — identical setters/snapshot to
-   `SimCoreLoop`, but opens a port and runs the background thread.
-3. **Wiring into `joystick_controller.py` behind a flag** (`use_rust_core_loop`,
-   default off): push inputs each UI tick (mode/gains/limits/offsets from config;
-   `rate_cmd` from the existing joystick mapping; PROGRAM setpoint `(az,el,ff)`
-   from the skyfield trajectory + mask-exit logic; frame from `camera_manager`),
-   read `snapshot()` for display, and apply `requested_mode`.
-4. **Sign-convention + closed-loop validation on hardware.** The sim converges
-   by construction (memory notes flag that real-hardware `x_sign`/`y_sign`
-   calibration can't be validated in sim); the Rust loop carries the same
-   parameters, so it's no worse off than the Python loop today.
+1. **Real serial `Transport`** — `serial.rs` (`SerialTransport`, serialport
+   crate, mirrors auxstar's 9600 8N1 + short-timeout/flush). Done; needs a port
+   to exercise.
+2. **Threaded `CoreLoop` PyO3 class** — `open_serial` (real port, off-GIL) and
+   `wrap_mount` (bridge to a Python mount for the HW sim). Validated via the
+   bridge against a Python fake mount (`test_rust_core_loop_bridge.py`).
+3. **Flag-gated wiring** — `RustCoreLoopAdapter` + `use_rust_core_loop`
+   (default off). Bridges to the connected controller, so no connect-flow
+   change; validated headlessly (`test_rust_loop_adapter.py`).
+4. **On-bench validation (your step):** RATE / PROGRAM / HOTSPOT in the HW-sim
+   UI and on hardware, plus `x_sign`/`y_sign` calibration (the sim can't
+   validate sign conventions).
 
-skyfield stays Python (the loop consumes setpoints it computes); the mask-exit
-and satellite-selection logic in `program_track` stays Python and feeds the
-setpoint.
+Deferred (use flag-off until ported): PROGRAM **launch tracking** and
+**below-horizon mask-exit** (the adapter holds in those cases); HANDOFF/MTI
+stubs. skyfield stays Python and feeds the setpoint.
+
+## Performance
+
+`bench_rust_vs_python.py` (run on this machine): transforms **58×** (numpy) /
+**562×** (scipy), PID step **114×**, hotspot detection **1.5×** (the benchmark
+caught and we fixed a naive-port regression that was 0.3×), full PROGRAM cycle
+**1.7×** (conservative — the Rust figure includes a simulated serial round-trip
+the Python side skips, and neither captures the off-GIL threading win).
+`test_rust_perf.py` guards against regressing below the Python baseline.
 
 ## Recommendation
 

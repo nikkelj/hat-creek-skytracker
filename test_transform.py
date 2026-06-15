@@ -201,9 +201,13 @@ class TestAzEl2AzAlt(unittest.TestCase):
                 self.assertGreaterEqual(result_azm, -180.0)
                 self.assertLessEqual(result_azm, 540.0)
 
-                # Valid elevation range
-                self.assertGreaterEqual(result_alt, -90.0)
-                self.assertLessEqual(result_alt, 90.0)
+                # Valid mount-altitude range. AzEl2AzAlt recovers ALT as a polar
+                # rotation angle via arccos, so its natural range is [0, 180°].
+                # Sky points outside the reachable hemisphere for a given alignment
+                # legitimately map to ALT > 90° (the forward transform is 2-to-1,
+                # and no |ALT| <= 90 representation of those points round-trips).
+                self.assertGreaterEqual(result_alt, 0.0)
+                self.assertLessEqual(result_alt, 180.0)
 
 class TestRoundTripConsistency(unittest.TestCase):
     """Test that forward and inverse transformations are consistent."""

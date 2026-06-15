@@ -121,6 +121,53 @@ def AzAlt2AzEl(AZM, ALT, alignment_azimuth, alignment_elevation):
 
     return az, el
 
+def AzEl2AzAlt(az, el, alignment_azimuth, alignment_elevation):
+    """
+    Transform from true az/el (azimuth, elevation) to mount coordinates (AZM, ALT).
+
+    This is the general inverse of :func:`AzAlt2AzEl`. Given a pointing direction in
+    the sky, it recovers mount coordinates that ``AzAlt2AzEl`` maps back onto that
+    direction (verified by round-trip: ``AzAlt2AzEl(AzEl2AzAlt(az, el, ...), ...)``
+    reproduces ``(az, el)``).
+
+    Note: the forward transform is two-to-one in azimuth (AZM and AZM+180 map to the
+    same sky point), so the AZM returned here is one of two equivalent solutions.
+
+    Args:
+        az: True azimuth angle (degrees)
+        el: True elevation angle (degrees)
+        alignment_azimuth: Alignment azimuth offset (degrees)
+        alignment_elevation: Alignment elevation offset (degrees)
+
+    Returns:
+        tuple: (AZM, ALT) in degrees
+    """
+    from scipy.spatial.transform import Rotation as R
+
+    align_az_rad = np.radians(alignment_azimuth)
+    align_el_rad = np.radians(alignment_elevation)
+
+    zenith = np.array([0, 0, 1.0])
+    align_vec = np.array([
+        np.cos(align_el_rad) * np.cos(align_az_rad),  # north component
+        np.cos(align_el_rad) * np.sin(align_az_rad),  # east component
+        np.sin(align_el_rad)                          # up component
+    ])
+
+    # Same alignment rotation used in the forward transform (zenith -> align_vec).
+    alignment_rotation = R.align_vectors([align_vec], [zenith])[0]
+
+    # Strip the alignment to get the pointing in the un-aligned mount frame. There,
+    # the forward composition reduces to:
+    #   u = [-sin(ALT)cos(2*AZM), -sin(ALT)sin(2*AZM), cos(ALT)]
+    pointing = cartesian_from_az_el(az, el)
+    u = alignment_rotation.inv().apply(pointing)
+
+    alt = np.degrees(np.arccos(np.clip(u[2], -1.0, 1.0)))
+    azm = np.degrees(np.arctan2(-u[1], -u[0])) / 2.0
+
+    return azm, alt
+
 def apply_rotation_to_az_el(az, el, rotation_angle):
     """
     Apply additional rotation around the pointing direction.

@@ -307,7 +307,13 @@ while running:
     if current_time - last_update_time >= update_interval:
         # Use lock to protect position updates for thread safety
         with position_update_lock:
-            tracking_vis_state.satellite_positions = {}
+            # NOTE: do not clear satellite_positions here. The rendering thread
+            # reads it live every frame; clearing it now and only repopulating
+            # at update_satellite_positions() below leaves an empty-dict window
+            # during the current_tt/slider math, and a render landing in that
+            # window paints a fully black frame -> visualization flicker. The
+            # update path below replaces the dict in a single atomic rebind, and
+            # the no-data branch clears it atomically, so no empty window exists.
 
             # Calculate current time for trajectory interpolation - ensure it's never None
             if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
@@ -333,6 +339,10 @@ while running:
             # Only update positions if trajectories are available
             if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
                 update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+            else:
+                # No trajectory data available: clear positions in a single
+                # atomic rebind (never leaves a partially-built/empty window).
+                tracking_vis_state.satellite_positions = {}
 
             # Update launch positions if any launch trajectories are loaded
             if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:

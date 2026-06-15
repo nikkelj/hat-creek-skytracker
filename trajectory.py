@@ -401,7 +401,13 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     Update satellite positions for the current timestamp with filtering.
     Modifies state object directly with updated satellite_positions dictionary.
     """
-    state.satellite_positions = {}
+    # Build into a local dict and publish it in a single atomic rebind at the
+    # end. The rendering thread reads state.satellite_positions live every
+    # frame; if we cleared and incrementally repopulated the live attribute
+    # here, a render landing mid-loop would copy a partially-filled dict and
+    # draw only some satellites -> the visualization "blink"/flicker. Assigning
+    # the finished dict once means readers always see a complete frame's worth.
+    new_positions = {}
 
     # Always handle all satellites with filtering (don't exclude other satellites when one is selected)
     for sat in state.satellites:
@@ -426,7 +432,10 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
                         include_sat = False
 
                 if include_sat:
-                    state.satellite_positions[sat] = (px, py, alt, dist)
+                    new_positions[sat] = (px, py, alt, dist)
+
+    # Atomic publish: readers see either the complete old dict or this new one.
+    state.satellite_positions = new_positions
 
 def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """

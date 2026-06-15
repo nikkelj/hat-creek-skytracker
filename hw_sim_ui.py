@@ -61,6 +61,16 @@ def draw_hw_sim_options(display, config_state, hardware_sim=None):
     display.hw_sim_save_rect = save_rect
     display.hw_sim_load_rect = load_rect
 
+    # Experimental: choose the control-loop implementation (Rust vs Python).
+    # Takes effect on restart; auto-saved on toggle for convenience.
+    rust_on = bool(getattr(config_state, "use_rust_core_loop", False))
+    rust_rect = pygame.Rect(x0 + 440, y0 + 40, 230, 34)
+    _btn(screen, rust_rect, f"Loop: {'RUST' if rust_on else 'PYTHON'}", display.font,
+         bg=(20, 110, 150) if rust_on else (70, 70, 70))
+    display.hw_sim_rust_loop_rect = rust_rect
+    screen.blit(display.small_font.render("(restart app to apply)", True, (150, 150, 150)),
+                (x0 + 440, y0 + 76))
+
     # Live status: what the sim thinks it is tracking right now.
     status = "target: --"
     if hardware_sim is not None:
@@ -110,6 +120,14 @@ def handle_hw_sim_click(pos, display, config_state, hardware_sim, status_message
     if getattr(display, 'hw_sim_load_rect', None) and display.hw_sim_load_rect.collidepoint(pos):
         config_state.load_from_file()
         status_messages.append("Sim config loaded")
+        return True
+
+    if getattr(display, 'hw_sim_rust_loop_rect', None) and display.hw_sim_rust_loop_rect.collidepoint(pos):
+        config_state.use_rust_core_loop = not bool(getattr(config_state, "use_rust_core_loop", False))
+        config_state.save_to_file()  # persist so it applies on restart
+        status_messages.append(
+            f"Control loop set to {'RUST' if config_state.use_rust_core_loop else 'PYTHON'} "
+            "- restart app to apply (saved)")
         return True
 
     for key, (minus, plus, step) in getattr(display, 'hw_sim_rects', {}).items():

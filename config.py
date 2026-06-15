@@ -79,6 +79,12 @@ class ConfigState:
         # Mount mode configuration
         self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
 
+        # Experimental: run the control loop in Rust (skytracker_core) instead of
+        # the Python MountControlThread. Read at startup in main.py; toggled from
+        # the Hardware Simulator screen. Takes effect on restart.
+        self.use_rust_core_loop = False
+        self.rust_core_loop_hz = 15
+
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
         self.azm_limit_max_str = "180.0"
@@ -177,7 +183,9 @@ class ConfigState:
             "hotspot_x_sign": self.hotspot_x_sign,
             "hotspot_y_sign": self.hotspot_y_sign,
             "sim_config": self.sim_config,
-            "mount_mode": self.mount_mode
+            "mount_mode": self.mount_mode,
+            "use_rust_core_loop": self.use_rust_core_loop,
+            "rust_core_loop_hz": self.rust_core_loop_hz
         }
 
     def load_from_dict(self, config_dict):
@@ -225,6 +233,10 @@ class ConfigState:
 
         # Load mount mode
         self.mount_mode = config_dict.get("mount_mode", self.mount_mode)
+
+        # Load experimental Rust core loop toggle
+        self.use_rust_core_loop = config_dict.get("use_rust_core_loop", self.use_rust_core_loop)
+        self.rust_core_loop_hz = config_dict.get("rust_core_loop_hz", self.rust_core_loop_hz)
 
         # Load hardware safety limits
         self.azm_limit_min_str = config_dict.get("azm_limit_min", self.azm_limit_min_str)

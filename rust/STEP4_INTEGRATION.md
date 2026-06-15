@@ -5,14 +5,15 @@ default**; with the flag off the app is byte-for-byte unchanged.
 
 ## Enabling it
 
-Either set the config flag or the environment variable:
+Three ways, in order of convenience:
 
-```python
-config_state.use_rust_core_loop = True      # (optional) config_state.rust_core_loop_hz = 15
-```
-```sh
-set SKYTRACKER_RUST_LOOP=1   # Windows
-```
+- **UI toggle (recommended):** Hardware Simulator screen → **"Loop: PYTHON/RUST"**
+  button (next to Save/Load). It flips `use_rust_core_loop`, auto-saves, and
+  takes effect on **restart** ("restart app to apply" is shown next to it).
+- Config flag directly: `config_state.use_rust_core_loop = True`
+  (`rust_core_loop_hz` optional, default 15).
+- Environment: `set SKYTRACKER_RUST_LOOP=1` (Windows) — overrides the flag for a
+  single run.
 
 When enabled, `main.py` starts a `RustCoreLoopAdapter` instead of
 `MountControlThread`. If `skytracker_core` isn't importable, it logs a warning

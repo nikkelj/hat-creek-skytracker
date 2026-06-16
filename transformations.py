@@ -231,9 +231,11 @@ def AzEl2AzAlt_AltAz(az, el, alignment_azimuth, alignment_elevation):
     Returns:
         tuple: (AZM, ALT) in degrees
     """
-    # Simplified inverse transformations for AltAz mount
+    # Simplified inverse transformations for AltAz mount. Must be the true inverse
+    # of AzAlt2AzEl_AltAz (el = 90 - ALT), otherwise program tracking commands the
+    # mount to the wrong ALT and the boresight lands at 90 - el (target missing).
     AZM = (az - alignment_azimuth) % 360  # AZM is azimuth minus offset
-    ALT = el - alignment_elevation  # ALT is 90 degrees minus elevation
+    ALT = 90.0 - el - alignment_elevation  # ALT is 90 degrees minus elevation
 
     return AZM, ALT
 

@@ -117,14 +117,14 @@ fn program_altaz_uses_transform() {
     i.mount_mode = MountMode::AltAz;
     i.alignment_az = 10.0;
     i.alignment_el = 0.0;
-    // AltAz: target_azm = az - align_az = 100-10 = 90; target_alt = el = 40.
+    // AltAz: target_azm = az - align_az = 100-10 = 90; target_alt = 90 - el = 50.
     i.setpoint = Some(Setpoint {
         az_deg: 100.0,
         el_deg: 40.0,
         ff_az_dps: 0.0,
         ff_el_dps: 0.0,
     });
-    let o = s.step(&i, None, 90.0, 40.0, 1.0);
+    let o = s.step(&i, None, 90.0, 50.0, 1.0);
     // At the transformed target: zero error, zero command.
     assert!(o.azm_error.abs() < 1e-9, "azm_error={}", o.azm_error);
     assert!(o.alt_error.abs() < 1e-9, "alt_error={}", o.alt_error);

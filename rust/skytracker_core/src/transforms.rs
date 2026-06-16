@@ -159,8 +159,9 @@ pub fn az_el_to_az_alt_altaz(
     alignment_azimuth: f64,
     alignment_elevation: f64,
 ) -> (f64, f64) {
+    // True inverse of az_alt_to_az_el_altaz (el = 90 - alt); see transformations.py.
     let azm = (az - alignment_azimuth).rem_euclid(360.0);
-    let alt = el - alignment_elevation;
+    let alt = 90.0 - el - alignment_elevation;
     (azm, alt)
 }
 

@@ -66,6 +66,9 @@ class ConfigState:
             "mount_misalignment_el_deg": 0.0,
             "mount_encoder_noise_deg": 0.0,     # per-read uniform noise bound
             "mount_rate_noise_dps": 0.0,        # slew rate jitter (1-sigma)
+            "mount_backlash_deg": 0.0,          # gear lost-motion on reversal (AVX ~0.006 = 22")
+            "mount_pe_amplitude_deg": 0.0,      # periodic error, zero-to-peak (AVX ~0.003 = 11")
+            "mount_pe_period_sec": 600.0,       # worm period (AVX ~10 min)
             "cam2_offset_rotation_deg": 0.0,    # inter-camera misalignment
             "cam2_offset_x_px": 0.0,
             "cam2_offset_y_px": 0.0,
@@ -78,6 +81,14 @@ class ConfigState:
 
         # Mount mode configuration
         self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
+
+        # Continuous-rate tracking: issue the fine 24-bit variable-rate
+        # (MC_SET_POS/NEG_GUIDERATE) command for smooth tracking instead of the
+        # coarse 10-step MC_MOVE, falling back to MC_MOVE above guide_rate_max_dps
+        # (e.g. the near-zenith keyhole). Off by default until verified on hardware
+        # with bench_guiderate.py.
+        self.continuous_rate_tracking = False
+        self.guide_rate_max_dps = 5.0  # max rate sent via the guide-rate command
 
         # Experimental: run the control loop in Rust (skytracker_core) instead of
         # the Python MountControlThread. Read at startup in main.py; toggled from
@@ -185,7 +196,9 @@ class ConfigState:
             "sim_config": self.sim_config,
             "mount_mode": self.mount_mode,
             "use_rust_core_loop": self.use_rust_core_loop,
-            "rust_core_loop_hz": self.rust_core_loop_hz
+            "rust_core_loop_hz": self.rust_core_loop_hz,
+            "continuous_rate_tracking": self.continuous_rate_tracking,
+            "guide_rate_max_dps": self.guide_rate_max_dps
         }
 
     def load_from_dict(self, config_dict):
@@ -237,6 +250,10 @@ class ConfigState:
         # Load experimental Rust core loop toggle
         self.use_rust_core_loop = config_dict.get("use_rust_core_loop", self.use_rust_core_loop)
         self.rust_core_loop_hz = config_dict.get("rust_core_loop_hz", self.rust_core_loop_hz)
+
+        # Continuous variable-rate tracking
+        self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)
+        self.guide_rate_max_dps = config_dict.get("guide_rate_max_dps", self.guide_rate_max_dps)
 
         # Load hardware safety limits
         self.azm_limit_min_str = config_dict.get("azm_limit_min", self.azm_limit_min_str)
@@ -314,8 +331,16 @@ class ConfigState:
                 print(f"Debug: Error loading {file_path}: {e}")
 
     def save_to_file(self):
-        """Save configuration to file."""
+        """Save configuration to file, keeping a one-deep backup so an accidental
+        overwrite (e.g. a default-valued ConfigState saving over a tuned config)
+        is recoverable from config.json.bak."""
         config_dict = self.get_config_dict()
+        if os.path.exists("config.json"):
+            try:
+                import shutil
+                shutil.copyfile("config.json", "config.json.bak")
+            except Exception as e:
+                print(f"Debug: could not back up config.json: {e}")
         with open("config.json", "w") as f:
             json.dump(config_dict, f)
 

@@ -401,6 +401,21 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
         rotation = fov_data.get('rotation', 0.0)
         color = fov_data.get('color', (255, 0, 0))
 
+        # Normalize elevation to [-180, 180] so mount-angle wrap doesn't produce
+        # a garbage value (e.g. ALT 351° -> el = 90 - 351 = -261°, really -9° past
+        # the horizon i.e. 99° elevation pointing past zenith).
+        el = (el + 180) % 360 - 180
+
+        # Reflect a past-zenith pointing back onto the visible hemisphere: el just
+        # over 90° means pointing slightly past the zenith toward the opposite
+        # azimuth, which on the polar plot is el = 180 - el at az + 180.
+        if el > 90:
+            el = 180 - el
+            az += 180
+        elif el < -90:
+            el = -180 - el
+            az += 180
+
         # Skip if below horizon or invalid
         if el < 0:
             continue

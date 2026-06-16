@@ -86,7 +86,9 @@ class RenderDetectTests(unittest.TestCase):
         cfg.sim_config["mount_rate_noise_dps"] = 0.0
         cfg.sim_config["mount_encoder_noise_deg"] = 0.0
         sim = HardwareSimulator(cfg, None, None)
-        sim.mount.az_true_deg, sim.mount.el_true_deg = 100.0, 30.0
+        # AltAz (the default): boresight sky el = 90 - mount ALT, so to point the
+        # camera at sky el 30 the mount sits at ALT 60.
+        sim.mount.az_true_deg, sim.mount.el_true_deg = 100.0, 60.0
         sim.current_target_azel = lambda: target
         return sim
 
@@ -131,9 +133,10 @@ class SimInTheLoopTests(unittest.TestCase):
         target_az, target_el = 100.0, 30.0
         sim = HardwareSimulator(cfg, None, None)
         sim.current_target_azel = lambda: (target_az, target_el, 'satellite', True)
-        # Start pointing off-target but within the wide-cam FOV.
+        # Start pointing off-target but within the wide-cam FOV. AltAz: mount ALT
+        # for sky el 30 is 60; offset by 1 in ALT (= 1 in sky el) plus 2 in az.
         sim.mount.az_true_deg = target_az + 2.0
-        sim.mount.el_true_deg = target_el + 1.0
+        sim.mount.el_true_deg = (90.0 - target_el) + 1.0
 
         state = JoystickModeState(None, cfg, lambda m: None)
         state.hardware_sim = sim
@@ -161,9 +164,10 @@ class SimInTheLoopTests(unittest.TestCase):
             last_centroid = state.hotspot_centroid
             time.sleep(0.03)
 
+        # Measure the residual in sky coordinates (AltAz: sky el = 90 - mount ALT).
         final_err = math.hypot(
             simulator.wrap180(sim.mount.az_true_deg - target_az),
-            sim.mount.el_true_deg - target_el)
+            (90.0 - sim.mount.el_true_deg) - target_el)
 
         self.assertTrue(state.hotspot_acquired, "should hold lock")
         self.assertLess(final_err, initial_err * 0.4,

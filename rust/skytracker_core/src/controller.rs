@@ -72,6 +72,12 @@ pub struct Inputs {
     pub ff_azm_enabled: bool,
     pub ff_alt_enabled: bool,
 
+    // Continuous variable-rate (guide-rate) tracking instead of discrete MC_MOVE.
+    // Applies only to PROGRAM/HOTSPOT; above guide_rate_max_dps the loop falls
+    // back to the discrete step (e.g. the near-zenith keyhole).
+    pub continuous_rate: bool,
+    pub guide_rate_max_dps: f64,
+
     // HOTSPOT
     pub hotspot: HotspotParams,
 }
@@ -94,6 +100,8 @@ impl Default for Inputs {
             setpoint: None,
             ff_azm_enabled: false,
             ff_alt_enabled: false,
+            continuous_rate: false,
+            guide_rate_max_dps: 5.0,
             hotspot: HotspotParams {
                 snr_threshold: 5.0,
                 gate_radius: 120.0,
@@ -269,8 +277,16 @@ impl LoopState {
             .update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
         self.azm_pid.set_feed_forward_enabled(inputs.ff_azm_enabled);
         self.alt_pid.set_feed_forward_enabled(inputs.ff_alt_enabled);
+        // Sky rates -> mount feed-forward. AZM tracks azimuth directly; in AltAz
+        // the ALT axis runs opposite sky elevation (ALT = 90 - el), so the ALT
+        // feed-forward is -ff_el_dps. Mirrors joystick_controller.program_track.
+        let alt_ff = if inputs.mount_mode == MountMode::AltAz {
+            -sp.ff_el_dps
+        } else {
+            sp.ff_el_dps
+        };
         self.azm_pid.set_feed_forward_rate(sp.ff_az_dps);
-        self.alt_pid.set_feed_forward_rate(sp.ff_el_dps);
+        self.alt_pid.set_feed_forward_rate(alt_ff);
 
         let dt = self.dt(now);
         let (az_out, az_rate) =
@@ -343,6 +359,17 @@ impl LoopState {
                 hp.y_sign,
                 true,
             );
+
+            // pixel_offset_to_angles gives the optical/sky-frame correction. In
+            // AltAz the ALT axis runs opposite sky elevation (el = 90 - ALT), so
+            // negate the elevation term to command the mount the right way --
+            // matching the mount-frame error PROGRAM track feeds the same PID.
+            // Mirrors joystick_controller.hotspot_track.
+            let el_error = if inputs.mount_mode == MountMode::AltAz {
+                -el_error
+            } else {
+                el_error
+            };
 
             self.azm_pid
                 .update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);

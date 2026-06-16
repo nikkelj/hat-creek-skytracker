@@ -148,6 +148,10 @@ class DisplaySetup:
         self.image_y = self.total_height // 2  # Adjusted from original hard-coded position
         self.status_y_start = self.total_height - 14 * 5  # Space for 5 lines
 
+        # Status log scrollback state (lines scrolled up from the newest message)
+        self.status_scroll_offset = 0
+        self.status_max_scroll = 0
+
         # Button states
         self.button_states = {}
 
@@ -193,6 +197,88 @@ class DisplaySetup:
             return pygame.transform.rotate(self.negative_image, self.rotation_angle)
         return self.bg_image_menu
 
+    def get_status_panel_rect(self):
+        """Rect of the scrollable status log, confined to the left mode-select bar.
+
+        Sits below the rotating logo and extends to the bottom of the bar so it is
+        as tall as the available space allows (and never spills into the right pane).
+        """
+        margin = 6
+        top = self.image_y + self.BG_IMAGE_SIZE[1] + 10  # just below the logo image
+        bottom = self.total_height - margin
+        if bottom - top < 60:  # guarantee a usable minimum height on short screens
+            top = max(margin, bottom - 60)
+        return pygame.Rect(margin, top, self.MENU_WIDTH - 2 * margin, bottom - top)
+
+    def _wrap_text(self, text, font, max_width):
+        """Greedy word-wrap a string to max_width px, hard-breaking over-long words."""
+        lines = []
+        cur = ""
+        for word in text.split(" "):
+            # Hard-break a single word that is wider than the panel
+            while font.size(word)[0] > max_width and len(word) > 1:
+                cut = len(word)
+                while cut > 1 and font.size(word[:cut])[0] > max_width:
+                    cut -= 1
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(word[:cut])
+                word = word[cut:]
+            trial = word if not cur else cur + " " + word
+            if font.size(trial)[0] <= max_width:
+                cur = trial
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = word
+        if cur:
+            lines.append(cur)
+        return lines if lines else [""]
+
+    def render_status_log(self, status_messages):
+        """Render the status log as a tall, word-wrapped, back-scrollable panel.
+
+        Newest message sits at the bottom; mouse-wheel scrolling (handled in the
+        main event loop via status_scroll_offset) reveals older messages above.
+        """
+        panel = self.get_status_panel_rect()
+        font = self.status_font
+        line_height = font.get_height() + 2
+        pad = 4
+        max_width = panel.width - 2 * pad
+
+        # Build the full wrapped-line list (oldest -> newest)
+        all_lines = []
+        for msg in status_messages:
+            all_lines.extend(self._wrap_text(str(msg), font, max_width))
+
+        max_visible = max(1, (panel.height - 2 * pad) // line_height)
+        total = len(all_lines)
+        self.status_max_scroll = max(0, total - max_visible)
+        self.status_scroll_offset = max(0, min(self.status_scroll_offset, self.status_max_scroll))
+
+        end = total - self.status_scroll_offset
+        start = max(0, end - max_visible)
+        visible = all_lines[start:end]
+
+        # Background + border so the log reads cleanly over the rotating logo
+        self.menu_screen.fill(self.COLOR_BACKGROUND_DARK, panel)
+        pygame.draw.rect(self.menu_screen, (70, 70, 70), panel, 1)
+
+        # Clip so nothing can bleed past the left bar into the right pane
+        prev_clip = self.menu_screen.get_clip()
+        self.menu_screen.set_clip(panel)
+        y = panel.y + pad
+        for line in visible:
+            self.menu_screen.blit(font.render(line, True, self.COLOR_TEXT_WHITE), (panel.x + pad, y))
+            y += line_height
+        # Hint that newer messages exist below the current scroll position
+        if self.status_scroll_offset > 0:
+            hint = font.render("v newer", True, (150, 150, 150))
+            self.menu_screen.blit(hint, (panel.right - hint.get_width() - pad, panel.bottom - line_height))
+        self.menu_screen.set_clip(prev_clip)
+
     def render_initial_menu(self, status_messages):
         """Render initial menu state."""
         self.menu_screen.fill(self.COLOR_BACKGROUND_DARK, (0, 0, self.MENU_WIDTH, self.total_height))
@@ -203,8 +289,6 @@ class DisplaySetup:
         for btn in self.buttons:
             draw_button(self.menu_screen, btn["rect"], btn["text"], self.button_states[btn["mode"]])
 
-        # Render status messages
-        for i, msg in enumerate(status_messages[-4:]):  # Show last 4 messages
-            status_render = self.status_font.render(msg, True, self.COLOR_TEXT_WHITE)
-            self.menu_screen.blit(status_render, (10, self.status_y_start + i * 14))
+        # Render status messages (scrollable log confined to the left bar)
+        self.render_status_log(status_messages)
         pygame.display.flip()

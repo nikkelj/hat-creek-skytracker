@@ -29,6 +29,8 @@ pub const MC_GET_POSITION: (u8, u8, u8) = (0x01, 1, 3);
 pub const MC_GOTO_FAST: (u8, u8, u8) = (0x02, 4, 0);
 pub const MC_MOVE_POS: (u8, u8, u8) = (0x24, 2, 0);
 pub const MC_MOVE_NEG: (u8, u8, u8) = (0x25, 2, 0);
+pub const MC_SET_POS_GUIDERATE: (u8, u8, u8) = (0x06, 4, 0);
+pub const MC_SET_NEG_GUIDERATE: (u8, u8, u8) = (0x07, 4, 0);
 pub const MC_GET_VER: (u8, u8, u8) = (0xfe, 1, 2);
 
 /// RATES table: fraction of a full revolution per second, index 0..=9.
@@ -97,6 +99,19 @@ pub fn encode_slew_fixed(target: u8, rate_step: i32) -> Vec<u8> {
     let (id, clen, rlen) = if rate_step >= 0 { MC_MOVE_POS } else { MC_MOVE_NEG };
     let mag = rate_step.unsigned_abs().min(255) as u8;
     passthrough(clen, target, id, [mag, 0, 0], rlen)
+}
+
+/// Continuous variable rate in deg/s via MC_SET_POS/NEG_GUIDERATE. Sign selects
+/// the opcode; magnitude is packed in rev/sec (dps/360 * 2^24) -- the same
+/// convention as the RATES table and `auxstar.hc_set_rate_dps`.
+pub fn encode_set_guiderate(target: u8, dps: f64) -> Vec<u8> {
+    let (id, clen, rlen) = if dps >= 0.0 {
+        MC_SET_POS_GUIDERATE
+    } else {
+        MC_SET_NEG_GUIDERATE
+    };
+    let mag = pack_int3((dps.abs()) / 360.0);
+    passthrough(clen, target, id, mag, rlen)
 }
 
 pub fn encode_goto_fast(target: u8, dd: f64, mm: f64, ss: f64) -> Vec<u8> {

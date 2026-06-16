@@ -10,19 +10,20 @@ fn ang_close(a: f64, b: f64, tol: f64) -> bool {
 
 #[test]
 fn altaz_formulas() {
-    // NOTE: the original transformations.py AltAz forward/inverse are NOT true
-    // inverses on elevation (AzEl2AzAlt uses ALT = el - align_el; AzAlt2AzEl
-    // uses el = 90 - ALT). We port both faithfully and check each formula
-    // directly; azimuth *does* round-trip.
-    let (align_az, align_el) = (12.0, 3.0);
+    // AzEl2AzAlt_AltAz must be the true inverse of AzAlt2AzEl_AltAz on elevation
+    // (forward el = 90 - ALT  =>  inverse ALT = 90 - el). Azimuth round-trips too.
+    // With align_el = 0 the elevation round-trip is exact (the forward ignores
+    // align_el, matching transformations.py).
+    let align_az = 12.0;
     for &az in &[0.0, 45.0, 123.0, 270.0, 359.0] {
         for &el in &[-5.0, 0.0, 30.0, 85.0] {
-            let (azm, alt) = az_el_to_az_alt_altaz(az, el, align_az, align_el);
+            let (azm, alt) = az_el_to_az_alt_altaz(az, el, align_az, 0.0);
             assert!(ang_close(azm, az - align_az, 1e-9), "azm");
-            assert!((alt - (el - align_el)).abs() < 1e-9, "alt");
-            // azimuth round-trips through the inverse
-            let (az2, _) = az_alt_to_az_el_altaz(azm, alt, align_az);
+            assert!((alt - (90.0 - el)).abs() < 1e-9, "alt");
+            // full round-trip through the inverse
+            let (az2, el2) = az_alt_to_az_el_altaz(azm, alt, align_az);
             assert!(ang_close(az, az2, 1e-9), "az {az}->{az2}");
+            assert!((el - el2).abs() < 1e-9, "el {el}->{el2}");
         }
     }
 }

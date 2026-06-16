@@ -93,6 +93,15 @@ impl<T: Transport> Mount<T> {
         Ok(resp.first() == Some(&b'#'))
     }
 
+    /// Continuous variable rate in deg/s (MC_SET_POS/NEG_GUIDERATE) -- the fine
+    /// alternative to the 10-step hc_slew_fixed.
+    pub fn hc_set_rate_dps(&mut self, target: u8, dps: f64) -> Result<bool, MountError> {
+        let req = protocol::encode_set_guiderate(target, dps);
+        let expected = protocol::expected_response_len(protocol::MC_SET_POS_GUIDERATE.2);
+        let resp = self.transact(&req, expected)?;
+        Ok(resp.first() == Some(&b'#'))
+    }
+
     pub fn hc_goto_fast(
         &mut self,
         target: u8,
@@ -204,6 +213,23 @@ impl SimResponder {
             self.advance();
             let sign = if msg_id == protocol::MC_MOVE_POS.0 { 1.0 } else { -1.0 };
             let dps = sign * protocol::rate(data[0]) * 360.0;
+            if dest == protocol::targets::ALT {
+                self.el_rate_dps = dps;
+            } else {
+                self.az_rate_dps = dps;
+            }
+            vec![b'#']
+        } else if msg_id == protocol::MC_SET_POS_GUIDERATE.0
+            || msg_id == protocol::MC_SET_NEG_GUIDERATE.0
+        {
+            // Continuous variable rate: value packed in rev/sec, sign by opcode.
+            self.advance();
+            let sign = if msg_id == protocol::MC_SET_POS_GUIDERATE.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            let dps = sign * protocol::unpack_int3(&data) * 360.0;
             if dest == protocol::targets::ALT {
                 self.el_rate_dps = dps;
             } else {

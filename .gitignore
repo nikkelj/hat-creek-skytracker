@@ -156,3 +156,5 @@ data/
 # Cached ephemeris
 tle_cache.tle*
 de421.bsp*
+# Local config backup written by ConfigState.save_to_file()
+config.json.bak

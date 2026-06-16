@@ -24,6 +24,7 @@ from lib.auxstar import NexstarHandController, RATES, Targets
 from tracking_visuals import PolarPlotMode
 from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
+from camera_manager import apply_gamma_correction, roi_sizes, roi_label_texts
 from utils import draw_button
 
 # Import PID controller and helper functions
@@ -33,6 +34,58 @@ from hotspot import detect_hotspot, pixel_offset_to_angles
 
 # PS4 Controller Button Labels (zero-indexed)
 BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
+
+# Functionality currently assigned to each joystick button, keyed by the pygame
+# button index (i.e. what process_joystick_events() acts on for `event.button`).
+# Buttons with no mapping are shown with a dash so the layout still documents
+# every physical button.
+BUTTON_FUNCTIONS = {
+    0:  "Capture",
+    1:  "Stop",
+    2:  "Tare axes",
+    3:  "Park",
+    4:  "Mount mode",
+    8:  "Track mode +",
+    10: "Bias fine/crs",
+    11: "Feed-fwd",
+    15: "Track mode -",
+}
+
+
+def _draw_disabled_scrim(display, rect):
+    """Draw a translucent grey scrim over a panel to show it is visible but
+    inactive (not interactable in the current mode/state)."""
+    scrim = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+    scrim.fill((25, 25, 25, 165))
+    display.menu_screen.blit(scrim, rect.topleft)
+
+
+def joystick_panel_layout(display):
+    """Geometry for the control panes that hug the RIGHT edge of the joystick
+    mode's upper-left quadrant, stacked bottom-up: PID Gain (bottom), Bias above
+    it, and PID Diagnostics above that. All right-aligned to the quadrant
+    divider, which keeps the center of the quadrant clear (reserved for the
+    forthcoming navball)."""
+    qx, qy = display.sub_x, display.sub_y
+    qw, qh = display.sub_width // 2, display.sub_height // 2
+
+    pid_w, pid_h = 250, 215
+    pid_x = qx + qw - pid_w - 12
+    pid_y = qy + qh - pid_h - 12
+
+    bias_w, bias_h = 250, 150
+    bias_x = qx + qw - bias_w - 12
+    bias_y = pid_y - bias_h - 12
+
+    diag_w, diag_h = 250, 112
+    diag_x = qx + qw - diag_w - 12
+    diag_y = bias_y - diag_h - 12
+
+    return {
+        'pid': pygame.Rect(pid_x, pid_y, pid_w, pid_h),
+        'bias': pygame.Rect(bias_x, bias_y, bias_w, bias_h),
+        'diag': pygame.Rect(diag_x, diag_y, diag_w, diag_h),
+    }
 
 # ==============================================================================
 # JOYSTICK MODE STATE CLASS
@@ -141,9 +194,12 @@ class JoystickModeState:
         self.alt_pid = None
         self.pid_last_update = 0.0
 
-        # Feed-forward and bias control state
-        self.feed_forward_azm_enabled = False
-        self.feed_forward_alt_enabled = False
+        # Feed-forward and bias control state. Honor the saved config flags so
+        # feed-forward (which supplies the target's trajectory rate and removes
+        # the velocity-lag that the integrator would otherwise wind up slowly)
+        # can be on by default; the FF AZ/EL buttons still toggle it live.
+        self.feed_forward_azm_enabled = bool(getattr(config_state, 'feed_forward_azm_enabled', False))
+        self.feed_forward_alt_enabled = bool(getattr(config_state, 'feed_forward_alt_enabled', False))
         self.bias_azm_deg = 0.0
         self.bias_alt_deg = 0.0
         self.bias_control_mode = "coarse"
@@ -429,6 +485,12 @@ class JoystickModeState:
                 self.config_state.pid_alt_i_gain,
                 self.config_state.pid_alt_d_gain
             )
+            # Keep each PID's feed-forward-enabled flag in sync with ours.
+            # create_pid_controllers() builds them with FF off, so without this the
+            # set_feed_forward_rate() calls below would be silently ignored until
+            # the FF buttons were toggled.
+            self.azm_pid.set_feed_forward_enabled(self.feed_forward_azm_enabled)
+            self.alt_pid.set_feed_forward_enabled(self.feed_forward_alt_enabled)
 
         try:
             # Get configured safety limits
@@ -513,8 +575,14 @@ class JoystickModeState:
                         target_az_deg += az_rate * lead_s
                         target_el_deg += el_rate * lead_s
 
-                    # Apply bias corrections
-                    target_az_deg += self.bias_azm_deg
+                    # Apply bias corrections. The AZ bias is an on-sky
+                    # (cross-elevation) nudge so it shifts the image consistently;
+                    # convert to an azimuth offset by dividing by cos(el), since
+                    # azimuth compresses toward the zenith (a raw azimuth bias is
+                    # nearly invisible at high elevation). Clamp cos(el) so the
+                    # scaling stays finite right at the zenith.
+                    cos_el = max(math.cos(math.radians(target_el_deg)), 0.087)  # >= cos(85°)
+                    target_az_deg += self.bias_azm_deg / cos_el
                     target_el_deg += self.bias_alt_deg
 
                     # Compute position errors using config state instance
@@ -522,11 +590,16 @@ class JoystickModeState:
                         self.config_state, current_azm, current_alt, target_az_deg, target_el_deg
                     )
 
-                    # Set feed-forward rates from trajectory
+                    # Set feed-forward rates from trajectory. The trajectory gives
+                    # sky rates; the PID drives the mount. AZM tracks azimuth
+                    # directly, but in AltAz the ALT axis runs opposite sky
+                    # elevation (ALT = 90 - el), so the ALT feed-forward is -el_rate.
+                    # Without this the elevation feed-forward pushes the wrong way.
                     if self.feed_forward_azm_enabled:
                         self.azm_pid.set_feed_forward_rate(az_rate)
                     if self.feed_forward_alt_enabled:
-                        self.alt_pid.set_feed_forward_rate(el_rate)
+                        alt_ff_rate = -el_rate if getattr(self.config_state, 'mount_mode', 'Eq') == 'AltAz' else el_rate
+                        self.alt_pid.set_feed_forward_rate(alt_ff_rate)
 
                     # Update PID controllers
                     current_time = time.time()
@@ -550,12 +623,12 @@ class JoystickModeState:
                     az_command = az_rate_cmd if az_rate_cmd != 0 else 0
                     el_command = el_rate_cmd if el_rate_cmd != 0 else 0
 
-                    # Apply rate commands
+                    # Apply rate commands (continuous variable-rate when enabled,
+                    # else the discrete MC_MOVE step).
                     if self.telescope_connected and not self.stopped:
-                        # Send slew commands
                         try:
-                            self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
-                            self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                            self._issue_axis_rate(Targets.AZM, az_pid_output, az_command)
+                            self._issue_axis_rate(Targets.ALT, el_pid_output, el_command)
                         except Exception as e:
                             print(f"Error sending satellite tracking commands: {e}")
 
@@ -594,6 +667,12 @@ class JoystickModeState:
                 self.config_state.pid_alt_i_gain,
                 self.config_state.pid_alt_d_gain
             )
+            # Keep each PID's feed-forward-enabled flag in sync with ours.
+            # create_pid_controllers() builds them with FF off, so without this the
+            # set_feed_forward_rate() calls below would be silently ignored until
+            # the FF buttons were toggled.
+            self.azm_pid.set_feed_forward_enabled(self.feed_forward_azm_enabled)
+            self.alt_pid.set_feed_forward_enabled(self.feed_forward_alt_enabled)
 
         try:
             # Get configured safety limits
@@ -688,8 +767,10 @@ class JoystickModeState:
                 az_deg += az_rate_dps * lead_s
                 target_el_deg += el_rate_dps * lead_s
 
-            # Apply bias corrections
-            az_deg += self.bias_azm_deg
+            # Apply bias corrections (AZ bias is on-sky cross-elevation; divide by
+            # cos(el) so it shifts the image consistently near the zenith).
+            cos_el = max(math.cos(math.radians(target_el_deg)), 0.087)  # >= cos(85°)
+            az_deg += self.bias_azm_deg / cos_el
             target_el_deg += self.bias_alt_deg
 
             # Compute position errors using config state instance
@@ -725,12 +806,11 @@ class JoystickModeState:
             az_command = az_rate_cmd if az_rate_cmd != 0 else 0
             el_command = el_rate_cmd if el_rate_cmd != 0 else 0
 
-            # Apply rate commands
+            # Apply rate commands (continuous variable-rate when enabled).
             if self.telescope_connected and not self.stopped:
-                # Send slew commands
                 try:
-                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_command)
-                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_command)
+                    self._issue_axis_rate(Targets.AZM, az_pid_output, az_command)
+                    self._issue_axis_rate(Targets.ALT, el_pid_output, el_command)
                 except Exception as e:
                     print(f"Error sending launch tracking commands: {e}")
 
@@ -881,6 +961,15 @@ class JoystickModeState:
                 y_sign=float(getattr(cfg, 'hotspot_y_sign', -1.0)),
             )
 
+            # pixel_offset_to_angles returns the correction in the optical/sky frame
+            # (elevation increasing upward). The PID drives the mount in mount
+            # coordinates; in AltAz mode the ALT axis runs opposite sky elevation
+            # (el = 90 - ALT), so negate the elevation term -- this makes HOTSPOT
+            # feed the same mount-frame error sign that PROGRAM track gets from
+            # compute_mount_position_error.
+            if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz':
+                el_error = -el_error
+
             # Drive the mount to null the optical error using the shared PID.
             current_time = now
             az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
@@ -904,8 +993,8 @@ class JoystickModeState:
 
             if self.telescope_connected and not self.stopped:
                 try:
-                    self.telescope_controller.hc_slew_fixed(Targets.AZM, az_rate_cmd)
-                    self.telescope_controller.hc_slew_fixed(Targets.ALT, el_rate_cmd)
+                    self._issue_axis_rate(Targets.AZM, az_pid_output, az_rate_cmd)
+                    self._issue_axis_rate(Targets.ALT, el_pid_output, el_rate_cmd)
                 except Exception as e:
                     print(f"HOTSPOT: error sending slew commands: {e}")
             return
@@ -930,6 +1019,24 @@ class JoystickModeState:
         self.tracking_mode = TrackingMode.PROGRAM
         if self.update_status_callback:
             self.update_status_callback("HOTSPOT: lost lock - falling back to PROGRAM track")
+
+    def _issue_axis_rate(self, target, pid_output_rev_s, discrete_cmd):
+        """Send one axis's rate to the mount.
+
+        In continuous-rate mode use the fine 24-bit variable-rate (guide-rate)
+        primitive so the commanded rate matches the target's motion exactly and
+        avoids the MC_MOVE quantization sawtooth. Fall back to the discrete
+        MC_MOVE step when the requested rate exceeds guide_rate_max_dps (the
+        regime where the guide-rate command may not be honored, e.g. the
+        near-zenith keyhole) or when continuous mode is off.
+        """
+        cfg = self.config_state
+        if getattr(cfg, 'continuous_rate_tracking', False) and hasattr(self.telescope_controller, 'hc_set_rate_dps'):
+            dps = pid_output_rev_s * 360.0
+            if abs(dps) <= float(getattr(cfg, 'guide_rate_max_dps', 5.0)):
+                self.telescope_controller.hc_set_rate_dps(target, dps)
+                return
+        self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
 
     def _hotspot_stop_motion(self):
         """Best-effort stop of both axes."""
@@ -1118,14 +1225,18 @@ class JoystickModeState:
         self.current_tt = self.ts.now().tt
 
 def render_position_display(display, joystick_state):
-    """Render the current AZM and ALT position display"""
-    if not joystick_state.telescope_connected:
-        return
+    """Render the current mode / AZM / ALT position box.
 
-    # Position to the right of joystick axes display (around x=165)
-    x_start = display.sub_x + 165
-    y_start = display.sub_y + 380  # Moved up 100 pixels to 380
-    width = 100  # ~100 pixels wide as requested
+    Anchored to the top-right corner of the joystick mode's upper-left
+    quadrant. The box is always drawn (so its location is visible) but is
+    greyed out when the telescope is not connected and there is no live data.
+    """
+    connected = joystick_state.telescope_connected
+
+    # Box sized to envelope its text (the old 100x65 box clipped the values).
+    width, height = 140, 86
+    x_start = display.sub_x + display.sub_width // 2 - width - 12
+    y_start = display.sub_y + 12
 
     # Background color based on stop state
     if joystick_state.stopped:
@@ -1136,10 +1247,9 @@ def render_position_display(display, joystick_state):
         border_color = (100, 100, 100)
 
     # Background rectangle for position display
-    pygame.draw.rect(display.menu_screen, bg_color,
-                     (x_start, y_start, width, 65))
-    pygame.draw.rect(display.menu_screen, border_color,
-                     (x_start, y_start, width, 65), 1)
+    box_rect = pygame.Rect(x_start, y_start, width, height)
+    pygame.draw.rect(display.menu_screen, bg_color, box_rect)
+    pygame.draw.rect(display.menu_screen, border_color, box_rect, 1)
 
     # Mode/status indicator at the top
     if joystick_state.stopped:
@@ -1148,31 +1258,36 @@ def render_position_display(display, joystick_state):
     else:
         status_text = joystick_state.tracking_mode.name  # Show current tracking mode
         status_color = (100, 255, 100)  # Green when active
-    status_render = display.tiny_font.render(status_text, True, status_color)
-    display.menu_screen.blit(status_render, (x_start + 5, y_start + 2))
+    status_render = display.small_font.render(status_text, True, status_color)
+    display.menu_screen.blit(status_render, (x_start + 6, y_start + 4))
 
     # Add mount mode indicator
     mount_mode_text = display.tiny_font.render(f"Mount: {joystick_state.mount_mode}", True, (200, 200, 100))
-    display.menu_screen.blit(mount_mode_text, (x_start + 5, y_start + 15))
+    display.menu_screen.blit(mount_mode_text, (x_start + 6, y_start + 22))
 
-    # Compact title below mount mode
-    title_text = display.tiny_font.render("Position:", True, (255, 255, 255))
-    display.menu_screen.blit(title_text, (x_start + 5, y_start + 27))
-
-    # Compact AZM display
+    # AZM display
     azm_label_text = display.tiny_font.render("AZM", True, (255, 255, 255))
-    display.menu_screen.blit(azm_label_text, (x_start + 5, y_start + 39))
+    display.menu_screen.blit(azm_label_text, (x_start + 6, y_start + 38))
+    azm_value = joystick_state.azm_display_str[:14] if connected else "--"
+    azm_value_text = display.tiny_font.render(azm_value, True, (0, 255, 0))
+    display.menu_screen.blit(azm_value_text, (x_start + 34, y_start + 38))
 
-    # Use tiny font for values to fit in compact space
-    azm_value_text = display.tiny_font.render(joystick_state.azm_display_str[:12], True, (0, 255, 0))
-    display.menu_screen.blit(azm_value_text, (x_start + 5, y_start + 49))
-
-    # Compact ALT display
+    # ALT display
     alt_label_text = display.tiny_font.render("ALT", True, (255, 255, 255))
-    display.menu_screen.blit(alt_label_text, (x_start + 5, y_start + 59))
+    display.menu_screen.blit(alt_label_text, (x_start + 6, y_start + 54))
+    alt_value = joystick_state.alt_display_str[:14] if connected else "--"
+    alt_value_text = display.tiny_font.render(alt_value, True, (0, 255, 0))
+    display.menu_screen.blit(alt_value_text, (x_start + 34, y_start + 54))
 
-    alt_value_text = display.tiny_font.render(joystick_state.alt_display_str[:12], True, (0, 255, 0))
-    display.menu_screen.blit(alt_value_text, (x_start + 5, y_start + 69))
+    # Connection hint at the bottom
+    conn_text = "Connected" if connected else "Disconnected"
+    conn_color = (120, 220, 120) if connected else (200, 120, 120)
+    conn_render = display.tiny_font.render(conn_text, True, conn_color)
+    display.menu_screen.blit(conn_render, (x_start + 6, y_start + 70))
+
+    # Grey the box out when there is no live telescope data
+    if not connected:
+        _draw_disabled_scrim(display, box_rect)
 
 # ==============================================================================
 # JOYSTICK MODE RENDERING FUNCTIONS
@@ -1246,151 +1361,128 @@ def render_connection_controls(display, joystick_state):
     display.menu_screen.blit(status_text, (display.sub_x + 10, status_y))
 
 def render_joystick_status(display, joystick_state):
-    """Render joystick status below connection controls"""
+    """Render the joystick status (button map + axes) below the connection
+    controls.
+
+    The full button map and axis displays are always drawn so their location
+    is visible, with each button labelled by the functionality currently
+    assigned to it. When no joystick is connected the whole block is greyed
+    out (visible but inactive).
+    """
+    connected = (joystick_state.connected_joystick is not None and
+                 joystick_state.connected_joystick in joystick_state.joysticks)
+    joy = joystick_state.joysticks[joystick_state.connected_joystick] if connected else None
+    num_buttons = joy.get_numbuttons() if connected else 0
+    num_axes = joy.get_numaxes() if connected else 0
+
+    base_x = display.sub_x + 10
     y_start = display.sub_y + 140
 
-    # Joystick name
-    if joystick_state.connected_joystick is not None and joystick_state.connected_joystick in joystick_state.joysticks:
-        joy = joystick_state.joysticks[joystick_state.connected_joystick]
+    # Joystick name (kept outside the grey scrim so its status stays readable)
+    if connected:
         name_text = display.small_font.render(f"Joystick: {joy.get_name()}", True, (255, 255, 255))
     else:
         name_text = display.small_font.render("Joystick: None", True, (255, 0, 0))
-    display.menu_screen.blit(name_text, (display.sub_x + 10, y_start))
+    display.menu_screen.blit(name_text, (base_x, y_start))
 
-    current_y = y_start + 25
+    # ---- Buttons section ---------------------------------------------------
+    region_top = y_start + 25
+    buttons_label = display.small_font.render("Buttons (function):", True, (255, 255, 255))
+    display.menu_screen.blit(buttons_label, (base_x, region_top))
 
-    # Button states
-    if joystick_state.connected_joystick is not None:
-        joy = joystick_state.joysticks[joystick_state.connected_joystick]
+    buttons_top = region_top + 20
+    col_w = 130
+    swatch_w, swatch_h = 26, 18
+    row_h = 22
+    num_slots = len(BUTTON_LABELS)
+    rows_per_col = (num_slots + 1) // 2  # 8 rows over two columns for 16 buttons
 
-        # Buttons section
-        buttons_label = display.small_font.render("Buttons:", True, (255, 255, 255))
-        display.menu_screen.blit(buttons_label, (display.sub_x + 10, current_y))
-        current_y += 20
+    for i in range(num_slots):
+        col = i // rows_per_col
+        row = i % rows_per_col
+        bx = base_x + col * col_w
+        by = buttons_top + row * row_h
 
-        # Display buttons dynamically
-        num_buttons = joy.get_numbuttons()
-        if num_buttons > 0:
-            for i in range(num_buttons):
-                button_state = joy.get_button(i)
-                button_color = (0, 255, 0) if button_state else (100, 100, 100)
+        active = connected and i < num_buttons and joy.get_button(i)
+        swatch_color = (0, 255, 0) if active else (90, 90, 90)
+        swatch_rect = pygame.Rect(bx, by, swatch_w, swatch_h)
+        pygame.draw.rect(display.menu_screen, swatch_color, swatch_rect)
+        pygame.draw.rect(display.menu_screen, (150, 150, 150), swatch_rect, 1)
 
-                col = i % 4
-                row = i // 4
-                button_rect = pygame.Rect(display.sub_x + 10 + col * 40, current_y + row * 25, 30, 20)
-                pygame.draw.rect(display.menu_screen, button_color, button_rect)
+        label = BUTTON_LABELS[i] if i < len(BUTTON_LABELS) else str(i)
+        label_color = (0, 0, 0) if active else (230, 230, 230)
+        label_text = display.tiny_font.render(label, True, label_color)
+        display.menu_screen.blit(label_text, label_text.get_rect(center=swatch_rect.center))
 
-                # Use button labels if available, otherwise fall back to numbers
-                if i < len(BUTTON_LABELS):
-                    button_label = BUTTON_LABELS[i]
-                else:
-                    button_label = str(i)
+        func = BUTTON_FUNCTIONS.get(i, "-")
+        func_color = (220, 220, 220) if i in BUTTON_FUNCTIONS else (120, 120, 120)
+        func_text = display.tiny_font.render(func, True, func_color)
+        display.menu_screen.blit(func_text, (bx + swatch_w + 4, by + 4))
 
-                button_text = display.tiny_font.render(button_label, True, (255, 255, 255))
-                text_rect = button_text.get_rect(center=button_rect.center)
-                display.menu_screen.blit(button_text, text_rect)
+    current_y = buttons_top + rows_per_col * row_h + 12
 
-            current_y += ((num_buttons - 1) // 4 + 1) * 25 + 15
+    # ---- Axes section ------------------------------------------------------
+    axes_label = display.small_font.render("Axes:", True, (255, 255, 255))
+    display.menu_screen.blit(axes_label, (base_x, current_y))
+    current_y += 20
 
-        # Axes section
-        axes_label = display.small_font.render("Axes:", True, (255, 255, 255))
-        display.menu_screen.blit(axes_label, (display.sub_x + 10, current_y))
-        current_y += 20
+    # First two axis pairs as 2D crosshair boxes (left/right sticks)
+    box_size = 60
+    crosshair_range = 20
+    for pair in range(2):
+        axis_x, axis_y = pair * 2, pair * 2 + 1
+        box_x, box_y = base_x, current_y
+        center_x = box_x + box_size // 2
+        center_y = box_y + box_size // 2
 
-        # Display axes
-        num_axes = joy.get_numaxes()
-        axes_displayed = 0
+        pygame.draw.rect(display.menu_screen, (80, 80, 80), (box_x, box_y, box_size, box_size))
+        pygame.draw.rect(display.menu_screen, (150, 150, 150), (box_x, box_y, box_size, box_size), 1)
 
-        # Display first two pairs of axes as 2D boxes with crosshairs
-        for pair in range(2):
-            axis_x = pair * 2
-            axis_y = pair * 2 + 1
+        x_val = joy.get_axis(axis_x) if connected and axis_x < num_axes else 0.0
+        y_val = joy.get_axis(axis_y) if connected and axis_y < num_axes else 0.0
+        crosshair_x = center_x + int(x_val * crosshair_range)
+        crosshair_y = center_y + int(y_val * crosshair_range)
 
-            if axis_x < num_axes and axis_y < num_axes:
-                # 2D controller display as square
-                box_size = 60
+        pygame.draw.line(display.menu_screen, (255, 255, 255),
+                         (crosshair_x, center_y - crosshair_range),
+                         (crosshair_x, center_y + crosshair_range), 1)
+        pygame.draw.line(display.menu_screen, (255, 255, 255),
+                         (center_x - crosshair_range, crosshair_y),
+                         (center_x + crosshair_range, crosshair_y), 1)
 
-                # Position the square box
-                box_x = display.sub_x + 10
-                box_y = current_y
-                center_x = box_x + box_size // 2
-                center_y = box_y + box_size // 2
+        pair_label = "Left Stick" if pair == 0 else "Right Stick"
+        label_text = display.tiny_font.render(pair_label, True, (255, 255, 255))
+        display.menu_screen.blit(label_text, (base_x + box_size + 10, current_y + 20))
 
-                # Draw 2D square box background
-                pygame.draw.rect(display.menu_screen, (80, 80, 80),
-                               (box_x, box_y, box_size, box_size))
-                pygame.draw.rect(display.menu_screen, (150, 150, 150),
-                               (box_x, box_y, box_size, box_size), 1)
+        current_y += box_size + 10
 
-                # Get axis values (-1 to 1 range)
-                x_val = joy.get_axis(axis_x)
-                y_val = joy.get_axis(axis_y)
+    # Triggers (L2/R2) as linear sliders
+    for idx, ax_label in ((4, "L2"), (5, "R2")):
+        slider_width, slider_height = 100, 12
+        slider_x, slider_y = base_x, current_y
+        pygame.draw.rect(display.menu_screen, (80, 80, 80), (slider_x, slider_y, slider_width, slider_height))
+        pygame.draw.rect(display.menu_screen, (150, 150, 150), (slider_x, slider_y, slider_width, slider_height), 1)
 
-                # Draw crosshairs (inverted Y interpretation)
-                crosshair_range = 20  # 20 pixels in each direction
-                crosshair_x = center_x + int(x_val * crosshair_range)
-                crosshair_y = center_y + int(y_val * crosshair_range)  # Inverted Y interpretation
+        axis_val = joy.get_axis(idx) if connected and idx < num_axes else -1.0
+        slider_pos = int((axis_val + 1) / 2 * slider_width)
+        pygame.draw.rect(display.menu_screen, (255, 255, 0),
+                         (slider_x + slider_pos - 2, slider_y - 2, 4, slider_height + 4))
 
-                # Vertical line
-                pygame.draw.line(display.menu_screen, (255, 255, 255),
-                               (crosshair_x, center_y - crosshair_range),
-                               (crosshair_x, center_y + crosshair_range), 1)
-                # Horizontal line
-                pygame.draw.line(display.menu_screen, (255, 255, 255),
-                               (center_x - crosshair_range, crosshair_y),
-                               (center_x + crosshair_range, crosshair_y), 1)
+        val_text = display.tiny_font.render(f"{ax_label}: {axis_val:+.2f}", True, (255, 255, 255))
+        display.menu_screen.blit(val_text, (slider_x + slider_width + 10, slider_y))
+        current_y += slider_height + 8
 
-                # Label
-                if pair == 0:
-                    pair_label = "Left Stick"
-                else:
-                    pair_label = "Right Stick"
-                label_text = display.tiny_font.render(pair_label, True, (255, 255, 255))
-                display.menu_screen.blit(label_text, (display.sub_x + 10 + box_size + 10, current_y + 20))
+    # Hat information
+    num_hats = joy.get_numhats() if connected else 0
+    hats_label = display.small_font.render(f"Hats: {num_hats}", True, (255, 255, 255))
+    display.menu_screen.blit(hats_label, (base_x, current_y))
+    current_y += 20
 
-                current_y += box_size + 10
-                axes_displayed += 2
-
-        # Display remaining axes as linear sliders
-        remaining_axes = num_axes - axes_displayed
-        if remaining_axes > 0:
-            for i in range(axes_displayed, num_axes):
-                # Linear slider
-                slider_width = 100
-                slider_height = 12
-                slider_x = display.sub_x + 10
-                slider_y = current_y
-
-                # Draw slider background
-                pygame.draw.rect(display.menu_screen, (80, 80, 80),
-                               (slider_x, slider_y, slider_width, slider_height))
-                pygame.draw.rect(display.menu_screen, (150, 150, 150),
-                               (slider_x, slider_y, slider_width, slider_height), 1)
-
-                # Get axis value and display position
-                axis_val = joy.get_axis(i)
-                slider_pos = int((axis_val + 1) / 2 * slider_width)  # Convert -1..1 to 0..width
-
-                # Draw slider position
-                pygame.draw.rect(display.menu_screen, (255, 255, 0),
-                               (slider_x + slider_pos - 2, slider_y - 2, 4, slider_height + 4))
-
-                # Slider value text - use special labels for L2/R2
-                if i == 4:
-                    axis_label = "L2"
-                elif i == 5:
-                    axis_label = "R2"
-                else:
-                    axis_label = f"A{i}"
-                val_text = display.tiny_font.render(f"{axis_label}: {axis_val:+.2f}", True, (255, 255, 255))
-                display.menu_screen.blit(val_text, (slider_x + slider_width + 10, slider_y))
-
-                current_y += slider_height + 8
-
-        # Hat information
-        num_hats = joy.get_numhats()
-        hats_label = display.small_font.render(f"Hats: {num_hats}", True, (255, 255, 255))
-        display.menu_screen.blit(hats_label, (display.sub_x + 10, current_y))
+    # Grey the whole button/axes block out when no joystick is connected
+    if not connected:
+        region = pygame.Rect(display.sub_x + 5, region_top - 2,
+                             2 * col_w + 20, current_y - region_top + 2)
+        _draw_disabled_scrim(display, region)
 
 def render_capture_controls(display, joystick_state):
     """Render capture controls and progress indicator below polar graph"""
@@ -1549,6 +1641,156 @@ def render_capture_controls(display, joystick_state):
         error_text = display.tiny_font.render("Capture Error", True, (255, 0, 0))
         display.menu_screen.blit(error_text, (display.sub_x + 10, display.sub_y + display.sub_height // 2 - 60))
 
+# ==============================================================================
+# JOYSTICK-LOOP CAMERA CONTROLS (half-height feeds)
+# ==============================================================================
+# The Joystick Loop view shows the two camera feeds at half height in the bottom
+# camera area. The helpers below give those feeds the same camera/view controls
+# as the Sensor Calibration view (gain, exposure, gamma, alignment rotation, ROI,
+# combined view + opacity, reset/save). A single layout helper is shared by the
+# renderer and the event handler so hit-testing never drifts from what is drawn.
+
+# Slider/control geometry constants for the joystick-loop camera area
+JL_SLIDER_W = 100          # gain / exposure / gamma slider track width
+JL_ROT_SLIDER_W = 120      # alignment-rotation slider track width
+JL_GAMMA_MIN = 0.01
+JL_GAMMA_MAX = 2.0
+JL_ROTATION_RANGE = 90.0   # -90deg .. +90deg
+
+
+def _joystick_camera_layout(display):
+    """Compute every draw/hit rect for the joystick-loop camera controls.
+
+    Returns a dict shared by render_joystick_camera_controls() and
+    handle_joystick_camera_control_events() so the two never diverge.
+    """
+    camera_area_x = display.sub_x + 10
+    camera_area_y = display.sub_y + display.sub_height // 2 + 10
+    camera_area_width = display.sub_width - 20
+    camera_area_height = display.sub_height // 2 - 20
+
+    cam_w = camera_area_width // 2 - 5
+    cam_h = camera_area_height
+
+    layout = {
+        "camera_area": pygame.Rect(camera_area_x, camera_area_y, camera_area_width, camera_area_height),
+        "cameras": [],
+    }
+
+    for idx in range(2):
+        if idx == 0:
+            fx = camera_area_x
+        else:
+            fx = camera_area_x + camera_area_width // 2 + 5
+        fy = camera_area_y
+
+        strip_y = fy + 4
+        gain_x = fx + 84
+        exp_x = gain_x + JL_SLIDER_W + 30
+        gamma_x = exp_x + JL_SLIDER_W + 30
+
+        # ROI size buttons: two columns of three at the top-right of the feed
+        roi_rects = []
+        roi_col1_x = fx + cam_w - 70
+        roi_col2_x = fx + cam_w - 36
+        roi_top = fy + 26
+        for i in range(6):
+            col_x = roi_col1_x if i < 3 else roi_col2_x
+            row = i % 3
+            roi_rects.append(pygame.Rect(col_x, roi_top + row * 15, 30, 12))
+
+        rot_x = fx + (cam_w - JL_ROT_SLIDER_W) // 2
+        rot_y = fy + cam_h - 26
+
+        layout["cameras"].append({
+            "fx": fx, "fy": fy, "cam_w": cam_w, "cam_h": cam_h,
+            "image_rect": pygame.Rect(fx, fy, cam_w, cam_h),
+            # Connect and disconnect share a slot; only the relevant one is shown.
+            "connect_rect": pygame.Rect(fx + 4, strip_y, 70, 18),
+            "disconnect_rect": pygame.Rect(fx + 4, strip_y, 70, 18),
+            "gain_track": pygame.Rect(gain_x, strip_y, JL_SLIDER_W, 18),
+            "exposure_track": pygame.Rect(exp_x, strip_y, JL_SLIDER_W, 18),
+            "gamma_track": pygame.Rect(gamma_x, strip_y, JL_SLIDER_W, 18),
+            "gamma_toggle": pygame.Rect(gamma_x + JL_SLIDER_W + 6, strip_y, 34, 18),
+            "roi_rects": roi_rects,
+            "rotation_track": pygame.Rect(rot_x, rot_y, JL_ROT_SLIDER_W, 14),
+        })
+
+    # Global view controls grouped at the bottom-center, clear of the per-camera
+    # ROI buttons that sit at each feed's top-right (the left feed's ROI buttons
+    # are right next to the seam, so the seam-top is not free).
+    seam_x = camera_area_x + camera_area_width // 2
+    bottom = camera_area_y + camera_area_height
+    layout["combined_btn"] = pygame.Rect(seam_x - 115, bottom - 48, 110, 18)
+    layout["opacity_track"] = pygame.Rect(seam_x + 15, bottom - 44, 100, 14)
+    layout["reset_btn"] = pygame.Rect(seam_x - 105, bottom - 24, 100, 20)
+    layout["save_btn"] = pygame.Rect(seam_x + 5, bottom - 24, 100, 20)
+    return layout
+
+
+def _process_feed_surface(camera, frame, width, height):
+    """Apply gamma + scale + alignment rotation, matching the Sensor Calibration view."""
+    processed = frame
+    if camera.gamma_enabled:
+        processed = apply_gamma_correction(frame, camera.gamma)
+    surface = pygame.transform.scale(processed, (width, height))
+    if camera.alignment_rotation != 0.0:
+        rotated = pygame.transform.rotate(surface, camera.alignment_rotation)
+        surface = pygame.Surface((width, height))
+        surface.fill((0, 0, 0))
+        surface.blit(rotated, (width // 2 - rotated.get_width() // 2,
+                               height // 2 - rotated.get_height() // 2))
+    return surface
+
+
+def _draw_feed_roi(screen, camera, image_rect):
+    """Draw the green ROI box + crosshair over a feed, matching the Sensor Calibration view."""
+    if camera.roi_size is None or camera.roi_size < 0:
+        return
+    roi_w_pct, roi_h_pct = roi_sizes[camera.roi_size]
+    roi_w = int(roi_w_pct * image_rect.width)
+    roi_h = int(roi_h_pct * image_rect.height)
+    roi_x = int(camera.roi_x * (image_rect.width - roi_w))
+    roi_y = int(camera.roi_y * (image_rect.height - roi_h))
+    rect = pygame.Rect(image_rect.x + roi_x, image_rect.y + roi_y, roi_w, roi_h)
+    pygame.draw.rect(screen, (0, 255, 0), rect, 2)
+    cx, cy = rect.centerx, rect.centery
+    pygame.draw.line(screen, (0, 255, 0), (cx - 10, cy), (cx + 10, cy), 1)
+    pygame.draw.line(screen, (0, 255, 0), (cx, cy - 10), (cx, cy + 10), 1)
+
+
+def _draw_feed_timestamps(display, camera, fx, fy, cam_w, cam_h, align):
+    """Draw UTC / Local / FPS stacked in a feed's outer-bottom corner.
+
+    The left feed uses its bottom-left corner and the right feed its bottom-right
+    corner, so the timestamps never collide with the centered rotation slider or
+    the seam-centered combined/opacity/reset/save controls.
+    """
+    info_font = pygame.font.Font(None, 16)
+    lines = [
+        f"UTC: {camera.utc_ts}",
+        f"Local: {camera.local_ts}",
+        f"FPS: {camera.fps:.1f}",
+    ]
+    line_h = 15
+    bottom = fy + cam_h - 4
+    for i, line in enumerate(lines):
+        surf = info_font.render(line, True, (255, 255, 255))
+        y = bottom - (len(lines) - i) * line_h  # stack upward; last line at the bottom
+        x = fx + 8 if align == 'left' else fx + cam_w - 8 - surf.get_width()
+        display.menu_screen.blit(surf, (x, y))
+
+
+def _draw_jl_slider(screen, font, track, ratio, label, track_color, handle_color):
+    """Draw a compact horizontal slider (track + handle + label above)."""
+    line_y = track.centery
+    pygame.draw.rect(screen, track_color, (track.x, line_y - 2, track.width, 4))
+    handle_x = track.x + int(max(0.0, min(1.0, ratio)) * track.width)
+    pygame.draw.rect(screen, handle_color, (handle_x - 4, line_y - 6, 8, 12))
+    if label:
+        screen.blit(font.render(label, True, (255, 255, 255)), (track.x, track.y - 12))
+
+
 def render_camera_feeds(display, joystick_state=None):
     """Render camera feeds with cross-hairs using existing camera manager"""
     try:
@@ -1598,14 +1840,43 @@ def render_camera_feeds(display, joystick_state=None):
                 print("No cameras detected - joystick mode camera features will not function")
             return
 
+        # Combined view: overlay both feeds (opacity-blended) across the full camera
+        # area, matching the Sensor Calibration view's combined mode.
+        combined_active = (camera_manager.combined_view_toggle and
+                           camera1_connected and camera2_connected and
+                           camera1_frame is not None and camera2_frame is not None)
+        if combined_active:
+            try:
+                comb_w = camera_area_width
+                comb_h = camera_area_height
+                surf1 = _process_feed_surface(camera1, camera1_frame, comb_w, comb_h).convert_alpha()
+                surf2 = _process_feed_surface(camera2, camera2_frame, comb_w, comb_h).convert_alpha()
+                opacity = camera_manager.camera_opacities[0] if camera_manager.camera_opacities else 0.5
+                surf1.set_alpha(int(opacity * 255))
+                surf2.set_alpha(int((1 - opacity) * 255))
+                display.menu_screen.blit(surf1, (camera_area_x, camera_area_y))
+                display.menu_screen.blit(surf2, (camera_area_x, camera_area_y))
+
+                center_x = camera_area_x + comb_w // 2
+                center_y = camera_area_y + comb_h // 2
+                pygame.draw.line(display.menu_screen, (255, 0, 0), (center_x - 20, center_y), (center_x + 20, center_y), 1)
+                pygame.draw.line(display.menu_screen, (255, 0, 0), (center_x, center_y - 20), (center_x, center_y + 20), 1)
+                combined_label = display.small_font.render(f"Combined View - Opacity: {opacity:.1f}", True, (0, 200, 200))
+                display.menu_screen.blit(combined_label, (camera_area_x + 10, camera_area_y + 10))
+            except Exception as e:
+                print(f"Error rendering combined joystick feed: {e}")
+                combined_active = False
+
         # Camera 1 (left half of camera area)
         cam1_width = camera_area_width // 2 - 5
         cam1_height = camera_area_height
 
-        if camera1_connected and camera1_frame is not None:
+        if not combined_active and camera1_connected and camera1_frame is not None:
             try:
-                cam1_scaled = pygame.transform.scale(camera1_frame, (cam1_width, cam1_height))
+                cam1_scaled = _process_feed_surface(camera1, camera1_frame, cam1_width, cam1_height)
                 display.menu_screen.blit(cam1_scaled, (camera_area_x, camera_area_y))
+                _draw_feed_roi(display.menu_screen, camera1,
+                               pygame.Rect(camera_area_x, camera_area_y, cam1_width, cam1_height))
 
                 # Draw cross-hair at center
                 center_x = camera_area_x + cam1_width // 2
@@ -1620,16 +1891,9 @@ def render_camera_feeds(display, joystick_state=None):
                 cam1_text = display.small_font.render("Camera 1", True, (255, 255, 255))
                 display.menu_screen.blit(cam1_text, (camera_area_x + 10, camera_area_y + 10))
 
-                # Display time and FPS info below camera 1 (similar to sensor calibration mode)
-                info_font = pygame.font.Font(None, 16)
-                fps_text = info_font.render(f"FPS: {camera1.fps:.1f}", True, (255, 255, 255))
-                display.menu_screen.blit(fps_text, (camera_area_x + cam1_width - 80, camera_area_y + cam1_height - 25))
-
-                utc_text = info_font.render(f"UTC: {camera1.utc_ts}", True, (255, 255, 255))
-                display.menu_screen.blit(utc_text, (camera_area_x + 10, camera_area_y + cam1_height - 25))
-
-                local_text = info_font.render(f"Local: {camera1.local_ts}", True, (255, 255, 255))
-                display.menu_screen.blit(local_text, (camera_area_x + cam1_width // 2, camera_area_y + cam1_height - 25))
+                # Time/FPS stacked in the left feed's bottom-left corner (clear of the
+                # centered rotation slider and the seam-centered view controls)
+                _draw_feed_timestamps(display, camera1, camera_area_x, camera_area_y, cam1_width, cam1_height, 'left')
             except Exception as e:
                 error_text = display.small_font.render("Camera 1 Error", True, (255, 0, 0))
                 display.menu_screen.blit(error_text, (camera_area_x + 10, camera_area_y + 10))
@@ -1647,10 +1911,12 @@ def render_camera_feeds(display, joystick_state=None):
         cam2_width = camera_area_width // 2 - 5
         cam2_height = camera_area_height
 
-        if camera2_connected and camera2_frame is not None:
+        if not combined_active and camera2_connected and camera2_frame is not None:
             try:
-                cam2_scaled = pygame.transform.scale(camera2_frame, (cam2_width, cam2_height))
+                cam2_scaled = _process_feed_surface(camera2, camera2_frame, cam2_width, cam2_height)
                 display.menu_screen.blit(cam2_scaled, (cam2_x, camera_area_y))
+                _draw_feed_roi(display.menu_screen, camera2,
+                               pygame.Rect(cam2_x, camera_area_y, cam2_width, cam2_height))
 
                 # Draw cross-hair at center
                 center_x = cam2_x + cam2_width // 2
@@ -1665,16 +1931,9 @@ def render_camera_feeds(display, joystick_state=None):
                 cam2_text = display.small_font.render("Camera 2", True, (255, 255, 255))
                 display.menu_screen.blit(cam2_text, (cam2_x + 10, camera_area_y + 10))
 
-                # Display time and FPS info below camera 2 (similar to sensor calibration mode)
-                info_font = pygame.font.Font(None, 16)
-                fps_text = info_font.render(f"FPS: {camera2.fps:.1f}", True, (255, 255, 255))
-                display.menu_screen.blit(fps_text, (cam2_x + cam2_width - 80, camera_area_y + cam2_height - 25))
-
-                utc_text = info_font.render(f"UTC: {camera2.utc_ts}", True, (255, 255, 255))
-                display.menu_screen.blit(utc_text, (cam2_x + 10, camera_area_y + cam2_height - 25))
-
-                local_text = info_font.render(f"Local: {camera2.local_ts}", True, (255, 255, 255))
-                display.menu_screen.blit(local_text, (cam2_x + cam2_width // 2, camera_area_y + cam2_height - 25))
+                # Time/FPS stacked in the right feed's bottom-right corner (clear of the
+                # centered rotation slider and the seam-centered view controls)
+                _draw_feed_timestamps(display, camera2, cam2_x, camera_area_y, cam2_width, cam2_height, 'right')
             except Exception as e:
                 error_text = display.small_font.render("Camera 2 Error", True, (255, 0, 0))
                 display.menu_screen.blit(error_text, (cam2_x + 10, camera_area_y + 10))
@@ -1693,6 +1952,9 @@ def render_camera_feeds(display, joystick_state=None):
                                                      camera_area_y + cam2_height // 2))
             display.menu_screen.blit(missing_text, text_rect)
 
+        # Camera and view controls overlaid on the half-height feeds
+        render_joystick_camera_controls(display, joystick_state)
+
     except Exception as e:
         # Catch any unexpected errors and display gracefully
         display.menu_screen.fill((0, 0, 0), (display.sub_x + 10, display.sub_y + display.sub_height // 2 + 10,
@@ -1703,6 +1965,359 @@ def render_camera_feeds(display, joystick_state=None):
                                                display.sub_y + display.sub_height * 3 // 4))
         display.menu_screen.blit(error_text, text_rect)
         print(f"Camera rendering error in joystick mode: {e}")
+
+
+def render_joystick_camera_controls(display, joystick_state=None):
+    """Render the camera/view controls overlaid on the half-height joystick-loop feeds.
+
+    Mirrors the Sensor Calibration view's control set: per-camera connect/disconnect,
+    gain, exposure, gamma (slider + toggle) and alignment-rotation sliders, ROI size
+    buttons, plus the global combined-view toggle, opacity slider and reset/save config.
+    """
+    try:
+        screen = display.menu_screen
+        mouse_pos = pygame.mouse.get_pos()
+        font = pygame.font.Font(None, 14)
+        layout = _joystick_camera_layout(display)
+
+        camera1 = camera_manager.get_camera(0)
+        camera2 = camera_manager.get_camera(1)
+        cameras = [camera1, camera2]
+
+        for idx, camera in enumerate(cameras):
+            if camera is None:
+                continue
+            cam = layout["cameras"][idx]
+
+            # Connect / Disconnect button (one shown depending on state)
+            if camera.connected:
+                rect = cam["disconnect_rect"]
+                hovered = rect.collidepoint(mouse_pos)
+                color = (255, 100, 100) if hovered else (200, 70, 70)
+                pygame.draw.rect(screen, color, rect)
+                screen.blit(font.render("Disconnect", True, (255, 255, 255)),
+                            font.render("Disconnect", True, (255, 255, 255)).get_rect(center=rect.center))
+            else:
+                rect = cam["connect_rect"]
+                hovered = rect.collidepoint(mouse_pos)
+                color = (100, 100, 255) if hovered else (70, 70, 200)
+                pygame.draw.rect(screen, color, rect)
+                screen.blit(font.render("Connect", True, (255, 255, 255)),
+                            font.render("Connect", True, (255, 255, 255)).get_rect(center=rect.center))
+                # No further per-camera controls when disconnected
+                continue
+
+            # Gain slider
+            max_gain = camera.prop.get('MaxGain', 500) if camera.prop else 500
+            gain_ratio = min(1.0, camera.gain / max_gain) if max_gain else 0.0
+            _draw_jl_slider(screen, font, cam["gain_track"], gain_ratio,
+                            f"Gain {camera.gain}", (100, 100, 100), (200, 0, 0))
+
+            # Exposure slider (logarithmic)
+            max_exp = camera.prop.get('MaxExposure', 500000) if camera.prop else 500000
+            min_exp = 1
+            if camera.exposure > 0 and max_exp > min_exp:
+                exp_ratio = math.log10(camera.exposure / min_exp) / math.log10(max_exp / min_exp)
+                exp_ratio = min(1.0, max(0.0, exp_ratio))
+            else:
+                exp_ratio = 0.0
+            exp_us = camera.exposure
+            if exp_us < 1000:
+                exp_val = f"{exp_us:g}us"
+            elif exp_us < 1000000:
+                exp_val = f"{exp_us / 1000.0:.1f}ms"
+            else:
+                exp_val = f"{exp_us / 1000000.0:.1f}s"
+            _draw_jl_slider(screen, font, cam["exposure_track"], exp_ratio,
+                            f"Exp {exp_val}", (100, 100, 100), (0, 200, 0))
+
+            # Gamma slider + toggle
+            gamma_ratio = (camera.gamma - JL_GAMMA_MIN) / (JL_GAMMA_MAX - JL_GAMMA_MIN)
+            _draw_jl_slider(screen, font, cam["gamma_track"], gamma_ratio,
+                            f"Gamma {camera.gamma:.2f}", (150, 150, 150), (200, 200, 255))
+            toggle = cam["gamma_toggle"]
+            toggle_color = (0, 150, 0) if camera.gamma_enabled else (150, 0, 0)
+            if toggle.collidepoint(mouse_pos):
+                toggle_color = tuple(min(255, c + 50) for c in toggle_color)
+            pygame.draw.rect(screen, toggle_color, toggle)
+            t_surf = font.render("ON" if camera.gamma_enabled else "OFF", True, (255, 255, 255))
+            screen.blit(t_surf, t_surf.get_rect(center=toggle.center))
+
+            # Alignment rotation slider (bottom-center)
+            rot = cam["rotation_track"]
+            rot_ratio = (camera.alignment_rotation + JL_ROTATION_RANGE) / (2 * JL_ROTATION_RANGE)
+            _draw_jl_slider(screen, font, rot, rot_ratio,
+                            f"Rot {camera.alignment_rotation:+.1f}", (50, 50, 150), (150, 150, 255))
+            # Center marker at 0 degrees
+            center_marker_x = rot.x + rot.width // 2
+            pygame.draw.line(screen, (255, 255, 255),
+                             (center_marker_x, rot.centery - 5), (center_marker_x, rot.centery + 5), 1)
+
+            # ROI size buttons
+            for i, roi_rect in enumerate(cam["roi_rects"]):
+                is_selected = (camera.roi_size == i)
+                is_hovered = roi_rect.collidepoint(mouse_pos)
+                if is_selected:
+                    pygame.draw.rect(screen, (0, 100, 0), roi_rect)
+                    pygame.draw.rect(screen, (0, 255, 0), roi_rect, 1)
+                    text_color = (255, 255, 255)
+                elif is_hovered:
+                    pygame.draw.rect(screen, (100, 100, 100), roi_rect)
+                    pygame.draw.rect(screen, (200, 200, 200), roi_rect, 1)
+                    text_color = (255, 255, 0)
+                else:
+                    pygame.draw.rect(screen, (70, 70, 70), roi_rect)
+                    pygame.draw.rect(screen, (150, 150, 150), roi_rect, 1)
+                    text_color = (255, 255, 255)
+                r_surf = font.render(roi_label_texts[i], True, text_color)
+                screen.blit(r_surf, r_surf.get_rect(center=roi_rect.center))
+
+        # Global view controls -----------------------------------------------
+        # Combined view toggle
+        combined_btn = layout["combined_btn"]
+        is_toggled = camera_manager.combined_view_toggle
+        is_hovered = combined_btn.collidepoint(mouse_pos)
+        if is_toggled:
+            btn_color = (50, 150, 50) if is_hovered else (0, 100, 0)
+        else:
+            btn_color = (100, 100, 100) if is_hovered else (70, 70, 70)
+        pygame.draw.rect(screen, btn_color, combined_btn)
+        pygame.draw.rect(screen, (150, 150, 150), combined_btn, 1)
+        c_surf = font.render("Combined View", True, (255, 255, 255))
+        screen.blit(c_surf, c_surf.get_rect(center=combined_btn.center))
+
+        # Opacity slider (only when both cameras connected)
+        if camera1 and camera2 and camera1.connected and camera2.connected:
+            opacity = camera_manager.camera_opacities[0] if camera_manager.camera_opacities else 0.5
+            _draw_jl_slider(screen, font, layout["opacity_track"], opacity,
+                            f"Opacity {opacity:.1f}", (100, 100, 100), (255, 255, 0))
+
+        # Reset / Save config buttons
+        reset_btn = layout["reset_btn"]
+        pygame.draw.rect(screen, (100, 70, 70) if reset_btn.collidepoint(mouse_pos) else (70, 50, 50), reset_btn)
+        pygame.draw.rect(screen, (150, 150, 150), reset_btn, 1)
+        rs_surf = font.render("Reset", True, (255, 255, 255))
+        screen.blit(rs_surf, rs_surf.get_rect(center=reset_btn.center))
+
+        save_btn = layout["save_btn"]
+        pygame.draw.rect(screen, (70, 100, 70) if save_btn.collidepoint(mouse_pos) else (50, 70, 50), save_btn)
+        pygame.draw.rect(screen, (150, 150, 150), save_btn, 1)
+        sv_surf = font.render("Save", True, (255, 255, 255))
+        screen.blit(sv_surf, sv_surf.get_rect(center=save_btn.center))
+
+    except Exception as e:
+        print(f"Error rendering joystick camera controls: {e}")
+
+
+def _apply_jl_camera_drag(current_pos, display):
+    """Apply slider drags for the joystick-loop camera controls (gain/exposure/gamma/rotation/opacity)."""
+    layout = _joystick_camera_layout(display)
+    for idx in range(2):
+        camera = camera_manager.get_camera(idx)
+        if camera is None or not camera.connected:
+            continue
+        cam = layout["cameras"][idx]
+
+        # Gain
+        track = cam["gain_track"]
+        if track.collidepoint(current_pos):
+            max_gain = camera.prop.get('MaxGain', 500) if camera.prop else 500
+            rel = min(max(current_pos[0] - track.x, 0), track.width)
+            camera_manager.set_camera_gain(idx, int((rel / track.width) * max_gain))
+
+        # Exposure (logarithmic)
+        track = cam["exposure_track"]
+        if track.collidepoint(current_pos):
+            max_exp = camera.prop.get('MaxExposure', 500000) if camera.prop else 500000
+            min_exp = 1
+            rel = min(max(current_pos[0] - track.x, 0), track.width)
+            slider_pos = rel / track.width
+            if max_exp > min_exp:
+                new_exp = int(min_exp * (10 ** (slider_pos * math.log10(max_exp / min_exp))))
+                new_exp = max(min_exp, min(new_exp, max_exp))
+            else:
+                new_exp = max_exp
+            camera_manager.set_camera_exposure(idx, new_exp)
+
+        # Gamma
+        track = cam["gamma_track"]
+        if track.collidepoint(current_pos):
+            rel = min(max(current_pos[0] - track.x, 0), track.width)
+            new_gamma = JL_GAMMA_MIN + (rel / track.width) * (JL_GAMMA_MAX - JL_GAMMA_MIN)
+            camera.gamma = round(max(JL_GAMMA_MIN, min(JL_GAMMA_MAX, new_gamma)), 2)
+
+        # Alignment rotation
+        track = cam["rotation_track"]
+        if track.collidepoint(current_pos):
+            rel = min(max(current_pos[0] - track.x, 0), track.width)
+            new_rot = ((rel / track.width) - 0.5) * (2 * JL_ROTATION_RANGE)
+            camera.alignment_rotation = max(-JL_ROTATION_RANGE, min(JL_ROTATION_RANGE, new_rot))
+
+    # Opacity (global, only when both cameras connected)
+    c1 = camera_manager.get_camera(0)
+    c2 = camera_manager.get_camera(1)
+    if c1 and c2 and c1.connected and c2.connected:
+        track = layout["opacity_track"]
+        if track.collidepoint(current_pos):
+            rel = min(max(current_pos[0] - track.x, 0), track.width)
+            camera_manager.camera_opacities[0] = max(0.0, min(1.0, rel / track.width))
+
+
+def _jl_pos_over_control(layout, idx, pos):
+    """True if pos hits any control overlaying the feed (so an image click is not an ROI-origin set)."""
+    cam = layout["cameras"][idx]
+    rects = [cam["connect_rect"], cam["disconnect_rect"], cam["gain_track"],
+             cam["exposure_track"], cam["gamma_track"], cam["gamma_toggle"],
+             cam["rotation_track"]] + cam["roi_rects"]
+    rects += [layout["combined_btn"], layout["opacity_track"], layout["reset_btn"], layout["save_btn"]]
+    return any(r.collidepoint(pos) for r in rects)
+
+
+def _jl_reset_camera_config(config_state, update_status_callback):
+    """Reset both cameras' settings to config-file defaults (mirrors Sensor Calibration reset)."""
+    if not config_state:
+        update_status_callback("Error: Config state not available")
+        return
+    c0 = camera_manager.get_camera(0)
+    c1 = camera_manager.get_camera(1)
+    c0.alignment_rotation = float(config_state.get_camera_alignment_rotation("camera1") or 0.0)
+    c0.gain = int(float(config_state.get_camera_gain("camera1") or 1))
+    c0.exposure = int(float(config_state.get_camera_exposure("camera1") or 10000))
+    c0.gamma = float(config_state.camera_configs["camera1"].get("gamma", 0.1))
+    c0.gamma_enabled = bool(config_state.camera_configs["camera1"].get("gamma_enabled", False))
+    c1.alignment_rotation = float(config_state.get_camera_alignment_rotation("camera2") or 0.0)
+    c1.gain = int(float(config_state.get_camera_gain("camera2") or 1))
+    c1.exposure = int(float(config_state.get_camera_exposure("camera2") or 10000))
+    c1.gamma = float(config_state.camera_configs["camera2"].get("gamma", 0.1))
+    c1.gamma_enabled = bool(config_state.camera_configs["camera2"].get("gamma_enabled", False))
+    if c0.connected and c0.cap:
+        camera_manager.set_camera_gain(0, c0.gain, update_status_callback)
+        camera_manager.set_camera_exposure(0, c0.exposure, update_status_callback)
+    if c1.connected and c1.cap:
+        camera_manager.set_camera_gain(1, c1.gain, update_status_callback)
+        camera_manager.set_camera_exposure(1, c1.exposure, update_status_callback)
+    update_status_callback("Camera settings reset to config file defaults")
+
+
+def _jl_save_camera_config(config_state, update_status_callback):
+    """Save both cameras' current settings to config.json (mirrors Sensor Calibration save)."""
+    if not config_state:
+        update_status_callback("Error: Config state not available")
+        return
+    c0 = camera_manager.get_camera(0)
+    c1 = camera_manager.get_camera(1)
+    config_state.camera_configs["camera1"]["alignment_rotation"] = c0.alignment_rotation
+    config_state.camera_configs["camera1"]["gain"] = c0.gain
+    config_state.camera_configs["camera1"]["exposure"] = c0.exposure
+    config_state.camera_configs["camera1"]["gamma"] = c0.gamma
+    config_state.camera_configs["camera1"]["gamma_enabled"] = c0.gamma_enabled
+    config_state.camera_configs["camera2"]["alignment_rotation"] = c1.alignment_rotation
+    config_state.camera_configs["camera2"]["gain"] = c1.gain
+    config_state.camera_configs["camera2"]["exposure"] = c1.exposure
+    config_state.camera_configs["camera2"]["gamma"] = c1.gamma
+    config_state.camera_configs["camera2"]["gamma_enabled"] = c1.gamma_enabled
+    config_state.save_to_file()
+    update_status_callback("Camera settings saved to config.json")
+
+
+def handle_joystick_camera_control_events(event, display, config_state=None, update_status_callback=None):
+    """Handle mouse events for the joystick-loop half-height camera controls.
+
+    Returns True if the event was consumed by a camera/view control."""
+    if update_status_callback is None:
+        update_status_callback = print
+
+    if event.type == pygame.MOUSEMOTION:
+        if event.buttons[0]:
+            _apply_jl_camera_drag(event.pos, display)
+        return False
+
+    if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+        return False
+
+    pos = event.pos
+    layout = _joystick_camera_layout(display)
+
+    for idx in range(2):
+        camera = camera_manager.get_camera(idx)
+        if camera is None:
+            continue
+        cam = layout["cameras"][idx]
+
+        # Connect / Disconnect
+        if not camera.connected:
+            if cam["connect_rect"].collidepoint(pos):
+                camera_manager.connect_camera(idx, update_status_callback)
+                return True
+            continue  # no other per-camera controls while disconnected
+        if cam["disconnect_rect"].collidepoint(pos):
+            camera_manager.disconnect_camera(idx, update_status_callback)
+            return True
+
+        # Gamma toggle
+        if cam["gamma_toggle"].collidepoint(pos):
+            camera.gamma_enabled = not camera.gamma_enabled
+            return True
+
+        # Slider clicks set the value immediately (then drag continues to adjust)
+        if (cam["gain_track"].collidepoint(pos) or cam["exposure_track"].collidepoint(pos) or
+                cam["gamma_track"].collidepoint(pos) or cam["rotation_track"].collidepoint(pos)):
+            _apply_jl_camera_drag(pos, display)
+            return True
+
+        # ROI size buttons
+        for i, roi_rect in enumerate(cam["roi_rects"]):
+            if roi_rect.collidepoint(pos):
+                if camera.roi_size == i:
+                    camera.roi_size = -1
+                    camera.roi_x = 0.5
+                    camera.roi_y = 0.5
+                    camera_manager.set_camera_roi(idx, update_status_callback, None, None, -1)
+                else:
+                    was_first = (camera.roi_size == -1)
+                    camera.roi_size = i
+                    if was_first:
+                        camera.roi_x = 0.5
+                        camera.roi_y = 0.5
+                    camera_manager.set_camera_roi(idx, update_status_callback, camera.roi_x, camera.roi_y, i)
+                return True
+
+    # Global view controls
+    if layout["combined_btn"].collidepoint(pos):
+        camera_manager.combined_view_toggle = not camera_manager.combined_view_toggle
+        return True
+
+    c1 = camera_manager.get_camera(0)
+    c2 = camera_manager.get_camera(1)
+    if c1 and c2 and c1.connected and c2.connected and layout["opacity_track"].collidepoint(pos):
+        track = layout["opacity_track"]
+        rel = min(max(pos[0] - track.x, 0), track.width)
+        camera_manager.camera_opacities[0] = max(0.0, min(1.0, rel / track.width))
+        return True
+
+    if layout["reset_btn"].collidepoint(pos):
+        _jl_reset_camera_config(config_state, update_status_callback)
+        return True
+    if layout["save_btn"].collidepoint(pos):
+        _jl_save_camera_config(config_state, update_status_callback)
+        return True
+
+    # ROI origin selection by clicking on a connected feed (skip if over any control)
+    for idx in range(2):
+        camera = camera_manager.get_camera(idx)
+        if camera is None or not camera.connected or camera.frame is None:
+            continue
+        cam = layout["cameras"][idx]
+        image_rect = cam["image_rect"]
+        if not image_rect.collidepoint(pos) or _jl_pos_over_control(layout, idx, pos):
+            continue
+        camera.roi_x = max(0.0, min(1.0, (pos[0] - image_rect.x) / image_rect.width))
+        camera.roi_y = max(0.0, min(1.0, (pos[1] - image_rect.y) / image_rect.height))
+        if camera.roi_size >= 0:
+            camera_manager.set_camera_roi(idx, update_status_callback, camera.roi_x, camera.roi_y, camera.roi_size)
+        return True
+
+    return False
 
 # ==============================================================================
 # JOYSTICK MODE EVENT HANDLING
@@ -1875,88 +2490,68 @@ def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tra
 
 def render_pid_diagnostics(display, joystick_state):
     """
-    Render PID diagnostics display for both azimuth and elevation axes.
-    Shows position errors, rate errors, and target/command rates.
+    Live PID tracking diagnostics for both axes: position error and commanded
+    rate, plus the active rate-command mode. Always drawn so its location is
+    visible (greyed out when not actively tracking), matching the PID Gain pane.
+    Reads only fields both the Python and Rust loops populate (position error and
+    pid output), so it works regardless of which control loop is running.
     """
-    # Only show during PROGRAM track mode and when PID controllers exist
-    if (joystick_state.tracking_mode != TrackingMode.PROGRAM or
-        joystick_state.azm_pid is None or joystick_state.alt_pid is None):
-        return
+    pane = joystick_panel_layout(display)['diag']
+    x_start, y_start, width, height = pane.x, pane.y, pane.width, pane.height
 
-    # Position the PID diagnostics on the right side of positions display
-    x_start = display.sub_x + 280  # To the right of the position display
-    y_start = display.sub_y + 380 - 300  # Moved down 100 pixels
-    width = 240
-    height = 120
+    # "Needed" = actively tracking (PROGRAM or HOTSPOT); otherwise greyed.
+    active = joystick_state.tracking_mode in (TrackingMode.PROGRAM, TrackingMode.HOTSPOT)
 
-    # Background rectangle for PID diagnostics
-    pygame.draw.rect(display.menu_screen, (50, 50, 50),
-                     (x_start, y_start, width, height))
-    pygame.draw.rect(display.menu_screen, (100, 100, 100),
-                     (x_start, y_start, width, height), 1)
+    # Palette: dim when idle, lit when active.
+    bg = (70, 70, 90) if active else (45, 45, 55)
+    border = (140, 140, 170) if active else (80, 80, 95)
+    label_c = (255, 200, 0) if active else (110, 100, 70)
+    val_c = (255, 255, 255) if active else (110, 110, 120)
+    rate_c = (160, 255, 160) if active else (90, 110, 90)
 
-    # Title
-    title_text = display.small_font.render("PID Diagnostics", True, (255, 255, 255))
-    display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
+    pygame.draw.rect(display.menu_screen, bg, (x_start, y_start, width, height))
+    pygame.draw.rect(display.menu_screen, border, (x_start, y_start, width, height), 1)
+    display.menu_screen.blit(
+        display.small_font.render("PID Diagnostics", True, val_c), (x_start + 10, y_start + 5))
 
-    # AZM Axis section
-    azm_title = display.tiny_font.render("AZIMUTH:", True, (255, 200, 0))
-    display.menu_screen.blit(azm_title, (x_start + 10, y_start + 20))
+    az_err = getattr(joystick_state, 'azm_position_error', 0.0)
+    el_err = getattr(joystick_state, 'alt_position_error', 0.0)
+    # pid_output is in rev/sec (the command scale); show it as deg/sec.
+    az_rate = getattr(joystick_state, 'azm_pid_output', 0.0) * 360.0
+    el_rate = getattr(joystick_state, 'alt_pid_output', 0.0) * 360.0
 
-    # Position error
-    pos_error_text = display.tiny_font.render(f"Az Error: {joystick_state.azm_position_error:+.2f}°", True, (255, 255, 255))
-    display.menu_screen.blit(pos_error_text, (x_start + 10, y_start + 35))
+    cx = [x_start + 10, x_start + 130]   # AZ column, EL column
+    display.menu_screen.blit(display.tiny_font.render("AZIMUTH", True, label_c), (cx[0], y_start + 26))
+    display.menu_screen.blit(display.tiny_font.render("ELEVATION", True, label_c), (cx[1], y_start + 26))
+    for col, err, rate in ((0, az_err, az_rate), (1, el_err, el_rate)):
+        display.menu_screen.blit(
+            display.tiny_font.render(f"err {err:+.2f}°", True, val_c), (cx[col], y_start + 42))
+        display.menu_screen.blit(
+            display.tiny_font.render(f"rate {rate:+.2f}°/s", True, rate_c), (cx[col], y_start + 58))
 
-    # Rate error
-    rate_error_text = display.tiny_font.render(f"Az Rate Error: {joystick_state.azm_rate_error:+.3f}", True, (255, 255, 255))
-    display.menu_screen.blit(rate_error_text, (x_start + 10, y_start + 50))
-
-    # Target rate
-    target_text = display.tiny_font.render(f"Az Target Rate: {joystick_state.azm_target_rate:+.2f}°/s", True, (200, 255, 200))
-    display.menu_screen.blit(target_text, (x_start + 10, y_start + 65))
-
-    # ALT Axis section
-    alt_title = display.tiny_font.render("ELEVATION:", True, (255, 200, 0))
-    display.menu_screen.blit(alt_title, (x_start + 125, y_start + 20))
-
-    # Position error
-    alt_pos_error_text = display.tiny_font.render(f"El Error: {joystick_state.alt_position_error:+.2f}°", True, (255, 255, 255))
-    display.menu_screen.blit(alt_pos_error_text, (x_start + 125, y_start + 35))
-
-    # Rate error
-    alt_rate_error_text = display.tiny_font.render(f"El Rate Error: {joystick_state.alt_rate_error:+.3f}", True, (255, 255, 255))
-    display.menu_screen.blit(alt_rate_error_text, (x_start + 125, y_start + 50))
-
-    # Target rate
-    alt_target_text = display.tiny_font.render(f"El Target Rate: {joystick_state.alt_target_rate:+.2f}°/s", True, (200, 255, 200))
-    display.menu_screen.blit(alt_target_text, (x_start + 125, y_start + 65))
-
-    # Feed-forward status
-    ff_azm_text = display.tiny_font.render(f"FF AZ: {joystick_state.feed_forward_azm_enabled}", True,
-                                           (0, 255, 0) if joystick_state.feed_forward_azm_enabled else (100, 100, 100))
-    display.menu_screen.blit(ff_azm_text, (x_start + 10, y_start + 85))
-
-    ff_alt_text = display.tiny_font.render(f"FF EL: {joystick_state.feed_forward_alt_enabled}", True,
-                                           (0, 255, 0) if joystick_state.feed_forward_alt_enabled else (100, 100, 100))
-    display.menu_screen.blit(ff_alt_text, (x_start + 125, y_start + 85))
-
-    # Bias display
-    bias_text = display.tiny_font.render(f"AZ: {joystick_state.bias_azm_deg:.1f}° EL: {joystick_state.bias_alt_deg:.1f}°", True, (150, 150, 255))
-    display.menu_screen.blit(bias_text, (x_start + 10, y_start + 100))
+    # Active rate-command primitive (the control-theory lesson at a glance).
+    cfg = getattr(joystick_state, 'config_state', None)
+    continuous = bool(getattr(cfg, 'continuous_rate_tracking', False)) if cfg else False
+    mode_label = "rate cmd: CONTINUOUS (guide-rate)" if continuous else "rate cmd: DISCRETE (MC_MOVE)"
+    mode_c = (120, 200, 255) if (active and continuous) else (val_c if active else (90, 90, 100))
+    display.menu_screen.blit(display.tiny_font.render(mode_label, True, mode_c), (x_start + 10, y_start + 80))
+    bias_text = f"bias AZ {getattr(joystick_state,'bias_azm_deg',0.0):+.1f}° EL {getattr(joystick_state,'bias_alt_deg',0.0):+.1f}°"
+    display.menu_screen.blit(display.tiny_font.render(bias_text, True, val_c if active else (90, 90, 100)),
+                             (x_start + 10, y_start + 94))
 
 def render_bias_control_grid(display, joystick_state):
     """
     Render visual grid for manual bias control with buttons and current values.
-    Positioned below PID diagnostics.
+    Anchored above the PID pane in the bottom-right of the upper-left quadrant.
+    Always drawn so its location is visible; greyed out and non-interactable
+    unless in PROGRAM mode.
     """
-    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
-        return
+    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
 
-    # Position below PID diagnostics
-    x_start = display.sub_x + 280
-    y_start = display.sub_y + 510 - 300  # Moved down 100 pixels
-    width = 240
-    height = 150
+    # Position above the PID pane, hugging the bottom-right of the quadrant
+    pane = joystick_panel_layout(display)['bias']
+    x_start, y_start = pane.x, pane.y
+    width, height = pane.width, pane.height
 
     # Background rectangle
     pygame.draw.rect(display.menu_screen, (60, 60, 80),
@@ -2016,25 +2611,34 @@ def render_bias_control_grid(display, joystick_state):
     # Store button rects in joystick state for mouse handling
     joystick_state.bias_button_rects = button_rects
 
+    # Grey out when not in PROGRAM mode (visible but not interactable)
+    if not enabled:
+        _draw_disabled_scrim(display, pane)
+
 def render_feed_forward_toggle_buttons(display, joystick_state):
     """
-    Render feed-forward toggle buttons for AZ and EL axes.
-    Positioned to the side of bias control.
+    Render feed-forward toggle buttons (FF AZ / FF EL / FF OFF) as a row inside
+    the bottom of the PID Gain Control pane. Always drawn so the controls are
+    visible; greyed out and non-interactable unless in PROGRAM mode.
     """
-    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
-        return
+    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
 
-    # Position to the right of bias control
-    x_start = display.sub_x + 530
-    y_start = display.sub_y + 480 - 400  # Moved up 400 pixels
-    button_width = 80
-    button_height = 30
-    button_spacing = 10
+    # Lay the buttons out along the bottom strip of the PID pane
+    pane = joystick_panel_layout(display)['pid']
+    button_width, button_height = 72, 22
+    button_spacing = 6
+    x_start = pane.x + 12
+    row_y = pane.bottom - button_height - 8
+
+    mouse_pos = pygame.mouse.get_pos()
+
+    # Section label
+    ff_label = display.tiny_font.render("Feed-Forward:", True, (220, 220, 220))
+    display.menu_screen.blit(ff_label, (x_start, row_y - 13))
 
     # AZ Feed-forward button
-    az_ff_rect = pygame.Rect(x_start, y_start, button_width, button_height)
-    mouse_pos = pygame.mouse.get_pos()
-    az_hover = az_ff_rect.collidepoint(mouse_pos)
+    az_ff_rect = pygame.Rect(x_start, row_y, button_width, button_height)
+    az_hover = enabled and az_ff_rect.collidepoint(mouse_pos)
 
     az_color = (0, 150, 0) if joystick_state.feed_forward_azm_enabled else (100, 100, 100)
     if az_hover:
@@ -2048,8 +2652,8 @@ def render_feed_forward_toggle_buttons(display, joystick_state):
     display.menu_screen.blit(az_text, text_rect)
 
     # EL Feed-forward button
-    el_ff_rect = pygame.Rect(x_start, y_start + button_height + button_spacing, button_width, button_height)
-    el_hover = el_ff_rect.collidepoint(mouse_pos)
+    el_ff_rect = pygame.Rect(x_start + button_width + button_spacing, row_y, button_width, button_height)
+    el_hover = enabled and el_ff_rect.collidepoint(mouse_pos)
 
     el_color = (0, 150, 0) if joystick_state.feed_forward_alt_enabled else (100, 100, 100)
     if el_hover:
@@ -2063,8 +2667,8 @@ def render_feed_forward_toggle_buttons(display, joystick_state):
     display.menu_screen.blit(el_text, text_rect)
 
     # Disable All button
-    disable_rect = pygame.Rect(x_start, y_start + 2*(button_height + button_spacing), button_width, button_height)
-    disable_hover = disable_rect.collidepoint(mouse_pos)
+    disable_rect = pygame.Rect(x_start + 2 * (button_width + button_spacing), row_y, button_width, button_height)
+    disable_hover = enabled and disable_rect.collidepoint(mouse_pos)
 
     disable_color = (150, 100, 100) if disable_hover else (120, 100, 100)
     pygame.draw.rect(display.menu_screen, disable_color, disable_rect)
@@ -2081,12 +2685,21 @@ def render_feed_forward_toggle_buttons(display, joystick_state):
         (" ff_off", disable_rect)
     ]
 
+    # Grey out the feed-forward strip when not in PROGRAM mode
+    if not enabled:
+        strip = pygame.Rect(pane.x + 1, row_y - 15, pane.width - 2, button_height + 19)
+        _draw_disabled_scrim(display, strip)
+
 def handle_bias_control_mouse_events(joystick_state, mouse_pos):
     """
     Handle mouse clicks on bias control buttons.
     Called from main event loop when buttons are clicked.
     """
     if not hasattr(joystick_state, 'bias_button_rects'):
+        return False
+
+    # Bias control is only interactable in PROGRAM mode (greyed out otherwise)
+    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
         return False
 
     step = 0.01 if joystick_state.bias_control_mode == "fine" else 0.1
@@ -2111,19 +2724,22 @@ def handle_bias_control_mouse_events(joystick_state, mouse_pos):
 def render_pid_gain_sliders(display, joystick_state):
     """
     Render PID gain sliders for adjusting P, I, D gains in joystick mode.
-    Positioned below the bias control grid.
+    Anchored to the bottom-right of the upper-left quadrant (below the Bias
+    pane). The feed-forward toggle buttons are drawn inside the bottom of this
+    pane by render_feed_forward_toggle_buttons(). Always drawn so its location
+    is visible; greyed out and non-interactable unless in PROGRAM mode.
     """
     # Only render when there's an active config_state
     if not hasattr(joystick_state, 'config_state') or joystick_state.config_state is None:
         return
 
     config_state = joystick_state.config_state
+    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
 
-    # Position below bias control
-    x_start = display.sub_x + 280
-    y_start = display.sub_y + 660 - 300  # Adjusted for bias control position
-    width = 240
-    height = 180  # Increased height for sliders
+    # Pane hugging the bottom-right of the quadrant
+    pane = joystick_panel_layout(display)['pid']
+    x_start, y_start = pane.x, pane.y
+    width, height = pane.width, pane.height
 
     # Background rectangle
     pygame.draw.rect(display.menu_screen, (70, 70, 90),
@@ -2148,27 +2764,24 @@ def render_pid_gain_sliders(display, joystick_state):
     LOG_SCALE_FACTOR = 5.0  # 5 orders of magnitude
     LOG_SCALE_OFFSET = PID_MIN_VALUE  # Start just above zero
 
-    # Create slider input rectangles and slider track rectangles if not already existing
-    if not hasattr(display, 'joystick_pid_rects'):
-        display.joystick_pid_rects = {
-            'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 30, 60, 20),  # Moved 10 pixels left
-            'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 65, 60, 20),  # Increased spacing
-            'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 100, 60, 20), # More spacing
-            'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 30, 60, 20),  # Moved 10 pixels left
-            'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 65, 60, 20),  # Increased spacing
-            'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 100, 60, 20), # More spacing
-        }
-
-    # Create slider track rectangles if not existing
-    if not hasattr(display, 'joystick_pid_slider_rects'):
-        display.joystick_pid_slider_rects = {
-            'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 55, SLIDER_WIDTH, 5),  # 5 pixels after edit box
-            'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 90, SLIDER_WIDTH, 5),  # 5 pixels after edit box
-            'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 125, SLIDER_WIDTH, 5), # 5 pixels after edit box
-            'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 55, SLIDER_WIDTH, 5),  # 5 pixels after edit box
-            'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 90, SLIDER_WIDTH, 5),  # 5 pixels after edit box
-            'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 125, SLIDER_WIDTH, 5), # 5 pixels after edit box
-        }
+    # Recompute slider input and track rectangles every frame so they track the
+    # pane's (quadrant-relative) position rather than being frozen at first render.
+    display.joystick_pid_rects = {
+        'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 30, 60, 20),
+        'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 65, 60, 20),
+        'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 100, 60, 20),
+        'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 30, 60, 20),
+        'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 65, 60, 20),
+        'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 100, 60, 20),
+    }
+    display.joystick_pid_slider_rects = {
+        'pid_azm_p_gain': pygame.Rect(x_start + 40 - 10, y_start + 55, SLIDER_WIDTH, 5),
+        'pid_azm_i_gain': pygame.Rect(x_start + 40 - 10, y_start + 90, SLIDER_WIDTH, 5),
+        'pid_azm_d_gain': pygame.Rect(x_start + 40 - 10, y_start + 125, SLIDER_WIDTH, 5),
+        'pid_alt_p_gain': pygame.Rect(x_start + 160 - 10, y_start + 55, SLIDER_WIDTH, 5),
+        'pid_alt_i_gain': pygame.Rect(x_start + 160 - 10, y_start + 90, SLIDER_WIDTH, 5),
+        'pid_alt_d_gain': pygame.Rect(x_start + 160 - 10, y_start + 125, SLIDER_WIDTH, 5),
+    }
 
     # AZM PID labels and inputs (left column)
     azm_title = display.tiny_font.render("AZM:", True, (255, 200, 100))
@@ -2306,11 +2919,21 @@ def render_pid_gain_sliders(display, joystick_state):
                                    (rect.x + 5 + text_width, rect.y + 5),
                                    (rect.x + 5 + text_width, rect.y + 20), 2)
 
+    # Grey out the slider area when not in PROGRAM mode (the feed-forward strip
+    # below is greyed separately by render_feed_forward_toggle_buttons()).
+    if not enabled:
+        slider_region = pygame.Rect(x_start + 1, y_start + 18, width - 2, 151)
+        _draw_disabled_scrim(display, slider_region)
+
 def handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
     """
     Handle mouse clicks on PID gain slider input fields.
     """
     if not hasattr(display, 'joystick_pid_rects') or not hasattr(joystick_state, 'config_state'):
+        return False
+
+    # PID gain sliders are only interactable in PROGRAM mode (greyed otherwise)
+    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
         return False
 
     config_state = joystick_state.config_state
@@ -2332,6 +2955,10 @@ def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
     Called from main event loop when buttons are clicked.
     """
     if not hasattr(joystick_state, 'ff_button_rects'):
+        return False
+
+    # Feed-forward toggles are only interactable in PROGRAM mode (greyed otherwise)
+    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
         return False
 
     for label, rect in joystick_state.ff_button_rects:

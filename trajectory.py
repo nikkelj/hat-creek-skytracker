@@ -553,93 +553,15 @@ def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=N
                 if include_in_table:
                     pass_entries.append(pass_data)
 
-    # Apply state-based filtering (text filter + altitude filters + sort)
-    filtered_entries = []
-    for entry in pass_entries:
-        # Text filtering
-        text_match = True
-        if state.filter_text:
-            satellite_name = entry['satellite'].name.lower() if entry['satellite'] and hasattr(entry['satellite'], 'name') else ""
-            satellite_norad = entry['satellite'].model.satnum_str if entry['satellite'] and hasattr(entry['satellite'], 'model') and hasattr(entry['satellite'].model, 'satnum_str') else ""
-            text_match = (
-                state.filter_text.lower() in satellite_name or
-                state.filter_text in satellite_norad
-            )
+    # Store the full candidate set; name/altitude filtering and multi-column
+    # sorting are applied live every frame in filter_and_sort_pass_table so the
+    # table responds immediately to filter edits and column-header clicks.
+    state.satellite_pass_table_full = pass_entries
 
-        # Above altitude filtering
-        above_alt_match = True
-        if state.filter_above_alt_text:
-            try:
-                alt_filter = float(state.filter_above_alt_text)
-                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
-                above_alt_match = satellite_altitude >= alt_filter
-            except (ValueError, TypeError):
-                above_alt_match = False
-
-        # Below altitude filtering
-        below_alt_match = True
-        if state.filter_below_alt_text:
-            try:
-                alt_filter = float(state.filter_below_alt_text)
-                satellite_altitude = float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0))
-                below_alt_match = satellite_altitude <= alt_filter
-            except (ValueError, TypeError):
-                below_alt_match = False
-
-        # Include entry if all filters pass
-        if text_match and above_alt_match and below_alt_match:
-            filtered_entries.append(entry)
-
-    # Apply state-based sorting
-    if state.table_sort_keys and len(state.table_sort_keys) > 0:
-        # Multi-column sorting based on state's sort configuration
-        # Find the active column
-        active_column = None
-        reverse_sort = False
-        for i, is_active in enumerate(state.table_sort_keys):
-            if is_active:
-                active_column = i
-                reverse_sort = state.table_sort_reverse[i] if state.table_sort_reverse and len(state.table_sort_reverse) > i else False
-                break
-
-        if active_column is not None:
-            column_mapping = {
-                0: 'name',
-                1: 'norad_id',
-                2: 'azimuth_at_max',
-                3: 'max_elevation',
-                4: 'closest_approach_time'
-            }
-
-            sort_key = column_mapping.get(active_column, 'max_elevation')
-
-            if sort_key == 'name':
-                filtered_entries.sort(key=lambda x: x['name'], reverse=reverse_sort)
-            elif sort_key == 'norad_id':
-                filtered_entries.sort(key=lambda x: x['norad_id'], reverse=reverse_sort)
-            elif sort_key == 'azimuth_at_max':
-                filtered_entries.sort(key=lambda x: x['azimuth_at_max'], reverse=reverse_sort)
-            elif sort_key == 'max_elevation':
-                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=reverse_sort)
-            elif sort_key == 'closest_approach_time':
-                def time_sort_key(x):
-                    time_str = x['closest_approach_time']
-                    if time_str == '--:--':
-                        return '23:59'  # Put unknown times at the end
-                    return time_str
-                filtered_entries.sort(key=time_sort_key, reverse=reverse_sort)
-            else:
-                # Default sort by max elevation descending
-                filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
-        else:
-            # Default sort by max elevation descending
-            filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
-    else:
-        # Default sort by max elevation descending
-        filtered_entries.sort(key=lambda x: x['max_elevation'], reverse=True)
-
-    # Limit to max_rows and update state directly
-    state.satellite_pass_table = filtered_entries[:max_rows]
+    # Compute the initial filtered + sorted view (the render loop refreshes this
+    # each frame, but populate it now so callers that draw immediately are correct).
+    from tracking_visuals import filter_and_sort_pass_table
+    state.satellite_pass_table = filter_and_sort_pass_table(state)
 
 def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
     """

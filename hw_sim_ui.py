@@ -16,6 +16,9 @@ ROWS = [
     ("Mount misalign EL (deg)", "mount_misalignment_el_deg", 0.1, "{:.2f}"),
     ("Encoder noise (deg)",     "mount_encoder_noise_deg",   0.01, "{:.3f}"),
     ("Rate jitter (deg/s)",     "mount_rate_noise_dps",      0.05, "{:.2f}"),
+    ("Backlash (deg)",          "mount_backlash_deg",        0.002, "{:.3f}"),
+    ("Periodic err amp (deg)",  "mount_pe_amplitude_deg",    0.001, "{:.3f}"),
+    ("Periodic err period (s)", "mount_pe_period_sec",       30,   "{:.0f}"),
     ("Cam2 rotation (deg)",     "cam2_offset_rotation_deg",  0.5, "{:.1f}"),
     ("Cam2 offset X (px)",      "cam2_offset_x_px",          1,   "{:.0f}"),
     ("Cam2 offset Y (px)",      "cam2_offset_y_px",          1,   "{:.0f}"),
@@ -26,7 +29,8 @@ ROWS = [
     ("Seed",                    "seed",                      1,   "{:.0f}"),
 ]
 
-NON_NEGATIVE = {"mount_encoder_noise_deg", "mount_rate_noise_dps", "star_density",
+NON_NEGATIVE = {"mount_encoder_noise_deg", "mount_rate_noise_dps", "mount_backlash_deg",
+                "mount_pe_amplitude_deg", "mount_pe_period_sec", "star_density",
                 "background_level", "read_noise", "target_brightness", "seed"}
 INTEGER_KEYS = {"star_density", "seed", "cam2_offset_x_px", "cam2_offset_y_px"}
 
@@ -85,8 +89,21 @@ def draw_hw_sim_options(display, config_state, hardware_sim=None):
         "(reconnect telescope + cameras after toggling to apply)", True, (150, 150, 150)),
         (x0, y0 + 100))
 
+    # Continuous variable-rate tracking toggle (the control-theory lesson):
+    # smooth guide-rate command vs the coarse 10-step MC_MOVE sawtooth. Applies
+    # live (no restart); auto-saved on toggle.
+    cont_on = bool(getattr(config_state, "continuous_rate_tracking", False))
+    cont_rect = pygame.Rect(x0, y0 + 120, 360, 30)
+    _btn(screen, cont_rect,
+         f"Rate cmd: {'CONTINUOUS (guide-rate)' if cont_on else 'DISCRETE (MC_MOVE)'}",
+         display.font, bg=(20, 110, 150) if cont_on else (70, 70, 70))
+    display.hw_sim_continuous_rect = cont_rect
+    screen.blit(display.small_font.render(
+        "(smooth vs sawtooth -- a control-theory lesson; applies live)", True, (150, 150, 150)),
+        (x0 + 370, y0 + 126))
+
     display.hw_sim_rects = {}
-    ry = y0 + 130
+    ry = y0 + 162
     for label, key, step, fmt in ROWS:
         screen.blit(display.small_font.render(label, True, (230, 230, 230)), (x0, ry + 6))
         minus = pygame.Rect(x0 + 230, ry, 28, 26)
@@ -128,6 +145,15 @@ def handle_hw_sim_click(pos, display, config_state, hardware_sim, status_message
         status_messages.append(
             f"Control loop set to {'RUST' if config_state.use_rust_core_loop else 'PYTHON'} "
             "- restart app to apply (saved)")
+        return True
+
+    if getattr(display, 'hw_sim_continuous_rect', None) and display.hw_sim_continuous_rect.collidepoint(pos):
+        config_state.continuous_rate_tracking = not bool(getattr(config_state, "continuous_rate_tracking", False))
+        config_state.save_to_file()
+        status_messages.append(
+            "Rate command: "
+            + ("CONTINUOUS guide-rate (smooth)" if config_state.continuous_rate_tracking
+               else "DISCRETE MC_MOVE (sawtooth)"))
         return True
 
     for key, (minus, plus, step) in getattr(display, 'hw_sim_rects', {}).items():

@@ -343,12 +343,28 @@ class NexstarHandController:
         elif lunar:
             request = '50{:02x}{:02x}{:02x}fffd00{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], COMMANDS[cmd][2])
         else:
-            packed_rate = pack_int3(rate)
+            # Direction is carried by POS vs NEG command id, so the magnitude is
+            # what gets packed (packing a negative through pack_int3 would corrupt
+            # the 3-byte value).
+            packed_rate = pack_int3(abs(rate))
             request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], packed_rate, COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         binary_response = self._transact(binary, COMMANDS[cmd][2]+1)
         return binary_response == b'#'
-    
+
+    def hc_set_rate_dps(self, target, dps):
+        """Command a continuous axis rate in degrees/second via the fine 24-bit
+        variable-rate (MC_SET_POS/NEG_GUIDERATE) primitive, instead of the coarse
+        10-step MC_MOVE. This is the smooth-tracking path that avoids the
+        rate-quantization sawtooth.
+
+        Encoding assumes the rev/sec convention shared with the RATES table
+        (pack_int3(rate_rev_per_sec) = int(rate/360 * 2**24), ~0.077"/s LSB). This
+        on-wire scale is UNVERIFIED on real hardware -- calibrate the scale and the
+        max sustainable rate with bench_guiderate.py before trusting it.
+        """
+        return self.hc_set_guide_rate(target, dps / 360.0)
+
     def hc_slew_fixed(self, target, rate):
         """Move axis. Axis will keep moving until a stop is sent!
         

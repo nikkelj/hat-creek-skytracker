@@ -150,8 +150,16 @@ class SimMount:
         self._az_rate_dps = 0.0   # signed deg/sec
         self._el_rate_dps = 0.0
         self._last_t = time.time()
+        self._t0 = self._last_t
         self._lock = threading.RLock()
         self._rng = rng if rng is not None else np.random.default_rng()
+        # Gear backlash state: input position within the lost-motion band per axis.
+        self._az_play = 0.0
+        self._el_play = 0.0
+        # Periodic-error state (lazily seeded on the first advance).
+        self._pe_prev_az = 0.0
+        self._pe_prev_el = 0.0
+        self._pe_init = False
 
     # --- sim params (read live from config so UI edits take effect) ---
     def _sim(self):
@@ -174,11 +182,60 @@ class SimMount:
         self._last_t = now
         if dt <= 0:
             return
-        jitter = float(self._sim().get('mount_rate_noise_dps', 0.0))
+        s = self._sim()
+        jitter = float(s.get('mount_rate_noise_dps', 0.0))
         az_rate = self._az_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
         el_rate = self._el_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
-        self.az_true_deg = (self.az_true_deg + az_rate * dt) % 360.0
-        self.el_true_deg = self.el_true_deg + el_rate * dt
+        # Gear backlash: on a direction reversal the load (optical axis) stalls
+        # until the lost motion is taken up. This is what makes discrete
+        # rate-stepping hunt -- every time the rate command flips sign the mount
+        # sits in a dead-zone before it starts moving back.
+        b = float(s.get('mount_backlash_deg', 0.0))
+        d_az = self._apply_backlash('_az_play', az_rate * dt, b)
+        d_el = self._apply_backlash('_el_play', el_rate * dt, b)
+        # Periodic (worm) error: a slow sinusoid riding on the true pointing.
+        # Inject the per-step delta so it adds to tracking instead of replacing it.
+        pe_az, pe_el = self._periodic_error(now)
+        if not self._pe_init:
+            self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
+            self._pe_init = True
+        d_az += pe_az - self._pe_prev_az
+        d_el += pe_el - self._pe_prev_el
+        self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
+        self.az_true_deg = (self.az_true_deg + d_az) % 360.0
+        self.el_true_deg = self.el_true_deg + d_el
+
+    def _apply_backlash(self, attr, delta, band):
+        """Pass a commanded delta through a backlash dead-zone of total width
+        `band` (deg). Returns the load (output) delta. The state held in `attr`
+        is the input position within the [-band/2, band/2] gap; the load only
+        moves once the input is pushed against an edge of the gap."""
+        if band <= 0.0:
+            return delta
+        play = getattr(self, attr) + delta
+        half = band / 2.0
+        if play > half:
+            out = play - half
+            play = half
+        elif play < -half:
+            out = play + half
+            play = -half
+        else:
+            out = 0.0
+        setattr(self, attr, play)
+        return out
+
+    def _periodic_error(self, now):
+        """Worm periodic error as a sinusoid (zero-to-peak amplitude, worm
+        period). The two axes run a quarter cycle apart so they don't move
+        identically. Returns (pe_az_deg, pe_el_deg)."""
+        s = self._sim()
+        amp = float(s.get('mount_pe_amplitude_deg', 0.0))
+        if amp <= 0.0:
+            return 0.0, 0.0
+        period = float(s.get('mount_pe_period_sec', 600.0)) or 600.0
+        ph = 2.0 * math.pi * (now - self._t0) / period
+        return amp * math.sin(ph), amp * math.sin(ph + math.pi / 2.0)
 
     def _encoder(self, true_deg, mis_deg):
         noise = float(self._sim().get('mount_encoder_noise_deg', 0.0))
@@ -225,6 +282,22 @@ class SimMount:
 
     def hc_set_guide_rate(self, target, rate, **kwargs):
         return True
+
+    # Fine continuous-rate primitive (MC_SET_POS/NEG_GUIDERATE). Sets the axis
+    # rate directly in deg/s, quantized to the real 24-bit guide-rate LSB so the
+    # sim faithfully shows "effectively continuous" tracking (vs the 10-step
+    # MC_MOVE used by hc_slew_fixed).
+    _GUIDE_LSB_DPS = 360.0 / 2 ** 24  # ~0.077 arcsec/s
+
+    def hc_set_rate_dps(self, target, dps):
+        with self._lock:
+            self._advance()
+            q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
+            if target == Targets.ALT:
+                self._el_rate_dps = q
+            else:
+                self._az_rate_dps = q
+            return True
 
     def close(self):
         with self._lock:
@@ -319,8 +392,30 @@ class HardwareSimulator:
         x_sign = float(getattr(cfg, 'hotspot_x_sign', 1.0))
         y_sign = float(getattr(cfg, 'hotspot_y_sign', -1.0))
 
-        cam_az = self.mount.az_true_deg
-        cam_el = self.mount.el_true_deg
+        # The camera is bolted to the mount, so what it sees on the sky is the
+        # mount's mechanical pointing run through the SAME forward transform the
+        # rest of the app uses (mount AZM/ALT -> sky az/el). Earlier this used the
+        # mount angles directly (identity); that only looked right while the sky->
+        # mount inverse was also wrong, and broke PROGRAM-track rendering once that
+        # was fixed (boresight landed at 90 - el).
+        mount_mode = getattr(cfg, 'mount_mode', 'Eq')
+        align_az = float(getattr(cfg, 'alignment_azimuth_str', 0.0) or 0.0)
+        align_el = float(getattr(cfg, 'alignment_elevation_str', 0.0) or 0.0)
+        if mount_mode == 'AltAz':
+            from transformations import AzAlt2AzEl_AltAz
+            cam_az, cam_el = AzAlt2AzEl_AltAz(
+                self.mount.az_true_deg, self.mount.el_true_deg, align_az)
+            # ALT axis runs opposite sky elevation (el = 90 - ALT): the sky el rate
+            # is the negated mount rate; azimuth tracks the mount directly.
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, -self.mount.el_rate_dps
+        elif mount_mode == 'Passthrough':
+            cam_az, cam_el = self.mount.az_true_deg, self.mount.el_true_deg
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
+        else:
+            from transformations import AzAlt2AzEl
+            cam_az, cam_el = AzAlt2AzEl(
+                self.mount.az_true_deg, self.mount.el_true_deg, align_az, align_el)
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 
         brightness = float(s.get('target_brightness', 200.0))
@@ -333,8 +428,8 @@ class HardwareSimulator:
         fov_x = w * ifd / 2.0   # half-FOV (deg) from boresight to edge
         fov_y = h * ifd / 2.0
         # angular motion during exposure -> pixel streak vector
-        sdx, sdy = angles_to_pixel(self.mount.az_rate_dps * exposure_s,
-                                   self.mount.el_rate_dps * exposure_s,
+        sdx, sdy = angles_to_pixel(sky_az_rate * exposure_s,
+                                   sky_el_rate * exposure_s,
                                    pix, foc, rot, cam_el, x_sign, y_sign)
         for i in range(len(saz)):
             d_az = wrap180(saz[i] - cam_az)

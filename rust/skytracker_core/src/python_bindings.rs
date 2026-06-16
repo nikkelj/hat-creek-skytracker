@@ -477,6 +477,11 @@ impl SimCoreLoop {
         i.ff_azm_enabled = azm;
         i.ff_alt_enabled = alt;
     }
+    fn set_continuous_rate(&self, enabled: bool, max_dps: f64) {
+        let mut i = self.shared.inputs.lock().unwrap();
+        i.continuous_rate = enabled;
+        i.guide_rate_max_dps = max_dps;
+    }
     #[allow(clippy::too_many_arguments)]
     fn set_hotspot_params(
         &self,
@@ -638,6 +643,11 @@ fn h_set_ff_enabled(sh: &Shared, azm: bool, alt: bool) {
     i.ff_azm_enabled = azm;
     i.ff_alt_enabled = alt;
 }
+fn h_set_continuous_rate(sh: &Shared, enabled: bool, max_dps: f64) {
+    let mut i = sh.inputs.lock().unwrap();
+    i.continuous_rate = enabled;
+    i.guide_rate_max_dps = max_dps;
+}
 #[allow(clippy::too_many_arguments)]
 fn h_set_hotspot_params(
     sh: &Shared,
@@ -764,6 +774,13 @@ impl Transport for PyMountTransport {
                 let rate = sign * (d[0] as i32);
                 let _ = mount.call_method1("hc_slew_fixed", (target, rate));
                 vec![b'#']
+            } else if msg_id == protocol::MC_SET_POS_GUIDERATE.0
+                || msg_id == protocol::MC_SET_NEG_GUIDERATE.0
+            {
+                let sign = if msg_id == protocol::MC_SET_POS_GUIDERATE.0 { 1.0 } else { -1.0 };
+                let dps = sign * protocol::unpack_int3(&d) * 360.0;
+                let _ = mount.call_method1("hc_set_rate_dps", (target, dps));
+                vec![b'#']
             } else if msg_id == protocol::MC_GOTO_FAST.0 {
                 let deg = protocol::unpack_int3(&d) * 360.0;
                 let _ = mount.call_method1("hc_goto_fast", (target, deg, 0.0_f64, 0.0_f64));
@@ -862,6 +879,9 @@ impl CoreLoop {
     }
     fn set_ff_enabled(&self, azm: bool, alt: bool) {
         h_set_ff_enabled(self.inner.shared(), azm, alt);
+    }
+    fn set_continuous_rate(&self, enabled: bool, max_dps: f64) {
+        h_set_continuous_rate(self.inner.shared(), enabled, max_dps);
     }
     #[allow(clippy::too_many_arguments)]
     fn set_hotspot_params(

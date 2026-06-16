@@ -58,10 +58,17 @@ class TrackingVisState:
         self.satellite_positions = {}
 
         # Pass table state
-        self.satellite_pass_table = []
-        self.table_sort_keys = [False, False, False, True, False]  # Default: sort by max elevation
-        self.table_sort_reverse = [True, True, True, True, True]  # Default: descending for all
+        self.satellite_pass_table = []        # filtered + sorted view actually drawn
+        self.satellite_pass_table_full = []   # full candidate set (pre name/alt filter + sort)
+        # Multi-column sort: ordered list of (column_index, reverse_descending) tuples,
+        # primary key first. Default: sort by max elevation, descending.
+        self.table_sort_order = [(3, True)]
+        # Legacy single-sort fields kept for serialization back-compat (derived from order)
+        self.table_sort_keys = [False, False, False, True, False]
+        self.table_sort_reverse = [True, True, True, True, True]
         self.pass_table_clickable_areas = []
+        self.pass_table_scroll_offset = 0     # first visible row index (scrollback)
+        self.pass_table_max_scroll = 0        # set during draw; clamps wheel scrolling
 
         # UI state
         self.dragging_slider = False
@@ -161,8 +168,11 @@ class TrackingVisState:
             'satellite_positions': self.satellite_positions,
             'selected_satellite': self.selected_satellite,
             'satellite_pass_table': self.satellite_pass_table,
+            'satellite_pass_table_full': self.satellite_pass_table_full,
             'table_sort_keys': self.table_sort_keys,
             'table_sort_reverse': self.table_sort_reverse,
+            'table_sort_order': self.table_sort_order,
+            'pass_table_scroll_offset': self.pass_table_scroll_offset,
             'paused': self.paused,
             'paused_tt': self.paused_tt,
             'dragging_slider': self.dragging_slider,
@@ -576,254 +586,250 @@ def draw_scroll_time_display(display, current_tt, ts):
     text_width, _ = display.small_font.size(time_text)
     display.menu_screen.blit(time_surface, (display.sub_x + display.sub_width // 2 - text_width // 2, display.sub_y + display.sub_height - 15))
 
+PASS_TABLE_WIDTH = 354
+PASS_TABLE_ROW_HEIGHT = 18
+PASS_TABLE_COL_WIDTHS = [120, 55, 42, 57, 80]  # Name, NORAD, Az, Max El, Closest
+
+
+def _pass_table_col_x(table_x):
+    """Left x of each column's text, given the table's left edge."""
+    xs = [table_x + 5]
+    for w in PASS_TABLE_COL_WIDTHS[:-1]:
+        xs.append(xs[-1] + w)
+    return xs
+
+
+def get_pass_table_rect(display):
+    """Bounding rect of the (scrollable) satellite passes box.
+
+    Anchored below the filter controls and grown to use the empty left-column
+    space, while reserving room at the bottom for the launch box and status text.
+    """
+    table_x = display.sub_x + 10
+    top = display.sub_y + 260  # below the filter inputs + "Satellites in view" line
+    bottom = display.sub_y + display.sub_height - 215  # room for launch box + status
+    height = max(150, min(bottom - top, 380))          # ~2x the old size, bounded
+    return pygame.Rect(table_x, top, PASS_TABLE_WIDTH, height)
+
+
 def draw_satellite_pass_table(display, state):
     """
-    Draw the satellite pass table in the lower left corner.
-    State-direct mutation function that modifies state.pass_table_clickable_areas directly.
-    Includes launch trajectories below satellite passes.
+    Draw the scrollable, multi-sortable satellite pass table plus the launch box.
+    State-direct mutation: rebuilds state.pass_table_clickable_areas each call.
+    Row clickable areas store the absolute index into state.satellite_pass_table.
     """
-    if not state.satellite_pass_table and (not hasattr(state, 'launch_trajectories') or not state.launch_trajectories):
-        state.pass_table_clickable_areas = []
+    state.pass_table_clickable_areas = []
+    have_launches = hasattr(state, 'launch_trajectories') and state.launch_trajectories
+    if not state.satellite_pass_table and not have_launches:
         return
 
-    # Table dimensions and positioning
-    table_width = 354  # Reduced by 20 pixels
-    row_height = 18
-    header_height = 25
+    box = get_pass_table_rect(display)
+    table_x, table_y, table_width, table_height = box.x, box.y, box.width, box.height
+    row_height = PASS_TABLE_ROW_HEIGHT
+    title_h = 22
+    header_h = 20
+    col_x_positions = _pass_table_col_x(table_x)
 
-    # Position satellite passes table above status messages (moved up to avoid overlap)
-    sat_table_y = display.sub_y + display.sub_height - 280
-    sat_table_height = 160  # Smaller height for satellite table alone
+    # Background + border
+    pygame.draw.rect(display.menu_screen, (40, 40, 40), box)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), box, 2)
 
-    # Launch trajectories table goes above satellite table
-    launch_table_y = display.sub_y + display.sub_height - 550  # Positioned above satellite passes
-    launch_table_height = 260  # Enough height for launches plus satellites
+    # Title
+    display.menu_screen.blit(display.small_font.render("Satellite Passes", True, (255, 255, 255)),
+                             (table_x + 5, table_y + 5))
 
-    # Use launch table position if we have launches, otherwise use satellite-only position
-    if hasattr(state, 'launch_trajectories') and state.launch_trajectories:
-        table_x = display.sub_x + 10
-        table_y = launch_table_y
-        table_height = launch_table_height
-    else:
-        table_x = display.sub_x + 10
-        table_y = sat_table_y
-        table_height = sat_table_height
+    # Sort summary (right-justified) — shows multi-key order and direction
+    order = state.table_sort_order or [(3, True)]
+    rank = {col: i + 1 for i, (col, _) in enumerate(order)}
+    rev = {col: r for col, r in order}
+    summary = " ".join(f"{PASS_TABLE_COLUMN_NAMES[c]}{'v' if r else '^'}" for c, r in order)
+    info_surface = display.small_font.render(f"Sort: {summary}", True, (180, 180, 180))
+    display.menu_screen.blit(info_surface, (table_x + table_width - info_surface.get_width() - 5, table_y + 5))
 
-    # Background
-    pygame.draw.rect(display.menu_screen, (40, 40, 40), (table_x, table_y, table_width, table_height))
-    pygame.draw.rect(display.menu_screen, (200, 200, 200), (table_x, table_y, table_width, table_height), 2)
-
-    # Column widths (Name, NORAD ID, Az, Max El, Closest Time)
-    col_widths = [120, 55, 42, 57, 80]
-    col_x_positions = [table_x + 5, table_x + col_widths[0] + 5, table_x + col_widths[0] + col_widths[1] + 5,
-                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + 5,
-                      table_x + col_widths[0] + col_widths[1] + col_widths[2] + col_widths[3] + 5]
-
-    # Table title
-    title_text = "Satellite Passes"
-    title_surface = display.small_font.render(title_text, True, (255, 255, 255))
-    display.menu_screen.blit(title_surface, (table_x + 5, table_y + 5))
-
-    # Column headers
-    column_headers = ["Name", "NORAD", "Az", "Max El", "Closest"]
-    state.pass_table_clickable_areas = []
-
-    header_y = table_y + 25
-    for i, header in enumerate(column_headers):
-        # Draw header background
-        header_bg_color = (60, 60, 60) if state.table_sort_keys and i < len(state.table_sort_keys) and state.table_sort_keys[i] else (50, 50, 50)
-        pygame.draw.rect(display.menu_screen, header_bg_color, (col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5))
-
-        # Draw header text
-        header_surface = display.small_font.render(header, True, (255, 255, 255))
-        display.menu_screen.blit(header_surface, (col_x_positions[i], header_y + 3))
-
-        # Add clickable border and area
-        header_rect = pygame.Rect(col_x_positions[i] - 3, header_y, col_widths[i], header_height - 5)
+    # Column headers (clickable) with sort priority + direction indicators
+    header_y = table_y + title_h
+    for i, header in enumerate(PASS_TABLE_COLUMN_NAMES):
+        in_sort = i in rank
+        header_bg_color = (60, 60, 60) if in_sort else (50, 50, 50)
+        header_rect = pygame.Rect(col_x_positions[i] - 3, header_y, PASS_TABLE_COL_WIDTHS[i], header_h)
+        pygame.draw.rect(display.menu_screen, header_bg_color, header_rect)
+        label = header
+        if in_sort:
+            label = f"{header}{'v' if rev[i] else '^'}{rank[i]}" if len(order) > 1 else f"{header}{'v' if rev[i] else '^'}"
+        display.menu_screen.blit(display.small_font.render(label, True, (255, 255, 255)),
+                                 (col_x_positions[i], header_y + 3))
         pygame.draw.rect(display.menu_screen, (150, 150, 150), header_rect, 1)
         state.pass_table_clickable_areas.append(('header', i, header_rect))
 
-    # Draw satellite pass table rows
-    row_y = header_y + header_height - 5
-    sat_rows_drawn = 0
+    # Scrollable rows region
+    rows_top = header_y + header_h + 2
+    rows_bottom = table_y + table_height - 14  # leave room for the scroll-position hint
+    rows_area_height = max(row_height, rows_bottom - rows_top)
+    visible_rows = max(1, rows_area_height // row_height)
 
-    # Draw satellite pass rows
-    for row_idx, pass_entry in enumerate(state.satellite_pass_table[:15]):  # Limit to 15 rows maximum
-        # Alternate row colors
-        if row_idx % 2 == 0:
-            row_bg_color = (45, 45, 45)
-        else:
-            row_bg_color = (35, 35, 35)
+    total = len(state.satellite_pass_table)
+    max_offset = max(0, total - visible_rows)
+    state.pass_table_max_scroll = max_offset  # consumed by the mouse-wheel handler
+    state.pass_table_scroll_offset = max(0, min(getattr(state, 'pass_table_scroll_offset', 0), max_offset))
+    offset = state.pass_table_scroll_offset
 
-        # Highlight selected satellite's row
-        if state.selected_satellite and pass_entry['satellite'] == state.selected_satellite:
+    # Clip rows so nothing draws past the box border
+    prev_clip = display.menu_screen.get_clip()
+    display.menu_screen.set_clip(pygame.Rect(table_x + 2, rows_top, table_width - 4, rows_bottom - rows_top))
+    row_y = rows_top
+    for vis_i in range(visible_rows):
+        idx = offset + vis_i
+        if idx >= total:
+            break
+        entry = state.satellite_pass_table[idx]
+        row_bg_color = (45, 45, 45) if idx % 2 == 0 else (35, 35, 35)
+        if state.selected_satellite and entry.get('satellite') == state.selected_satellite:
             row_bg_color = (80, 100, 120)  # Blue highlight for selected
-
-        # Draw row background
         pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
 
-        # Draw cell contents
         cell_values = [
-            pass_entry['name'][:20],  # Truncate long names
-            pass_entry['norad_id'],
-            f"{pass_entry['azimuth_at_max']:.0f}°",
-            f"{pass_entry['max_elevation']:.1f}°",
-            pass_entry.get('closest_approach_time', '--:--')  # Local time of minimum slant range
+            str(entry['name'])[:20],
+            entry['norad_id'],
+            f"{entry['azimuth_at_max']:.0f}°",
+            f"{entry['max_elevation']:.1f}°",
+            entry.get('closest_approach_time', '--:--'),
         ]
-
         for col_idx, value in enumerate(cell_values):
-            # Draw cell text
-            value_surface = display.small_font.render(value, True, (255, 255, 255))
-            display.menu_screen.blit(value_surface, (col_x_positions[col_idx], row_y + 2))
+            display.menu_screen.blit(display.small_font.render(str(value), True, (255, 255, 255)),
+                                     (col_x_positions[col_idx], row_y + 2))
 
-        # Add row clickable area for selection
         row_rect = pygame.Rect(table_x + 3, row_y, table_width - 6, row_height)
         pygame.draw.rect(display.menu_screen, (100, 100, 100), row_rect, 1)
-        state.pass_table_clickable_areas.append(('row', row_idx, row_rect))
-
+        state.pass_table_clickable_areas.append(('row', idx, row_rect))
         row_y += row_height
+    display.menu_screen.set_clip(prev_clip)
 
-    # Add info text about sorting in title row, right-justified
-    sort_index = state.table_sort_keys.index(True) if state.table_sort_keys and True in state.table_sort_keys else 3
-    sort_order = 'Desc' if state.table_sort_reverse and sort_index < len(state.table_sort_reverse) and state.table_sort_reverse[sort_index] else 'Asc'
-    # Draw launch trajectories table section (below satellite passes)
-    launch_row_start_y = row_y + 10  # Small gap between sections
+    # Scroll-position hint (only when there are more rows than fit)
+    if total > visible_rows:
+        shown_first = offset + 1
+        shown_last = min(offset + visible_rows, total)
+        hint = display.small_font.render(f"{shown_first}-{shown_last} / {total}  (scroll)", True, (150, 150, 150))
+        display.menu_screen.blit(hint, (table_x + 5, table_y + table_height - 13))
 
-    # Draw separator line between satellite and launch sections
-    if hasattr(state, 'launch_trajectories') and state.launch_trajectories:
-        separator_y = row_y + 5
-        pygame.draw.line(display.menu_screen, (100, 100, 100), (table_x + 10, separator_y), (table_x + table_width - 10, separator_y), 1)
+    # Launch trajectories in a separate bounded box below the passes box
+    if have_launches:
+        _draw_launch_trajectory_box(display, state, table_x, box.bottom + 10, table_width, col_x_positions, row_height)
 
-        # Launch section header
-        launch_header_y = separator_y + 5
-        launch_title_text = "Launch Trajectories"
-        launch_title_surface = display.small_font.render(launch_title_text, True, (200, 200, 255))  # Light blue for launches
-        display.menu_screen.blit(launch_title_surface, (table_x + 5, launch_header_y))
 
-        # Draw launch trajectory rows
-        launch_row_y = launch_header_y + row_height
-        total_rows_drawn = sat_rows_drawn
+def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, col_x_positions, row_height):
+    """Draw the launch-trajectory selector as its own bounded box below the passes table."""
+    launch_names = [n for n in sorted(state.launch_trajectories.keys()) if not n.endswith('_arcs')]
+    if not launch_names:
+        return
 
-        # Get launch trajectories sorted by name for consistent ordering
-        launch_names = sorted(state.launch_trajectories.keys())
-        if '_arcs' in launch_names:
-            launch_names.remove('_arcs')  # Remove arc segments key
+    title_h = 20
+    box_height = title_h + len(launch_names) * row_height + 6
+    box = pygame.Rect(table_x, table_y, table_width, box_height)
+    pygame.draw.rect(display.menu_screen, (40, 35, 45), box)
+    pygame.draw.rect(display.menu_screen, (160, 150, 200), box, 2)
 
-        # Build launch entries similar to satellite entries
-        for launch_name in launch_names:
-            if launch_name.endswith('_arcs'):
-                continue
+    display.menu_screen.blit(display.small_font.render("Launch Trajectories", True, (200, 200, 255)),
+                             (table_x + 5, table_y + 4))
 
-            # Check if we have space for more rows
-            if total_rows_drawn >= PASS_TABLE_MAX_ROWS:
-                break
+    launch_row_y = table_y + title_h
+    for i, launch_name in enumerate(launch_names):
+        row_bg_color = (55, 45, 55) if i % 2 == 0 else (45, 35, 45)
+        if state.selected_launch == launch_name:
+            row_bg_color = (100, 80, 120)
+        pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, launch_row_y, table_width - 6, row_height))
 
-            # Create launch entry dictionary
-            launch_entry = {
-                'name': launch_name,
-                'type': 'launch'
-            }
-
-            # Alternate row colors for launch rows (different from satellite rows)
-            if total_rows_drawn % 2 == 0:
-                row_bg_color = (55, 45, 55)  # Slightly purple-tinted
+        launch_name_clean = (launch_name.rstrip('.csv') if launch_name.endswith('.csv') else launch_name)[:20]
+        if launch_name in state.launch_trajectories:
+            trajectory_data, times_array = state.launch_trajectories[launch_name]
+            if times_array.size > 0:
+                duration = times_array[-1] - times_array[0]
+                max_alt = max([point[1] for point in trajectory_data] + [0])
             else:
-                row_bg_color = (45, 35, 45)  # Darker purple-tinted
+                duration, max_alt = 0, 0
+        else:
+            duration, max_alt = 0, 0
 
-            # Highlight selected launch
-            if state.selected_launch == launch_name:
-                row_bg_color = (100, 80, 120)  # Purple highlight for selected launch
+        cell_values = [launch_name_clean, "LAUNCH", f"{max_alt:.0f}°", f"{duration:.0f}s", "--:--"]
+        for col_idx, value in enumerate(cell_values):
+            color = (255, 255, 220) if col_idx == 0 else (255, 255, 255)
+            display.menu_screen.blit(display.small_font.render(value, True, color),
+                                     (col_x_positions[col_idx], launch_row_y + 2))
 
-            # Draw row background
-            pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, launch_row_y, table_width - 6, row_height))
+        launch_row_rect = pygame.Rect(table_x + 3, launch_row_y, table_width - 6, row_height)
+        pygame.draw.rect(display.menu_screen, (100, 100, 100), launch_row_rect, 1)
+        state.pass_table_clickable_areas.append(('launch', launch_name, launch_row_rect))
+        launch_row_y += row_height
 
-            # Draw launch cell contents
-            launch_name_clean = launch_name.rstrip('.csv')[:20] if launch_name.endswith('.csv') else launch_name[:20]
+# Default sort direction (reverse == descending) applied when a column first
+# becomes a sort key. Elevation/azimuth default to descending (most prominent
+# passes on top); name/NORAD/time default to ascending.
+PASS_TABLE_DEFAULT_DESC = {0: False, 1: False, 2: True, 3: True, 4: False}
 
-            # Get trajectory info for additional columns
-            if launch_name in state.launch_trajectories:
-                trajectory_data, times_array = state.launch_trajectories[launch_name]
-                if times_array.size > 0:
-                    duration = times_array[-1] - times_array[0]
-                    max_alt = max([point[1] for point in trajectory_data] + [0])
-                else:
-                    duration = 0
-                    max_alt = 0
-            else:
-                duration = 0
-                max_alt = 0
+# Column display names, used for header labels and the sort summary line.
+PASS_TABLE_COLUMN_NAMES = ['Name', 'NORAD', 'Az', 'Max El', 'Closest']
 
-            cell_values = [
-                launch_name_clean,                    # Name
-                "LAUNCH",                           # NORAD ID equivalent (placeholder)
-                f"{max_alt:.0f}°",                  # Max elevation equivalent (showing max altitude for launch)
-                f"{duration:.0f}s",                 # Duration instead of time
-                "--:--"                             # No closest time for launches
-            ]
 
-            for col_idx, value in enumerate(cell_values):
-                # Draw cell text
-                color = (255, 255, 220) if col_idx == 0 else (255, 255, 255)  # Lighter color for launch names
-                value_surface = display.small_font.render(value, True, color)
-                display.menu_screen.blit(value_surface, (col_x_positions[col_idx], launch_row_y + 2))
+def _pass_table_sort_key(column):
+    """Return a sort-key function for a pass-table column index."""
+    if column == 0:
+        return lambda e: str(e.get('name', '')).strip().lower()
+    if column == 1:
+        # Numeric NORAD when possible, otherwise alphabetical (kept after numbers)
+        return lambda e: (0, int(e['norad_id'])) if str(e.get('norad_id', '')).isdigit() else (1, str(e.get('norad_id', '')))
+    if column == 2:
+        return lambda e: e.get('azimuth_at_max', 0.0)
+    if column == 3:
+        return lambda e: e.get('max_elevation', 0.0)
+    if column == 4:
+        return lambda e: e.get('closest_approach_time') if e.get('closest_approach_time') not in (None, '--:--') else '99:99'
+    return None
 
-            # Add row clickable area for launch selection
-            launch_row_rect = pygame.Rect(table_x + 3, launch_row_y, table_width - 6, row_height)
-            pygame.draw.rect(display.menu_screen, (100, 100, 100), launch_row_rect, 1)
-            state.pass_table_clickable_areas.append(('launch', launch_name, launch_row_rect))
-
-            launch_row_y += row_height
-            total_rows_drawn += 1
-
-    info_text = f"Sorted by: {['Name', 'NORAD', 'Az', 'Max El', 'Closest'][sort_index]} ({sort_order})"
-    info_surface = display.small_font.render(info_text, True, (180, 180, 180))
-    info_x = table_x + table_width - info_surface.get_width() - 5  # Right-justified
-    display.menu_screen.blit(info_surface, (info_x, table_y + 5))  # Same Y as title
 
 def filter_and_sort_pass_table(state):
     """
-    Filter and sort the satellite pass table based on name and altitude filters.
-    State-direct mutation function that takes a tracking_vis_state object directly.
-    Returns the filtered and sorted pass table.
+    Filter and multi-sort the satellite pass table for display.
+
+    Reads the full candidate set (state.satellite_pass_table_full), applies the
+    page's name/above-alt/below-alt filters, then applies the ordered multi-column
+    sort in state.table_sort_order (primary key first). Returns the full filtered
+    and sorted list (the draw function handles scrolling/truncation).
     """
-    if not state.satellite_pass_table:
+    source = state.satellite_pass_table_full or state.satellite_pass_table
+    if not source:
         return []
 
-    # Apply name and altitude filters
-    filtered_table = [entry for entry in state.satellite_pass_table if (
-        not state.filter_text or
-        state.filter_text.lower() in entry['satellite'].name.lower() or
-        state.filter_text in entry['satellite'].model.satnum_str
-    ) and (
-        not state.filter_above_alt_text or
-        float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0)) >= float(state.filter_above_alt_text)
-    ) and (
-        not state.filter_below_alt_text or
-        float(state.satellite_mean_altitudes.get(entry['satellite'], 0.0)) <= float(state.filter_below_alt_text)
-    )]
+    def name_ok(entry):
+        if not state.filter_text:
+            return True
+        sat = entry.get('satellite')
+        name = sat.name.lower() if sat is not None and hasattr(sat, 'name') else str(entry.get('name', '')).lower()
+        norad = sat.model.satnum_str if sat is not None and hasattr(sat, 'model') and hasattr(sat.model, 'satnum_str') else str(entry.get('norad_id', ''))
+        return state.filter_text.lower() in name or state.filter_text in norad
 
-    # Apply sorting based on sort keys
-    if state.table_sort_keys and any(state.table_sort_keys):
-        # Find the column to sort by
-        sort_column = None
-        for i, is_sorted in enumerate(state.table_sort_keys):
-            if is_sorted:
-                sort_column = i
-                break
+    def alt_ok(entry):
+        sat = entry.get('satellite')
+        alt = float(state.satellite_mean_altitudes.get(sat, 0.0)) if sat is not None else 0.0
+        if state.filter_above_alt_text:
+            try:
+                if alt < float(state.filter_above_alt_text):
+                    return False
+            except ValueError:
+                pass
+        if state.filter_below_alt_text:
+            try:
+                if alt > float(state.filter_below_alt_text):
+                    return False
+            except ValueError:
+                pass
+        return True
 
-        if sort_column is not None:
-            reverse_sort = state.table_sort_reverse[sort_column] if state.table_sort_reverse and sort_column < len(state.table_sort_reverse) else True
+    filtered_table = [entry for entry in source if name_ok(entry) and alt_ok(entry)]
 
-            # Define sort key functions for each column
-            sort_keys = {
-                0: lambda x: x['satellite'].name.strip().lower(),  # Name (alphabetical)
-                1: lambda x: x['satellite'].model.satnum_str,      # NORAD ID (numerical string)
-                2: lambda x: x['azimuth_at_max'],                   # Azimuth
-                3: lambda x: x['max_elevation'],                    # Max Elevation
-                4: lambda x: x.get('closest_approach_time', '99:99')  # Closest Time (handle missing)
-            }
-
-            if sort_column in sort_keys:
-                filtered_table.sort(key=sort_keys[sort_column], reverse=reverse_sort)
+    # Stable multi-key sort: apply least-significant key first so earlier keys win.
+    order = state.table_sort_order or [(3, True)]
+    for column, reverse in reversed(order):
+        key_func = _pass_table_sort_key(column)
+        if key_func is not None:
+            filtered_table.sort(key=key_func, reverse=reverse)
 
     return filtered_table

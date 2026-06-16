@@ -182,6 +182,10 @@ class RustCoreLoopAdapter:
             float(getattr(cfg, "alt_offset_str", 0.0) or 0.0),
         )
         loop.set_mount_mode(_mount_mode_str(cfg))
+        loop.set_continuous_rate(
+            bool(getattr(cfg, "continuous_rate_tracking", False)),
+            float(getattr(cfg, "guide_rate_max_dps", 5.0)),
+        )
         try:
             loop.set_alignment(
                 float(cfg.alignment_azimuth_str), float(cfg.alignment_elevation_str)
@@ -226,9 +230,17 @@ class RustCoreLoopAdapter:
         self.loop.set_ff_enabled(
             bool(st.feed_forward_azm_enabled), bool(st.feed_forward_alt_enabled)
         )
+        # Apply operator bias to the setpoint (the Python program_track path does
+        # this too; the Rust loop owns the setpoint here so it must be applied
+        # here or the bias controls have no effect). AZ bias is on-sky
+        # cross-elevation, so divide by cos(el) -- azimuth compresses toward the
+        # zenith -- with cos(el) clamped so it stays finite near the zenith.
+        cos_el = max(np.cos(np.radians(float(target_alt))), 0.087)  # >= cos(85°)
+        biased_az = float(target_az) + float(getattr(st, "bias_azm_deg", 0.0)) / cos_el
+        biased_el = float(target_alt) + float(getattr(st, "bias_alt_deg", 0.0))
         self.loop.set_setpoint(
-            float(target_az),
-            float(target_alt),
+            biased_az,
+            biased_el,
             float(az_rate) if az_rate is not None else 0.0,
             float(el_rate) if el_rate is not None else 0.0,
         )

@@ -138,12 +138,29 @@ pub fn run_cycle<T: Transport>(
     // 4) Decision step (pure).
     let out = state.step(&inputs, frame.as_deref(), current_azm, current_alt, now);
 
-    // 5) Actuate (only when the step commands a rate).
+    // 5) Actuate (only when the step commands a rate). In continuous-rate mode
+    //    PROGRAM/HOTSPOT issue the fine variable-rate (guide-rate) command using
+    //    the PID's continuous output, falling back to the discrete MC_MOVE step
+    //    above guide_rate_max_dps (e.g. the near-zenith keyhole). Manual
+    //    RATE_CONTROL always uses the discrete joystick step.
+    let continuous = inputs.continuous_rate
+        && matches!(inputs.mode, Mode::Program | Mode::Hotspot);
+    let max_dps = inputs.guide_rate_max_dps;
     if let Some(r) = out.azm_rate_cmd {
-        let _ = mount.hc_slew_fixed(targets::AZM, r);
+        let dps = out.azm_pid_output * 360.0;
+        if continuous && dps.abs() <= max_dps {
+            let _ = mount.hc_set_rate_dps(targets::AZM, dps);
+        } else {
+            let _ = mount.hc_slew_fixed(targets::AZM, r);
+        }
     }
     if let Some(r) = out.alt_rate_cmd {
-        let _ = mount.hc_slew_fixed(targets::ALT, r);
+        let dps = out.alt_pid_output * 360.0;
+        if continuous && dps.abs() <= max_dps {
+            let _ = mount.hc_set_rate_dps(targets::ALT, dps);
+        } else {
+            let _ = mount.hc_slew_fixed(targets::ALT, r);
+        }
     }
 
     // 6) Publish snapshot.

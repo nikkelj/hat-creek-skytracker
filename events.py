@@ -223,16 +223,35 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
                     state.selected_satellite = state.satellite_pass_table[index]['satellite']
                     return True
                 elif area_type == 'header':
-                    # Sort by column
-                    if state.table_sort_keys and index < len(state.table_sort_keys):
-                        if state.table_sort_keys[index]:
-                            state.table_sort_reverse[index] = not state.table_sort_reverse[index]
+                    # Column-header sort. Plain click = single-column sort (re-click
+                    # toggles direction). Shift-click = add/toggle a secondary sort
+                    # tier, enabling multi-column sorting.
+                    from tracking_visuals import PASS_TABLE_DEFAULT_DESC
+                    col = index
+                    shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+                    order = list(state.table_sort_order or [])
+                    existing = next((k for k, (c, _) in enumerate(order) if c == col), None)
+                    default_desc = PASS_TABLE_DEFAULT_DESC.get(col, True)
+                    if shift:
+                        if existing is not None:
+                            c, r = order[existing]
+                            order[existing] = (c, not r)
                         else:
-                            state.table_sort_keys = [False] * len(state.table_sort_keys)
-                            state.table_sort_keys[index] = True
-                            state.table_sort_reverse = [False] * len(state.table_sort_reverse)
-                            state.table_sort_reverse[index] = True
-                        return True
+                            order.append((col, default_desc))
+                    else:
+                        if len(order) == 1 and order[0][0] == col:
+                            order = [(col, not order[0][1])]
+                        else:
+                            order = [(col, default_desc)]
+                    state.table_sort_order = order
+                    # Keep legacy single-sort fields roughly in sync (primary key)
+                    if order:
+                        primary_col, primary_rev = order[0]
+                        state.table_sort_keys = [j == primary_col for j in range(len(state.table_sort_keys))]
+                        state.table_sort_reverse = [primary_rev for _ in range(len(state.table_sort_reverse))]
+                    # Reset scroll to top so the new ordering is visible from the start
+                    state.pass_table_scroll_offset = 0
+                    return True
                 elif area_type == 'launch':
                     # Handle launch trajectory selection
                     launch_name = index

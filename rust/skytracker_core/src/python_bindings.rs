@@ -477,10 +477,16 @@ impl SimCoreLoop {
         i.ff_azm_enabled = azm;
         i.ff_alt_enabled = alt;
     }
+    fn set_lead_time(&self, secs: f64) {
+        self.shared.inputs.lock().unwrap().lead_time_sec = secs;
+    }
     fn set_continuous_rate(&self, enabled: bool, max_dps: f64) {
         let mut i = self.shared.inputs.lock().unwrap();
         i.continuous_rate = enabled;
         i.guide_rate_max_dps = max_dps;
+    }
+    fn set_handoff_min_frames(&self, n: u32) {
+        self.shared.inputs.lock().unwrap().handoff_min_frames = n;
     }
     #[allow(clippy::too_many_arguments)]
     fn set_hotspot_params(
@@ -643,10 +649,16 @@ fn h_set_ff_enabled(sh: &Shared, azm: bool, alt: bool) {
     i.ff_azm_enabled = azm;
     i.ff_alt_enabled = alt;
 }
+fn h_set_lead_time(sh: &Shared, secs: f64) {
+    sh.inputs.lock().unwrap().lead_time_sec = secs;
+}
 fn h_set_continuous_rate(sh: &Shared, enabled: bool, max_dps: f64) {
     let mut i = sh.inputs.lock().unwrap();
     i.continuous_rate = enabled;
     i.guide_rate_max_dps = max_dps;
+}
+fn h_set_handoff_min_frames(sh: &Shared, n: u32) {
+    sh.inputs.lock().unwrap().handoff_min_frames = n;
 }
 #[allow(clippy::too_many_arguments)]
 fn h_set_hotspot_params(
@@ -880,8 +892,14 @@ impl CoreLoop {
     fn set_ff_enabled(&self, azm: bool, alt: bool) {
         h_set_ff_enabled(self.inner.shared(), azm, alt);
     }
+    fn set_lead_time(&self, secs: f64) {
+        h_set_lead_time(self.inner.shared(), secs);
+    }
     fn set_continuous_rate(&self, enabled: bool, max_dps: f64) {
         h_set_continuous_rate(self.inner.shared(), enabled, max_dps);
+    }
+    fn set_handoff_min_frames(&self, n: u32) {
+        h_set_handoff_min_frames(self.inner.shared(), n);
     }
     #[allow(clippy::too_many_arguments)]
     fn set_hotspot_params(

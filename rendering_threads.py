@@ -44,6 +44,33 @@ def draw_triangle_on_surface(surface, x, y, color, size=5):
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
 
+
+def draw_dashed_line_on_surface(surface, color, p0, p1, dash=5, gap=4, width=1):
+    """Draw a single dashed line segment from p0 to p1."""
+    x0, y0 = p0
+    x1, y1 = p1
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return
+    ux, uy = dx / length, dy / length
+    step = dash + gap
+    n = int(length // step) + 1
+    for i in range(n):
+        s = i * step
+        e = min(s + dash, length)
+        sx, sy = x0 + ux * s, y0 + uy * s
+        ex, ey = x0 + ux * e, y0 + uy * e
+        pygame.draw.line(surface, color, (sx, sy), (ex, ey), width)
+
+
+def draw_dashed_polygon_on_surface(surface, color, points, dash=5, gap=4, width=1):
+    """Draw a closed dashed polygon through points."""
+    n = len(points)
+    for i in range(n):
+        draw_dashed_line_on_surface(surface, color, points[i], points[(i + 1) % n],
+                                    dash=dash, gap=gap, width=width)
+
 def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, full_screen_bounds=None):
     """
     Draw polar plot on a specified surface with given bounds.
@@ -87,6 +114,40 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
     # Draw center dot explicitly to ensure it's visible over grid lines
     pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 3, 0)
+
+    # ---- Cardinal directions + numeric axis labels --------------------------
+    # Restored after a prior iteration dropped them. Drawn off the main thread,
+    # so we create local fonts rather than relying on display fonts.
+    pygame.font.init()
+    _dir_font = pygame.font.Font(None, 20)
+    _num_font = pygame.font.Font(None, 15)
+
+    def _blit_centered(text, color, px, py, font):
+        s = font.render(text, True, color)
+        surface.blit(s, (int(px - s.get_width() / 2), int(py - s.get_height() / 2)))
+
+    # Numeric azimuth ticks every 30 deg just outside the horizon ring (the four
+    # cardinals get letters instead). Azimuth: 0 = N = up, 90 = E = right.
+    for az_deg in range(0, 360, 30):
+        if az_deg in (0, 90, 180, 270):
+            continue
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 13) * math.sin(az_rad)
+        ly = cy - (radius + 13) * math.cos(az_rad)
+        _blit_centered(f"{az_deg}", (140, 140, 150), lx, ly, _num_font)
+
+    # Cardinal direction letters, further out; N highlighted.
+    for az_deg, lbl, col in ((0, "N", (255, 130, 130)), (90, "E", (225, 225, 235)),
+                             (180, "S", (225, 225, 235)), (270, "W", (225, 225, 235))):
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 18) * math.sin(az_rad)
+        ly = cy - (radius + 18) * math.cos(az_rad)
+        _blit_centered(lbl, col, lx, ly, _dir_font)
+
+    # Elevation ring labels (30 and 60 deg), placed just right of the N-S spoke.
+    for el in (30, 60):
+        r = (90 - el) / 90 * radius
+        _blit_centered(f"{el}°", (120, 170, 120), cx + 14, cy - r, _num_font)
 
     # Draw precomputed arc segments for selected satellite
     if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
@@ -380,12 +441,21 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
         if y_offset > panel_y + panel_height - padding:
             break
 
+FOV_MAGNIFICATION = 10  # dotted boxes are drawn at this magnification for clarity
+
+
 def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, joystick_mode_state=None):
-    """Draw camera FOV boxes on the polar plot surface."""
+    """Draw camera FOV boxes on the polar plot surface.
+
+    Each camera's true FOV box is drawn solid, plus a FOV_MAGNIFICATION-times
+    (10x) magnified copy in dotted lines so the small finder/imager fields are
+    actually visible and their position/orientation can be read at a glance. A
+    legend notes the 10x exaggeration."""
     if not hasattr(state, 'camera_fov_data') or not state.camera_fov_data:
         return
 
     surface_width, surface_height = surface.get_size()
+    drew_any = False
 
     # Center coordinates for polar plot (relative to surface)
     center_x = surface_width // 2
@@ -467,6 +537,7 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
         # Close the polygon for pygame.draw.polygon
         if len(corners_list) > 2:
             pygame.draw.polygon(surface, color, corners_list, 2)
+            drew_any = True
 
             # Draw rotation indicator line from center
             indicator_length = half_width * 0.3
@@ -478,10 +549,24 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
             pygame.draw.line(surface, color, (int(x), int(y)),
                            (int(indicator_end_x), int(indicator_end_y)), 1)
 
+            # 10x-magnified dotted copy: same center/rotation, corners scaled out
+            # so the (tiny) true FOV is legible. Lighter shade to read as a hint.
+            mag_corners = corners_local * FOV_MAGNIFICATION @ rot_matrix.T + np.array([x, y])
+            mag_list = [(int(c[0]), int(c[1])) for c in mag_corners]
+            mag_color = tuple(min(255, int(ch * 0.6 + 90)) for ch in color)
+            draw_dashed_polygon_on_surface(surface, mag_color, mag_list, dash=5, gap=4, width=1)
+
         # Draw corner markers for better visibility
         for corner in corners_screen:
             cx, cy = corner
             pygame.draw.circle(surface, color, (int(cx), int(cy)), 2, 1)
+
+    # Legend: note the dotted boxes are magnified (drawn once, bottom-left).
+    if drew_any:
+        pygame.font.init()
+        legend_font = pygame.font.Font(None, 15)
+        legend = legend_font.render(f"- - -  {FOV_MAGNIFICATION}x FOV", True, (200, 200, 210))
+        surface.blit(legend, (10, surface_height - 18))
 
 def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """Draw satellites on a specified surface with given bounds."""

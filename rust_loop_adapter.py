@@ -135,6 +135,11 @@ class RustCoreLoopAdapter:
             self._push_rate(st)
         elif mode == TrackingMode.PROGRAM:
             self._push_program_setpoint(st)
+        elif mode == TrackingMode.HANDOFF:
+            # HANDOFF needs BOTH the program setpoint (it keeps program-tracking)
+            # and camera frames + hotspot params (it detects in parallel).
+            self._push_program_setpoint(st)
+            self._push_hotspot(st, cfg)
         elif mode == TrackingMode.HOTSPOT:
             self._push_hotspot(st, cfg)
 
@@ -170,6 +175,9 @@ class RustCoreLoopAdapter:
             cfg.pid_azm_p_gain, cfg.pid_azm_i_gain, cfg.pid_azm_d_gain,
             cfg.pid_alt_p_gain, cfg.pid_alt_i_gain, cfg.pid_alt_d_gain,
         )
+        # Lead time mirrors the Python program_track path so both cores extrapolate
+        # the setpoint forward by the same amount (transport-latency compensation).
+        loop.set_lead_time(float(getattr(cfg, "pid_lead_time_sec", 0.0) or 0.0))
         try:
             loop.set_limits(
                 float(cfg.azm_limit_min_str), float(cfg.azm_limit_max_str),
@@ -186,6 +194,7 @@ class RustCoreLoopAdapter:
             bool(getattr(cfg, "continuous_rate_tracking", False)),
             float(getattr(cfg, "guide_rate_max_dps", 5.0)),
         )
+        loop.set_handoff_min_frames(int(getattr(cfg, "handoff_min_frames", 5) or 5))
         try:
             loop.set_alignment(
                 float(cfg.alignment_azimuth_str), float(cfg.alignment_elevation_str)
@@ -230,20 +239,24 @@ class RustCoreLoopAdapter:
         self.loop.set_ff_enabled(
             bool(st.feed_forward_azm_enabled), bool(st.feed_forward_alt_enabled)
         )
-        # Apply operator bias to the setpoint (the Python program_track path does
-        # this too; the Rust loop owns the setpoint here so it must be applied
-        # here or the bias controls have no effect). AZ bias is on-sky
-        # cross-elevation, so divide by cos(el) -- azimuth compresses toward the
-        # zenith -- with cos(el) clamped so it stays finite near the zenith.
-        cos_el = max(np.cos(np.radians(float(target_alt))), 0.087)  # >= cos(85°)
-        biased_az = float(target_az) + float(getattr(st, "bias_azm_deg", 0.0)) / cos_el
-        biased_el = float(target_alt) + float(getattr(st, "bias_alt_deg", 0.0))
-        self.loop.set_setpoint(
-            biased_az,
-            biased_el,
-            float(az_rate) if az_rate is not None else 0.0,
-            float(el_rate) if el_rate is not None else 0.0,
+        # Apply operator bias to the setpoint (the Rust loop owns the setpoint
+        # here, so it must be applied here or the bias controls have no effect).
+        # Reuse JoystickModeState._apply_bias_to_target so both control loops use
+        # the EXACT same Az/El + along/cross-track projection (single source of
+        # truth -- the two capabilities are co-developed and must not drift). The
+        # along/cross-track terms need the target's sky-velocity direction, which
+        # is the (az_rate, el_rate) we already have.
+        az_rate_f = float(az_rate) if az_rate is not None else 0.0
+        el_rate_f = float(el_rate) if el_rate is not None else 0.0
+        # Cache target sky-velocity for the camera bias-direction axes (the Python
+        # program_track path caches the same fields).
+        st.target_az_rate = az_rate_f
+        st.target_el_rate = el_rate_f
+        st.target_el_deg = float(target_alt)
+        biased_az, biased_el = st._apply_bias_to_target(
+            float(target_az), float(target_alt), az_rate_f, el_rate_f
         )
+        self.loop.set_setpoint(biased_az, biased_el, az_rate_f, el_rate_f)
 
     def _push_hotspot(self, st, cfg):
         import camera_manager

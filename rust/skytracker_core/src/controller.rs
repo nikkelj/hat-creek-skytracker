@@ -71,12 +71,20 @@ pub struct Inputs {
     pub setpoint: Option<Setpoint>,
     pub ff_azm_enabled: bool,
     pub ff_alt_enabled: bool,
+    /// Lead time (s): extrapolate the sky setpoint forward by this much using the
+    /// trajectory (feed-forward) rates to compensate read/command transport
+    /// latency. Mirrors joystick_controller.program_track's pid_lead_time_sec.
+    /// 0 = disabled. Kept congruent with the Python control loop.
+    pub lead_time_sec: f64,
 
     // Continuous variable-rate (guide-rate) tracking instead of discrete MC_MOVE.
     // Applies only to PROGRAM/HOTSPOT; above guide_rate_max_dps the loop falls
     // back to the discrete step (e.g. the near-zenith keyhole).
     pub continuous_rate: bool,
     pub guide_rate_max_dps: f64,
+
+    // HANDOFF: hand to HOTSPOT after this many consecutive solid detections.
+    pub handoff_min_frames: u32,
 
     // HOTSPOT
     pub hotspot: HotspotParams,
@@ -100,8 +108,10 @@ impl Default for Inputs {
             setpoint: None,
             ff_azm_enabled: false,
             ff_alt_enabled: false,
+            lead_time_sec: 0.0,
             continuous_rate: false,
             guide_rate_max_dps: 5.0,
+            handoff_min_frames: 5,
             hotspot: HotspotParams {
                 snr_threshold: 5.0,
                 gate_radius: 120.0,
@@ -150,6 +160,18 @@ fn wrap180(deg: f64) -> f64 {
     (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// Run hot-spot detection on a frame (gated or full-frame). Returns None when
+/// there is no frame or nothing qualifies. Pure; issues no commands.
+fn detect_in_frame(
+    frame: Option<&Frame>,
+    hp: &HotspotParams,
+    gate: Option<(f64, f64, f64)>,
+) -> Option<Detection> {
+    let f = frame?;
+    let view = ndarray::ArrayView2::from_shape((f.h, f.w), f.data.as_slice()).ok()?;
+    hotspot::detect_hotspot(&view, gate, hp.snr_threshold, 12, 0.5, 3)
+}
+
 /// Per-axis PID + the HOTSPOT lock/coast state machine + mode-entry guards.
 pub struct LoopState {
     pub azm_pid: PidController,
@@ -165,6 +187,10 @@ pub struct LoopState {
     hotspot_acquired: bool,
     hotspot_miss_count: u32,
     hotspot_last_detection_time: f64,
+    hotspot_entry_time: f64,
+
+    // HANDOFF: consecutive-detection counter toward the auto hand-off.
+    handoff_detection_count: u32,
 }
 
 impl LoopState {
@@ -179,6 +205,8 @@ impl LoopState {
             hotspot_acquired: false,
             hotspot_miss_count: 0,
             hotspot_last_detection_time: 0.0,
+            hotspot_entry_time: 0.0,
+            handoff_detection_count: 0,
         }
     }
 
@@ -220,6 +248,24 @@ impl LoopState {
         if inputs.mode != Mode::Standby {
             self.standby_stopped = false;
         }
+
+        // Per-mode entry resets (mirrors JoystickModeState mode-transition logic).
+        let entering = self.prev_mode != Some(inputs.mode);
+        if entering {
+            match inputs.mode {
+                Mode::Hotspot => {
+                    self.hotspot_gate_center = None;
+                    self.hotspot_acquired = false;
+                    self.hotspot_miss_count = 0;
+                    self.hotspot_last_detection_time = 0.0;
+                    self.hotspot_entry_time = now;
+                }
+                Mode::Handoff => {
+                    self.handoff_detection_count = 0;
+                }
+                _ => {}
+            }
+        }
         self.prev_mode = Some(inputs.mode);
 
         match inputs.mode {
@@ -236,11 +282,14 @@ impl LoopState {
                 out.alt_rate_cmd = Some(inputs.rate_cmd.1);
             }
             Mode::Program => self.step_program(inputs, current_azm, current_alt, now, &mut out),
+            Mode::Handoff => {
+                self.step_handoff(inputs, frame, current_azm, current_alt, now, &mut out)
+            }
             Mode::Hotspot => {
                 self.step_hotspot(inputs, frame, current_azm, current_alt, now, &mut out)
             }
-            // HANDOFF / MTI: stubs, as in Python.
-            Mode::Handoff | Mode::Mti => {}
+            // MTI: stub, as in Python.
+            Mode::Mti => {}
         }
 
         out
@@ -259,11 +308,21 @@ impl LoopState {
             None => return, // no target yet
         };
 
+        // Lead/extrapolate the sky setpoint by lead_time using the trajectory
+        // (feed-forward) rates, to compensate read/command transport latency.
+        // Mirrors program_track's `target += rate * lead_s` (applied to the sky
+        // az/el before sky_to_mount). Operator bias is applied upstream in the
+        // Python adapter; lead and bias are both additive to the setpoint, so the
+        // net target matches program_track regardless of which side applies which.
+        let lead = inputs.lead_time_sec;
+        let led_az = sp.az_deg + sp.ff_az_dps * lead;
+        let led_el = sp.el_deg + sp.ff_el_dps * lead;
+
         // Sky -> mount (the per-cycle transform we ported in step 5).
         let (target_azm, target_alt) = transforms::sky_to_mount(
             inputs.mount_mode,
-            sp.az_deg,
-            sp.el_deg,
+            led_az,
+            led_el,
             inputs.alignment_az,
             inputs.alignment_el,
         );
@@ -304,6 +363,45 @@ impl LoopState {
         out.alt_rate_cmd = Some(al_rate);
     }
 
+    /// HANDOFF: keep PROGRAM track closing the loop while running the hot-spot
+    /// detector in parallel; hand the loop to HOTSPOT after `handoff_min_frames`
+    /// consecutive solid detections. Mirrors JoystickModeState.handoff_track.
+    #[allow(clippy::too_many_arguments)]
+    fn step_handoff(
+        &mut self,
+        inputs: &Inputs,
+        frame: Option<&Frame>,
+        current_azm: f64,
+        current_alt: f64,
+        now: f64,
+        out: &mut StepOutput,
+    ) {
+        // 1) Keep PROGRAM-tracking (drives the mount; includes lead + feed-forward).
+        self.step_program(inputs, current_azm, current_alt, now, out);
+
+        // 2) Run the hot-spot detector in parallel (full frame, no commanding).
+        let need = inputs.handoff_min_frames.max(1);
+        match detect_in_frame(frame, &inputs.hotspot, None) {
+            Some(d) => {
+                self.handoff_detection_count += 1;
+                out.hotspot_snr = d.snr;
+                out.hotspot_centroid = Some((d.cx, d.cy));
+                out.hotspot_status = "detecting";
+                if self.handoff_detection_count >= need {
+                    self.handoff_detection_count = 0;
+                    out.requested_mode = Some(Mode::Hotspot);
+                    out.status_msg =
+                        Some("HANDOFF: solid detection - engaging HOTSPOT tracker".to_string());
+                }
+            }
+            None => {
+                // Require *consecutive* detections; any miss resets the counter.
+                self.handoff_detection_count = 0;
+                out.hotspot_status = "program";
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn step_hotspot(
         &mut self,
@@ -333,16 +431,11 @@ impl LoopState {
             return;
         }
 
-        // Detect on this cycle's frame (if any).
-        let detection: Option<Detection> = frame.and_then(|f| {
-            // Zero-copy f32 view straight over the frame buffer (the loop's hot
-            // path — no per-cycle conversion or allocation).
-            let view = ndarray::ArrayView2::from_shape((f.h, f.w), f.data.as_slice()).ok()?;
-            let gate = self
-                .hotspot_gate_center
-                .map(|(cx, cy)| (cx, cy, hp.gate_radius));
-            hotspot::detect_hotspot(&view, gate, hp.snr_threshold, 12, 0.5, 3)
-        });
+        // Detect on this cycle's frame (gated to the last lock once acquired).
+        let gate = self
+            .hotspot_gate_center
+            .map(|(cx, cy)| (cx, cy, hp.gate_radius));
+        let detection = detect_in_frame(frame, &hp, gate);
 
         if let Some(det) = detection {
             let (h, w) = frame.map(|f| (f.h, f.w)).unwrap_or((0, 0));
@@ -404,20 +497,26 @@ impl LoopState {
 
         // No detection this cycle.
         self.hotspot_miss_count += 1;
-        let elapsed = if self.hotspot_acquired {
-            now - self.hotspot_last_detection_time
-        } else {
-            f64::INFINITY
-        };
 
-        if self.hotspot_acquired && elapsed < hp.coast_time_s {
-            // Coast: leave the last continuous slew running (no new command).
-            out.hotspot_status = "coasting";
-            out.hotspot_acquired = true;
+        if self.hotspot_acquired {
+            // Coast: leave the last continuous slew running (no new command)
+            // through a brief dropout before declaring the lock lost.
+            if now - self.hotspot_last_detection_time < hp.coast_time_s {
+                out.hotspot_status = "coasting";
+                out.hotspot_acquired = true;
+                return;
+            }
+        } else if now - self.hotspot_entry_time < hp.coast_time_s.max(1.0) {
+            // Acquisition grace: just entered HOTSPOT (manual or handed off). Give
+            // frames time to arrive / the target time to be found before bailing,
+            // and leave the last slew running so a moving target stays roughly
+            // framed. Without this the loop fell back to PROGRAM on the very first
+            // frameless cycle (the async frame push lags the mode change).
+            out.hotspot_status = "acquiring";
             return;
         }
 
-        // Lock lost: stop and hand back to PROGRAM.
+        // Lock lost (or never acquired within the grace window): stop and hand back.
         out.azm_rate_cmd = Some(0);
         out.alt_rate_cmd = Some(0);
         out.requested_mode = Some(Mode::Program);

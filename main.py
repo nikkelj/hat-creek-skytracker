@@ -28,7 +28,7 @@ from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events
+from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 from mount_control import MountControlThread
@@ -569,6 +569,11 @@ while running:
                                     )
                                 break  # Only handle one slider at a time
 
+                    # Lead-time slider drag (reuse the click handler so the lead
+                    # range logic stays in one place)
+                    if joystick_mode_state is not None:
+                        handle_lead_slider_mouse_events(joystick_mode_state, display, current_pos)
+
 
         elif event.type == pygame.MOUSEMOTION:
             if current_mode is None:
@@ -826,6 +831,10 @@ while running:
 
         # Render feed-forward toggle buttons
         render_feed_forward_toggle_buttons(display, joystick_mode_state)
+
+        # Render the navball + PID-tuning strip charts in the center column
+        render_navball(display, joystick_mode_state)
+        render_tracking_strip_charts(display, joystick_mode_state)
 
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)

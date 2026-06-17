@@ -50,7 +50,10 @@ def main():
                                 render_combined_view_controls)
     from joystick_controller import (JoystickModeState, render_connection_controls,
                                      render_joystick_status, render_position_display,
-                                     render_pid_diagnostics, render_camera_feeds)
+                                     render_pid_diagnostics, render_camera_feeds,
+                                     render_navball, render_tracking_strip_charts,
+                                     render_bias_control_grid, render_pid_gain_sliders,
+                                     render_feed_forward_toggle_buttons, TrackingMode)
     from utils import draw_button_with_objects
 
     msgs = []
@@ -97,7 +100,14 @@ def main():
     try:
         az, el, kind, vis = hw.current_target_azel()
         if vis:
-            hw.mount.az_true_deg, hw.mount.el_true_deg = az, el
+            # Aim the sim mount at the target in MOUNT coords so render_frame
+            # (which converts mount->sky) actually centers it. In AltAz the ALT
+            # axis runs opposite sky elevation (ALT = 90 - el).
+            if getattr(cfg, 'mount_mode', 'AltAz') == 'AltAz':
+                align = float(getattr(cfg, 'alignment_azimuth_str', 0.0) or 0.0)
+                hw.mount.az_true_deg, hw.mount.el_true_deg = az - align, 90.0 - el
+            else:
+                hw.mount.az_true_deg, hw.mount.el_true_deg = az, el
     except Exception:
         pass
     cfg.sim_config["star_density"] = 90000
@@ -130,9 +140,14 @@ def main():
     jms = JoystickModeState(tvs, cfg, cb)
     jms.hardware_sim = hw
     jms.connect_telescope()
-    jms.current_azm, jms.current_alt = hw.mount.az_true_deg, hw.mount.el_true_deg
-    jms.azm_display_str = f"{hw.mount.az_true_deg:.1f}"
-    jms.alt_display_str = f"{hw.mount.el_true_deg:.1f}"
+    # current_azm/current_alt are MOUNT coordinates (what the encoders read). In
+    # AltAz the mount ALT axis runs opposite sky elevation (ALT = 90 - el), so
+    # feed mount coords here -- otherwise the navball (which converts mount->sky)
+    # would read inverted in the screenshot.
+    jms.current_azm = hw.mount.az_true_deg
+    jms.current_alt = 90.0 - hw.mount.el_true_deg
+    jms.azm_display_str = f"{jms.current_azm:.1f}"
+    jms.alt_display_str = f"{jms.current_alt:.1f}"
 
     cur_tt = ts.now().tt
 
@@ -202,6 +217,22 @@ def main():
         import traceback; traceback.print_exc()
 
     # ============ Joystick Loop ============
+    # Exercise the new center-column panels: PROGRAM mode so the bias/PID panes
+    # light up, a bit of bias set, and some synthetic diagnostics history so the
+    # strip charts show traces.
+    import math as _math
+    jms.tracking_mode = TrackingMode.PROGRAM
+    jms.bias_frame, jms.bias_resolution = "alongcross", "fine"
+    jms.bias_intrack_deg, jms.bias_crosstrack_deg = 0.35, -0.20
+    for i in range(jms.diag_history_len):
+        jms.az_rate_history.append(0.8 * _math.sin(i * 0.08))
+        jms.el_rate_history.append(0.5 * _math.cos(i * 0.06))
+        jms.az_err_history.append(0.15 * _math.sin(i * 0.05 + 1))
+        jms.el_err_history.append(0.10 * _math.cos(i * 0.04))
+    jms.azm_position_error, jms.alt_position_error = 0.12, -0.07
+    jms.azm_pid_output, jms.alt_pid_output = 0.002, -0.001
+    # Target sky-velocity so the camera along/cross-track bias axes render.
+    jms.target_az_rate, jms.target_el_rate, jms.target_el_deg = 0.6, 0.3, 40.0
     try:
         update_camera_frames_from_buffers()
         display.menu_screen.fill((30, 30, 30), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))
@@ -212,6 +243,11 @@ def main():
                    lambda: render_joystick_status(display, jms),
                    lambda: render_position_display(display, jms),
                    lambda: render_pid_diagnostics(display, jms),
+                   lambda: render_pid_gain_sliders(display, jms),
+                   lambda: render_bias_control_grid(display, jms),
+                   lambda: render_feed_forward_toggle_buttons(display, jms),
+                   lambda: render_navball(display, jms),
+                   lambda: render_tracking_strip_charts(display, jms),
                    lambda: render_camera_feeds(display, jms)):
             try:
                 fn()

@@ -56,6 +56,10 @@ class ConfigState:
         self.hotspot_x_sign = 1.0           # per-axis sign calibration (set on hardware)
         self.hotspot_y_sign = -1.0
 
+        # HANDOFF mode: PROGRAM track runs the hotspot detector in parallel and
+        # hands the loop to HOTSPOT after this many consecutive solid detections.
+        self.handoff_min_frames = 5
+
         # Hardware simulator configuration (mount + camera sim). enabled=False
         # leaves all real-hardware behavior unchanged.
         self.sim_config = {
@@ -191,6 +195,7 @@ class ConfigState:
             "hotspot_snr_threshold": self.hotspot_snr_threshold,
             "hotspot_gate_radius": self.hotspot_gate_radius,
             "hotspot_coast_time_sec": self.hotspot_coast_time_sec,
+            "handoff_min_frames": self.handoff_min_frames,
             "hotspot_x_sign": self.hotspot_x_sign,
             "hotspot_y_sign": self.hotspot_y_sign,
             "sim_config": self.sim_config,
@@ -236,6 +241,7 @@ class ConfigState:
         self.hotspot_snr_threshold = config_dict.get("hotspot_snr_threshold", self.hotspot_snr_threshold)
         self.hotspot_gate_radius = config_dict.get("hotspot_gate_radius", self.hotspot_gate_radius)
         self.hotspot_coast_time_sec = config_dict.get("hotspot_coast_time_sec", self.hotspot_coast_time_sec)
+        self.handoff_min_frames = config_dict.get("handoff_min_frames", self.handoff_min_frames)
         self.hotspot_x_sign = config_dict.get("hotspot_x_sign", self.hotspot_x_sign)
         self.hotspot_y_sign = config_dict.get("hotspot_y_sign", self.hotspot_y_sign)
 
@@ -748,86 +754,35 @@ def draw_config_options(display, config_state):
     # Draw grouping box and label
     group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 990)
     pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
-    group_label = display.font.render("Observer Location", True, (0, 0, 0))
+    group_label = display.font.render("Site / Mount / Limits", True, (0, 0, 0))
     display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
 
-    # Draw labels and inputs
-    lat_label = display.font.render("Latitude:", True, (0, 0, 0))
-    display.menu_screen.blit(lat_label, (display.sub_x + 20, display.sub_y + 30))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lat'])
-    lat_text = display.font.render(config_state.lat_str, True, (0, 0, 0))
-    display.menu_screen.blit(lat_text, (display.input_rects['lat'].x + 5, display.input_rects['lat'].y + 5))
-
-    lon_label = display.font.render("Longitude:", True, (0, 0, 0))
-    display.menu_screen.blit(lon_label, (display.sub_x + 20, display.sub_y + 120))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['lon'])
-    lon_text = display.font.render(config_state.lon_str, True, (0, 0, 0))
-    display.menu_screen.blit(lon_text, (display.input_rects['lon'].x + 5, display.input_rects['lon'].y + 5))
-
-    alt_label = display.font.render("Altitude (m):", True, (0, 0, 0))
-    display.menu_screen.blit(alt_label, (display.sub_x + 20, display.sub_y + 210))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt'])
-    alt_text = display.font.render(config_state.alt_str, True, (0, 0, 0))
-    display.menu_screen.blit(alt_text, (display.input_rects['alt'].x + 5, display.input_rects['alt'].y + 5))
-
-    elevation_mask_label = display.font.render("Elevation Mask (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(elevation_mask_label, (display.sub_x + 20, display.sub_y + 300))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['elevation_mask'])
-    elevation_mask_text = display.font.render(config_state.elevation_mask_str, True, (0, 0, 0))
-    display.menu_screen.blit(elevation_mask_text, (display.input_rects['elevation_mask'].x + 5, display.input_rects['elevation_mask'].y + 5))
-
-    # Mount Alignment fields
-    mount_alignment_header = display.font.render("Azimuth Alignment (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(mount_alignment_header, (display.sub_x + 20, display.sub_y + 380))
-
-    azimuth_label = display.font.render("Azimuth Alignment (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(azimuth_label, (display.sub_x + 20, display.sub_y + 410))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_azimuth'])
-    azimuth_text = display.font.render(config_state.alignment_azimuth_str, True, (0, 0, 0))
-    display.menu_screen.blit(azimuth_text, (display.input_rects['alignment_azimuth'].x + 5, display.input_rects['alignment_azimuth'].y + 5))
-
-    elevation_alignment_label = display.font.render("Elevation Alignment (deg) (Eq mode):", True, (0, 0, 0))
-    display.menu_screen.blit(elevation_alignment_label, (display.sub_x + 20, display.sub_y + 470))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alignment_elevation'])
-    elevation_alignment_text = display.font.render(config_state.alignment_elevation_str, True, (0, 0, 0))
-    display.menu_screen.blit(elevation_alignment_text, (display.input_rects['alignment_elevation'].x + 5, display.input_rects['alignment_elevation'].y + 5))
-
-    azm_offset_label = display.font.render("Azm Offset (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(azm_offset_label, (display.sub_x + 20, display.sub_y + 550))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_offset'])
-    azm_offset_text = display.font.render(config_state.azm_offset_str, True, (0, 0, 0))
-    display.menu_screen.blit(azm_offset_text, (display.input_rects['azm_offset'].x + 5, display.input_rects['azm_offset'].y + 5))
-
-    alt_offset_label = display.font.render("Alt Offset (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(alt_offset_label, (display.sub_x + 20, display.sub_y + 630))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_offset'])
-    alt_offset_text = display.font.render(config_state.alt_offset_str, True, (0, 0, 0))
-    display.menu_screen.blit(alt_offset_text, (display.input_rects['alt_offset'].x + 5, display.input_rects['alt_offset'].y + 5))
-
-    # Hardware safety limits
-    azm_limit_min_label = display.font.render("AZM Limit Min (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(azm_limit_min_label, (display.sub_x + 20, display.sub_y + 700))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_limit_min'])
-    azm_limit_min_text = display.font.render(config_state.azm_limit_min_str, True, (0, 0, 0))
-    display.menu_screen.blit(azm_limit_min_text, (display.input_rects['azm_limit_min'].x + 5, display.input_rects['azm_limit_min'].y + 5))
-
-    azm_limit_max_label = display.font.render("AZM Limit Max (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(azm_limit_max_label, (display.sub_x + 20, display.sub_y + 760))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['azm_limit_max'])
-    azm_limit_max_text = display.font.render(config_state.azm_limit_max_str, True, (0, 0, 0))
-    display.menu_screen.blit(azm_limit_max_text, (display.input_rects['azm_limit_max'].x + 5, display.input_rects['azm_limit_max'].y + 5))
-
-    alt_limit_min_label = display.font.render("ALT Limit Min (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(alt_limit_min_label, (display.sub_x + 20, display.sub_y + 820))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_limit_min'])
-    alt_limit_min_text = display.font.render(config_state.alt_limit_min_str, True, (0, 0, 0))
-    display.menu_screen.blit(alt_limit_min_text, (display.input_rects['alt_limit_min'].x + 5, display.input_rects['alt_limit_min'].y + 5))
-
-    alt_limit_max_label = display.font.render("ALT Limit Max (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(alt_limit_max_label, (display.sub_x + 20, display.sub_y + 880))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['alt_limit_max'])
-    alt_limit_max_text = display.font.render(config_state.alt_limit_max_str, True, (0, 0, 0))
-    display.menu_screen.blit(alt_limit_max_text, (display.input_rects['alt_limit_max'].x + 5, display.input_rects['alt_limit_max'].y + 5))
+    # Left column fields. Each label is drawn a consistent gap ABOVE its input
+    # box, with the y derived from display.input_rects so the column stays
+    # aligned regardless of box spacing. (Previously the label offsets were
+    # hand-tuned and drifted out of register -- the azimuth-alignment label even
+    # overlapped its own box, and a duplicate header was drawn above it.)
+    left_fields = [
+        ('lat', "Latitude:", config_state.lat_str),
+        ('lon', "Longitude:", config_state.lon_str),
+        ('alt', "Altitude (m):", config_state.alt_str),
+        ('elevation_mask', "Elevation Mask (deg):", config_state.elevation_mask_str),
+        ('alignment_azimuth', "Azimuth Alignment (deg):", config_state.alignment_azimuth_str),
+        ('alignment_elevation', "Elevation Align (deg, Eq):", config_state.alignment_elevation_str),
+        ('azm_offset', "Azm Offset (deg):", config_state.azm_offset_str),
+        ('alt_offset', "Alt Offset (deg):", config_state.alt_offset_str),
+        ('azm_limit_min', "AZM Limit Min (deg):", config_state.azm_limit_min_str),
+        ('azm_limit_max', "AZM Limit Max (deg):", config_state.azm_limit_max_str),
+        ('alt_limit_min', "ALT Limit Min (deg):", config_state.alt_limit_min_str),
+        ('alt_limit_max', "ALT Limit Max (deg):", config_state.alt_limit_max_str),
+    ]
+    for field, label_text, value_str in left_fields:
+        rect = display.input_rects[field]
+        label = display.font.render(label_text, True, (0, 0, 0))
+        display.menu_screen.blit(label, (rect.x, rect.y - 22))
+        pygame.draw.rect(display.menu_screen, (255, 255, 255), rect)
+        value = display.font.render(value_str, True, (0, 0, 0))
+        display.menu_screen.blit(value, (rect.x + 5, rect.y + 5))
 
     # Focus highlights for location fields
     if config_state.focused_field == "lat":

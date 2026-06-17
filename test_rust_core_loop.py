@@ -73,11 +73,18 @@ class SimCoreLoopTests(unittest.TestCase):
         self.assertGreater(snap["hotspot_snr"], 5.0)
         self.assertIsNotNone(snap["hotspot_centroid"])
 
-    def test_hotspot_loss_requests_program(self):
+    def test_hotspot_no_frame_holds_then_falls_back(self):
         loop = rc.SimCoreLoop(50.0, 45.0)
         loop.set_mode("hotspot")
-        # No frame pushed and never acquired -> immediate fall-back request.
+        # First frameless cycle on entry: the acquisition grace holds (it must NOT
+        # bail immediately -- the async frame push can lag the mode change).
         loop.step(0.1)
+        snap = loop.snapshot()
+        self.assertIsNone(snap["requested_mode"])
+        self.assertEqual(snap["hotspot_status"], "acquiring")
+        # Past the grace window with still no detection -> fall back to PROGRAM.
+        for _ in range(15):
+            loop.step(0.1)
         snap = loop.snapshot()
         self.assertEqual(snap["requested_mode"], "program")
         self.assertEqual(snap["hotspot_status"], "lost")

@@ -151,14 +151,74 @@ fn hotspot_locks_on_blob() {
 }
 
 #[test]
-fn hotspot_no_frame_falls_back_to_program() {
+fn hotspot_no_frame_holds_then_falls_back() {
     let mut s = LoopState::new();
     let mut i = base_inputs();
     i.mode = Mode::Hotspot;
-    let o = s.step(&i, None, 50.0, 45.0, 100.0);
-    assert_eq!(o.requested_mode, Some(Mode::Program));
-    assert_eq!(o.hotspot_status, "lost");
-    assert_eq!(o.azm_rate_cmd, Some(0));
+    i.hotspot.coast_time_s = 1.0; // acquisition grace = max(coast, 1.0) = 1.0s
+    // First frameless cycle on entry: hold in the acquisition grace rather than
+    // bailing immediately (the async frame push can lag the mode change). Leave
+    // the last slew running (no command).
+    let o1 = s.step(&i, None, 50.0, 45.0, 100.0);
+    assert_eq!(o1.requested_mode, None);
+    assert_eq!(o1.hotspot_status, "acquiring");
+    assert_eq!(o1.azm_rate_cmd, None);
+    // Past the grace window with still no detection -> fall back to PROGRAM.
+    let o2 = s.step(&i, None, 50.0, 45.0, 101.5);
+    assert_eq!(o2.requested_mode, Some(Mode::Program));
+    assert_eq!(o2.hotspot_status, "lost");
+    assert_eq!(o2.azm_rate_cmd, Some(0));
+}
+
+#[test]
+fn handoff_program_tracks_and_hands_off_after_n_detections() {
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Handoff;
+    i.mount_mode = MountMode::Passthrough;
+    i.handoff_min_frames = 3;
+    i.setpoint = Some(Setpoint {
+        az_deg: 15.0,
+        el_deg: 25.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let f = blob_frame(256, 200, 138.0, 110.0);
+    // Each cycle: program-tracks (commands a rate toward the setpoint) AND counts
+    // a detection. Hand-off to HOTSPOT fires on the 3rd consecutive detection.
+    let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0);
+    assert!(o1.azm_rate_cmd.unwrap() > 0, "handoff must keep program-tracking");
+    assert_eq!(o1.hotspot_status, "detecting");
+    assert_eq!(o1.requested_mode, None);
+    let o2 = s.step(&i, Some(&f), 10.0, 20.0, 1.1);
+    assert_eq!(o2.requested_mode, None);
+    let o3 = s.step(&i, Some(&f), 10.0, 20.0, 1.2);
+    assert_eq!(o3.requested_mode, Some(Mode::Hotspot));
+}
+
+#[test]
+fn handoff_resets_count_on_missed_detection() {
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Handoff;
+    i.mount_mode = MountMode::Passthrough;
+    i.handoff_min_frames = 2;
+    i.setpoint = Some(Setpoint {
+        az_deg: 15.0,
+        el_deg: 25.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let f = blob_frame(256, 200, 138.0, 110.0);
+    let _ = s.step(&i, Some(&f), 10.0, 20.0, 1.0); // count 1
+    let miss = s.step(&i, None, 10.0, 20.0, 1.1); // no frame -> reset
+    assert_eq!(miss.hotspot_status, "program");
+    assert_eq!(miss.requested_mode, None);
+    // Needs two fresh consecutive detections again before handing off.
+    let a = s.step(&i, Some(&f), 10.0, 20.0, 1.2);
+    assert_eq!(a.requested_mode, None);
+    let b = s.step(&i, Some(&f), 10.0, 20.0, 1.3);
+    assert_eq!(b.requested_mode, Some(Mode::Hotspot));
 }
 
 #[test]

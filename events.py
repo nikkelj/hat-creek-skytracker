@@ -269,6 +269,11 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
                     return True
                 break
 
+    # While a launch is active it is the sole target -- don't let plot clicks
+    # select/track a satellite (a launched rocket overrides any satellite target).
+    if getattr(state, 'selected_launch', None) and getattr(state, 'launch_launched', False):
+        return False
+
     # Satellite selection - if no table click
     if state.selected_satellite and state.satellite_positions.get(state.selected_satellite):
         px, py, _, _ = state.satellite_positions[state.selected_satellite]

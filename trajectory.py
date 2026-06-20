@@ -1,5 +1,6 @@
 import numpy as np
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from skyfield.api import wgs84, load
 
@@ -9,7 +10,14 @@ from skyfield.api import wgs84, load
 
 # Simulation and Trajectory Parameters
 TRAJECTORY_DURATION_MINUTES_DEFAULT = 15  # Default duration for trajectory computation
-TIME_SAMPLES_COUNT = 301  # Number of time samples for trajectory (every ~6 seconds)
+TIME_SAMPLES_COUNT = 301  # Legacy: sample count at the historical 30 min window (kept for reference)
+# Bulk trajectories (all visible sats) are for DISPLAY + the pass table, so they
+# are sampled coarsely -- this keeps a long (e.g. 120 min) window cheap to compute
+# and cache. The actively tracked satellite is recomputed separately at the fine
+# interval below (see compute_fine_selected_trajectory), because live PROGRAM
+# tracking interpolates that one trajectory and needs tight spacing on fast passes.
+TRAJECTORY_SAMPLE_INTERVAL_SECONDS = 30.0       # bulk/display spacing (sample count scales with duration)
+TRAJECTORY_FINE_SAMPLE_INTERVAL_SECONDS = 6.0   # selected/tracked satellite spacing
 MIN_VISIBLE_ALTITUDE_DEGREES = 15.0  # Minimum altitude considered visible (degrees)
 DEFAULT_ELEVATION_MASK_DEGREES = 10.0  # Default elevation mask
 FRUSTUM_UNCERTAINTY_MARGIN_DEGREES = 15.0  # Extra margin for visibility checking
@@ -49,11 +57,131 @@ MINIMUM_VISIBLE_ALTITUDE_DEGREES = 0.0  # Minimum altitude to consider for visib
 TRAJECTORY_CACHE = {}
 SUN_EPHEMERIS_CACHE = None
 
+# ---- Disk-backed trajectory cache --------------------------------------------
+# Persists the most recent window's computed trajectories so a quick relaunch can
+# serve the precise pass from disk instead of recomputing it (~2.5s for ~1700
+# sats). Hits require an exact (TLE fingerprint, t0, t1) match, which is why the
+# auto/launch window center is snapped to a coarse grid -- see quantized_now().
+TRAJECTORY_DISK_CACHE_FILE = "trajectory_disk_cache.npz"
+# Window-center quantization. Two launches within the same bucket produce
+# identical t0/t1 -> identical cache keys -> a full disk hit. The displayed window
+# center can lag true "now" by up to this many seconds, which is imperceptible
+# against the default +/-15 min window. Tune up for more hits, down for less lag.
+AUTO_CENTER_QUANTIZE_SECONDS = 120
+
+
+def quantized_now(bucket_seconds=AUTO_CENTER_QUANTIZE_SECONDS):
+    """Current UTC time floored to a bucket grid, so the launch/auto trajectory
+    window is reproducible across quick relaunches (enables disk-cache hits)."""
+    now = datetime.now(timezone.utc)
+    snapped = (int(now.timestamp()) // int(bucket_seconds)) * int(bucket_seconds)
+    return datetime.fromtimestamp(snapped, tz=timezone.utc)
+
+
 def clear_trajectory_cache():
     """Clear the trajectory cache to free memory"""
     global TRAJECTORY_CACHE, SUN_EPHEMERIS_CACHE
     TRAJECTORY_CACHE.clear()
     SUN_EPHEMERIS_CACHE = None
+
+
+def _file_fingerprint(path):
+    """Cheap content fingerprint (size + mtime) so an edited source file
+    invalidates any cache derived from it automatically."""
+    try:
+        st = os.stat(path)
+        return f"{int(st.st_size)}_{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
+def save_trajectory_disk_cache(state, t0_tt, t1_tt, tle_path="tle_cache.tle",
+                               cache_file=TRAJECTORY_DISK_CACHE_FILE):
+    """Persist the current window's trajectories to disk as packed float arrays.
+
+    Stores a single window (overwrites any previous one). All satellites in a
+    window share one time grid, so it's stored once. Arc segments are NOT stored
+    -- they're cheaply recomputed from the trajectory on load. Best-effort: any
+    failure is swallowed (the cache is an optimization, never required)."""
+    try:
+        entries = []  # (sid, traj_f32, times_f64)
+        for s in state.satellites:
+            if s not in state.satellite_trajectories:
+                continue
+            traj, ta = state.satellite_trajectories[s]
+            if not traj:
+                continue
+            sid = getattr(getattr(s, 'model', None), 'satnum_str', None)
+            if sid is None:
+                continue
+            entries.append((sid, np.asarray(traj, dtype=np.float32), np.asarray(ta, dtype=np.float64)))
+        if not entries:
+            return 0
+
+        # Bulk trajectories share one sample count, but the selected satellite may
+        # carry a fine-resolution entry of a different length. Keep only the modal
+        # length so np.stack and the single shared time grid stay valid; the fine
+        # selected-sat trajectory is recomputed live next run, so it needn't persist.
+        from collections import Counter
+        modal_len = Counter(e[1].shape[0] for e in entries).most_common(1)[0][0]
+        entries = [e for e in entries if e[1].shape[0] == modal_len]
+        if not entries:
+            return 0
+
+        ids = [e[0] for e in entries]
+        times_array = entries[0][2]
+        data = np.stack([e[1] for e in entries], axis=0)  # (n_sats, n_samples, n_cols) float32
+        # np.savez appends ".npz" if the name lacks it, so keep the suffix on the
+        # temp file too; then atomically swap it into place.
+        tmp = cache_file + ".tmp.npz"
+        np.savez(tmp,
+                 fingerprint=np.array(_file_fingerprint(tle_path)),
+                 t0_tt=np.array(float(t0_tt)), t1_tt=np.array(float(t1_tt)),
+                 times=times_array, ids=np.array(ids), data=data)
+        os.replace(tmp, cache_file)
+        return len(ids)
+    except Exception:
+        return 0
+
+
+def load_trajectory_disk_cache(t0_tt, t1_tt, tle_path="tle_cache.tle",
+                               cache_file=TRAJECTORY_DISK_CACHE_FILE):
+    """If a disk cache matching this exact (TLE fingerprint, t0, t1) window
+    exists, reconstruct its entries into the in-memory TRAJECTORY_CACHE so the
+    next precompute_trajectories() serves them as hits. Returns entries loaded
+    (0 on miss). Cheap to call on a miss (reads only the small header arrays)."""
+    if not os.path.exists(cache_file):
+        return 0
+    try:
+        with np.load(cache_file, allow_pickle=False) as z:
+            if str(z['fingerprint']) != _file_fingerprint(tle_path):
+                return 0
+            if abs(float(z['t0_tt']) - float(t0_tt)) > 1e-6 or \
+               abs(float(z['t1_tt']) - float(t1_tt)) > 1e-6:
+                return 0
+            times = z['times']
+            ids = z['ids']
+            data = z['data']
+    except Exception:
+        return 0
+
+    start_tt = float(t0_tt)
+    times = np.asarray(times, dtype=np.float64)
+    loaded = 0
+    for i in range(len(ids)):
+        arr = np.asarray(data[i], dtype=np.float64)  # (n_samples, n_cols)
+        # Column 0 is the absolute TT Julian date (~2.46e6); float32 can't hold it
+        # to better than ~0.1 day, which would corrupt the future/past arc coloring.
+        # It's identical to the float64 `times` grid we stored separately, so
+        # restore it exactly rather than trusting the packed float32 copy.
+        if arr.shape[1] > 0:
+            arr[:, 0] = times
+        traj = arr.tolist()
+        segments = _create_arc_segments_simple(arr, start_tt)
+        cache_key = f"{ids[i]}_{start_tt:.6f}_{float(t1_tt):.6f}"
+        TRAJECTORY_CACHE[cache_key] = (traj, times, segments)
+        loaded += 1
+    return loaded
 
 def _is_satellite_potentially_visible(satellite, observer, time_samples, elevation_mask_deg=10.0):
     """
@@ -77,6 +205,68 @@ def _is_satellite_potentially_visible(satellite, observer, time_samples, elevati
         # If there's an error calculating position, assume it's not visible to be safe
         return False
 
+def _batched_visibility_mask(satellites, observer, visibility_times, min_visible_alt_deg):
+    """
+    Vectorized coarse visibility test for ALL satellites at once.
+
+    Propagates every satellite at every sample time in a single compiled
+    SGP4 call (sgp4.api.SatrecArray) instead of one Python call per satellite,
+    then converts the TEME positions to topocentric elevation with pure NumPy.
+    Returns a boolean array (len == len(satellites)); True == the satellite rises
+    above `min_visible_alt_deg` at one or more sample times.
+
+    This is an approximation of Skyfield's full altaz() (it uses a single GAST
+    z-rotation for TEME->ECEF and skips precession/nutation/polar-motion), but
+    the error is < ~0.05 deg -- far inside the 15 deg visibility margin this gate
+    runs with -- so it does not change which satellites pass. Raises on any
+    unexpected condition so the caller can fall back to the per-satellite path.
+    """
+    from sgp4.api import SatrecArray  # part of skyfield's own sgp4 dependency
+
+    # Observer geocentric position + local "up" unit vector (WGS84 ellipsoid), km.
+    a_km = 6378.137
+    f = 1.0 / 298.257223563
+    e2 = f * (2.0 - f)
+    phi = math.radians(observer.latitude.degrees)
+    lam = math.radians(observer.longitude.degrees)
+    h_km = observer.elevation.m / 1000.0
+    sin_phi, cos_phi = math.sin(phi), math.cos(phi)
+    sin_lam, cos_lam = math.sin(lam), math.cos(lam)
+    N = a_km / math.sqrt(1.0 - e2 * sin_phi * sin_phi)
+    ox = (N + h_km) * cos_phi * cos_lam
+    oy = (N + h_km) * cos_phi * sin_lam
+    oz = (N * (1.0 - e2) + h_km) * sin_phi
+    # Local up (ENU) unit vector in ECEF.
+    ux, uy, uz = cos_phi * cos_lam, cos_phi * sin_lam, sin_phi
+
+    # Batched SGP4: r has shape (n_sats, n_times, 3) in TEME km.
+    satrec_array = SatrecArray([sat.model for sat in satellites])
+    jd = np.ascontiguousarray(visibility_times.whole)
+    fr = np.ascontiguousarray(visibility_times.ut1_fraction)
+    err, r, _v = satrec_array.sgp4(jd, fr)
+
+    x, y, z = r[:, :, 0], r[:, :, 1], r[:, :, 2]
+
+    # TEME -> ECEF: rotation about z by GAST (broadcast across the time axis).
+    theta = np.asarray(visibility_times.gast) * (np.pi / 12.0)  # hours -> radians
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    xe = cos_t * x + sin_t * y
+    ye = -sin_t * x + cos_t * y
+    ze = z
+
+    # Topocentric range vector and elevation (only the "up" projection is needed).
+    rho_x, rho_y, rho_z = xe - ox, ye - oy, ze - oz
+    up = rho_x * ux + rho_y * uy + rho_z * uz
+    rng = np.sqrt(rho_x * rho_x + rho_y * rho_y + rho_z * rho_z)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        elev_deg = np.degrees(np.arcsin(np.clip(up / rng, -1.0, 1.0)))
+
+    # Propagation failures (decayed orbits etc.) can't be visible; drop them so
+    # they never reach the precise pass (where they'd error out anyway).
+    elev_deg = np.where(err != 0, -np.inf, elev_deg)
+
+    return np.any(elev_deg > min_visible_alt_deg, axis=1)
+
 def _filter_satellites_by_visibility(satellites, observer, ts, center_time, duration_minutes, elevation_mask_deg=10.0, update_status_callback=None):
     """
     Filter satellites to only compute trajectories for those that could potentially be visible.
@@ -96,17 +286,31 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
                      int(duration_minutes / VISIBILITY_SEED_INTERVAL_MINUTES))
     visibility_times = ts.linspace(t0, t1, num_samples)
 
-    visible_satellites = []
-    total_checked = 0
+    min_visible_alt = max(elevation_mask_deg, FRUSTUM_UNCERTAINTY_MARGIN_DEGREES)
 
-    for sat in satellites:
-        total_checked += 1
-        if _is_satellite_potentially_visible(sat, observer, visibility_times, elevation_mask_deg):
-            visible_satellites.append(sat)
+    # Fast path: propagate all satellites in one batched SGP4 call. Falls back to
+    # the per-satellite loop if anything about the vectorized path goes wrong.
+    visible_satellites = None
+    if satellites:
+        try:
+            mask = _batched_visibility_mask(satellites, observer, visibility_times, min_visible_alt)
+            visible_satellites = [sat for sat, vis in zip(satellites, mask) if vis]
+        except Exception as e:
+            if update_status_callback:
+                update_status_callback(f"Batched visibility filter unavailable ({e}); using per-sat path")
+            visible_satellites = None
 
-        # Progress update for filtering
-        if update_status_callback and total_checked % VISIBILITY_FILTER_BATCH_SIZE == 0 and total_checked > 0:
-            update_status_callback(f"Visibility filtered {len(visible_satellites)}/{total_checked} satellites...")
+    if visible_satellites is None:
+        visible_satellites = []
+        total_checked = 0
+        for sat in satellites:
+            total_checked += 1
+            if _is_satellite_potentially_visible(sat, observer, visibility_times, elevation_mask_deg):
+                visible_satellites.append(sat)
+
+            # Progress update for filtering
+            if update_status_callback and total_checked % VISIBILITY_FILTER_BATCH_SIZE == 0 and total_checked > 0:
+                update_status_callback(f"Visibility filtered {len(visible_satellites)}/{total_checked} satellites...")
 
     if visible_satellites:
         visibility_ratio = len(visible_satellites) / len(satellites) * 100
@@ -117,6 +321,83 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
         update_status_callback(f"Visibility filtering: {len(visible_satellites)}/{len(satellites)} satellites potentially visible ({visibility_ratio:.1f}%)")
 
     return visible_satellites
+
+def _compute_one_trajectory(sat, observer, times, cx, cy, radius):
+    """Compute a single satellite's trajectory + arc segments over `times`.
+
+    Shared by the bulk precompute (coarse spacing, all sats) and the fine
+    selected-satellite recompute (tight spacing, one sat). Returns
+    (trajectory_list, times_array, segments) in the standard 8-column format:
+    [time_tt, alt_deg, az_deg, dist_km, px, py, az_rate_dps, el_rate_dps]."""
+    topocentrics = (sat - observer).at(times)
+    alts, azs, distances = topocentrics.altaz()
+
+    alt_deg = np.array(alts.degrees)
+    az_deg = np.array(azs.degrees)
+    dist_km = np.array(distances.km)
+    time_vals = np.array(times.tt)
+
+    # Vectorized polar-plot pixel coordinates.
+    az_rad = np.radians(az_deg % 360)
+    polar_radius = (90 - alt_deg) / 90 * radius
+    px_coords = cx + polar_radius * np.sin(az_rad)
+    py_coords = cy - polar_radius * np.cos(az_rad)
+
+    times_array = time_vals.copy()
+
+    # Angular rates (deg/s) via finite differences over the sample spacing.
+    dt_seconds = (times_array[1] - times_array[0]) * 86400.0 if len(times_array) > 1 else 1.0
+    az_rates_dps = np.zeros(len(times_array))
+    el_rates_dps = np.zeros(len(times_array))
+    for i in range(1, len(times_array) - 1):
+        az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
+        el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
+    if len(times_array) > 1:
+        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
+        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
+        el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
+        el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
+
+    trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords, az_rates_dps, el_rates_dps])
+    trajectory = trajectory_data.tolist()
+    segments = _create_arc_segments_simple(trajectory_data, time_vals[0])
+    return trajectory, times_array, segments
+
+
+def compute_fine_selected_trajectory(state, sat, observer, ts, display, t0, t1,
+                                     fine_interval_seconds=TRAJECTORY_FINE_SAMPLE_INTERVAL_SECONDS):
+    """Recompute ONE satellite (the tracked/selected one) at fine time resolution
+    and publish it into state.satellite_trajectories / _arc_segments, replacing
+    the coarse bulk entry. Bulk trajectories are sampled coarsely for display;
+    PROGRAM tracking interpolates this entry, so the selected sat needs tight
+    spacing to keep interpolation + feed-forward error low on fast passes.
+
+    Single satellite, so it's only a few milliseconds -- safe to call inline from
+    the main loop on selection/window change. Returns True on success."""
+    if sat is None or t0 is None or t1 is None:
+        return False
+    try:
+        cx = display.sub_x + display.sub_width // 2
+        cy = display.sub_y + display.sub_height // 2
+        radius = min(display.sub_width, display.sub_height) // 2 - 50
+        span_days = float(t1.tt - t0.tt)
+        n = max(2, round(span_days * 86400.0 / fine_interval_seconds) + 1)
+        times = ts.linspace(t0, t1, n)
+        trajectory, times_array, segments = _compute_one_trajectory(sat, observer, times, cx, cy, radius)
+
+        # Publish via copy-rebind so a concurrent reader (render thread / position
+        # loop) always sees a complete dict, consistent with precompute's atomic
+        # publish. Cheap: copies ~dict-of-refs, only on selection/window change.
+        new_traj = dict(state.satellite_trajectories)
+        new_arcs = dict(state.satellite_arc_segments)
+        new_traj[sat] = (trajectory, times_array)
+        new_arcs[sat] = segments
+        state.satellite_trajectories = new_traj
+        state.satellite_arc_segments = new_arcs
+        return True
+    except Exception:
+        return False
+
 
 def precompute_trajectories(state, observer, ts, display, update_status_callback=None, center_time=None, duration_minutes=15):
     """Optimized trajectory computation with caching, reduced resolution, vectorization, and visibility filtering.
@@ -146,8 +427,11 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
         t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes/2))
         t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes/2))
 
-    # OPTIMIZATION 1: Reduce time resolution from 1-second to 6-second intervals (5x speedup)
-    times = ts.linspace(t0, t1, 301)  # Every 6 seconds instead of 1 second
+    # Bulk/display sampling: coarse, fixed cadence; sample count scales with the
+    # window so a long (120 min) span stays cheap. The tracked satellite is
+    # refined elsewhere (compute_fine_selected_trajectory) for tracking accuracy.
+    num_time_samples = max(2, round(duration_minutes * 60.0 / TRAJECTORY_SAMPLE_INTERVAL_SECONDS) + 1)
+    times = ts.linspace(t0, t1, num_time_samples)
 
     # Filter satellites that are visible AND in our label dictionary and not cached
     satellites_to_compute = []
@@ -165,8 +449,14 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
                 satellites_to_compute.append((sat, cache_key))
 
     total_sats = len(satellites_to_compute)
-    state.satellite_trajectories = {}
-    state.satellite_arc_segments = {}
+    # Build into local dicts and publish them in a single atomic rebind at the
+    # end (see the tail of this function). precompute may now run on a background
+    # worker thread while the render thread reads state.satellite_trajectories /
+    # _arc_segments live every frame; incrementally filling the live attributes
+    # here would let a render land mid-fill and see a partial frame. Assigning the
+    # finished dicts once means readers always see the complete old or new set.
+    trajectories = {}
+    arc_segments = {}
 
     if update_status_callback:
         update_status_callback(f"Computing optimized trajectories for {total_sats}/{satellites_in_label_dict} satellites...")
@@ -175,60 +465,13 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
     for sat, cache_key in satellites_to_compute:
         processed_count += 1
 
-        # OPTIMIZATION 2: Batch processing of satellite positions
-        difference = sat - observer
-        topocentrics = difference.at(times)
-
-        # Get position arrays (vectorized operation)
-        alts, azs, distances = topocentrics.altaz()
-
-        # OPTIMIZATION 3: Convert to numpy arrays for vectorized operations
-        alt_deg = np.array(alts.degrees)
-        az_deg = np.array(azs.degrees)
-        dist_km = np.array(distances.km)
-        time_vals = np.array(times.tt)
-
-        # OPTIMIZATION 4: Vectorized pixel coordinate calculation (eliminate Python loops)
-        az_rad = np.radians(az_deg % 360)
-        polar_radius = (90 - alt_deg) / 90 * radius
-
-        # Compute all pixel coordinates at once
-        px_coords = cx + polar_radius * np.sin(az_rad)
-        py_coords = cy - polar_radius * np.cos(az_rad)
-
-        # OPTIMIZATION 5: Pre-compute time-to-index mapping for faster interpolation
-        times_array = time_vals.copy()
-
-        # Add rate calculations (degrees/second)
-        dt = times_array[1] - times_array[0]  # Time step in days
-        dt_seconds = dt * 86400.0  # Convert to seconds
-
-        # Calculate rates (finite differences)
-        az_rates_dps = np.zeros(len(times_array))
-        el_rates_dps = np.zeros(len(times_array))
-
-        for i in range(1, len(times_array) - 1):
-            az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
-            el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
-
-        # Handle endpoints with forward/backward differences
-        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
-        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
-        el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
-        el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
-
-        # OPTIMIZATION 6: Create trajectory data structure with rates
-        trajectory_data = np.column_stack([time_vals, alt_deg, az_deg, dist_km, px_coords, py_coords, az_rates_dps, el_rates_dps])
-        trajectory = trajectory_data.tolist()
-
-        # OPTIMIZATION 7: Create arc segments (color will be determined during rendering)
-        segments = _create_arc_segments_simple(trajectory_data, times.tt[0])
+        trajectory, times_array, segments = _compute_one_trajectory(sat, observer, times, cx, cy, radius)
 
         # Cache the computed trajectory
         TRAJECTORY_CACHE[cache_key] = (trajectory, times_array, segments)
 
-        state.satellite_trajectories[sat] = (trajectory, times_array)
-        state.satellite_arc_segments[sat] = segments
+        trajectories[sat] = (trajectory, times_array)
+        arc_segments[sat] = segments
 
         # Progress update
         if update_status_callback and processed_count % TRAJECTORY_COMPUTE_BATCH_SIZE == 0 and processed_count > 0:
@@ -244,12 +487,46 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
 
             if cache_key in TRAJECTORY_CACHE:
                 cached_data = TRAJECTORY_CACHE[cache_key]
-                state.satellite_trajectories[sat] = (cached_data[0], cached_data[1])
-                state.satellite_arc_segments[sat] = cached_data[2]
+                trajectories[sat] = (cached_data[0], cached_data[1])
+                arc_segments[sat] = cached_data[2]
                 cache_hits += 1
 
     if cache_hits > 0:
         print(f"DEBUG: Trajectory optimization: {cache_hits} satellites loaded from cache")
+
+    # Atomic publish: readers (render thread / position updates) see either the
+    # complete previous set or this complete new one, never a partial fill.
+    state.satellite_trajectories = trajectories
+    state.satellite_arc_segments = arc_segments
+    # Also publish a packed array view of the columns the per-frame position
+    # update needs (alt, dist, px, py), so that update can interpolate every
+    # satellite in one vectorized shot instead of a Python loop. Single-tuple
+    # rebind so a concurrent reader sees a consistent (stack, sats, times) set.
+    state.position_stack = _build_position_stack(trajectories)
+
+
+def _build_position_stack(trajectories):
+    """Pack the bulk trajectories into one contiguous array for vectorized
+    per-frame position interpolation. Returns (stack, sats, times) where
+    stack has shape (n_sats, n_samples, 4) holding [alt, dist, px, py], sats is
+    the matching satellite list, and times is the shared TT grid. Satellites that
+    don't match the modal grid length (e.g. the fine-resolution selected sat,
+    present here at its coarse length when the stack is built) are simply the
+    ones kept by the modal filter. Returns None if there's nothing to pack."""
+    sats = [s for s, (traj, _ta) in trajectories.items() if traj]
+    if not sats:
+        return None
+    from collections import Counter
+    modal_len = Counter(len(trajectories[s][0]) for s in sats).most_common(1)[0][0]
+    keep = [s for s in sats if len(trajectories[s][0]) == modal_len]
+    if not keep:
+        return None
+    times = np.asarray(trajectories[keep[0]][1], dtype=np.float64)
+    stack = np.empty((len(keep), modal_len, 4), dtype=np.float64)
+    for i, s in enumerate(keep):
+        arr = np.asarray(trajectories[s][0], dtype=np.float64)
+        stack[i] = arr[:, (1, 3, 4, 5)]  # alt, dist, px, py
+    return stack, keep, times
 
 def _create_arc_segments_simple(trajectory_data, start_time):
     """Create arc segments with simple time-based color coding"""
@@ -409,30 +686,108 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     # the finished dict once means readers always see a complete frame's worth.
     new_positions = {}
 
-    # Always handle all satellites with filtering (don't exclude other satellites when one is selected)
-    for sat in state.satellites:
-        if sat in state.satellite_trajectories:
-            px, py, alt, dist = interpolate_position(state.satellite_trajectories[sat], current_tt)
-            if px is not None and alt > elevation_mask_deg:
-                # Apply filters
-                include_sat = True
-                if state.filter_text:
-                    include_sat = state.filter_text.lower() in sat.name.lower() or state.filter_text in sat.model.satnum_str
-                if state.filter_above_alt_text:
-                    try:
-                        alt_filter = float(state.filter_above_alt_text)
-                        include_sat = include_sat and state.satellite_mean_altitudes[sat] >= alt_filter
-                    except ValueError:
-                        include_sat = False
-                if state.filter_below_alt_text:
-                    try:
-                        alt_filter = float(state.filter_below_alt_text)
-                        include_sat = include_sat and state.satellite_mean_altitudes[sat] <= alt_filter
-                    except ValueError:
-                        include_sat = False
+    trajectories = state.satellite_trajectories
+    filter_text = state.filter_text
+    filter_above = state.filter_above_alt_text
+    filter_below = state.filter_below_alt_text
+    mean_alts = state.satellite_mean_altitudes
+    filters_active = bool(filter_text or filter_above or filter_below)
 
-                if include_sat:
-                    new_positions[sat] = (px, py, alt, dist)
+    # Fast path: one vectorized interpolation over the packed stack. This runs on
+    # the main loop every frame; the stack lets us interpolate all ~5k sats and
+    # reject below-mask ones in NumPy, then build the dict only for the ~hundreds
+    # actually visible -- ~0.6 ms vs ~25 ms for the per-sat Python loop. Skipped
+    # when name/altitude filters are active (handled by the inline path below).
+    position_stack = getattr(state, 'position_stack', None)
+    if position_stack is not None and not filters_active:
+        stack, stack_sats, stack_times = position_stack
+        n = len(stack_times)
+        if n >= 2 and len(stack_sats):
+            idx = int(np.searchsorted(stack_times, current_tt) - 1)
+            idx = 0 if idx < 0 else (n - 2 if idx > n - 2 else idx)
+            ta0 = stack_times[idx]
+            ta1 = stack_times[idx + 1]
+            frac = (current_tt - ta0) / (ta1 - ta0)
+            # Clamp so before-start/after-end hold the endpoint (matches the
+            # per-sat clamp semantics of interpolate_position).
+            frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+            a = stack[:, idx, :]
+            b = stack[:, idx + 1, :]
+            alt = a[:, 0] + frac * (b[:, 0] - a[:, 0])
+            visible = np.nonzero(alt > elevation_mask_deg)[0]
+            if len(visible):
+                px = a[:, 2] + frac * (b[:, 2] - a[:, 2])
+                py = a[:, 3] + frac * (b[:, 3] - a[:, 3])
+                dist = a[:, 1] + frac * (b[:, 1] - a[:, 1])
+                for i in visible:
+                    new_positions[stack_sats[i]] = (float(px[i]), float(py[i]), float(alt[i]), float(dist[i]))
+        # Stack covers all bulk sats (the selected sat is present at its coarse
+        # length); publish and return without the per-sat loop.
+        state.satellite_positions = new_positions
+        return
+
+    # Inline fallback: filters active, or no stack yet. Every bulk trajectory
+    # shares ONE time grid, so the search index + fraction are identical across
+    # them -- compute once per distinct grid (keyed by id) rather than a
+    # np.searchsorted per satellite.
+    grid_cache = {}  # id(times_array) -> (kind, idx, frac)
+
+    def _interp_params(times_array):
+        key = id(times_array)
+        params = grid_cache.get(key)
+        if params is None:
+            n = len(times_array)
+            idx = int(np.searchsorted(times_array, current_tt) - 1)
+            if idx < 0:
+                params = ('start', 0, 0.0)
+            elif idx >= n - 1:
+                params = ('end', n - 1, 0.0)
+            else:
+                ta0 = times_array[idx]
+                ta1 = times_array[idx + 1]
+                frac = (current_tt - ta0) / (ta1 - ta0)
+                params = ('mid', idx, frac)
+            grid_cache[key] = params
+        return params
+
+    for sat, (trajectory, times_array) in trajectories.items():
+        if not trajectory:
+            continue
+        kind, idx, frac = _interp_params(times_array)
+        if kind == 'mid':
+            r0 = trajectory[idx]
+            r1 = trajectory[idx + 1]
+            alt = r0[1] + frac * (r1[1] - r0[1])
+            if alt <= elevation_mask_deg:
+                continue  # below mask: skip the rest of the interpolation
+            px = r0[4] + frac * (r1[4] - r0[4])
+            py = r0[5] + frac * (r1[5] - r0[5])
+            dist = r0[3] + frac * (r1[3] - r0[3])
+        else:
+            row = trajectory[idx]
+            alt = row[1]
+            if alt <= elevation_mask_deg:
+                continue
+            px, py, dist = row[4], row[5], row[3]
+
+        # Optional name / altitude filters (usually all empty -> skipped).
+        if filter_text:
+            if not (filter_text.lower() in sat.name.lower() or filter_text in sat.model.satnum_str):
+                continue
+        if filter_above:
+            try:
+                if mean_alts[sat] < float(filter_above):
+                    continue
+            except ValueError:
+                continue
+        if filter_below:
+            try:
+                if mean_alts[sat] > float(filter_below):
+                    continue
+            except ValueError:
+                continue
+
+        new_positions[sat] = (px, py, alt, dist)
 
     # Atomic publish: readers see either the complete old dict or this new one.
     state.satellite_positions = new_positions
@@ -639,11 +994,100 @@ def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
     else:
         return pass_table
 
+# Binary cache for parsed launch/tracking trajectories. The ECEF (.txt) parse does
+# a per-point Skyfield altaz() + is_sunlit() loop (~1.3s for the current files),
+# re-run on every launch and every 15 min refresh even though the files never
+# change. We cache the geometry-INDEPENDENT result arrays (absolute time, alt, az,
+# range, rates, sunlit) keyed by the source file's size+mtime; pixel coordinates
+# and arc segments depend on the display geometry, so they're recomputed cheaply
+# on load. Caches live in a sibling ".traj_cache" dir, invisible to the .txt/.csv glob.
+LAUNCH_CACHE_DIRNAME = ".traj_cache"
+
+
+def _launch_cache_path(filepath):
+    d = os.path.join(os.path.dirname(filepath), LAUNCH_CACHE_DIRNAME)
+    return os.path.join(d, os.path.basename(filepath) + ".npz")
+
+
+def _load_launch_trajectory_cache(filepath):
+    """Return the cached geometry-independent arrays for `filepath` as a dict, or
+    None on miss/stale/error."""
+    cache_path = _launch_cache_path(filepath)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as z:
+            if str(z['fingerprint']) != _file_fingerprint(filepath):
+                return None
+            return {k: z[k] for k in ('tt', 'alt', 'az', 'dist', 'az_rate', 'el_rate', 'sunlit', 'launch_tt')}
+    except Exception:
+        return None
+
+
+def _save_launch_trajectory_cache(filepath, tt, alt, az, dist, az_rate, el_rate, sunlit, launch_tt):
+    """Persist the geometry-independent arrays for `filepath` (best-effort)."""
+    try:
+        cache_path = _launch_cache_path(filepath)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp = cache_path + ".tmp.npz"
+        np.savez(tmp,
+                 fingerprint=np.array(_file_fingerprint(filepath)),
+                 tt=np.asarray(tt, dtype=np.float64),
+                 alt=np.asarray(alt, dtype=np.float64),
+                 az=np.asarray(az, dtype=np.float64),
+                 dist=np.asarray(dist, dtype=np.float64),
+                 az_rate=np.asarray(az_rate, dtype=np.float64),
+                 el_rate=np.asarray(el_rate, dtype=np.float64),
+                 sunlit=np.asarray(sunlit),
+                 launch_tt=np.array(float(launch_tt)))
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass
+
+
+def _finalize_tracking_trajectory(tt_array, alt_deg, az_deg, dist_km, az_rates_dps,
+                                  el_rates_dps, sun_stat, launch_tt, display):
+    """Build the display-ready tracking-trajectory dict (pixel coords + arc
+    segments) from the geometry-independent arrays. Cheap and pure-NumPy; run on
+    both the fresh-parse and cache-hit paths so the cache is display-independent."""
+    if display:
+        cx = display.sub_x + display.sub_width // 2
+        cy = display.sub_y + display.sub_height // 2
+        radius = min(display.sub_width, display.sub_height) // 2 - 50
+    else:
+        cx, cy, radius = 400, 300, 300
+
+    az_rad = np.radians(az_deg % 360)
+    polar_radius = (90 - alt_deg) / 90 * radius
+    px_coords = cx + polar_radius * np.sin(az_rad)
+    py_coords = cy - polar_radius * np.cos(az_rad)
+
+    trajectory_data = np.column_stack([
+        tt_array, alt_deg, az_deg, dist_km, px_coords, py_coords,
+        az_rates_dps, el_rates_dps, sun_stat,
+    ]).tolist()
+
+    segments = _create_tracking_arc_segments(trajectory_data, launch_tt)
+    return {'trajectory': (trajectory_data, np.asarray(tt_array)), 'arcs': segments}
+
+
 def read_tracking_trajectory(filepath, display=None, update_status_callback=None):
     """
     Read a tracking trajectory file in twilight format with ECEF coordinates.
     Returns a dictionary with trajectory data and arc segments, or None on failure.
     """
+    # Fast path: reuse the cached parse if the source file is unchanged. This skips
+    # the expensive per-point Skyfield altaz()/is_sunlit() loop below entirely.
+    cached = _load_launch_trajectory_cache(filepath)
+    if cached is not None:
+        try:
+            return _finalize_tracking_trajectory(
+                cached['tt'], cached['alt'], cached['az'], cached['dist'],
+                cached['az_rate'], cached['el_rate'], cached['sunlit'],
+                float(cached['launch_tt']), display)
+        except Exception:
+            pass  # fall through to a full re-parse on any cache problem
+
     try:
         # Load observer coordinates from config
         import json
@@ -794,22 +1238,7 @@ def read_tracking_trajectory(filepath, display=None, update_status_callback=None
         dist_km = np.array(ranges_km)
         sun_stat = np.array(sunlit_status)
 
-        # Calculate pixel coordinates
-        if display:
-            cx = display.sub_x + display.sub_width // 2
-            cy = display.sub_y + display.sub_height // 2
-            radius = min(display.sub_width, display.sub_height) // 2 - 50
-        else:
-            cx = 400
-            cy = 300
-            radius = 300
-
-        az_rad = np.radians(az_deg % 360)
-        polar_radius = (90 - alt_deg) / 90 * radius
-        px_coords = cx + polar_radius * np.sin(az_rad)
-        py_coords = cy - polar_radius * np.cos(az_rad)
-
-        # Calculate angular rates from position data
+        # Calculate angular rates from position data (geometry-independent)
         az_rates_dps = np.zeros(len(times_array))
         el_rates_dps = np.zeros(len(times_array))
 
@@ -830,27 +1259,13 @@ def read_tracking_trajectory(filepath, display=None, update_status_callback=None
             el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
             el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
 
-        # Create trajectory data array (same format as satellite trajectories)
-        trajectory_data = np.column_stack([
-            tt_array,         # time_vals (TT)
-            alt_deg,          # alt_deg
-            az_deg,           # az_deg
-            dist_km,          # dist_km
-            px_coords,        # px_coords
-            py_coords,        # py_coords
-            az_rates_dps,     # az_rates_dps
-            el_rates_dps,     # el_rates_dps
-            sun_stat          # sunlit status
-            
-        ]).tolist()
-
-        # Create arc segments
-        segments = _create_tracking_arc_segments(trajectory_data, launch_time.tt)
-
-        return {
-            'trajectory': (trajectory_data, tt_array),
-            'arcs': segments
-        }
+        # Persist the geometry-independent parse result so future loads skip the
+        # per-point Skyfield work, then build the display-ready trajectory.
+        _save_launch_trajectory_cache(filepath, tt_array, alt_deg, az_deg, dist_km,
+                                      az_rates_dps, el_rates_dps, sun_stat, launch_time.tt)
+        return _finalize_tracking_trajectory(tt_array, alt_deg, az_deg, dist_km,
+                                             az_rates_dps, el_rates_dps, sun_stat,
+                                             launch_time.tt, display)
 
     except Exception as e:
         if update_status_callback:

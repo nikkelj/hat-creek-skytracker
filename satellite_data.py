@@ -4,7 +4,6 @@ import requests
 from skyfield.api import load
 import math
 from datetime import datetime
-import pygame
 
 # ==============================================================================
 # SATELLITE DATA MANAGEMENT
@@ -84,10 +83,20 @@ def load_satellite_data(state, update_status_callback=None):
 
 def create_satellite_labels_and_metadata(state, update_status_callback=None):
     """
-    Create label renderings and compute orbital parameters for all satellites
-    Modifies state object directly with labels and orbital parameters
+    Compute orbital parameters for all satellites and register them in the
+    tracked-satellite set. Modifies state object directly.
+
+    NOTE: We deliberately do NOT pre-render label surfaces here. The tracking-vis
+    render loop renders labels lazily on demand, keyed by clipped name (see
+    rendering_threads.SATELLITE_LABEL_CACHE / SATELLITE_LABEL_FONT). Pre-rendering
+    a pygame text surface for every one of ~16k satellites at launch cost ~20s of
+    pure waste -- those surfaces were never drawn; `satellite_labels` is consumed
+    only as a membership set (`sat in state.satellite_labels`). We keep it a dict
+    for backward compatibility and store the label text as the value (cheap, and
+    handy for debugging) instead of a rendered Surface.
     """
-    update_status_callback("Creating satellite labels and metadata...")
+    if update_status_callback:
+        update_status_callback("Computing satellite metadata...")
     MU = 3.986004418e14  # Earth's gravitational parameter in m^3/s^2
     R_EARTH = 6371  # Earth radius in km
 
@@ -99,10 +108,7 @@ def create_satellite_labels_and_metadata(state, update_status_callback=None):
     for sat in state.satellites:
         name = sat.name.strip()
         norad_id = sat.model.satnum_str
-        label_text = f"{norad_id} - {name}"
-        # Create pygame text surface for the label
-        font = pygame.font.Font(None, 16)  # Small font for satellite labels
-        state.satellite_labels[sat] = font.render(label_text, True, (255, 255, 255))  # White text
+        state.satellite_labels[sat] = f"{norad_id} - {name}"  # text, rendered lazily at draw time
 
         # Compute orbital parameters
         n = sat.model.no_kozai / 60  # Mean motion in rad/s
@@ -116,4 +122,5 @@ def create_satellite_labels_and_metadata(state, update_status_callback=None):
         state.satellite_mean_altitudes[sat] = mean_altitude
         state.satellite_perigee[sat] = perigee
         state.satellite_apogee[sat] = apogee
-    update_status_callback("Satellite labels and metadata ready.")
+    if update_status_callback:
+        update_status_callback("Satellite metadata ready.")

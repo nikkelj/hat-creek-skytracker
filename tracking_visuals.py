@@ -20,10 +20,13 @@ class TrackingVisState:
 
     def __init__(self):
         from datetime import datetime, timezone, timedelta
+        from trajectory import quantized_now
 
-        # Time-related state
-        self.center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # Initial to current UTC ISO
-        self.duration_str = "30"
+        # Time-related state. Snap the initial center to the quantization grid so
+        # the launch window is reproducible across quick relaunches -> the on-disk
+        # trajectory cache can be reused instead of recomputing the precise pass.
+        self.center_time_str = quantized_now().strftime("%Y-%m-%dT%H:%M:%SZ")  # Initial to current UTC ISO (grid-snapped)
+        self.duration_str = "120"
         self.t0 = None
         self.t1 = None
         self.current_tt = None
@@ -91,6 +94,13 @@ class TrackingVisState:
 
         # Flags
         self.recompute_triggered = False
+        # True while a background trajectory precompute worker is running. Used by
+        # main.py to keep the UI responsive at launch (the first precompute runs
+        # off the main loop) and to single-flight concurrent recompute requests.
+        self.precompute_in_progress = False
+        # Set True by the precompute worker once trajectories are first published,
+        # so the UI can drop the "computing..." affordance.
+        self.trajectories_ready = False
 
         # Satellite data (moved from global variables)
         self.satellite_labels = {}
@@ -99,6 +109,9 @@ class TrackingVisState:
         self.satellite_apogee = {}
         self.satellite_trajectories = {}
         self.satellite_arc_segments = {}
+        # Packed (stack, sats, times) view of trajectories for vectorized per-frame
+        # position interpolation; published by precompute_trajectories.
+        self.position_stack = None
         self.tle_loaded = False
         self.satellites = []
         self.cache_file = "tle_cache.tle"
@@ -156,9 +169,9 @@ class TrackingVisState:
         self.focused_field = None
 
         # Reset actual field values to defaults
-        from datetime import datetime, timezone
-        self.center_time_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.duration_str = "30"
+        from trajectory import quantized_now
+        self.center_time_str = quantized_now().strftime("%Y-%m-%dT%H:%M:%SZ")  # grid-snapped (see __init__)
+        self.duration_str = "120"
 
         # Clear filter text
         self.filter_text = ""

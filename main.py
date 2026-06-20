@@ -22,7 +22,7 @@ except Exception as e:
     ASI_AVAILABLE = False
     asi = None
 from utils import draw_menu_button, draw_button_with_objects
-from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
+from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions, load_trajectory_disk_cache, save_trajectory_disk_cache, quantized_now, compute_fine_selected_trajectory
 from config import load_config, handle_input, draw_config_options
 from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
 from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
@@ -133,8 +133,8 @@ position_update_lock = threading.Lock()
 
 # Initialize rendering threads
 print("Initializing rendering threads...")
-tracking_viz_thread = TrackingVisualizationThread(display, config_state, tracking_vis_state, target_fps=10)
-joystick_viz_thread = JoystickVisualizationThread(display, config_state, tracking_vis_state, target_fps=10)
+tracking_viz_thread = TrackingVisualizationThread(display, config_state, tracking_vis_state, target_fps=30)
+joystick_viz_thread = JoystickVisualizationThread(display, config_state, tracking_vis_state, target_fps=30)
 
 # Share the timescale reference with rendering threads for synchronization
 ts = load.timescale()
@@ -217,12 +217,23 @@ except Exception as e:
     # Force immediate trajectory computation after TLEs are loaded
     last_trajectory_update = 0
 
+# Load launch trajectories eagerly at startup so the "Launch Trajectories" box
+# (and the Launch button, which only shows once a launch is selected) is available
+# immediately. Previously this only happened inside the background precompute
+# worker, so launches didn't appear until several seconds after launch/recompute.
+# Loading is cheap (binary-cached); the worker still refreshes it each cycle to
+# pick up any launch files added during the session.
+try:
+    tracking_vis_state.launch_trajectories = read_launch_trajectories("./launches", display, update_status_callback)
+except Exception as e:
+    print(f"Debug: Error loading launch trajectories at startup: {e}")
+
 # Force immediate trajectory computation with no delays
 recompute_triggered = True
 # Force immediate timer trigger
 last_trajectory_update = -1
 last_update_time = 0
-update_interval = 0.1  # Target 10 Hz
+update_interval = 1.0 / 30.0  # Target 30 Hz (vectorized update is ~0.6 ms, so cheap)
 last_trajectory_update = -1  # Force immediate trigger on first loop
 trajectory_interval = 900  # 15 minutes
 
@@ -230,13 +241,66 @@ trajectory_interval = 900  # 15 minutes
 # MAIN PROGRAM LOOP
 # ==============================================================================
 
+def start_precompute_worker(center_time, duration_minutes, observer):
+    """Run the heavy trajectory pipeline (visibility filter + precise pass +
+    launch trajectories + pass table) on a background daemon thread so the main
+    loop keeps drawing and handling input while it runs -- this is what makes the
+    window appear instantly at launch instead of freezing for a couple seconds.
+
+    Single-flight: callers must check tracking_vis_state.precompute_in_progress
+    first. The worker only appends to status_messages (the main loop renders them
+    every frame); it must NOT touch pygame/display drawing from this thread.
+    precompute_trajectories publishes its result dicts atomically, so the render
+    thread always sees a complete trajectory set."""
+    def _worker():
+        def cb(msg):
+            status_messages.append(msg)  # list.append is atomic in CPython
+        try:
+            # Disk cache: try to serve this exact window from a previous run so the
+            # precise pass is skipped, then refresh it after computing. Window
+            # bounds must match precompute_trajectories' internal t0/t1 exactly.
+            t0_tt = ts.utc(center_time - timedelta(minutes=duration_minutes / 2)).tt
+            t1_tt = ts.utc(center_time + timedelta(minutes=duration_minutes / 2)).tt
+            tle_path = tracking_vis_state.cache_file
+            hits = load_trajectory_disk_cache(t0_tt, t1_tt, tle_path=tle_path)
+            if hits:
+                cb(f"Loaded {hits} trajectories from disk cache")
+
+            precompute_trajectories(tracking_vis_state, observer, ts, display, cb,
+                                    center_time, duration_minutes)
+            launch_trajectories = read_launch_trajectories("./launches", display, cb)
+            tracking_vis_state.launch_trajectories = launch_trajectories
+            build_satellite_pass_table(tracking_vis_state,
+                                       elevation_mask_deg=float(config_state.elevation_mask_str or 10.0),
+                                       ts=ts)
+            tracking_vis_state.trajectories_ready = True
+            cb("Trajectories ready")
+
+            # Persist this window for the next launch (best-effort; off critical path).
+            if not hits:
+                save_trajectory_disk_cache(tracking_vis_state, t0_tt, t1_tt, tle_path=tle_path)
+        except Exception as e:
+            cb(f"Error computing trajectories: {str(e)}")
+        finally:
+            tracking_vis_state.precompute_in_progress = False
+
+    tracking_vis_state.precompute_in_progress = True
+    threading.Thread(target=_worker, name="precompute", daemon=True).start()
+
+# Tracks the (selected satellite, trajectory window) the fine-resolution recompute
+# last ran for, so we only refine on an actual change. prev_precompute_in_progress
+# lets us force a refine after each bulk republish (which overwrites the fine entry).
+last_fine_key = None
+prev_precompute_in_progress = False
+
 running = True
 while running:
     current_time = time.time()
     mouse_pos = pygame.mouse.get_pos()
 
 
-    if tracking_vis_state.recompute_triggered and tracking_vis_state.tle_loaded:
+    if (tracking_vis_state.recompute_triggered and tracking_vis_state.tle_loaded
+            and not tracking_vis_state.precompute_in_progress):
         try:
             center_time_obj = datetime.fromisoformat(tracking_vis_state.center_time_str.replace('Z', '+00:00'))
             center_time = center_time_obj.replace(tzinfo=timezone.utc)
@@ -252,37 +316,33 @@ while running:
             tracking_vis_state.scroll_bar_start_label = "-" + str(duration_minutes/2) + " min"
             tracking_vis_state.scroll_bar_end_label = "+" + str(duration_minutes/2) + " min"
 
+            # Reset view state immediately; the heavy compute runs in the background
+            # and publishes trajectories when ready (the slider self-corrects to the
+            # live time every frame once t0/t1 are set above).
             update_status_callback("Recomputing trajectories...")
-            precompute_trajectories(tracking_vis_state, observer, ts, display, update_status_callback, center_time, duration_minutes)
-
-            # Load launch trajectories after recomputing satellite trajectories
-            launch_trajectories = read_launch_trajectories("./launches", display, update_status_callback)
-            tracking_vis_state.launch_trajectories = launch_trajectories
-
-            # Build satellite pass table (filtered for current visibility + upcoming passes)
-            build_satellite_pass_table(tracking_vis_state, elevation_mask_deg=float(config_state.elevation_mask_str or 10.0), ts=ts)
-
-            last_trajectory_update = current_time
-            update_status_callback("Trajectories recomputed")
             tracking_vis_state.selected_satellite = None
             tracking_vis_state.paused = False
             tracking_vis_state.paused_tt = None
-            fraction = max(0.0, min(1.0, (ts.now().tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)))
-            display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
+            start_precompute_worker(center_time, duration_minutes, observer)
+            last_trajectory_update = current_time
+            tracking_vis_state.recompute_triggered = False
         except Exception as e:
             update_status_callback(f"Error recomputing: {str(e)}")
-        tracking_vis_state.recompute_triggered = False
+            tracking_vis_state.recompute_triggered = False
 
-    # Precompute trajectories and arc segments every 15 minutes
-    if current_time - last_trajectory_update >= trajectory_interval:
+    # Precompute trajectories and arc segments every 15 minutes (background).
+    if (current_time - last_trajectory_update >= trajectory_interval
+            and not tracking_vis_state.precompute_in_progress):
         update_status_callback("Starting trajectory precomputation...")
         lat = float(config_state.lat_str or 0)
         lon = float(config_state.lon_str or 0)
         alt_m = float(config_state.alt_str or 0)
         observer = wgs84.latlon(lat, lon, elevation_m=alt_m)
-        # Use current time as center and user-specified duration
-        duration_minutes_auto = float(tracking_vis_state.duration_str) if tracking_vis_state.duration_str else 30.0
-        current_utc = datetime.now(timezone.utc)
+        # Use current time as center and user-specified duration. Snap the center
+        # to the quantization grid so the window matches across relaunches (disk
+        # cache reuse); the live "now" marker still tracks true time via the slider.
+        duration_minutes_auto = float(tracking_vis_state.duration_str) if tracking_vis_state.duration_str else 120.0
+        current_utc = quantized_now()
         tracking_vis_state.t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes_auto/2))
         tracking_vis_state.t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes_auto/2))
 
@@ -293,20 +353,11 @@ while running:
         tracking_vis_state.scroll_bar_start_label = "-" + str(duration_minutes_auto/2) + " min"
         tracking_vis_state.scroll_bar_end_label = "+" + str(duration_minutes_auto/2) + " min"
 
-        precompute_trajectories(tracking_vis_state, observer, ts, display, update_status_callback)
-
-        # Load launch trajectories after recomputing satellite trajectories
-        launch_trajectories = read_launch_trajectories("./launches", display, update_status_callback)
-        tracking_vis_state.launch_trajectories = launch_trajectories
-
-        # Build satellite pass table (filtered for current visibility + upcoming passes)
-        build_satellite_pass_table(tracking_vis_state, elevation_mask_deg=float(config_state.elevation_mask_str or 10.0), ts=ts)
-
+        # Pass current_utc as an explicit center so the worker's internal time
+        # window matches the t0/t1 we set above. Runs in the background; the
+        # slider self-corrects to live time every frame (see the position block).
+        start_precompute_worker(current_utc, duration_minutes_auto, observer)
         last_trajectory_update = current_time
-        update_status_callback("Trajectories updated")
-        # Initialize slider to current time
-        fraction = (ts.now().tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
-        display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
 
     # Compute satellite positions at 10 Hz
     if current_time - last_update_time >= update_interval:
@@ -354,6 +405,32 @@ while running:
                 update_launch_positions(tracking_vis_state, current_tt)
 
         last_update_time = current_time
+
+    # Fine-resolution trajectory for the actively tracked satellite. Bulk
+    # trajectories are sampled coarsely (display only); the selected satellite is
+    # what PROGRAM tracking interpolates, so recompute just that one at tight
+    # spacing. Retrigger on selection change, window change, or after a bulk
+    # republish (which overwrites the fine entry with a coarse one).
+    if (not tracking_vis_state.precompute_in_progress) and prev_precompute_in_progress:
+        last_fine_key = None  # bulk just republished -> refine the selected sat again
+    prev_precompute_in_progress = tracking_vis_state.precompute_in_progress
+
+    sel = tracking_vis_state.selected_satellite
+    if sel is None:
+        last_fine_key = None
+    elif (tracking_vis_state.tle_loaded and tracking_vis_state.t0 is not None
+          and tracking_vis_state.t1 is not None and not tracking_vis_state.precompute_in_progress):
+        fine_key = (sel, tracking_vis_state.t0.tt, tracking_vis_state.t1.tt)
+        if fine_key != last_fine_key:
+            try:
+                obs_fine = wgs84.latlon(float(config_state.lat_str or 0),
+                                        float(config_state.lon_str or 0),
+                                        elevation_m=float(config_state.alt_str or 0))
+                if compute_fine_selected_trajectory(tracking_vis_state, sel, obs_fine, ts,
+                                                    display, tracking_vis_state.t0, tracking_vis_state.t1):
+                    last_fine_key = fine_key
+            except Exception as e:
+                print(f"Debug: fine trajectory recompute failed: {e}")
 
     # Handle events using modular event system
     # Always process joystick events first, regardless of current mode

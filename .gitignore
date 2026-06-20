@@ -156,5 +156,9 @@ data/
 # Cached ephemeris
 tle_cache.tle*
 de421.bsp*
+# Hipparcos star catalogue (downloaded by skyfield for star_catalog.py / tetra3 DB build)
+hip_main.dat*
+# Tycho catalogue (downloaded from CDS for deep/narrow-FOV star rendering + tetra3 DB)
+tyc_main.dat*
 # Local config backup written by ConfigState.save_to_file()
 config.json.bak

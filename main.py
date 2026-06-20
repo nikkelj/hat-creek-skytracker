@@ -25,10 +25,12 @@ from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
 from config import load_config, handle_input, draw_config_options
 from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
+from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
+from alignment import AlignmentState
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events
+from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 from mount_control import MountControlThread
@@ -168,6 +170,11 @@ global hardware_sim
 hardware_sim = HardwareSimulator(config_state, tracking_vis_state, ts)
 joystick_mode_state.hardware_sim = hardware_sim
 camera_manager.simulator = hardware_sim
+
+# Automated pointing-model alignment state (Alignment sub-UI). The runner thread is
+# created on demand when the operator presses Start.
+global alignment_state
+alignment_state = AlignmentState()
 print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
 
 # Dedicated real-time mount control thread. Owns all serial traffic to the
@@ -466,6 +473,13 @@ while running:
             # Hardware Sim screen: toggle / steppers / save-load
             elif current_mode == "hw_sim":
                 handle_hw_sim_click(pos, display, config_state, hardware_sim, status_messages)
+            elif current_mode == "alignment":
+                # Camera-panel controls (right half) take precedence, but only when the
+                # camera view is shown; fall through to the alignment controls otherwise.
+                cam_view = getattr(alignment_state, 'view_mode', 'camera') == 'camera'
+                if not (cam_view and handle_alignment_camera_events(event, display, config_state, update_status_callback)):
+                    handle_alignment_click(pos, display, config_state, alignment_state,
+                                           joystick_mode_state, tracking_vis_state, ts, status_messages)
 
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
@@ -512,6 +526,18 @@ while running:
                     if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
                         tracking_vis_state.hovered_satellite = sat
                         break
+                # Starfield hover: star_screen_positions are in surface coords; the
+                # surface is blitted at (display.sub_x, display.sub_y).
+                tracking_vis_state.hovered_star = None
+                for sx, sy, hip in (tracking_vis_state.star_screen_positions or []):
+                    if math.hypot(sx + display.sub_x - event.pos[0],
+                                  sy + display.sub_y - event.pos[1]) < 8:
+                        tracking_vis_state.hovered_star = hip
+                        break
+            elif current_mode == "alignment":
+                # Handle camera control slider dragging on the right-half camera panel
+                if getattr(alignment_state, 'view_mode', 'camera') == 'camera':
+                    handle_alignment_camera_events(event, display, config_state, update_status_callback)
             elif current_mode == "joystick_loop":
                 # Handle camera control slider dragging on the half-height feeds
                 handle_joystick_camera_control_events(event, display, config_state, update_status_callback)
@@ -598,6 +624,14 @@ while running:
                     if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
                         tracking_vis_state.hovered_satellite = sat
                         break
+                # Starfield hover: star_screen_positions are in surface coords; the
+                # surface is blitted at (display.sub_x, display.sub_y).
+                tracking_vis_state.hovered_star = None
+                for sx, sy, hip in (tracking_vis_state.star_screen_positions or []):
+                    if math.hypot(sx + display.sub_x - event.pos[0],
+                                  sy + display.sub_y - event.pos[1]) < 8:
+                        tracking_vis_state.hovered_star = hip
+                        break
 
         elif event.type == pygame.MOUSEBUTTONUP:
             # Reset all button clicked states - essential for UI feedback
@@ -664,6 +698,8 @@ while running:
         draw_config_options(display, config_state)
     elif current_mode == "hw_sim":
         draw_hw_sim_options(display, config_state, hardware_sim)
+    elif current_mode == "alignment":
+        draw_alignment_options(display, config_state, alignment_state, joystick_mode_state)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         # Only clear if we don't have a thread surface (initial loading)
         # This prevents washing away the displayed surface while thread is rendering
@@ -831,6 +867,9 @@ while running:
 
         # Render feed-forward toggle buttons
         render_feed_forward_toggle_buttons(display, joystick_mode_state)
+
+        # Render plate-solve pane (toggle + apply-alignment)
+        render_plate_solve_panel(display, joystick_mode_state)
 
         # Render the navball + PID-tuning strip charts in the center column
         render_navball(display, joystick_mode_state)

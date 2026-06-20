@@ -256,6 +256,11 @@ class RustCoreLoopAdapter:
         biased_az, biased_el = st._apply_bias_to_target(
             float(target_az), float(target_alt), az_rate_f, el_rate_f
         )
+        # Pointing-model pre-correction: the Rust loop runs the plain geometric
+        # transform, so the 7-term correction must be applied here in Python (mirrors
+        # control.compute_mount_position_error so both control paths agree).
+        from control import apply_pointing_model
+        biased_az, biased_el = apply_pointing_model(self.config_state, biased_az, biased_el)
         self.loop.set_setpoint(biased_az, biased_el, az_rate_f, el_rate_f)
 
     def _push_hotspot(self, st, cfg):

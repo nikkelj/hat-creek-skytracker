@@ -27,6 +27,10 @@ SATELLITE_LABEL_FONT = None
 # Cache for rendered satellite label surfaces to avoid expensive re-rendering
 SATELLITE_LABEL_CACHE = {}
 
+# Font + label-surface cache for star names (created off the main thread).
+STAR_LABEL_FONT = None
+STAR_LABEL_CACHE = {}
+
 # Polar plot constants (must match tracking_visuals.py)
 POLAR_RADIUS_OFFSET = 50
 
@@ -70,6 +74,94 @@ def draw_dashed_polygon_on_surface(surface, color, points, dash=5, gap=4, width=
     for i in range(n):
         draw_dashed_line_on_surface(surface, color, points[i], points[(i + 1) % n],
                                     dash=dash, gap=gap, width=width)
+
+def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx, cy, radius,
+                               elevation_mask, draw_labels=True, publish_positions=True):
+    """Draw catalogue stars on the polar plot and publish their screen positions.
+
+    Stars are sized/brightened by visual magnitude. Only the brightest ~5% in view
+    (top_label_mask) and the hovered star are labelled (full-screen only). Publishes
+    state.star_screen_positions (for main-thread hover hit-testing) and
+    state.starfield_cutoff_mag (the faintest rendered magnitude, shown in the UI).
+    publish_positions=False (the small joystick quadrant) leaves the hover data alone.
+    Wrapped by the caller in try/except so a catalogue hiccup never kills rendering.
+    """
+    global STAR_LABEL_FONT, STAR_LABEL_CACHE
+
+    from star_catalog import get_catalog
+    catalog = get_catalog(ephemeris=getattr(state, 'ephemeris', None))
+
+    lat = float(config_state.lat_str or 0.0)
+    lon = float(config_state.lon_str or 0.0)
+    elev = float(config_state.alt_str or 0.0)
+    max_count = int(getattr(config_state, 'max_rendered_star_count', 2000))
+    limiting_mag = float(getattr(config_state, 'star_limiting_magnitude', 6.5))
+
+    res = catalog.current_altaz(lat, lon, elev, ts, current_tt,
+                                elevation_mask=elevation_mask,
+                                max_count=max_count, limiting_mag=limiting_mag)
+    if publish_positions:
+        state.starfield_cutoff_mag = res['cutoff_mag']
+
+    n = res['n_visible']
+    if n == 0:
+        if publish_positions:
+            state.star_screen_positions = []
+        return
+
+    az = res['az']
+    el = res['el']
+    mag = res['mag']
+    hip = res['hip']
+    top_mask = res['top_label_mask']
+
+    # Vectorised polar projection: r=(90-el)/90*radius, az 0=N=up, east=right.
+    az_rad = np.radians(az)
+    r = (90.0 - el) / 90.0 * radius
+    sx = cx + r * np.sin(az_rad)
+    sy = cy - r * np.cos(az_rad)
+
+    # Magnitude -> dot radius and brightness. Brightest stars are bigger/whiter.
+    bright = float(mag.min())
+    span = max(0.5, limiting_mag - bright)
+    norm = np.clip((mag - bright) / span, 0.0, 1.0)  # 0 = brightest, 1 = faintest
+    dot_r = np.clip(2.6 - 2.0 * norm, 0.6, 2.6)
+    intensity = np.clip(255.0 - 150.0 * norm, 90.0, 255.0).astype(int)
+
+    if STAR_LABEL_FONT is None:
+        pygame.font.init()
+        STAR_LABEL_FONT = pygame.font.Font(None, 14)
+
+    hovered = getattr(state, 'hovered_star', None)
+    positions = []
+    sx_i = sx.astype(int)
+    sy_i = sy.astype(int)
+    for i in range(n):
+        col = (intensity[i], intensity[i], min(255, intensity[i] + 10))
+        ri = int(round(dot_r[i]))
+        if ri <= 0:
+            surface.set_at((sx_i[i], sy_i[i]), col)
+        else:
+            pygame.draw.circle(surface, col, (sx_i[i], sy_i[i]), ri)
+
+        h = int(hip[i])
+        positions.append((sx_i[i], sy_i[i], h))
+
+        if draw_labels and (top_mask[i] or h == hovered):
+            name = catalog.name_for(h)
+            label = STAR_LABEL_CACHE.get(name)
+            if label is None:
+                try:
+                    label = STAR_LABEL_FONT.render(name, True, (170, 190, 220))
+                    STAR_LABEL_CACHE[name] = label
+                except pygame.error:
+                    label = None
+            if label is not None:
+                surface.blit(label, (sx_i[i] + 4, sy_i[i] - 6))
+
+    if publish_positions:
+        state.star_screen_positions = positions
+
 
 def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, full_screen_bounds=None):
     """
@@ -148,6 +240,43 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
     for el in (30, 60):
         r = (90 - el) / 90 * radius
         _blit_centered(f"{el}°", (120, 170, 120), cx + 14, cy - r, _num_font)
+
+    # Catalogue starfield, drawn under satellites/FOV. Rendered in both the full-screen
+    # plot and the smaller joystick quadrant; labels + hover hit-testing only full-screen.
+    if getattr(config_state, 'starfield_enabled', True):
+        full_screen = (mode == PolarPlotMode.FULL_SCREEN)
+        try:
+            _draw_starfield_on_surface(surface, config_state, ts, current_tt, state,
+                                       cx, cy, radius, elevation_mask,
+                                       draw_labels=full_screen, publish_positions=full_screen)
+        except Exception as e:
+            print(f"Starfield render error: {e}")
+
+        # Limiting-magnitude readout just inside the horizon ring (full-screen only).
+        if full_screen:
+            cutoff = getattr(state, 'starfield_cutoff_mag', None)
+            if cutoff is not None and not math.isnan(cutoff):
+                n_stars = len(getattr(state, 'star_screen_positions', []) or [])
+                txt = f"lim mag {cutoff:.1f}  ({n_stars} stars)"
+                _blit_centered(txt, (150, 170, 200), cx, cy + radius - 8, _num_font)
+    elif mode == PolarPlotMode.FULL_SCREEN:
+        state.star_screen_positions = []
+
+    # Plate-solve "solved pointing" marker (cyan cross at the solved boresight az/el).
+    if mode == PolarPlotMode.FULL_SCREEN:
+        ls = getattr(state, 'last_solve', None)
+        if ls is not None and ls.get('az') is not None and ls.get('el') is not None and ls['el'] >= 0:
+            saz_rad = math.radians(ls['az'])
+            sr = (90.0 - ls['el']) / 90.0 * radius
+            px = int(cx + sr * math.sin(saz_rad))
+            py = int(cy - sr * math.cos(saz_rad))
+            cyan = (0, 230, 230)
+            pygame.draw.line(surface, cyan, (px - 7, py), (px + 7, py), 1)
+            pygame.draw.line(surface, cyan, (px, py - 7), (px, py + 7), 1)
+            pygame.draw.circle(surface, cyan, (px, py), 9, 1)
+            r = ls.get('result')
+            tag = f"solved {r.n_matches}m" if r is not None else "solved"
+            _blit_centered(tag, cyan, px, py - 16, _num_font)
 
     # Draw precomputed arc segments for selected satellite
     if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:

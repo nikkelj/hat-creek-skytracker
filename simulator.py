@@ -313,7 +313,7 @@ class HardwareSimulator:
     """Ties the sim mount, config, tracking state and time together, and renders
     camera frames on demand."""
 
-    def __init__(self, config_state, tracking_vis_state, ts):
+    def __init__(self, config_state, tracking_vis_state, ts, star_catalog=None):
         self.config_state = config_state
         self.tracking_vis_state = tracking_vis_state
         self.ts = ts
@@ -321,6 +321,8 @@ class HardwareSimulator:
         self.mount = SimMount(config_state, rng=self._rng)
         self._stars = None
         self._stars_seed = None
+        # Shared Hipparcos catalogue (lazy). False = tried and failed; None = untried.
+        self._star_catalog = star_catalog
 
     def _sim(self):
         return getattr(self.config_state, 'sim_config', {}) or {}
@@ -342,6 +344,72 @@ class HardwareSimulator:
         mag = rng.uniform(0.2, 1.0, n)  # relative brightness factor
         self._stars = (az, el, mag)
         self._stars_seed = seed
+
+    # --- real star catalogue (Hipparcos) ---
+    def _get_star_catalog(self):
+        """Lazily resolve the shared StarCatalog; returns None if unavailable."""
+        if self._star_catalog is None:
+            try:
+                from star_catalog import get_catalog
+                eph = getattr(self.tracking_vis_state, 'ephemeris', None)
+                self._star_catalog = get_catalog(ephemeris=eph)
+            except Exception as e:
+                print(f"Sim star catalog unavailable: {e}")
+                self._star_catalog = False  # sentinel: tried and failed
+        return self._star_catalog or None
+
+    def _catalog_fov_stars(self, cam_az, cam_el, fov_x, fov_y, brightness):
+        """Real catalogue stars in the camera FOV as (az, el, amp) arrays, or None.
+
+        Prefers the deep Tycho catalogue (needed for the narrow real-camera FOVs that
+        Hipparcos can't populate), falling back to Hipparcos. amp is scaled so the
+        faintest rendered star clears the read noise (so it's plate-solvable) and the
+        brightest saturate rather than blow up.
+        """
+        if self.ts is None:
+            return None
+        cfg = self.config_state
+        s = self._sim()
+        lat = float(cfg.lat_str or 0.0)
+        lon = float(cfg.lon_str or 0.0)
+        elev = float(cfg.alt_str or 0.0)
+        t_tt = self.ts.now().tt
+        eph = getattr(self.tracking_vis_state, 'ephemeris', None)
+
+        # Deep catalogue first (Tycho, ~mag 10) for narrow FOVs; else Hipparcos.
+        # sim_use_deep_catalog lets callers force the Hipparcos path (deterministic,
+        # and what the wide-FOV demo DBs are built from).
+        limit = float(s.get('sim_star_limit_mag', 10.0))
+        az = el = mag = None
+        deep = None
+        if s.get('sim_use_deep_catalog', True):
+            try:
+                from star_catalog import get_deep_catalog
+                deep = get_deep_catalog(ephemeris=eph)
+            except Exception:
+                deep = None
+        if deep is not None:
+            az, el, mag = deep.stars_in_fov(lat, lon, elev, self.ts, t_tt,
+                                            cam_az, cam_el, fov_x, fov_y, limiting_mag=limit)
+        else:
+            cat = self._get_star_catalog()
+            if cat is None:
+                return None
+            limit = min(limit, float(getattr(cfg, 'star_limiting_magnitude', 6.5)) + 1.0)
+            az, el, mag = cat.stars_in_fov(lat, lon, elev, self.ts, t_tt,
+                                           cam_az, cam_el, fov_x, fov_y, limiting_mag=limit)
+        if az is None or len(az) == 0:
+            return (np.empty(0), np.empty(0), np.empty(0))
+
+        # Detectability floor: the faintest star (mag == limit) renders at a few read
+        # noise sigma above background so plate solving has real sources to centroid.
+        read_noise = float(s.get('read_noise', 2.0))
+        floor_amp = max(10.0, 5.0 * read_noise)  # faintest star ~5 sigma -> centroidable
+        # Cap brightest stars BELOW the tracked target so the satellite/plume stays the
+        # most prominent object (so it's pickable by eye and by the HOTSPOT tracker).
+        star_cap = max(floor_amp + 1.0, 0.85 * brightness)
+        amp = np.clip(floor_amp * np.power(10.0, -0.4 * (mag - limit)), 0.0, star_cap)
+        return az, el, amp
 
     # --- current target ---
     def current_target_azel(self):
@@ -422,32 +490,74 @@ class HardwareSimulator:
         exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
 
         # Star field (streaked by mount motion during the exposure).
-        self._ensure_stars()
-        saz, sel, smag = self._stars
         ifd = ifov_deg(pix, foc)
         fov_x = w * ifd / 2.0   # half-FOV (deg) from boresight to edge
         fov_y = h * ifd / 2.0
-        # angular motion during exposure -> pixel streak vector
-        sdx, sdy = angles_to_pixel(sky_az_rate * exposure_s,
-                                   sky_el_rate * exposure_s,
-                                   pix, foc, rot, cam_el, x_sign, y_sign)
-        for i in range(len(saz)):
-            d_az = wrap180(saz[i] - cam_az)
-            d_el = sel[i] - cam_el
-            if abs(d_az) > fov_x or abs(d_el) > fov_y:
-                continue
-            dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
-            sx, sy = cx + dx, cy + dy
-            if -10 <= sx < w + 10 and -10 <= sy < h + 10:
-                render_streak(frame, sx, sy, -sdx, -sdy,
-                              amp=brightness * 0.6 * smag[i], sigma=1.0)
+
+        # Star field. Isolated in try/except so a catalogue hiccup can NEVER stop the
+        # target (satellite/plume) from rendering -- get_data_after_exposure has no
+        # error handling, so a throw here would otherwise blank the whole frame.
+        try:
+            star_data = None
+            if bool(s.get('sim_use_real_stars', False)):
+                star_data = self._catalog_fov_stars(cam_az, cam_el, fov_x, fov_y, brightness)
+            if star_data is not None:
+                saz, sel, samp = star_data
+            else:
+                self._ensure_stars()
+                saz, sel, smag = self._stars
+                samp = brightness * 0.6 * np.asarray(smag)
+
+            # angular motion during exposure -> pixel streak vector
+            sdx, sdy = angles_to_pixel(sky_az_rate * exposure_s,
+                                       sky_el_rate * exposure_s,
+                                       pix, foc, rot, cam_el, x_sign, y_sign)
+            # Cheap angular pre-reject, then the exact pixel-bounds test decides
+            # visibility. The az axis compresses by cos(el) into pixels (see
+            # angles_to_pixel), so a raw |d_az| > fov_x gate would carve a phantom
+            # vertical wall at column (w/2)*cos(el) -- stars wink out well inside the
+            # frame, badly so near the zenith. Compare cross-elevation instead, with a
+            # generous diagonal radius that is also safe under image rotation.
+            cos_el = max(math.cos(math.radians(cam_el)), 1e-3)
+            gate = math.hypot(fov_x, fov_y) + 0.5
+            for i in range(len(saz)):
+                d_az = wrap180(saz[i] - cam_az)
+                d_el = sel[i] - cam_el
+                if abs(d_az) * cos_el > gate or abs(d_el) > gate:
+                    continue
+                dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
+                sx, sy = cx + dx, cy + dy
+                if -10 <= sx < w + 10 and -10 <= sy < h + 10:
+                    render_streak(frame, sx, sy, -sdx, -sdy,
+                                  amp=float(samp[i]), sigma=1.0)
+        except Exception as e:
+            print(f"Sim star-field render skipped: {e}")
 
         # Target
         az, el, kind, visible = self.current_target_azel()
+        if s.get('sim_debug_target', False) and cam_index == 0:
+            _now = time.time()
+            if _now - getattr(self, '_dbg_last', 0.0) > 1.0:
+                self._dbg_last = _now
+                if visible:
+                    _daz = wrap180(az - cam_az)
+                    _del = el - cam_el
+                    _in = abs(_daz) <= fov_x and abs(_del) <= fov_y
+                    print(f"[simdbg] sat=({az:.3f},{el:.3f}) {kind} | boresight=({cam_az:.3f},{cam_el:.3f}) "
+                          f"true_mount=({self.mount.az_true_deg:.3f},{self.mount.el_true_deg:.3f}) | "
+                          f"dAz={_daz:+.3f} dEl={_del:+.3f} fov=+-({fov_x:.3f},{fov_y:.3f}) inFOV={_in}", flush=True)
+                else:
+                    tvs = self.tracking_vis_state
+                    print(f"[simdbg] current_target_azel -> NOT VISIBLE | selected="
+                          f"{getattr(tvs, 'selected_satellite', None)} "
+                          f"in_trajectories={getattr(tvs, 'selected_satellite', None) in (getattr(tvs, 'satellite_trajectories', {}) or {})}",
+                          flush=True)
         if visible:
             d_az = wrap180(az - cam_az)
             d_el = el - cam_el
-            if abs(d_az) <= fov_x and abs(d_el) <= fov_y:
+            # Cross-el corrected gate (same cos(el) compression as the star field).
+            cos_el = max(math.cos(math.radians(cam_el)), 1e-3)
+            if abs(d_az) * cos_el <= fov_x and abs(d_el) <= fov_y:
                 dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
                 tx, ty = cx + dx, cy + dy
                 if kind == 'plume':
@@ -511,14 +621,26 @@ class SimCap:
         return asi.ASI_EXP_SUCCESS
 
     def get_data_after_exposure(self, *a, **k):
-        frame = self.simulator.render_frame(self.cam_index)
+        # Render defensively: the capture loop (camera_buffer) swallows exceptions and
+        # returns None on error, which silently FREEZES the feed on the last frame. So
+        # any render failure here is logged (so the real cause is visible) and we still
+        # return a valid background frame, keeping the feed alive.
+        try:
+            frame = self.simulator.render_frame(self.cam_index)
+        except Exception as e:
+            import traceback
+            print(f"SimCap render_frame error (cam {self.cam_index}): {e}")
+            traceback.print_exc()
+            s = self.simulator._sim()
+            bg = float(s.get('background_level', 6.0))
+            frame = np.full((self._h, self._w), bg, dtype=np.uint8)
         # honor a non-full ROI by cropping the center (boresight stays centered)
         if frame.shape != (self._h, self._w):
             fh, fw = frame.shape
             y0 = max(0, (fh - self._h) // 2)
             x0 = max(0, (fw - self._w) // 2)
             frame = frame[y0:y0 + self._h, x0:x0 + self._w]
-        return frame.tobytes()
+        return np.ascontiguousarray(frame).tobytes()
 
     def close(self):
         return None

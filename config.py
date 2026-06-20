@@ -23,6 +23,26 @@ class ConfigState:
         self.alignment_azimuth_str = "0.0"
         self.alignment_elevation_str = "0.0"
 
+        # Star catalogue / starfield configuration
+        self.starfield_enabled = True          # draw catalogue stars on the skyplot
+        self.max_rendered_star_count = 2000    # brightest-N cap (skyplot + sim images)
+        self.star_limiting_magnitude = 6.5     # faintest star ever considered
+
+        # Plate solver (tetra3) configuration
+        self.plate_solve_enabled = False       # background plate-solve worker on/off
+        self.plate_solve_camera_index = 0      # which camera the solver reads (0=wide/finder)
+
+        # Automated alignment: when a sample point won't plate-solve, the runner spirals
+        # outward over this many grid cells (~0.5x FOV each) searching for a solve before
+        # giving up / pausing for a manual jog.
+        self.alignment_grid_search_cells = 100
+
+        # Pointing model (7-term alt-az TPOINT). Coefficients in degrees; applied as a
+        # Python pre-step at target-setting time when pointing_model_enabled is True.
+        self.pointing_model_enabled = False
+        self.pointing_model_terms = {"IA": 0.0, "IE": 0.0, "AN": 0.0, "AW": 0.0,
+                                     "NPAE": 0.0, "CA": 0.0, "TF": 0.0}
+
         # Position offset configuration
         self.azm_offset_str = "0.0"
         self.alt_offset_str = "0.0"
@@ -76,7 +96,11 @@ class ConfigState:
             "cam2_offset_rotation_deg": 0.0,    # inter-camera misalignment
             "cam2_offset_x_px": 0.0,
             "cam2_offset_y_px": 0.0,
-            "star_density": 300,                # stars sprinkled over the sky
+            "star_density": 300,                # stars sprinkled over the sky (legacy random field)
+            "sim_use_real_stars": False,        # render the real star catalogue instead of the random field
+            "sim_star_limit_mag": 10.0,         # faintest catalogue star rendered into sim images (deep for narrow FOV)
+            "sim_use_deep_catalog": True,       # use Tycho (deep) when present; False forces Hipparcos
+            "sim_debug_target": False,          # print per-frame target-vs-boresight diagnostics (cam1, 1 Hz)
             "background_level": 6.0,
             "read_noise": 2.0,
             "target_brightness": 200.0,
@@ -172,6 +196,14 @@ class ConfigState:
             "elevation_mask": self.elevation_mask_str,
             "alignment_azimuth": self.alignment_azimuth_str,
             "alignment_elevation": self.alignment_elevation_str,
+            "starfield_enabled": self.starfield_enabled,
+            "max_rendered_star_count": self.max_rendered_star_count,
+            "star_limiting_magnitude": self.star_limiting_magnitude,
+            "plate_solve_enabled": self.plate_solve_enabled,
+            "plate_solve_camera_index": self.plate_solve_camera_index,
+            "alignment_grid_search_cells": self.alignment_grid_search_cells,
+            "pointing_model_enabled": self.pointing_model_enabled,
+            "pointing_model_terms": self.pointing_model_terms,
             "azm_offset": self.azm_offset_str,
             "alt_offset": self.alt_offset_str,
             "azm_limit_min": self.azm_limit_min_str,
@@ -214,6 +246,15 @@ class ConfigState:
         self.elevation_mask_str = config_dict.get("elevation_mask", self.elevation_mask_str)
         self.alignment_azimuth_str = config_dict.get("alignment_azimuth", self.alignment_azimuth_str)
         self.alignment_elevation_str = config_dict.get("alignment_elevation", self.alignment_elevation_str)
+        self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
+        self.max_rendered_star_count = config_dict.get("max_rendered_star_count", self.max_rendered_star_count)
+        self.star_limiting_magnitude = config_dict.get("star_limiting_magnitude", self.star_limiting_magnitude)
+        self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)
+        self.plate_solve_camera_index = config_dict.get("plate_solve_camera_index", self.plate_solve_camera_index)
+        self.alignment_grid_search_cells = config_dict.get("alignment_grid_search_cells", self.alignment_grid_search_cells)
+        self.pointing_model_enabled = config_dict.get("pointing_model_enabled", self.pointing_model_enabled)
+        if isinstance(config_dict.get("pointing_model_terms"), dict):
+            self.pointing_model_terms.update(config_dict["pointing_model_terms"])
         self.azm_offset_str = config_dict.get("azm_offset", self.azm_offset_str)
         self.alt_offset_str = config_dict.get("alt_offset", self.alt_offset_str)
 

@@ -102,8 +102,18 @@ def draw_hw_sim_options(display, config_state, hardware_sim=None):
         "(smooth vs sawtooth -- a control-theory lesson; applies live)", True, (150, 150, 150)),
         (x0 + 370, y0 + 126))
 
+    # Real star catalogue in synthetic images (vs the legacy random field). Applies live.
+    real_stars = bool(s.get("sim_use_real_stars", False))
+    rs_rect = pygame.Rect(x0, y0 + 156, 360, 26)
+    _btn(screen, rs_rect, f"Sim stars: {'REAL CATALOGUE' if real_stars else 'RANDOM FIELD'}",
+         display.font, bg=(20, 110, 60) if real_stars else (70, 70, 70))
+    display.hw_sim_real_stars_rect = rs_rect
+    screen.blit(display.small_font.render(
+        "(renders Hipparcos/Tycho stars into camera frames; needs a deep catalogue for narrow FOV)",
+        True, (150, 150, 150)), (x0 + 370, y0 + 162))
+
     display.hw_sim_rects = {}
-    ry = y0 + 162
+    ry = y0 + 196
     for label, key, step, fmt in ROWS:
         screen.blit(display.small_font.render(label, True, (230, 230, 230)), (x0, ry + 6))
         minus = pygame.Rect(x0 + 230, ry, 28, 26)
@@ -154,6 +164,12 @@ def handle_hw_sim_click(pos, display, config_state, hardware_sim, status_message
             "Rate command: "
             + ("CONTINUOUS guide-rate (smooth)" if config_state.continuous_rate_tracking
                else "DISCRETE MC_MOVE (sawtooth)"))
+        return True
+
+    if getattr(display, 'hw_sim_real_stars_rect', None) and display.hw_sim_real_stars_rect.collidepoint(pos):
+        s["sim_use_real_stars"] = not bool(s.get("sim_use_real_stars", False))
+        status_messages.append(
+            f"Sim stars: {'REAL catalogue' if s['sim_use_real_stars'] else 'random field'} (applies live)")
         return True
 
     for key, (minus, plus, step) in getattr(display, 'hw_sim_rects', {}).items():

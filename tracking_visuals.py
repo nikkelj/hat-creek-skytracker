@@ -57,6 +57,17 @@ class TrackingVisState:
         self.hovered_satellite = None
         self.satellite_positions = {}
 
+        # Starfield state (Hipparcos catalogue rendered on the skyplot).
+        # star_screen_positions is published by the render thread each frame as
+        # (sx, sy, hip) tuples and consumed by the main thread for hover hit-testing.
+        self.hovered_star = None              # HIP id of star under the cursor, or None
+        self.star_screen_positions = []       # [(sx, sy, hip), ...] in screen coords
+        self.starfield_cutoff_mag = None      # faintest rendered magnitude (UI display)
+
+        # Most recent plate-solve result (set by the plate-solve worker), drawn on the
+        # skyplot as a "solved pointing" marker. dict: result, az, el, align_az, ...
+        self.last_solve = None
+
         # Pass table state
         self.satellite_pass_table = []        # filtered + sorted view actually drawn
         self.satellite_pass_table_full = []   # full candidate set (pre name/alt filter + sort)

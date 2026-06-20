@@ -3,6 +3,7 @@ import serial
 import serial.tools.list_ports
 import math
 import time
+import threading
 from collections import deque
 from datetime import datetime, timezone
 from skyfield.api import load
@@ -106,10 +107,17 @@ def joystick_panel_layout(display):
     diag_x = qx + qw - diag_w - 12
     diag_y = bias_y - diag_h - 12
 
+    # Plate-solve pane above the diagnostics pane, clamped so it never rides up over
+    # the connect/port/status rows at the top of the quadrant.
+    plate_w, plate_h = 250, 92
+    plate_x = qx + qw - plate_w - 12
+    plate_y = max(qy + 104, diag_y - plate_h - 12)
+
     return {
         'pid': pygame.Rect(pid_x, pid_y, pid_w, pid_h),
         'bias': pygame.Rect(bias_x, bias_y, bias_w, bias_h),
         'diag': pygame.Rect(diag_x, diag_y, diag_w, diag_h),
+        'plate': pygame.Rect(plate_x, plate_y, plate_w, plate_h),
     }
 
 
@@ -202,6 +210,16 @@ class JoystickModeState:
         # Hardware simulator (set by main.py); when sim is enabled the connect
         # calls below hand back the sim mount instead of a real serial controller.
         self.hardware_sim = None
+
+        # Plate-solving (tetra3). Runs in a background worker at ~1 Hz, solving the
+        # latest frame from the configured camera and deriving the instantaneous
+        # alignment. last_solve holds the most recent result dict for the UI/overlay.
+        self.plate_solver = None
+        self.plate_solve_thread = None
+        self.plate_solve_running = False
+        self.last_solve = None        # dict: result, az, el, align_az, t, mount_azm/alt
+        self.plate_solve_status = ""
+        self.ps_button_rects = []
 
         # UI state
         self.connect_button_hover = False
@@ -2315,6 +2333,7 @@ def render_camera_feeds(display, joystick_state=None):
                     cam1_rect = pygame.Rect(camera_area_x, camera_area_y, cam1_width, cam1_height)
                     _draw_cam2_fov_in_cam1(display, joystick_state, cam1_rect)
                     _draw_feed_axes(display, joystick_state, cam1_rect, camera1, 'camera1')
+                    draw_solve_centroids_on_feed(display, joystick_state, cam1_rect, 0)
             except Exception as e:
                 error_text = display.small_font.render("Camera 1 Error", True, (255, 0, 0))
                 display.menu_screen.blit(error_text, (camera_area_x + 10, camera_area_y + 10))
@@ -2866,6 +2885,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
             return True
 
+        # Handle plate-solve pane clicks (toggle / apply alignment)
+        if handle_plate_solve_mouse_events(joystick_state, mouse_pos, config_state):
+            return True
+
         # Handle joystick launch button clicks
         if (hasattr(display, 'joystick_launch_button') and
             display.joystick_launch_button and
@@ -2919,6 +2942,213 @@ def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tra
             print("Capture started on all connected cameras")
         else:
             print("No cameras available for capture")
+
+def _plate_solve_worker(joystick_state):
+    """Background loop: solve the latest camera frame and derive the instantaneous
+    alignment. Pairs each solve with the mount-reported encoder position and the frame
+    time so the az/el conversion and alignment are self-consistent."""
+    import time as _t
+    from skyfield.api import load as _sf_load
+    from camera_manager import camera_manager
+    import plate_solver as ps_mod
+
+    cfg = joystick_state.config_state
+    tvs = joystick_state.tracking_vis_state
+    ts = joystick_state.ts or _sf_load.timescale()
+    cam_index = int(getattr(cfg, 'plate_solve_camera_index', 0))
+    cam_name = f"camera{cam_index + 1}"
+    eph = getattr(tvs, 'ephemeris', None)
+
+    try:
+        solver = ps_mod.PlateSolver(cfg, cam_name)
+        joystick_state.plate_solve_status = f"loading DB {solver.db_name}..."
+        solver.ensure_loaded()
+        joystick_state.plate_solver = solver
+    except Exception as e:
+        joystick_state.plate_solve_status = f"solver init failed: {e}"
+        joystick_state.plate_solve_running = False
+        return
+
+    while joystick_state.plate_solve_running:
+        try:
+            camera = camera_manager.get_camera(cam_index)
+            raw = (camera.thread.get_latest_raw()
+                   if camera is not None and getattr(camera, 'thread', None) is not None else None)
+            if raw is None:
+                joystick_state.plate_solve_status = "no camera frame"
+                _t.sleep(0.5)
+                continue
+
+            # Snapshot the encoder position and time paired with this frame.
+            mount_azm = joystick_state.current_azm_raw
+            mount_alt = joystick_state.current_alt_raw
+            t = ts.now()
+
+            result = solver.solve(raw)
+            if result is None or not result.solved:
+                joystick_state.plate_solve_status = "no solution"
+                joystick_state.last_solve = None
+                if tvs is not None:
+                    tvs.last_solve = None
+                _t.sleep(1.0)
+                continue
+
+            az = el = align_az = None
+            if eph is not None:
+                lat = float(cfg.lat_str or 0.0)
+                lon = float(cfg.lon_str or 0.0)
+                elev = float(cfg.alt_str or 0.0)
+                az, el = ps_mod.solved_azel(result.ra_deg, result.dec_deg, lat, lon, elev, eph, ts, t)
+                align_az = ps_mod.instantaneous_alignment_azimuth(az, mount_azm)
+
+            solve_info = {
+                'result': result, 'az': az, 'el': el, 'align_az': align_az,
+                'mount_azm': mount_azm, 'mount_alt': mount_alt, 't': t,
+                'src_shape': tuple(raw.shape[:2]), 'cam_index': cam_index,
+            }
+            joystick_state.last_solve = solve_info
+            if tvs is not None:
+                tvs.last_solve = solve_info  # consumed by the skyplot overlay
+            joystick_state.plate_solve_status = f"OK {result.n_matches}m FOV {result.fov_deg:.2f}"
+        except Exception as e:
+            joystick_state.plate_solve_status = f"err: {e}"
+        _t.sleep(1.0)
+
+
+def toggle_plate_solve(joystick_state):
+    """Start/stop the background plate-solve worker."""
+    import plate_solver as ps_mod
+    if joystick_state.plate_solve_running:
+        joystick_state.plate_solve_running = False
+        joystick_state.plate_solve_status = "stopped"
+        if joystick_state.config_state is not None:
+            joystick_state.config_state.plate_solve_enabled = False
+        return
+    if not ps_mod.tetra3_available():
+        joystick_state.plate_solve_status = "tetra3 not installed"
+        return
+    joystick_state.plate_solve_running = True
+    if joystick_state.config_state is not None:
+        joystick_state.config_state.plate_solve_enabled = True
+    th = threading.Thread(target=_plate_solve_worker, args=(joystick_state,), daemon=True)
+    joystick_state.plate_solve_thread = th
+    th.start()
+
+
+def apply_instantaneous_alignment(joystick_state, config_state):
+    """Write the most recent solved alignment azimuth into config (AltAz mode)."""
+    ls = joystick_state.last_solve
+    if ls is None or ls.get('align_az') is None or config_state is None:
+        joystick_state.plate_solve_status = "no solution to apply"
+        return
+    align_az = ls['align_az']
+    config_state.alignment_azimuth_str = f"{align_az:.4f}"
+    try:
+        config_state.save_to_file()
+    except Exception as e:
+        print(f"Apply-alignment save failed: {e}")
+    tvs = joystick_state.tracking_vis_state
+    if tvs is not None:
+        tvs.alignment_azimuth = align_az
+    joystick_state.plate_solve_status = f"applied align az {align_az:+.3f}"
+
+
+def draw_solve_centroids_on_feed(display, joystick_state, cam_rect, cam_index):
+    """Overlay the plate solver's matched star centroids on a camera feed.
+
+    matched_centroids are in solved-frame pixel coords (row, col); scale them into the
+    on-screen feed rect. Drawn only on the camera the solver is reading.
+    """
+    ls = getattr(joystick_state, 'last_solve', None)
+    if ls is None or ls.get('cam_index') != cam_index:
+        return
+    result = ls.get('result')
+    src = ls.get('src_shape')
+    if result is None or src is None:
+        return
+    cents = getattr(result, 'matched_centroids', None)
+    if cents is None or len(cents) == 0:
+        return
+    src_h, src_w = src[0], src[1]
+    if src_h <= 0 or src_w <= 0:
+        return
+    sx_scale = cam_rect.width / float(src_w)
+    sy_scale = cam_rect.height / float(src_h)
+    for c in cents:
+        row, col = float(c[0]), float(c[1])
+        px = int(cam_rect.x + col * sx_scale)
+        py = int(cam_rect.y + row * sy_scale)
+        pygame.draw.circle(display.menu_screen, (0, 230, 230), (px, py), 5, 1)
+
+
+def render_plate_solve_panel(display, joystick_state):
+    """Plate-solve pane: on/off toggle, Apply-Alignment button, and solve status."""
+    pane = joystick_panel_layout(display)['plate']
+    pygame.draw.rect(display.menu_screen, (35, 40, 50), pane)
+    pygame.draw.rect(display.menu_screen, (120, 140, 180), pane, 2)
+    display.menu_screen.blit(display.small_font.render("Plate Solve", True, (200, 210, 235)),
+                             (pane.x + 8, pane.y + 4))
+
+    mouse_pos = pygame.mouse.get_pos()
+    btn_w, btn_h = 78, 22
+    toggle_rect = pygame.Rect(pane.x + 8, pane.y + 26, btn_w, btn_h)
+    on = joystick_state.plate_solve_running
+    tcol = (0, 150, 0) if on else (100, 100, 100)
+    if toggle_rect.collidepoint(mouse_pos):
+        tcol = tuple(min(255, c + 40) for c in tcol)
+    pygame.draw.rect(display.menu_screen, tcol, toggle_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), toggle_rect, 1)
+    tlabel = display.tiny_font.render("Solve ON" if on else "Solve OFF", True, (255, 255, 255))
+    display.menu_screen.blit(tlabel, tlabel.get_rect(center=toggle_rect.center))
+
+    have = joystick_state.last_solve is not None and joystick_state.last_solve.get('align_az') is not None
+    apply_rect = pygame.Rect(pane.x + 8 + btn_w + 8, pane.y + 26, 110, btn_h)
+    acol = (60, 90, 140) if have else (70, 70, 70)
+    if have and apply_rect.collidepoint(mouse_pos):
+        acol = tuple(min(255, c + 40) for c in acol)
+    pygame.draw.rect(display.menu_screen, acol, apply_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), apply_rect, 1)
+    alabel = display.tiny_font.render("Apply Align", True, (255, 255, 255))
+    display.menu_screen.blit(alabel, alabel.get_rect(center=apply_rect.center))
+
+    joystick_state.ps_button_rects = [('ps_toggle', toggle_rect), ('ps_apply', apply_rect)]
+
+    ls = joystick_state.last_solve
+    y = pane.y + 50
+    if ls is not None and ls.get('az') is not None:
+        r = ls['result']
+        rmse = f"{r.rmse:.1f}\"" if r.rmse == r.rmse else "--"  # NaN-safe
+        display.menu_screen.blit(
+            display.tiny_font.render(f"SOLVED  {r.n_matches} stars  RMSE {rmse}", True, (110, 220, 140)),
+            (pane.x + 8, y)); y += 12
+        lines = [f"sky az {ls['az']:.2f}  el {ls['el']:.2f}",
+                 f"align az -> {ls['align_az']:+.3f}°"]
+        col = (200, 200, 200)
+    else:
+        st = joystick_state.plate_solve_status or "idle"
+        col = (220, 205, 120) if joystick_state.plate_solve_running else (150, 150, 150)
+        display.menu_screen.blit(display.tiny_font.render(
+            ("searching... " + st) if joystick_state.plate_solve_running else st, True, col),
+            (pane.x + 8, y)); y += 12
+        lines = []
+    for ln in lines:
+        display.menu_screen.blit(display.tiny_font.render(ln, True, col), (pane.x + 8, y))
+        y += 12
+
+
+def handle_plate_solve_mouse_events(joystick_state, mouse_pos, config_state):
+    """Route clicks on the plate-solve pane's toggle / apply buttons."""
+    if not getattr(joystick_state, 'ps_button_rects', None):
+        return False
+    for name, rect in joystick_state.ps_button_rects:
+        if rect.collidepoint(mouse_pos):
+            if name == 'ps_toggle':
+                toggle_plate_solve(joystick_state)
+            elif name == 'ps_apply':
+                apply_instantaneous_alignment(joystick_state, config_state)
+            return True
+    return False
+
 
 def render_pid_diagnostics(display, joystick_state):
     """

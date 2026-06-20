@@ -280,6 +280,24 @@ class PIDController:
         return math.degrees(error_rad)
 
 
+def apply_pointing_model(config_state, target_az_deg, target_el_deg):
+    """Correct a desired sky (az, el) through the configured 7-term pointing model.
+
+    Returns the commanded sky position to feed the (unmodified) mount transform. A no-op
+    when the model is disabled. Shared by the Python control path and the Rust-loop
+    adapter so both apply the same correction (the Rust transform stays geometric).
+    """
+    if not getattr(config_state, 'pointing_model_enabled', False):
+        return target_az_deg, target_el_deg
+    try:
+        from pointing_model import PointingModel
+        model = PointingModel(getattr(config_state, 'pointing_model_terms', None))
+        return model.correct(target_az_deg, target_el_deg)
+    except Exception as e:
+        print(f"Pointing-model correction skipped: {e}")
+        return target_az_deg, target_el_deg
+
+
 def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg, target_az_deg, target_el_deg):
     """
     Compute position error between current mount position and target position.
@@ -304,6 +322,11 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
     if mount_mode == 'AltAz':
         # Import here to avoid circular import
         from transformations import AzEl2AzAlt_AltAz
+
+        # Pointing-model pre-step: correct the desired sky position so the (imperfect)
+        # mount lands the boresight on target. Kept OUT of the transform itself, which is
+        # mirrored in Rust and parity-tested; this stays Python-only.
+        target_az_deg, target_el_deg = apply_pointing_model(config_state, target_az_deg, target_el_deg)
 
         # Convert target sky position to mount coordinates (simplified AltAz mode)
         target_azm_deg, target_alt_deg = AzEl2AzAlt_AltAz(
@@ -339,11 +362,25 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
     azm_error_deg = target_azm_deg - current_azm_deg
     alt_error_deg = target_alt_deg - current_alt_deg
 
-    # Handle azimuth wraparound (mount coordinates)
-    if azm_error_deg > 180:
-        azm_error_deg -= 360
-    elif azm_error_deg < -180:
-        azm_error_deg += 360
+    # Handle azimuth wraparound (mount coordinates). Use modular reduction rather
+    # than a single-step +/-360 so the result is the true shortest-arc error for
+    # ANY input range. current_azm carries azm_offset (mount_control.py) and can
+    # fall outside [0, 360), while target_azm is %360 from the transform; when the
+    # two land in different 360-deg windows a one-shot if/elif fails to wrap past
+    # ~1.5 turns and returns e.g. +340 instead of -20. That value is then clamped
+    # to +180 (compute_pid_output), driving the mount the long way ("360 lap" on
+    # acquire). Matches the Rust wrap180() and the AZM derivative wrap above.
+    azm_error_deg = (azm_error_deg + 180.0) % 360.0 - 180.0
+
+    # Handle ALT wraparound too. The ALT encoder is just as modular as AZM
+    # (hc_get_position returns a fraction of a revolution -> current_alt in
+    # [0, 360); mount_control.py), and in AltAz the convention is el = 90 - ALT,
+    # so the boresight points at zenith when ALT ~= 0 -- right on the 0/360 seam.
+    # On a near-overhead pass current_alt can read ~359 while target_alt is a few
+    # degrees, and the raw difference becomes ~-357. Without this reduction the
+    # PID drives the ALT axis the long way -- a near-full 360 traversal the mount
+    # cannot physically make -- instead of the few-degree hop across the seam.
+    alt_error_deg = (alt_error_deg + 180.0) % 360.0 - 180.0
 
     return azm_error_deg, alt_error_deg
 

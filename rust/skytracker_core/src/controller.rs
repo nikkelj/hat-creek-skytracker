@@ -328,7 +328,13 @@ impl LoopState {
         );
 
         let azm_error = wrap180(target_azm - current_azm);
-        let alt_error = target_alt - current_alt;
+        // ALT is wrapped too: the ALT encoder is modular ([0, 360)) and in AltAz
+        // el = 90 - ALT, so the boresight sits at zenith when ALT ~= 0, on the
+        // 0/360 seam. On a near-overhead pass current_alt can read ~359 while
+        // target_alt is a few degrees; without wrap the PID would drive a near-
+        // full 360 ALT traversal instead of the short hop. Mirrors
+        // control.compute_mount_position_error.
+        let alt_error = wrap180(target_alt - current_alt);
 
         self.azm_pid
             .update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);

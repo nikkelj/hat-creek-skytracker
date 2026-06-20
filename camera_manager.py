@@ -1046,6 +1046,37 @@ def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_h
             label_text = tiny_font.render(f"Exp: {exp_val}", True, (255, 255, 255))
             menu_screen.blit(label_text, (slider_x, slider_y + 20))
 
+        # Camera 2 Gamma Slider - positioned next to exposure slider on right side
+        slider_x = sub_x + cam_display_width + 750
+        slider_y = sub_y + 20
+        slider_color = (150, 150, 150)  # Different color for gamma slider
+        pygame.draw.rect(menu_screen, slider_color, (slider_x, slider_y, 120, 5))
+
+        # Handle position - gamma range 0.01 to 2.0
+        gamma_ratio = (camera2.gamma - 0.01) / (2.0 - 0.01)
+        gamma_ratio = max(0.0, min(1.0, gamma_ratio))
+        handle_x = slider_x + int(gamma_ratio * 120)
+        camera_manager.button_states["camera2_gamma_slider"] = camera_manager.button_states.get("camera2_gamma_slider", {"hover": False, "dragging": False})
+        camera_manager.button_states["camera2_gamma_slider"]["hover"] = pygame.Rect(handle_x - 5, slider_y - 5, 10, 15).collidepoint(mouse_pos)
+        handle_color = (150, 150, 255) if camera_manager.button_states["camera2_gamma_slider"]["hover"] else (200, 200, 255)
+        pygame.draw.rect(menu_screen, handle_color, (handle_x - 5, slider_y - 5, 10, 15))
+
+        # Label
+        label_text = tiny_font.render(f"Gamma: {camera2.gamma:.2f}", True, (255, 255, 255))
+        menu_screen.blit(label_text, (slider_x, slider_y + 20))
+
+        # Gamma toggle button next to gamma slider
+        gamma_toggle_rect = pygame.Rect(slider_x + 130, slider_y - 5, 40, 15)
+        camera_manager.button_states["camera2_gamma_toggle"] = camera_manager.button_states.get("camera2_gamma_toggle", {"hover": False, "clicked": False})
+        camera_manager.button_states["camera2_gamma_toggle"]["hover"] = gamma_toggle_rect.collidepoint(mouse_pos)
+        toggle_color = (0, 150, 0) if camera2.gamma_enabled else (150, 0, 0)  # Green if enabled, red if disabled
+        if camera_manager.button_states["camera2_gamma_toggle"]["hover"]:
+            toggle_color = tuple(min(255, c + 50) for c in toggle_color)  # Brighten on hover
+        pygame.draw.rect(menu_screen, toggle_color, gamma_toggle_rect)
+        toggle_text = tiny_font.render("ON" if camera2.gamma_enabled else "OFF", True, (255, 255, 255))
+        text_rect = toggle_text.get_rect(center=gamma_toggle_rect.center)
+        menu_screen.blit(toggle_text, text_rect)
+
 
 def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height):
     """Render ROI controls for both cameras - positioned near each camera image"""
@@ -1096,12 +1127,13 @@ def render_camera_roi_controls(menu_screen, sub_x, sub_y, sub_width, sub_height)
 
     if camera2.connected:
         # Camera 2 ROI Size Controls - positioned in upper right of camera 2 image
+        # (mirrors Camera 1: snug against the right edge of the camera 2 image so
+        # the buttons clear the gain/exposure/gamma sliders along the top)
         for i, size_text in enumerate(roi_label_texts):
-            # Position buttons vertically near upper right edge of camera 2 - moved 800 pixels right
             if i < 3:  # First column
-                rect = pygame.Rect(sub_x + cam_display_width + 15 + 780, sub_y + 10 + i * 15, 28, 12)
+                rect = pygame.Rect(sub_x + 2 * cam_display_width - 65, sub_y + 10 + i * 15, 28, 12)
             else:  # Second column
-                rect = pygame.Rect(sub_x + cam_display_width + 55 + 780, sub_y + 10 + (i - 3) * 15, 28, 12)
+                rect = pygame.Rect(sub_x + 2 * cam_display_width - 25, sub_y + 10 + (i - 3) * 15, 28, 12)
 
             is_selected = (camera2.roi_size == i)
             is_hovered = rect.collidepoint(mouse_pos)
@@ -1237,6 +1269,17 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             if camera2_exposure_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_exposure_slider"]["dragging"] = True
 
+            # Camera 2 Gamma Slider track detection
+            camera2_gamma_track_rect = pygame.Rect(display.sub_x + cam_display_width + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            if camera2_gamma_track_rect.collidepoint(pos):
+                camera_manager.button_states["camera2_gamma_slider"] = camera_manager.button_states.get("camera2_gamma_slider", {"hover": False, "dragging": False})
+                camera_manager.button_states["camera2_gamma_slider"]["dragging"] = True
+
+            # Camera 2 Gamma Toggle button detection
+            camera2_gamma_toggle_rect = pygame.Rect(display.sub_x + cam_display_width + 880, display.sub_y + 10, 40, 15)
+            if camera2_gamma_toggle_rect.collidepoint(pos):
+                camera_manager.cameras[1].gamma_enabled = not camera_manager.cameras[1].gamma_enabled
+
         # Camera 1/2 Alignment Rotation Slider track detection - bottom-center of camera display
         cam_display_height = display.sub_height - 30
         ROTATION_SLIDER_WIDTH = 160
@@ -1310,7 +1353,8 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             # Skip camera image click if it's within a slider track area
             camera1_gain_track_rect = pygame.Rect(display.sub_x + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             camera1_exposure_track_rect = pygame.Rect(display.sub_x + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
-            skip_camera1_click = camera1_gain_track_rect.collidepoint(pos) or camera1_exposure_track_rect.collidepoint(pos)
+            camera1_gamma_track_rect = pygame.Rect(display.sub_x + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            skip_camera1_click = camera1_gain_track_rect.collidepoint(pos) or camera1_exposure_track_rect.collidepoint(pos) or camera1_gamma_track_rect.collidepoint(pos)
 
             if camera1_image_rect.collidepoint(pos) and camera1.frame is not None and not skip_camera1_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
@@ -1334,9 +1378,9 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             is_roi_selection = False
             for i in range(6):
                 if i < 3:  # First column
-                    roi_rect = pygame.Rect(display.sub_x + cam_display_width + 15 + 780, display.sub_y + 10 + i * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + 2 * cam_display_width - 65, display.sub_y + 10 + i * 15, 28, 12)
                 else:  # Second column
-                    roi_rect = pygame.Rect(display.sub_x + cam_display_width + 55 + 780, display.sub_y + 10 + (i - 3) * 15, 28, 12)
+                    roi_rect = pygame.Rect(display.sub_x + 2 * cam_display_width - 25, display.sub_y + 10 + (i - 3) * 15, 28, 12)
 
                 if roi_rect.collidepoint(pos):
                     is_roi_selection = True
@@ -1363,7 +1407,8 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             # Skip camera image click if it's within a slider track area
             camera2_gain_track_rect = pygame.Rect(display.sub_x + cam_display_width + 450 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
             camera2_exposure_track_rect = pygame.Rect(display.sub_x + cam_display_width + 600 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
-            skip_camera2_click = camera2_gain_track_rect.collidepoint(pos) or camera2_exposure_track_rect.collidepoint(pos)
+            camera2_gamma_track_rect = pygame.Rect(display.sub_x + cam_display_width + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+            skip_camera2_click = camera2_gain_track_rect.collidepoint(pos) or camera2_exposure_track_rect.collidepoint(pos) or camera2_gamma_track_rect.collidepoint(pos)
 
             if camera2_image_rect.collidepoint(pos) and camera2.frame is not None and not skip_camera2_click and not is_roi_selection and not is_combined_view_controls_click:
                 # Convert click position to normalized coordinates (0.0 to 1.0)
@@ -1517,6 +1562,19 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
                     else:
                         new_exposure = max_exp
                     camera_manager.set_camera_exposure(1, new_exposure, lambda msg: print(f"Exposure: {new_exposure} μs"))
+
+                # Check if mouse is over Camera 2 Gamma Slider track
+                camera2_gamma_track_rect = pygame.Rect(display.sub_x + cam_display_width + 750 - 10, display.sub_y + 20 - 10, 120 + 20, 25)
+                if camera2_gamma_track_rect.collidepoint(current_pos):
+                    slider_x = display.sub_x + cam_display_width + 750
+                    slider_width = 120
+                    gamma_min = 0.01
+                    gamma_max = 2.0
+                    relative_x = min(max(current_pos[0] - slider_x, 0), slider_width)
+                    slider_pos = relative_x / slider_width  # 0-1 position along slider
+                    new_gamma = gamma_min + slider_pos * (gamma_max - gamma_min)
+                    new_gamma = max(gamma_min, min(gamma_max, new_gamma))
+                    camera_manager.cameras[1].gamma = round(new_gamma, 2)  # Round to 2 decimal places
 
             # Handle Camera 1 Alignment Rotation Slider dragging
             if camera1.connected:

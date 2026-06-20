@@ -25,10 +25,12 @@ from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions
 from config import load_config, handle_input, draw_config_options
 from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
+from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
+from alignment import AlignmentState
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events
+from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 from mount_control import MountControlThread
@@ -152,9 +154,7 @@ def update_status_callback(message):
         draw_menu_button(display, btn)
     if display.bg_image_menu:
         display.menu_screen.blit(display.bg_image_menu, display.image_rect.topleft if display.image_rect else ((display.MENU_WIDTH - 160) // 2, display.image_y))
-    for i, msg in enumerate(status_messages[-4:]):
-        status_render = display.status_font.render(msg, True, display.COLOR_TEXT_WHITE)
-        display.menu_screen.blit(status_render, (10, display.status_y_start + i * 14))
+    display.render_status_log(status_messages)
     pygame.display.flip()
     pygame.time.wait(50)  # Brief pause to ensure display update
     print(f"Debug: Status - {message}")
@@ -170,13 +170,35 @@ global hardware_sim
 hardware_sim = HardwareSimulator(config_state, tracking_vis_state, ts)
 joystick_mode_state.hardware_sim = hardware_sim
 camera_manager.simulator = hardware_sim
+
+# Automated pointing-model alignment state (Alignment sub-UI). The runner thread is
+# created on demand when the operator presses Start.
+global alignment_state
+alignment_state = AlignmentState()
 print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
 
 # Dedicated real-time mount control thread. Owns all serial traffic to the
 # mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
 # from this render loop. It no-ops while the telescope is disconnected.
 global mount_control_thread
-mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+# Experiment: optionally run the control loop in Rust (skytracker_core) via the
+# RustCoreLoopAdapter, behind a flag (default off). Enable with
+# config_state.use_rust_core_loop = True or env SKYTRACKER_RUST_LOOP=1.
+import os as _os
+_use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
+    _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")
+)
+if _use_rust_loop:
+    try:
+        from rust_loop_adapter import RustCoreLoopAdapter
+        _hz = int(getattr(config_state, "rust_core_loop_hz", 15))
+        mount_control_thread = RustCoreLoopAdapter(joystick_mode_state, config_state, target_hz=_hz)
+        print("Using RUST core control loop (skytracker_core).")
+    except Exception as _e:
+        print(f"Rust core loop unavailable ({_e}); falling back to MountControlThread.")
+        mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
+else:
+    mount_control_thread = MountControlThread(joystick_mode_state, config_state, target_hz=15)
 mount_control_thread.start()
 print("Mount control thread started.")
 
@@ -290,7 +312,13 @@ while running:
     if current_time - last_update_time >= update_interval:
         # Use lock to protect position updates for thread safety
         with position_update_lock:
-            tracking_vis_state.satellite_positions = {}
+            # NOTE: do not clear satellite_positions here. The rendering thread
+            # reads it live every frame; clearing it now and only repopulating
+            # at update_satellite_positions() below leaves an empty-dict window
+            # during the current_tt/slider math, and a render landing in that
+            # window paints a fully black frame -> visualization flicker. The
+            # update path below replaces the dict in a single atomic rebind, and
+            # the no-data branch clears it atomically, so no empty window exists.
 
             # Calculate current time for trajectory interpolation - ensure it's never None
             if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
@@ -316,6 +344,10 @@ while running:
             # Only update positions if trajectories are available
             if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
                 update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+            else:
+                # No trajectory data available: clear positions in a single
+                # atomic rebind (never leaves a partially-built/empty window).
+                tracking_vis_state.satellite_positions = {}
 
             # Update launch positions if any launch trajectories are loaded
             if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:
@@ -441,6 +473,13 @@ while running:
             # Hardware Sim screen: toggle / steppers / save-load
             elif current_mode == "hw_sim":
                 handle_hw_sim_click(pos, display, config_state, hardware_sim, status_messages)
+            elif current_mode == "alignment":
+                # Camera-panel controls (right half) take precedence, but only when the
+                # camera view is shown; fall through to the alignment controls otherwise.
+                cam_view = getattr(alignment_state, 'view_mode', 'camera') == 'camera'
+                if not (cam_view and handle_alignment_camera_events(event, display, config_state, update_status_callback)):
+                    handle_alignment_click(pos, display, config_state, alignment_state,
+                                           joystick_mode_state, tracking_vis_state, ts, status_messages)
 
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
@@ -456,8 +495,11 @@ while running:
 
             # Handle joystick mode events
             elif current_mode == "joystick_loop":
-                # Handle joystick mode mouse events except slider dragging
-                handle_joystick_mode_mouse_events(event, joystick_mode_state, display, tracking_vis_state, config_state, current_tracking_surface)
+                # Camera/view controls on the half-height feeds take precedence; if the
+                # click was not consumed by a camera control, fall through to the
+                # normal joystick-mode handler (satellite selection, launch, etc.).
+                if not handle_joystick_camera_control_events(event, display, config_state, update_status_callback):
+                    handle_joystick_mode_mouse_events(event, joystick_mode_state, display, tracking_vis_state, config_state, current_tracking_surface)
 
 
         elif event.type == pygame.MOUSEMOTION:
@@ -484,7 +526,21 @@ while running:
                     if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
                         tracking_vis_state.hovered_satellite = sat
                         break
+                # Starfield hover: star_screen_positions are in surface coords; the
+                # surface is blitted at (display.sub_x, display.sub_y).
+                tracking_vis_state.hovered_star = None
+                for sx, sy, hip in (tracking_vis_state.star_screen_positions or []):
+                    if math.hypot(sx + display.sub_x - event.pos[0],
+                                  sy + display.sub_y - event.pos[1]) < 8:
+                        tracking_vis_state.hovered_star = hip
+                        break
+            elif current_mode == "alignment":
+                # Handle camera control slider dragging on the right-half camera panel
+                if getattr(alignment_state, 'view_mode', 'camera') == 'camera':
+                    handle_alignment_camera_events(event, display, config_state, update_status_callback)
             elif current_mode == "joystick_loop":
+                # Handle camera control slider dragging on the half-height feeds
+                handle_joystick_camera_control_events(event, display, config_state, update_status_callback)
                 # Handle PID slider dragging in joystick mode
                 if event.buttons[0]:  # Left mouse button is pressed
                     current_pos = event.pos
@@ -539,6 +595,11 @@ while running:
                                     )
                                 break  # Only handle one slider at a time
 
+                    # Lead-time slider drag (reuse the click handler so the lead
+                    # range logic stays in one place)
+                    if joystick_mode_state is not None:
+                        handle_lead_slider_mouse_events(joystick_mode_state, display, current_pos)
+
 
         elif event.type == pygame.MOUSEMOTION:
             if current_mode is None:
@@ -562,6 +623,14 @@ while running:
                 for sat, (px, py, _, _) in tracking_vis_state.satellite_positions.items():
                     if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
                         tracking_vis_state.hovered_satellite = sat
+                        break
+                # Starfield hover: star_screen_positions are in surface coords; the
+                # surface is blitted at (display.sub_x, display.sub_y).
+                tracking_vis_state.hovered_star = None
+                for sx, sy, hip in (tracking_vis_state.star_screen_positions or []):
+                    if math.hypot(sx + display.sub_x - event.pos[0],
+                                  sy + display.sub_y - event.pos[1]) < 8:
+                        tracking_vis_state.hovered_star = hip
                         break
 
         elif event.type == pygame.MOUSEBUTTONUP:
@@ -589,6 +658,20 @@ while running:
                 tracking_vis_state.dragging_slider = False
                 tracking_vis_state.scroll_start = None
 
+        elif event.type == pygame.MOUSEWHEEL:
+            wheel_pos = pygame.mouse.get_pos()
+            # Scroll the left-bar status log when the cursor is over it
+            if display.get_status_panel_rect().collidepoint(wheel_pos):
+                display.status_scroll_offset = max(
+                    0, min(display.status_scroll_offset + event.y, display.status_max_scroll))
+            # Scroll the satellite passes table when hovering it in tracking-vis mode
+            elif current_mode == "tracking_vis":
+                from tracking_visuals import get_pass_table_rect
+                if get_pass_table_rect(display).collidepoint(wheel_pos):
+                    max_scroll = getattr(tracking_vis_state, 'pass_table_max_scroll', 0)
+                    tracking_vis_state.pass_table_scroll_offset = max(
+                        0, min(tracking_vis_state.pass_table_scroll_offset - event.y, max_scroll))
+
     # Render continuously
     # (Global current_tracking_surface already declared at top)
 
@@ -603,11 +686,10 @@ while running:
 
     for btn in display.buttons:
         draw_menu_button(display, btn)
-    # Render status messages each frame
-    status_messages = status_messages[-4:]  # Keep last 4 messages
-    for i, msg in enumerate(status_messages):
-        status_render = display.status_font.render(msg, True, display.COLOR_TEXT_WHITE)  # White text for dark theme
-        display.menu_screen.blit(status_render, (10, display.status_y_start + i * 14))
+    # Render status messages each frame (scrollable log confined to the left bar).
+    # Keep a bounded history so older messages remain available for scrollback.
+    status_messages = status_messages[-500:]
+    display.render_status_log(status_messages)
 
     cx = display.sub_x + display.sub_width // 2
     cy = display.sub_y + display.sub_height // 2
@@ -616,6 +698,8 @@ while running:
         draw_config_options(display, config_state)
     elif current_mode == "hw_sim":
         draw_hw_sim_options(display, config_state, hardware_sim)
+    elif current_mode == "alignment":
+        draw_alignment_options(display, config_state, alignment_state, joystick_mode_state)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         # Only clear if we don't have a thread surface (initial loading)
         # This prevents washing away the displayed surface while thread is rendering
@@ -641,9 +725,10 @@ while running:
         draw_time_display(display)
         draw_satellite_count(display, tracking_vis_state)
 
-        # Modular pass table filtering and sorting - replaced ~30 lines of inline filtering logic
+        # Apply live name/altitude filtering + multi-column sort each frame so the
+        # table reacts immediately to filter edits and column-header clicks.
         from tracking_visuals import filter_and_sort_pass_table
-        sorted_filtered_pass_table = filter_and_sort_pass_table(tracking_vis_state)
+        tracking_vis_state.satellite_pass_table = filter_and_sort_pass_table(tracking_vis_state)
 
         # Draw satellite pass table
         draw_satellite_pass_table(display, tracking_vis_state)
@@ -782,6 +867,13 @@ while running:
 
         # Render feed-forward toggle buttons
         render_feed_forward_toggle_buttons(display, joystick_mode_state)
+
+        # Render plate-solve pane (toggle + apply-alignment)
+        render_plate_solve_panel(display, joystick_mode_state)
+
+        # Render the navball + PID-tuning strip charts in the center column
+        render_navball(display, joystick_mode_state)
+        render_tracking_strip_charts(display, joystick_mode_state)
 
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)

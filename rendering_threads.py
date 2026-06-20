@@ -27,6 +27,10 @@ SATELLITE_LABEL_FONT = None
 # Cache for rendered satellite label surfaces to avoid expensive re-rendering
 SATELLITE_LABEL_CACHE = {}
 
+# Font + label-surface cache for star names (created off the main thread).
+STAR_LABEL_FONT = None
+STAR_LABEL_CACHE = {}
+
 # Polar plot constants (must match tracking_visuals.py)
 POLAR_RADIUS_OFFSET = 50
 
@@ -43,6 +47,121 @@ def draw_triangle_on_surface(surface, x, y, color, size=5):
     """Draw triangle shape on a specified surface."""
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
+
+
+def draw_dashed_line_on_surface(surface, color, p0, p1, dash=5, gap=4, width=1):
+    """Draw a single dashed line segment from p0 to p1."""
+    x0, y0 = p0
+    x1, y1 = p1
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return
+    ux, uy = dx / length, dy / length
+    step = dash + gap
+    n = int(length // step) + 1
+    for i in range(n):
+        s = i * step
+        e = min(s + dash, length)
+        sx, sy = x0 + ux * s, y0 + uy * s
+        ex, ey = x0 + ux * e, y0 + uy * e
+        pygame.draw.line(surface, color, (sx, sy), (ex, ey), width)
+
+
+def draw_dashed_polygon_on_surface(surface, color, points, dash=5, gap=4, width=1):
+    """Draw a closed dashed polygon through points."""
+    n = len(points)
+    for i in range(n):
+        draw_dashed_line_on_surface(surface, color, points[i], points[(i + 1) % n],
+                                    dash=dash, gap=gap, width=width)
+
+def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx, cy, radius,
+                               elevation_mask, draw_labels=True, publish_positions=True):
+    """Draw catalogue stars on the polar plot and publish their screen positions.
+
+    Stars are sized/brightened by visual magnitude. Only the brightest ~5% in view
+    (top_label_mask) and the hovered star are labelled (full-screen only). Publishes
+    state.star_screen_positions (for main-thread hover hit-testing) and
+    state.starfield_cutoff_mag (the faintest rendered magnitude, shown in the UI).
+    publish_positions=False (the small joystick quadrant) leaves the hover data alone.
+    Wrapped by the caller in try/except so a catalogue hiccup never kills rendering.
+    """
+    global STAR_LABEL_FONT, STAR_LABEL_CACHE
+
+    from star_catalog import get_catalog
+    catalog = get_catalog(ephemeris=getattr(state, 'ephemeris', None))
+
+    lat = float(config_state.lat_str or 0.0)
+    lon = float(config_state.lon_str or 0.0)
+    elev = float(config_state.alt_str or 0.0)
+    max_count = int(getattr(config_state, 'max_rendered_star_count', 2000))
+    limiting_mag = float(getattr(config_state, 'star_limiting_magnitude', 6.5))
+
+    res = catalog.current_altaz(lat, lon, elev, ts, current_tt,
+                                elevation_mask=elevation_mask,
+                                max_count=max_count, limiting_mag=limiting_mag)
+    if publish_positions:
+        state.starfield_cutoff_mag = res['cutoff_mag']
+
+    n = res['n_visible']
+    if n == 0:
+        if publish_positions:
+            state.star_screen_positions = []
+        return
+
+    az = res['az']
+    el = res['el']
+    mag = res['mag']
+    hip = res['hip']
+    top_mask = res['top_label_mask']
+
+    # Vectorised polar projection: r=(90-el)/90*radius, az 0=N=up, east=right.
+    az_rad = np.radians(az)
+    r = (90.0 - el) / 90.0 * radius
+    sx = cx + r * np.sin(az_rad)
+    sy = cy - r * np.cos(az_rad)
+
+    # Magnitude -> dot radius and brightness. Brightest stars are bigger/whiter.
+    bright = float(mag.min())
+    span = max(0.5, limiting_mag - bright)
+    norm = np.clip((mag - bright) / span, 0.0, 1.0)  # 0 = brightest, 1 = faintest
+    dot_r = np.clip(2.6 - 2.0 * norm, 0.6, 2.6)
+    intensity = np.clip(255.0 - 150.0 * norm, 90.0, 255.0).astype(int)
+
+    if STAR_LABEL_FONT is None:
+        pygame.font.init()
+        STAR_LABEL_FONT = pygame.font.Font(None, 14)
+
+    hovered = getattr(state, 'hovered_star', None)
+    positions = []
+    sx_i = sx.astype(int)
+    sy_i = sy.astype(int)
+    for i in range(n):
+        col = (intensity[i], intensity[i], min(255, intensity[i] + 10))
+        ri = int(round(dot_r[i]))
+        if ri <= 0:
+            surface.set_at((sx_i[i], sy_i[i]), col)
+        else:
+            pygame.draw.circle(surface, col, (sx_i[i], sy_i[i]), ri)
+
+        h = int(hip[i])
+        positions.append((sx_i[i], sy_i[i], h))
+
+        if draw_labels and (top_mask[i] or h == hovered):
+            name = catalog.name_for(h)
+            label = STAR_LABEL_CACHE.get(name)
+            if label is None:
+                try:
+                    label = STAR_LABEL_FONT.render(name, True, (170, 190, 220))
+                    STAR_LABEL_CACHE[name] = label
+                except pygame.error:
+                    label = None
+            if label is not None:
+                surface.blit(label, (sx_i[i] + 4, sy_i[i] - 6))
+
+    if publish_positions:
+        state.star_screen_positions = positions
+
 
 def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, full_screen_bounds=None):
     """
@@ -87,6 +206,77 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
     # Draw center dot explicitly to ensure it's visible over grid lines
     pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 3, 0)
+
+    # ---- Cardinal directions + numeric axis labels --------------------------
+    # Restored after a prior iteration dropped them. Drawn off the main thread,
+    # so we create local fonts rather than relying on display fonts.
+    pygame.font.init()
+    _dir_font = pygame.font.Font(None, 20)
+    _num_font = pygame.font.Font(None, 15)
+
+    def _blit_centered(text, color, px, py, font):
+        s = font.render(text, True, color)
+        surface.blit(s, (int(px - s.get_width() / 2), int(py - s.get_height() / 2)))
+
+    # Numeric azimuth ticks every 30 deg just outside the horizon ring (the four
+    # cardinals get letters instead). Azimuth: 0 = N = up, 90 = E = right.
+    for az_deg in range(0, 360, 30):
+        if az_deg in (0, 90, 180, 270):
+            continue
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 13) * math.sin(az_rad)
+        ly = cy - (radius + 13) * math.cos(az_rad)
+        _blit_centered(f"{az_deg}", (140, 140, 150), lx, ly, _num_font)
+
+    # Cardinal direction letters, further out; N highlighted.
+    for az_deg, lbl, col in ((0, "N", (255, 130, 130)), (90, "E", (225, 225, 235)),
+                             (180, "S", (225, 225, 235)), (270, "W", (225, 225, 235))):
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 18) * math.sin(az_rad)
+        ly = cy - (radius + 18) * math.cos(az_rad)
+        _blit_centered(lbl, col, lx, ly, _dir_font)
+
+    # Elevation ring labels (30 and 60 deg), placed just right of the N-S spoke.
+    for el in (30, 60):
+        r = (90 - el) / 90 * radius
+        _blit_centered(f"{el}°", (120, 170, 120), cx + 14, cy - r, _num_font)
+
+    # Catalogue starfield, drawn under satellites/FOV. Rendered in both the full-screen
+    # plot and the smaller joystick quadrant; labels + hover hit-testing only full-screen.
+    if getattr(config_state, 'starfield_enabled', True):
+        full_screen = (mode == PolarPlotMode.FULL_SCREEN)
+        try:
+            _draw_starfield_on_surface(surface, config_state, ts, current_tt, state,
+                                       cx, cy, radius, elevation_mask,
+                                       draw_labels=full_screen, publish_positions=full_screen)
+        except Exception as e:
+            print(f"Starfield render error: {e}")
+
+        # Limiting-magnitude readout just inside the horizon ring (full-screen only).
+        if full_screen:
+            cutoff = getattr(state, 'starfield_cutoff_mag', None)
+            if cutoff is not None and not math.isnan(cutoff):
+                n_stars = len(getattr(state, 'star_screen_positions', []) or [])
+                txt = f"lim mag {cutoff:.1f}  ({n_stars} stars)"
+                _blit_centered(txt, (150, 170, 200), cx, cy + radius - 8, _num_font)
+    elif mode == PolarPlotMode.FULL_SCREEN:
+        state.star_screen_positions = []
+
+    # Plate-solve "solved pointing" marker (cyan cross at the solved boresight az/el).
+    if mode == PolarPlotMode.FULL_SCREEN:
+        ls = getattr(state, 'last_solve', None)
+        if ls is not None and ls.get('az') is not None and ls.get('el') is not None and ls['el'] >= 0:
+            saz_rad = math.radians(ls['az'])
+            sr = (90.0 - ls['el']) / 90.0 * radius
+            px = int(cx + sr * math.sin(saz_rad))
+            py = int(cy - sr * math.cos(saz_rad))
+            cyan = (0, 230, 230)
+            pygame.draw.line(surface, cyan, (px - 7, py), (px + 7, py), 1)
+            pygame.draw.line(surface, cyan, (px, py - 7), (px, py + 7), 1)
+            pygame.draw.circle(surface, cyan, (px, py), 9, 1)
+            r = ls.get('result')
+            tag = f"solved {r.n_matches}m" if r is not None else "solved"
+            _blit_centered(tag, cyan, px, py - 16, _num_font)
 
     # Draw precomputed arc segments for selected satellite
     if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
@@ -380,12 +570,21 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
         if y_offset > panel_y + panel_height - padding:
             break
 
+FOV_MAGNIFICATION = 10  # dotted boxes are drawn at this magnification for clarity
+
+
 def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, joystick_mode_state=None):
-    """Draw camera FOV boxes on the polar plot surface."""
+    """Draw camera FOV boxes on the polar plot surface.
+
+    Each camera's true FOV box is drawn solid, plus a FOV_MAGNIFICATION-times
+    (10x) magnified copy in dotted lines so the small finder/imager fields are
+    actually visible and their position/orientation can be read at a glance. A
+    legend notes the 10x exaggeration."""
     if not hasattr(state, 'camera_fov_data') or not state.camera_fov_data:
         return
 
     surface_width, surface_height = surface.get_size()
+    drew_any = False
 
     # Center coordinates for polar plot (relative to surface)
     center_x = surface_width // 2
@@ -400,6 +599,21 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
         height_deg = fov_data.get('fov_height_deg', 1.0)
         rotation = fov_data.get('rotation', 0.0)
         color = fov_data.get('color', (255, 0, 0))
+
+        # Normalize elevation to [-180, 180] so mount-angle wrap doesn't produce
+        # a garbage value (e.g. ALT 351° -> el = 90 - 351 = -261°, really -9° past
+        # the horizon i.e. 99° elevation pointing past zenith).
+        el = (el + 180) % 360 - 180
+
+        # Reflect a past-zenith pointing back onto the visible hemisphere: el just
+        # over 90° means pointing slightly past the zenith toward the opposite
+        # azimuth, which on the polar plot is el = 180 - el at az + 180.
+        if el > 90:
+            el = 180 - el
+            az += 180
+        elif el < -90:
+            el = -180 - el
+            az += 180
 
         # Skip if below horizon or invalid
         if el < 0:
@@ -452,6 +666,7 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
         # Close the polygon for pygame.draw.polygon
         if len(corners_list) > 2:
             pygame.draw.polygon(surface, color, corners_list, 2)
+            drew_any = True
 
             # Draw rotation indicator line from center
             indicator_length = half_width * 0.3
@@ -463,10 +678,24 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
             pygame.draw.line(surface, color, (int(x), int(y)),
                            (int(indicator_end_x), int(indicator_end_y)), 1)
 
+            # 10x-magnified dotted copy: same center/rotation, corners scaled out
+            # so the (tiny) true FOV is legible. Lighter shade to read as a hint.
+            mag_corners = corners_local * FOV_MAGNIFICATION @ rot_matrix.T + np.array([x, y])
+            mag_list = [(int(c[0]), int(c[1])) for c in mag_corners]
+            mag_color = tuple(min(255, int(ch * 0.6 + 90)) for ch in color)
+            draw_dashed_polygon_on_surface(surface, mag_color, mag_list, dash=5, gap=4, width=1)
+
         # Draw corner markers for better visibility
         for corner in corners_screen:
             cx, cy = corner
             pygame.draw.circle(surface, color, (int(cx), int(cy)), 2, 1)
+
+    # Legend: note the dotted boxes are magnified (drawn once, bottom-left).
+    if drew_any:
+        pygame.font.init()
+        legend_font = pygame.font.Font(None, 15)
+        legend = legend_font.render(f"- - -  {FOV_MAGNIFICATION}x FOV", True, (200, 200, 210))
+        surface.blit(legend, (10, surface_height - 18))
 
 def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """Draw satellites on a specified surface with given bounds."""

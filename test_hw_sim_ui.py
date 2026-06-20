@@ -72,6 +72,26 @@ class HwSimUiTests(unittest.TestCase):
     def test_click_miss_returns_false(self):
         self.assertFalse(handle_hw_sim_click((5, 5), self.display, self.cfg, None, self.msgs))
 
+    def test_rust_loop_toggle_auto_saves(self):
+        saves = []
+        self.cfg.save_to_file = lambda *a, **k: saves.append(True)  # don't touch disk
+        self.assertFalse(self.cfg.use_rust_core_loop)
+        handle_hw_sim_click(_center(self.display.hw_sim_rust_loop_rect), self.display,
+                            self.cfg, None, self.msgs)
+        self.assertTrue(self.cfg.use_rust_core_loop)
+        self.assertTrue(saves, "toggle should auto-save so it persists for restart")
+        handle_hw_sim_click(_center(self.display.hw_sim_rust_loop_rect), self.display,
+                            self.cfg, None, self.msgs)
+        self.assertFalse(self.cfg.use_rust_core_loop)
+
+    def test_rust_loop_flag_round_trips(self):
+        self.cfg.use_rust_core_loop = True
+        self.cfg.rust_core_loop_hz = 20
+        loaded = ConfigState()
+        loaded.load_from_dict(self.cfg.get_config_dict())
+        self.assertTrue(loaded.use_rust_core_loop)
+        self.assertEqual(loaded.rust_core_loop_hz, 20)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

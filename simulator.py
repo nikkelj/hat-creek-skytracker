@@ -150,8 +150,16 @@ class SimMount:
         self._az_rate_dps = 0.0   # signed deg/sec
         self._el_rate_dps = 0.0
         self._last_t = time.time()
+        self._t0 = self._last_t
         self._lock = threading.RLock()
         self._rng = rng if rng is not None else np.random.default_rng()
+        # Gear backlash state: input position within the lost-motion band per axis.
+        self._az_play = 0.0
+        self._el_play = 0.0
+        # Periodic-error state (lazily seeded on the first advance).
+        self._pe_prev_az = 0.0
+        self._pe_prev_el = 0.0
+        self._pe_init = False
 
     # --- sim params (read live from config so UI edits take effect) ---
     def _sim(self):
@@ -174,11 +182,60 @@ class SimMount:
         self._last_t = now
         if dt <= 0:
             return
-        jitter = float(self._sim().get('mount_rate_noise_dps', 0.0))
+        s = self._sim()
+        jitter = float(s.get('mount_rate_noise_dps', 0.0))
         az_rate = self._az_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
         el_rate = self._el_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
-        self.az_true_deg = (self.az_true_deg + az_rate * dt) % 360.0
-        self.el_true_deg = self.el_true_deg + el_rate * dt
+        # Gear backlash: on a direction reversal the load (optical axis) stalls
+        # until the lost motion is taken up. This is what makes discrete
+        # rate-stepping hunt -- every time the rate command flips sign the mount
+        # sits in a dead-zone before it starts moving back.
+        b = float(s.get('mount_backlash_deg', 0.0))
+        d_az = self._apply_backlash('_az_play', az_rate * dt, b)
+        d_el = self._apply_backlash('_el_play', el_rate * dt, b)
+        # Periodic (worm) error: a slow sinusoid riding on the true pointing.
+        # Inject the per-step delta so it adds to tracking instead of replacing it.
+        pe_az, pe_el = self._periodic_error(now)
+        if not self._pe_init:
+            self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
+            self._pe_init = True
+        d_az += pe_az - self._pe_prev_az
+        d_el += pe_el - self._pe_prev_el
+        self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
+        self.az_true_deg = (self.az_true_deg + d_az) % 360.0
+        self.el_true_deg = self.el_true_deg + d_el
+
+    def _apply_backlash(self, attr, delta, band):
+        """Pass a commanded delta through a backlash dead-zone of total width
+        `band` (deg). Returns the load (output) delta. The state held in `attr`
+        is the input position within the [-band/2, band/2] gap; the load only
+        moves once the input is pushed against an edge of the gap."""
+        if band <= 0.0:
+            return delta
+        play = getattr(self, attr) + delta
+        half = band / 2.0
+        if play > half:
+            out = play - half
+            play = half
+        elif play < -half:
+            out = play + half
+            play = -half
+        else:
+            out = 0.0
+        setattr(self, attr, play)
+        return out
+
+    def _periodic_error(self, now):
+        """Worm periodic error as a sinusoid (zero-to-peak amplitude, worm
+        period). The two axes run a quarter cycle apart so they don't move
+        identically. Returns (pe_az_deg, pe_el_deg)."""
+        s = self._sim()
+        amp = float(s.get('mount_pe_amplitude_deg', 0.0))
+        if amp <= 0.0:
+            return 0.0, 0.0
+        period = float(s.get('mount_pe_period_sec', 600.0)) or 600.0
+        ph = 2.0 * math.pi * (now - self._t0) / period
+        return amp * math.sin(ph), amp * math.sin(ph + math.pi / 2.0)
 
     def _encoder(self, true_deg, mis_deg):
         noise = float(self._sim().get('mount_encoder_noise_deg', 0.0))
@@ -226,6 +283,22 @@ class SimMount:
     def hc_set_guide_rate(self, target, rate, **kwargs):
         return True
 
+    # Fine continuous-rate primitive (MC_SET_POS/NEG_GUIDERATE). Sets the axis
+    # rate directly in deg/s, quantized to the real 24-bit guide-rate LSB so the
+    # sim faithfully shows "effectively continuous" tracking (vs the 10-step
+    # MC_MOVE used by hc_slew_fixed).
+    _GUIDE_LSB_DPS = 360.0 / 2 ** 24  # ~0.077 arcsec/s
+
+    def hc_set_rate_dps(self, target, dps):
+        with self._lock:
+            self._advance()
+            q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
+            if target == Targets.ALT:
+                self._el_rate_dps = q
+            else:
+                self._az_rate_dps = q
+            return True
+
     def close(self):
         with self._lock:
             self._az_rate_dps = 0.0
@@ -240,7 +313,7 @@ class HardwareSimulator:
     """Ties the sim mount, config, tracking state and time together, and renders
     camera frames on demand."""
 
-    def __init__(self, config_state, tracking_vis_state, ts):
+    def __init__(self, config_state, tracking_vis_state, ts, star_catalog=None):
         self.config_state = config_state
         self.tracking_vis_state = tracking_vis_state
         self.ts = ts
@@ -248,6 +321,8 @@ class HardwareSimulator:
         self.mount = SimMount(config_state, rng=self._rng)
         self._stars = None
         self._stars_seed = None
+        # Shared Hipparcos catalogue (lazy). False = tried and failed; None = untried.
+        self._star_catalog = star_catalog
 
     def _sim(self):
         return getattr(self.config_state, 'sim_config', {}) or {}
@@ -269,6 +344,72 @@ class HardwareSimulator:
         mag = rng.uniform(0.2, 1.0, n)  # relative brightness factor
         self._stars = (az, el, mag)
         self._stars_seed = seed
+
+    # --- real star catalogue (Hipparcos) ---
+    def _get_star_catalog(self):
+        """Lazily resolve the shared StarCatalog; returns None if unavailable."""
+        if self._star_catalog is None:
+            try:
+                from star_catalog import get_catalog
+                eph = getattr(self.tracking_vis_state, 'ephemeris', None)
+                self._star_catalog = get_catalog(ephemeris=eph)
+            except Exception as e:
+                print(f"Sim star catalog unavailable: {e}")
+                self._star_catalog = False  # sentinel: tried and failed
+        return self._star_catalog or None
+
+    def _catalog_fov_stars(self, cam_az, cam_el, fov_x, fov_y, brightness):
+        """Real catalogue stars in the camera FOV as (az, el, amp) arrays, or None.
+
+        Prefers the deep Tycho catalogue (needed for the narrow real-camera FOVs that
+        Hipparcos can't populate), falling back to Hipparcos. amp is scaled so the
+        faintest rendered star clears the read noise (so it's plate-solvable) and the
+        brightest saturate rather than blow up.
+        """
+        if self.ts is None:
+            return None
+        cfg = self.config_state
+        s = self._sim()
+        lat = float(cfg.lat_str or 0.0)
+        lon = float(cfg.lon_str or 0.0)
+        elev = float(cfg.alt_str or 0.0)
+        t_tt = self.ts.now().tt
+        eph = getattr(self.tracking_vis_state, 'ephemeris', None)
+
+        # Deep catalogue first (Tycho, ~mag 10) for narrow FOVs; else Hipparcos.
+        # sim_use_deep_catalog lets callers force the Hipparcos path (deterministic,
+        # and what the wide-FOV demo DBs are built from).
+        limit = float(s.get('sim_star_limit_mag', 10.0))
+        az = el = mag = None
+        deep = None
+        if s.get('sim_use_deep_catalog', True):
+            try:
+                from star_catalog import get_deep_catalog
+                deep = get_deep_catalog(ephemeris=eph)
+            except Exception:
+                deep = None
+        if deep is not None:
+            az, el, mag = deep.stars_in_fov(lat, lon, elev, self.ts, t_tt,
+                                            cam_az, cam_el, fov_x, fov_y, limiting_mag=limit)
+        else:
+            cat = self._get_star_catalog()
+            if cat is None:
+                return None
+            limit = min(limit, float(getattr(cfg, 'star_limiting_magnitude', 6.5)) + 1.0)
+            az, el, mag = cat.stars_in_fov(lat, lon, elev, self.ts, t_tt,
+                                           cam_az, cam_el, fov_x, fov_y, limiting_mag=limit)
+        if az is None or len(az) == 0:
+            return (np.empty(0), np.empty(0), np.empty(0))
+
+        # Detectability floor: the faintest star (mag == limit) renders at a few read
+        # noise sigma above background so plate solving has real sources to centroid.
+        read_noise = float(s.get('read_noise', 2.0))
+        floor_amp = max(10.0, 5.0 * read_noise)  # faintest star ~5 sigma -> centroidable
+        # Cap brightest stars BELOW the tracked target so the satellite/plume stays the
+        # most prominent object (so it's pickable by eye and by the HOTSPOT tracker).
+        star_cap = max(floor_amp + 1.0, 0.85 * brightness)
+        amp = np.clip(floor_amp * np.power(10.0, -0.4 * (mag - limit)), 0.0, star_cap)
+        return az, el, amp
 
     # --- current target ---
     def current_target_azel(self):
@@ -319,40 +460,104 @@ class HardwareSimulator:
         x_sign = float(getattr(cfg, 'hotspot_x_sign', 1.0))
         y_sign = float(getattr(cfg, 'hotspot_y_sign', -1.0))
 
-        cam_az = self.mount.az_true_deg
-        cam_el = self.mount.el_true_deg
+        # The camera is bolted to the mount, so what it sees on the sky is the
+        # mount's mechanical pointing run through the SAME forward transform the
+        # rest of the app uses (mount AZM/ALT -> sky az/el). Earlier this used the
+        # mount angles directly (identity); that only looked right while the sky->
+        # mount inverse was also wrong, and broke PROGRAM-track rendering once that
+        # was fixed (boresight landed at 90 - el).
+        mount_mode = getattr(cfg, 'mount_mode', 'Eq')
+        align_az = float(getattr(cfg, 'alignment_azimuth_str', 0.0) or 0.0)
+        align_el = float(getattr(cfg, 'alignment_elevation_str', 0.0) or 0.0)
+        if mount_mode == 'AltAz':
+            from transformations import AzAlt2AzEl_AltAz
+            cam_az, cam_el = AzAlt2AzEl_AltAz(
+                self.mount.az_true_deg, self.mount.el_true_deg, align_az)
+            # ALT axis runs opposite sky elevation (el = 90 - ALT): the sky el rate
+            # is the negated mount rate; azimuth tracks the mount directly.
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, -self.mount.el_rate_dps
+        elif mount_mode == 'Passthrough':
+            cam_az, cam_el = self.mount.az_true_deg, self.mount.el_true_deg
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
+        else:
+            from transformations import AzAlt2AzEl
+            cam_az, cam_el = AzAlt2AzEl(
+                self.mount.az_true_deg, self.mount.el_true_deg, align_az, align_el)
+            sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 
         brightness = float(s.get('target_brightness', 200.0))
         exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
 
         # Star field (streaked by mount motion during the exposure).
-        self._ensure_stars()
-        saz, sel, smag = self._stars
         ifd = ifov_deg(pix, foc)
         fov_x = w * ifd / 2.0   # half-FOV (deg) from boresight to edge
         fov_y = h * ifd / 2.0
-        # angular motion during exposure -> pixel streak vector
-        sdx, sdy = angles_to_pixel(self.mount.az_rate_dps * exposure_s,
-                                   self.mount.el_rate_dps * exposure_s,
-                                   pix, foc, rot, cam_el, x_sign, y_sign)
-        for i in range(len(saz)):
-            d_az = wrap180(saz[i] - cam_az)
-            d_el = sel[i] - cam_el
-            if abs(d_az) > fov_x or abs(d_el) > fov_y:
-                continue
-            dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
-            sx, sy = cx + dx, cy + dy
-            if -10 <= sx < w + 10 and -10 <= sy < h + 10:
-                render_streak(frame, sx, sy, -sdx, -sdy,
-                              amp=brightness * 0.6 * smag[i], sigma=1.0)
+
+        # Star field. Isolated in try/except so a catalogue hiccup can NEVER stop the
+        # target (satellite/plume) from rendering -- get_data_after_exposure has no
+        # error handling, so a throw here would otherwise blank the whole frame.
+        try:
+            star_data = None
+            if bool(s.get('sim_use_real_stars', False)):
+                star_data = self._catalog_fov_stars(cam_az, cam_el, fov_x, fov_y, brightness)
+            if star_data is not None:
+                saz, sel, samp = star_data
+            else:
+                self._ensure_stars()
+                saz, sel, smag = self._stars
+                samp = brightness * 0.6 * np.asarray(smag)
+
+            # angular motion during exposure -> pixel streak vector
+            sdx, sdy = angles_to_pixel(sky_az_rate * exposure_s,
+                                       sky_el_rate * exposure_s,
+                                       pix, foc, rot, cam_el, x_sign, y_sign)
+            # Cheap angular pre-reject, then the exact pixel-bounds test decides
+            # visibility. The az axis compresses by cos(el) into pixels (see
+            # angles_to_pixel), so a raw |d_az| > fov_x gate would carve a phantom
+            # vertical wall at column (w/2)*cos(el) -- stars wink out well inside the
+            # frame, badly so near the zenith. Compare cross-elevation instead, with a
+            # generous diagonal radius that is also safe under image rotation.
+            cos_el = max(math.cos(math.radians(cam_el)), 1e-3)
+            gate = math.hypot(fov_x, fov_y) + 0.5
+            for i in range(len(saz)):
+                d_az = wrap180(saz[i] - cam_az)
+                d_el = sel[i] - cam_el
+                if abs(d_az) * cos_el > gate or abs(d_el) > gate:
+                    continue
+                dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
+                sx, sy = cx + dx, cy + dy
+                if -10 <= sx < w + 10 and -10 <= sy < h + 10:
+                    render_streak(frame, sx, sy, -sdx, -sdy,
+                                  amp=float(samp[i]), sigma=1.0)
+        except Exception as e:
+            print(f"Sim star-field render skipped: {e}")
 
         # Target
         az, el, kind, visible = self.current_target_azel()
+        if s.get('sim_debug_target', False) and cam_index == 0:
+            _now = time.time()
+            if _now - getattr(self, '_dbg_last', 0.0) > 1.0:
+                self._dbg_last = _now
+                if visible:
+                    _daz = wrap180(az - cam_az)
+                    _del = el - cam_el
+                    _in = abs(_daz) <= fov_x and abs(_del) <= fov_y
+                    print(f"[simdbg] sat=({az:.3f},{el:.3f}) {kind} | boresight=({cam_az:.3f},{cam_el:.3f}) "
+                          f"true_mount=({self.mount.az_true_deg:.3f},{self.mount.el_true_deg:.3f}) | "
+                          f"dAz={_daz:+.3f} dEl={_del:+.3f} fov=+-({fov_x:.3f},{fov_y:.3f}) inFOV={_in}", flush=True)
+                else:
+                    tvs = self.tracking_vis_state
+                    print(f"[simdbg] current_target_azel -> NOT VISIBLE | selected="
+                          f"{getattr(tvs, 'selected_satellite', None)} "
+                          f"in_trajectories={getattr(tvs, 'selected_satellite', None) in (getattr(tvs, 'satellite_trajectories', {}) or {})}",
+                          flush=True)
         if visible:
             d_az = wrap180(az - cam_az)
             d_el = el - cam_el
-            if abs(d_az) <= fov_x and abs(d_el) <= fov_y:
+            # Cross-el corrected gate (same cos(el) compression as the star field).
+            cos_el = max(math.cos(math.radians(cam_el)), 1e-3)
+            if abs(d_az) * cos_el <= fov_x and abs(d_el) <= fov_y:
                 dx, dy = angles_to_pixel(d_az, d_el, pix, foc, rot, cam_el, x_sign, y_sign)
                 tx, ty = cx + dx, cy + dy
                 if kind == 'plume':
@@ -416,14 +621,26 @@ class SimCap:
         return asi.ASI_EXP_SUCCESS
 
     def get_data_after_exposure(self, *a, **k):
-        frame = self.simulator.render_frame(self.cam_index)
+        # Render defensively: the capture loop (camera_buffer) swallows exceptions and
+        # returns None on error, which silently FREEZES the feed on the last frame. So
+        # any render failure here is logged (so the real cause is visible) and we still
+        # return a valid background frame, keeping the feed alive.
+        try:
+            frame = self.simulator.render_frame(self.cam_index)
+        except Exception as e:
+            import traceback
+            print(f"SimCap render_frame error (cam {self.cam_index}): {e}")
+            traceback.print_exc()
+            s = self.simulator._sim()
+            bg = float(s.get('background_level', 6.0))
+            frame = np.full((self._h, self._w), bg, dtype=np.uint8)
         # honor a non-full ROI by cropping the center (boresight stays centered)
         if frame.shape != (self._h, self._w):
             fh, fw = frame.shape
             y0 = max(0, (fh - self._h) // 2)
             x0 = max(0, (fw - self._w) // 2)
             frame = frame[y0:y0 + self._h, x0:x0 + self._w]
-        return frame.tobytes()
+        return np.ascontiguousarray(frame).tobytes()
 
     def close(self):
         return None

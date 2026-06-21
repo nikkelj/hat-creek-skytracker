@@ -25,6 +25,10 @@ from utils import draw_menu_button, draw_button_with_objects
 from trajectory import precompute_trajectories, update_satellite_positions, build_satellite_pass_table, read_launch_trajectories, update_launch_positions, load_trajectory_disk_cache, save_trajectory_disk_cache, quantized_now, compute_fine_selected_trajectory
 from config import load_config, handle_input, draw_config_options
 from hw_sim_ui import draw_hw_sim_options, handle_hw_sim_click
+from post_process_ui import (
+    PostProcessState, draw_post_process, handle_pp_click, handle_pp_motion,
+    handle_pp_mouseup, handle_pp_wheel, handle_pp_key,
+)
 from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
 from alignment import AlignmentState
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
@@ -98,6 +102,9 @@ if camera_manager.cameras[1]:
 # Input field state for tracking vis (now handled by TrackingVisState class)
 
 current_mode = None
+# Lazily created when the Post Process screen is first opened (it scans data/ and
+# spins up decode worker threads, so we avoid the cost unless the user goes there).
+post_process_state = None
 clock = pygame.time.Clock()
 
 # Author background image now handled by DisplaySetup class
@@ -455,7 +462,14 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
+            if current_mode == "post_process" and post_process_state is not None:
+                # Post-process screen owns the keyboard (text fields + hotkeys);
+                # only ESC with nothing focused falls through to quit.
+                if event.key == pygame.K_ESCAPE and post_process_state.focus is None:
+                    running = False
+                else:
+                    handle_pp_key(event, display, post_process_state, status_messages)
+            elif event.key == pygame.K_ESCAPE:
                 running = False
             elif current_mode == "config_options" and config_state.focused_field:
                 handle_input(event, config_state)
@@ -550,6 +564,10 @@ while running:
             # Hardware Sim screen: toggle / steppers / save-load
             elif current_mode == "hw_sim":
                 handle_hw_sim_click(pos, display, config_state, hardware_sim, status_messages)
+            elif current_mode == "post_process":
+                if post_process_state is None:
+                    post_process_state = PostProcessState()
+                handle_pp_click(pos, display, post_process_state, status_messages)
             elif current_mode == "alignment":
                 # Camera-panel controls (right half) take precedence, but only when the
                 # camera view is shown; fall through to the alignment controls otherwise.
@@ -584,6 +602,8 @@ while running:
                 # Handle main menu hover states
                 for btn in display.buttons:
                     display.button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
+            elif current_mode == "post_process" and post_process_state is not None:
+                handle_pp_motion(event.pos, display, post_process_state, event.buttons)
             elif current_mode == "config_options":
                 display.button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
                 display.button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
@@ -683,6 +703,8 @@ while running:
                 # Handle main menu hover states
                 for btn in display.buttons:
                     display.button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
+            elif current_mode == "post_process" and post_process_state is not None:
+                handle_pp_motion(event.pos, display, post_process_state, event.buttons)
             elif current_mode == "config_options":
                 display.button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
                 display.button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
@@ -716,6 +738,8 @@ while running:
                 display.button_states[btn["mode"]]["clicked"] = False
             if current_mode is None:
                 pass
+            elif current_mode == "post_process" and post_process_state is not None:
+                handle_pp_mouseup(event.pos, display, post_process_state)
             elif current_mode == "config_options":
                 display.button_states["save"]["clicked"] = False
                 display.button_states["load"]["clicked"] = False
@@ -741,6 +765,9 @@ while running:
             if display.get_status_panel_rect().collidepoint(wheel_pos):
                 display.status_scroll_offset = max(
                     0, min(display.status_scroll_offset + event.y, display.status_max_scroll))
+            # Scroll the run list in the post-process library
+            elif current_mode == "post_process" and post_process_state is not None:
+                handle_pp_wheel(wheel_pos, display, post_process_state, event.y)
             # Scroll the satellite passes table when hovering it in tracking-vis mode
             elif current_mode == "tracking_vis":
                 from tracking_visuals import get_pass_table_rect
@@ -961,9 +988,9 @@ while running:
         # strings, which the rendering code above reads.
 
     elif current_mode == "post_process":
-        sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
-        display.menu_screen.fill((150, 150, 150), sub_rect)
-        # Add post-processing tool code here later
+        if post_process_state is None:
+            post_process_state = PostProcessState()
+        draw_post_process(display, post_process_state)
     elif current_mode == "author_info":
         sub_rect = (display.sub_x, display.sub_y, display.sub_width, display.sub_height)
         if display.author_bg:
@@ -988,6 +1015,11 @@ print("Shutting down mount control thread...")
 if mount_control_thread:
     mount_control_thread.stop()
     mount_control_thread.join(timeout=2.0)
+
+# Stop post-process decode/export worker threads if the screen was opened
+if post_process_state is not None:
+    print("Shutting down post-process workers...")
+    post_process_state.shutdown()
 
 # Clean up rendering threads
 print("Shutting down rendering threads...")

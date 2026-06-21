@@ -153,6 +153,9 @@ cython_debug/
 # Project data
 data/
 
+# Post-processing MP4 exports (clips / stabilized movies)
+exports/
+
 # Cached ephemeris
 tle_cache.tle*
 de421.bsp*

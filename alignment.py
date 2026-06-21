@@ -17,6 +17,7 @@ import threading
 import time
 
 from pointing_model import PointingModel, fibonacci_sky_grid
+from eq_pointing_model import EquatorialPointingModel
 
 # Phases of the alignment run (surfaced to the UI).
 IDLE = "idle"
@@ -93,26 +94,24 @@ class AlignmentState:
         self.view_mode = view
 
 
-def slew_to_azel(controller, config_state, az_deg, el_deg, timeout=20.0,
-                 tol_deg=0.02, settle_cycles=3, kp=4.0, max_dps=5.0, position_cb=None):
-    """Slew the mount so the boresight points at sky (az, el) and wait for it to settle.
+def _assumed_pole(config_state):
+    """Assumed (aligned) celestial-pole direction for Eq mode: (pole_az, pole_alt)."""
+    pole_az = float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0)
+    pole_alt = float(getattr(config_state, 'alignment_elevation_str', 0.0) or 0.0)
+    if pole_alt == 0.0:
+        pole_alt = float(getattr(config_state, 'lat_str', 0.0) or 0.0)
+    return pole_az, pole_alt
 
-    Coarse goto for the bulk move, then a proportional continuous-rate (guide-rate)
-    settle onto the target. Using hc_set_rate_dps (not the coarse discrete MC_MOVE
-    table, whose mid rates are far too slow for fine settling) converges smoothly
-    without overshoot. The closed-loop settle is what makes the encoder bias show up as
-    a real pointing error in the sim, and matches real hardware where goto alone isn't
-    accurate. Uses the BASE transform (no pointing model) to measure raw mount
-    behaviour. Returns True if it settled within tolerance.
+
+def _settle_to_mount(controller, azm_t, alt_t, timeout, tol_deg, settle_cycles,
+                     kp, max_dps, position_cb, to_sky):
+    """Coarse goto + proportional continuous-rate settle onto mount axes (azm_t, alt_t).
+
+    ``to_sky(azm, alt) -> (az, el)`` converts the live encoder reading for the position
+    callback. Shared by the AltAz and Eq slews so only the sky<->mount transform differs.
+    Returns True if it settled within tolerance.
     """
-    from transformations import AzEl2AzAlt_AltAz, AzAlt2AzEl_AltAz
     from lib.auxstar import Targets
-
-    align_az = float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0)
-    align_el = float(getattr(config_state, 'alignment_elevation_str', 0.0) or 0.0)
-    azm_t, alt_t = AzEl2AzAlt_AltAz(az_deg, el_deg, align_az, align_el)
-
-    # Coarse jump to get within the settle window quickly.
     try:
         controller.hc_goto_fast(Targets.AZM, azm_t, 0, 0)
         controller.hc_goto_fast(Targets.ALT, alt_t, 0, 0)
@@ -121,14 +120,10 @@ def slew_to_azel(controller, config_state, az_deg, el_deg, timeout=20.0,
 
     use_rate = hasattr(controller, 'hc_set_rate_dps')
 
-    def _clamp(v):
-        return max(-max_dps, min(max_dps, v))
-
     def _command(target, err):
         if use_rate:
-            controller.hc_set_rate_dps(target, _clamp(kp * err))
+            controller.hc_set_rate_dps(target, max(-max_dps, min(max_dps, kp * err)))
         else:
-            # Fallback: fastest discrete rate scaled to the error (coarse).
             r = 9 if abs(err) > 2 else 7 if abs(err) > 0.5 else 5 if abs(err) > 0.1 else 3
             controller.hc_slew_fixed(target, r * (1 if err > 0 else -1))
 
@@ -148,11 +143,11 @@ def slew_to_azel(controller, config_state, az_deg, el_deg, timeout=20.0,
         cur_alt = controller.hc_get_position(Targets.ALT) * 360.0
         if position_cb is not None:
             try:
-                position_cb(*AzAlt2AzEl_AltAz(cur_azm, cur_alt, align_az))
+                position_cb(*to_sky(cur_azm, cur_alt))
             except Exception:
                 pass
         e_az = _wrap180(azm_t - cur_azm)
-        e_alt = alt_t - cur_alt
+        e_alt = _wrap180(alt_t - cur_alt)
         if abs(e_az) < tol_deg and abs(e_alt) < tol_deg:
             stable += 1
             if stable >= settle_cycles:
@@ -166,6 +161,35 @@ def slew_to_azel(controller, config_state, az_deg, el_deg, timeout=20.0,
 
     _stop()
     return abs(e_az) < tol_deg * 5 and abs(e_alt) < tol_deg * 5
+
+
+def slew_to_azel(controller, config_state, az_deg, el_deg, timeout=20.0,
+                 tol_deg=0.02, settle_cycles=3, kp=4.0, max_dps=5.0, position_cb=None):
+    """Slew the mount so the boresight points at sky (az, el) (AltAz mode) and settle.
+
+    Coarse goto then a proportional continuous-rate (guide-rate) settle. Uses the BASE
+    AltAz transform (no pointing model) to measure raw mount behaviour. Returns True if it
+    settled within tolerance.
+    """
+    from transformations import AzEl2AzAlt_AltAz, AzAlt2AzEl_AltAz
+    align_az = float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0)
+    align_el = float(getattr(config_state, 'alignment_elevation_str', 0.0) or 0.0)
+    azm_t, alt_t = AzEl2AzAlt_AltAz(az_deg, el_deg, align_az, align_el)
+    return _settle_to_mount(controller, azm_t, alt_t, timeout, tol_deg, settle_cycles,
+                            kp, max_dps, position_cb,
+                            lambda azm, alt: AzAlt2AzEl_AltAz(azm, alt, align_az))
+
+
+def slew_to_azel_eq(controller, config_state, az_deg, el_deg, timeout=20.0,
+                    tol_deg=0.1, settle_cycles=2, kp=4.0, max_dps=5.0, position_cb=None):
+    """Eq-mode slew: convert sky (az, el) to mount (hour-angle, dec) about the assumed pole
+    and settle the AZM (HA) / ALT (Dec) axes. Returns True if it settled within tolerance."""
+    from transformations import azel_to_eq_mount, eq_mount_to_azel
+    pole_az, pole_alt = _assumed_pole(config_state)
+    azm_t, alt_t = azel_to_eq_mount(az_deg, el_deg, pole_az, pole_alt)
+    return _settle_to_mount(controller, azm_t, alt_t, timeout, tol_deg, settle_cycles,
+                            kp, max_dps, position_cb,
+                            lambda azm, alt: eq_mount_to_azel(azm, alt, pole_az, pole_alt))
 
 
 class GuiSampler:
@@ -201,11 +225,21 @@ class GuiSampler:
             self.align_state.current_mount_azel = (az, el)
 
     def slew(self, az, el):
-        """Coarse goto + closed-loop settle onto (az, el). Returns True if it settled."""
+        """Coarse goto + closed-loop settle onto (az, el). Returns True if it settled.
+
+        Uses a loose, config-driven settle tolerance: capture() pairs the encoder reading
+        at solve time with the solved sky position, so landing a fraction of a degree off
+        the grid point costs no accuracy -- only "stopped moving, in a star-rich field"
+        matters. Tight settling here is the main dusk-time waste, so it is avoided.
+        """
         controller = getattr(self.joystick_state, 'telescope_controller', None)
         if controller is None:
             return False
-        ok = slew_to_azel(controller, self.config_state, az, el, position_cb=self._publish_pos)
+        cfg = self.config_state
+        tol = float(getattr(cfg, 'alignment_settle_tol_deg', 0.3) or 0.3)
+        cycles = int(getattr(cfg, 'alignment_settle_cycles', 2) or 2)
+        ok = slew_to_azel(controller, cfg, az, el, tol_deg=tol, settle_cycles=cycles,
+                          position_cb=self._publish_pos)
         time.sleep(self.settle_pause)  # let the camera grab a fresh post-slew frame
         return ok
 
@@ -264,11 +298,69 @@ class GuiSampler:
             pass
 
 
+class EqGuiSampler(GuiSampler):
+    """Eq-mode sampler: slews in HA/Dec about the assumed pole and returns samples in mount
+    HA/Dec space ``(h_cmd, d_cmd, h_obs, d_obs, meta)`` for the equatorial pointing-model fit.
+
+    h_cmd/d_cmd are the encoder axes at solve time (AZM=HA, ALT=Dec) directly; h_obs/d_obs are
+    the plate-solved sky position mapped back to HA/Dec through the assumed pole geometry.
+    """
+
+    def slew(self, az, el):
+        controller = getattr(self.joystick_state, 'telescope_controller', None)
+        if controller is None:
+            return False
+        cfg = self.config_state
+        tol = float(getattr(cfg, 'alignment_settle_tol_deg', 0.3) or 0.3)
+        cycles = int(getattr(cfg, 'alignment_settle_cycles', 2) or 2)
+        ok = slew_to_azel_eq(controller, cfg, az, el, tol_deg=tol, settle_cycles=cycles,
+                             position_cb=self._publish_pos)
+        time.sleep(self.settle_pause)
+        return ok
+
+    def capture(self):
+        import camera_manager
+        from transformations import azel_to_eq_mount
+        import plate_solver as ps_mod
+        from lib.auxstar import Targets
+
+        controller = getattr(self.joystick_state, 'telescope_controller', None)
+        if controller is None:
+            return None
+        camera = camera_manager.camera_manager.get_camera(self.cam_index)
+        raw = (camera.thread.get_latest_raw()
+               if camera is not None and getattr(camera, 'thread', None) is not None else None)
+        if raw is None:
+            return None
+        t = self.ts.now()
+        result = self.solver.solve(raw)
+        if result is None or not result.solved:
+            return None
+        cfg = self.config_state
+        lat = float(cfg.lat_str or 0.0); lon = float(cfg.lon_str or 0.0)
+        elev = float(cfg.alt_str or 0.0)
+        az_obs, el_obs = ps_mod.solved_azel(result.ra_deg, result.dec_deg, lat, lon, elev,
+                                            self.ephemeris, self.ts, t)
+        pole_az, pole_alt = _assumed_pole(cfg)
+        h_obs, d_obs = azel_to_eq_mount(az_obs, el_obs, pole_az, pole_alt)
+        h_cmd = controller.hc_get_position(Targets.AZM) * 360.0
+        d_cmd = controller.hc_get_position(Targets.ALT) * 360.0
+        h_cmd = _wrap180(h_cmd)
+        meta = {'result': result, 'az_obs': az_obs % 360.0, 'el_obs': el_obs,
+                'n_matches': result.n_matches, 'fov': result.fov_deg, 'rmse': result.rmse,
+                'cam_index': self.cam_index, 't': t}
+        if self.align_state is not None:
+            self.align_state.last_solve = meta
+            self.align_state.current_mount_azel = (az_obs % 360.0, el_obs)
+        return (h_cmd, d_cmd, _wrap180(h_obs), d_obs, meta)
+
+
 def make_default_sample_fn(joystick_state, config_state, solver, ts, ephemeris,
                            cam_index=0, settle_pause=0.4, align_state=None):
-    """Build the GUI sampler (slew + capture + plate-solve). See GuiSampler."""
-    return GuiSampler(joystick_state, config_state, solver, ts, ephemeris,
-                      cam_index, settle_pause, align_state)
+    """Build the GUI sampler (slew + capture + plate-solve), alt-az or Eq by mount mode."""
+    cls = EqGuiSampler if getattr(config_state, 'mount_mode', 'AltAz') == 'Eq' else GuiSampler
+    return cls(joystick_state, config_state, solver, ts, ephemeris,
+               cam_index, settle_pause, align_state)
 
 
 class AlignmentRunner(threading.Thread):
@@ -284,7 +376,9 @@ class AlignmentRunner(threading.Thread):
     def __init__(self, align_state, config_state, sampler,
                  n_points=18, holdout_frac=0.25, el_min=None, el_max=80.0,
                  remove_refraction=False, status_cb=None,
-                 pending_points=None, append=False, grid_cells=None):
+                 pending_points=None, append=False, grid_cells=None,
+                 seed_terms=None, free_terms=None, target_rms_arcmin=None, robust=True,
+                 eq_mode=None):
         super().__init__(daemon=True)
         self.s = align_state
         self.config_state = config_state
@@ -300,6 +394,21 @@ class AlignmentRunner(threading.Thread):
         self.status_cb = status_cb
         self.pending_points = pending_points
         self.append = append
+        # Partial (nightly-refresh) fit: hold all but ``free_terms`` at ``seed_terms``.
+        self.seed_terms = seed_terms
+        self.free_terms = free_terms
+        # Adaptive early-stop target (arcmin); falls back to config, 0 disables.
+        if target_rms_arcmin is None:
+            target_rms_arcmin = float(getattr(config_state, 'alignment_target_rms_arcmin', 0.0) or 0.0)
+        self.target_rms_arcmin = float(target_rms_arcmin)
+        # Reject gross-outlier solves (bad matches, a satellite in the field) before the final fit.
+        self.robust = bool(robust)
+        # Equatorial mode fits the EQ pointing model in hour-angle/dec space; the sampler then
+        # returns (h_cmd, d_cmd, h_obs, d_obs) instead of (az_cmd, el_cmd, az_obs, el_obs).
+        if eq_mode is None:
+            eq_mode = getattr(config_state, 'mount_mode', 'AltAz') == 'Eq'
+        self.eq_mode = bool(eq_mode)
+        self.lat_deg = float(getattr(config_state, 'lat_str', 0.0) or 0.0)
         if grid_cells is None:
             grid_cells = int(getattr(config_state, 'alignment_grid_search_cells', 100) or 0)
         self.grid_cells = max(0, int(grid_cells))
@@ -407,6 +516,18 @@ class AlignmentRunner(threading.Thread):
             s.samples.append(smp[:4])
             s.sample_meta.append(meta)
 
+    def _fit(self, samples):
+        """Fit the pointing model from samples, honouring partial-fit (seed/free) options.
+
+        Eq mode fits the equatorial model in HA/Dec space; AltAz fits the alt-az model.
+        """
+        if self.eq_mode:
+            return EquatorialPointingModel.fit(samples, self.lat_deg, seed_terms=self.seed_terms,
+                                               free_terms=self.free_terms, robust=self.robust)
+        return PointingModel.fit(samples, remove_refraction=self.remove_refraction,
+                                 seed_terms=self.seed_terms, free_terms=self.free_terms,
+                                 robust=self.robust)
+
     # ---- main loop ------------------------------------------------------------
     def run(self):
         s = self.s
@@ -431,6 +552,12 @@ class AlignmentRunner(threading.Thread):
             # --- collect fit samples ---
             s.phase = RUNNING
             total = len(pending)
+            # Adaptive early-stop: once the running fit is good enough (and enough points are
+            # covered) for two consecutive checks, stop sampling the rest of the grid. The
+            # Fibonacci grid is ordered by the golden angle, so the first dozen points already
+            # span azimuth well -- the tail mostly refines an already-good fit.
+            early_floor = max(MIN_SAMPLES + 6, 12)
+            consec_good = 0
             for i, (az, el) in enumerate(pending):
                 if self._abort.is_set():
                     s.phase = IDLE
@@ -443,6 +570,21 @@ class AlignmentRunner(threading.Thread):
                     self._record(smp, 'fit')
                 else:
                     s.failed_points.append((az, el))
+
+                if (self.target_rms_arcmin > 0 and not self.append
+                        and len(s.samples) >= early_floor and i + 1 < total):
+                    try:
+                        _m, _st = self._fit(s.samples)
+                        if _st['rms_after_arcmin'] <= self.target_rms_arcmin:
+                            consec_good += 1
+                        else:
+                            consec_good = 0
+                        if consec_good >= 2:
+                            self._status(f"early-stop: fit RMS {_st['rms_after_arcmin']:.2f}' "
+                                         f"<= {self.target_rms_arcmin:.2f}' after {len(s.samples)}/{total}")
+                            break
+                    except Exception:
+                        consec_good = 0
             s.progress = (total, total)
 
             if len(s.samples) < MIN_SAMPLES:
@@ -455,7 +597,7 @@ class AlignmentRunner(threading.Thread):
 
             # --- fit ---
             self._status("fitting pointing model...")
-            model, stats = PointingModel.fit(s.samples, remove_refraction=self.remove_refraction)
+            model, stats = self._fit(s.samples)
             s.model = model
             s.stats = stats
 
@@ -472,8 +614,11 @@ class AlignmentRunner(threading.Thread):
                     else:
                         s.failed_points.append((az, el))
             if s.backtest_samples:
-                s.backtest_rms_deg = model.backtest(s.backtest_samples,
-                                                    remove_refraction=self.remove_refraction)
+                if self.eq_mode:
+                    s.backtest_rms_deg = model.backtest(s.backtest_samples)
+                else:
+                    s.backtest_rms_deg = model.backtest(s.backtest_samples,
+                                                        remove_refraction=self.remove_refraction)
 
             s.current_target = None
             s.phase = DONE
@@ -495,11 +640,15 @@ class AlignmentRunner(threading.Thread):
 
 
 def accept_alignment(align_state, config_state, save=True):
-    """Write the fitted model into config and enable it."""
+    """Write the fitted model into config and enable it (alt-az or equatorial by type)."""
     if align_state.model is None:
         return False
-    config_state.pointing_model_terms = align_state.model.to_config()
-    config_state.pointing_model_enabled = True
+    if isinstance(align_state.model, EquatorialPointingModel):
+        config_state.eq_pointing_model_terms = align_state.model.to_config()
+        config_state.eq_pointing_model_enabled = True
+    else:
+        config_state.pointing_model_terms = align_state.model.to_config()
+        config_state.pointing_model_enabled = True
     if save:
         try:
             config_state.save_to_file()

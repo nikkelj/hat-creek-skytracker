@@ -66,6 +66,63 @@ class TestPointingModelFit(unittest.TestCase):
             self.assertLess(abs(((az_obs - az_d + 180) % 360 - 180)) * math.cos(math.radians(el_d)), 0.01)
             self.assertLess(abs(el_obs - el_d), 0.01)
 
+    def test_partial_fit_refits_index_only(self):
+        """A seeded partial fit recovers drifted IA/IE while holding the (correctly seeded)
+        mechanical terms fixed -- the nightly-refresh path."""
+        mech = {"AN": 0.07, "AW": -0.04, "NPAE": 0.05, "CA": 0.03, "TF": 0.04}
+        truth = PointingModel({"IA": 2.3, "IE": -0.9, **mech})
+        grid = fibonacci_sky_grid(8, el_min=20, el_max=78)
+        samples = self._make_samples(truth, grid, noise_arcsec=8.0, seed=3)
+        seed = dict(mech)  # last night's mechanical terms, zero index errors
+        seed.update({"IA": 0.0, "IE": 0.0})
+        model, stats = PointingModel.fit(samples, seed_terms=seed, free_terms=["IA", "IE"])
+        # Mechanical terms must be held exactly at the seed (not re-fit).
+        for k in mech:
+            self.assertEqual(model.terms[k], mech[k])
+        # Index errors recovered from only 8 points.
+        self.assertAlmostEqual(model.terms["IA"], truth.terms["IA"], delta=0.03)
+        self.assertAlmostEqual(model.terms["IE"], truth.terms["IE"], delta=0.03)
+        self.assertLess(stats["rms_after_arcmin"], 1.0)
+
+    def test_stats_report_condition_number(self):
+        """A well-spread grid is well-conditioned; a clustered one is not."""
+        truth = PointingModel({"IA": 1.0, "IE": -0.5, "AN": 0.05, "AW": 0.03,
+                               "NPAE": 0.04, "CA": 0.02, "TF": 0.03})
+        wide = self._make_samples(truth, fibonacci_sky_grid(40, el_min=15, el_max=80))
+        _, st_wide = PointingModel.fit(wide)
+        self.assertIn("design_cond", st_wide)
+        # A grid clustered in a tiny az/el patch can't separate the terms -> huge cond.
+        clustered = self._make_samples(truth, [(100 + 0.5 * i, 45 + 0.3 * i) for i in range(12)])
+        _, st_cl = PointingModel.fit(clustered)
+        self.assertGreater(st_cl["design_cond"], st_wide["design_cond"])
+
+    def test_robust_fit_rejects_outlier(self):
+        """A single grossly-wrong solve is rejected so it can't drag the model."""
+        truth = PointingModel({"IA": 1.5, "IE": -0.6, "AN": 0.06, "AW": -0.04,
+                               "NPAE": 0.05, "CA": 0.03, "TF": 0.04})
+        grid = fibonacci_sky_grid(30, el_min=15, el_max=80)
+        samples = self._make_samples(truth, grid, noise_arcsec=8.0, seed=5)
+        # Corrupt one sample with a 2-degree plate-solve blunder.
+        bad = list(samples[7]); bad[2] = (bad[2] + 2.0) % 360.0; bad[3] += 2.0
+        samples[7] = tuple(bad)
+
+        naive, st_naive = PointingModel.fit(samples, robust=False)
+        robust, st_robust = PointingModel.fit(samples, robust=True)
+        self.assertEqual(st_robust["n_rejected"], 1)
+        self.assertLess(st_robust["rms_after_arcmin"], st_naive["rms_after_arcmin"])
+        # Robust terms stay close to truth; the naive fit is pulled off by the blunder.
+        for k in TERM_NAMES:
+            self.assertAlmostEqual(robust.terms[k], truth.terms[k], delta=0.05)
+
+    def test_robust_keeps_clean_samples(self):
+        """With clean data, robust mode rejects nothing (the absolute floor protects inliers)."""
+        truth = PointingModel({"IA": 1.0, "IE": 0.5, "AN": 0.05, "AW": 0.02,
+                               "NPAE": 0.03, "CA": 0.02, "TF": 0.03})
+        grid = fibonacci_sky_grid(24, el_min=20, el_max=78)
+        samples = self._make_samples(truth, grid, noise_arcsec=8.0, seed=6)
+        _, st = PointingModel.fit(samples, robust=True)
+        self.assertEqual(st["n_rejected"], 0)
+
     def test_grid_respects_elevation_band(self):
         grid = fibonacci_sky_grid(30, el_min=20, el_max=78)
         self.assertGreater(len(grid), 10)

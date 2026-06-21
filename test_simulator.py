@@ -23,7 +23,7 @@ from config import ConfigState
 from lib.auxstar import RATES, Targets
 from hotspot import detect_hotspot, pixel_offset_to_angles
 import simulator
-from simulator import SimMount, HardwareSimulator, angles_to_pixel
+from simulator import SimMount, HardwareSimulator, angles_to_pixel, injected_boresight
 
 
 class MountDynamicsTests(unittest.TestCase):
@@ -114,6 +114,59 @@ class RenderDetectTests(unittest.TestCase):
         sim.mount._az_rate_dps = 5.0  # moving -> stars streak -> more lit pixels
         streaked = sim.render_frame(0).astype(np.int32).sum()
         self.assertGreater(streaked, static)
+
+
+class InjectedErrorTests(unittest.TestCase):
+    """The sim can inject a full pointing model + refraction so an alignment run recovers
+    all seven terms end-to-end (not just the encoder-bias IA/IE)."""
+
+    def test_no_injection_is_identity(self):
+        cfg = ConfigState()
+        az, el = injected_boresight(cfg, 123.0, 45.0)
+        self.assertAlmostEqual(az, 123.0, places=9)
+        self.assertAlmostEqual(el, 45.0, places=9)
+
+    def test_pointing_model_matches_predict_observed(self):
+        from pointing_model import PointingModel
+        terms = {"IA": 0.4, "IE": -0.2, "AN": 0.05, "AW": -0.03, "NPAE": 0.04, "CA": 0.02, "TF": 0.03}
+        cfg = ConfigState()
+        cfg.sim_config["mount_pointing_model"] = terms
+        exp_az, exp_el = PointingModel(terms).predict_observed(80.0, 50.0)
+        az, el = injected_boresight(cfg, 80.0, 50.0)
+        self.assertAlmostEqual(az, exp_az, places=9)
+        self.assertAlmostEqual(el, exp_el, places=9)
+
+    def test_refraction_lifts_elevation(self):
+        from pointing_model import bennett_refraction_deg
+        cfg = ConfigState()
+        cfg.sim_config["sim_refraction"] = True
+        az, el = injected_boresight(cfg, 200.0, 25.0)
+        self.assertAlmostEqual(az, 200.0, places=9)
+        self.assertAlmostEqual(el, 25.0 + bennett_refraction_deg(25.0), places=9)
+        self.assertGreater(el, 25.0)  # apparent is higher than geometric
+
+    def test_render_shifts_field_by_injected_model(self):
+        """A large injected IA shifts the rendered boresight, so a target placed at the
+        nominal boresight no longer lands at frame center."""
+        cfg = ConfigState()
+        cfg.sim_config["enabled"] = True
+        cfg.sim_config["mount_encoder_noise_deg"] = 0.0
+        cfg.sim_config["read_noise"] = 0.0
+        sim = HardwareSimulator(cfg, None, None)
+        sim.mount.az_true_deg, sim.mount.el_true_deg = 100.0, 60.0  # nominal sky boresight az100 el30
+        # Target sits exactly at the NOMINAL boresight (az 100, el 30).
+        sim.current_target_azel = lambda: (100.0, 30.0, 'satellite', True)
+
+        cfg.sim_config["mount_pointing_model"] = {}
+        d0 = detect_hotspot(sim.render_frame(0), snr_threshold=5.0)
+        self.assertIsNotNone(d0)
+        h, w = cfg.sim_config["cam_height"], cfg.sim_config["cam_width"]
+        self.assertLess(abs(d0.cx - w / 2) + abs(d0.cy - h / 2), 3.0)  # centered, no model
+
+        cfg.sim_config["mount_pointing_model"] = {"IA": 0.3}  # ~0.3 deg azimuth shift
+        d1 = detect_hotspot(sim.render_frame(0), snr_threshold=5.0)
+        self.assertIsNotNone(d1)
+        self.assertGreater(abs(d1.cx - w / 2) + abs(d1.cy - h / 2), 5.0)  # shifted off-center
 
 
 class SimInTheLoopTests(unittest.TestCase):

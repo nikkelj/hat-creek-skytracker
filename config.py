@@ -37,11 +37,33 @@ class ConfigState:
         # giving up / pausing for a manual jog.
         self.alignment_grid_search_cells = 100
 
+        # Alignment slew settle: the plate-solve pairs the encoder reading AT SOLVE TIME
+        # with the solved sky position, so the sample is correct no matter how far from the
+        # grid point we land -- the mount only needs to be *near* a star-rich field and to
+        # have stopped moving enough that stars don't streak. A loose tolerance + few settle
+        # cycles is therefore the single biggest dusk-time saver (a tight 0.02 deg asymptotic
+        # settle wastes seconds per point for zero accuracy gain). Degrees / cycles.
+        self.alignment_settle_tol_deg = 0.3
+        self.alignment_settle_cycles = 2
+
+        # Adaptive early-stop: once the running fit's post-fit sky RMS (arcmin) drops to/below
+        # this for two consecutive checks (and enough points are covered), stop sampling the
+        # remaining fit grid early. Disabled by default (0.0 -> always sample the full grid):
+        # with few, azimuth-correlated points the per-term accuracy (esp. NPAE/CA) softens, so
+        # this is opt-in. Set e.g. 0.75 to trade a little term accuracy for a faster run.
+        self.alignment_target_rms_arcmin = 0.0
+
         # Pointing model (7-term alt-az TPOINT). Coefficients in degrees; applied as a
         # Python pre-step at target-setting time when pointing_model_enabled is True.
         self.pointing_model_enabled = False
         self.pointing_model_terms = {"IA": 0.0, "IE": 0.0, "AN": 0.0, "AW": 0.0,
                                      "NPAE": 0.0, "CA": 0.0, "TF": 0.0}
+
+        # Equatorial (Eq-mode) 7-term pointing model: residual mount errors after polar
+        # alignment (eq_pointing_model.py). Applied in hour-angle/dec space in the Eq branch.
+        self.eq_pointing_model_enabled = False
+        self.eq_pointing_model_terms = {"IH": 0.0, "ID": 0.0, "NP": 0.0, "CH": 0.0,
+                                        "ME": 0.0, "MA": 0.0, "TF": 0.0}
 
         # Position offset configuration
         self.azm_offset_str = "0.0"
@@ -93,6 +115,21 @@ class ConfigState:
             "mount_backlash_deg": 0.0,          # gear lost-motion on reversal (AVX ~0.006 = 22")
             "mount_pe_amplitude_deg": 0.0,      # periodic error, zero-to-peak (AVX ~0.003 = 11")
             "mount_pe_period_sec": 600.0,       # worm period (AVX ~10 min)
+            # Injected 7-term alt-az pointing model: the repeatable mount/optical errors the
+            # alignment routine must recover (encoder bias above is only an IA/IE-like offset).
+            # Empty/zero = no distortion. Used by the sim render so the rendered boresight lands
+            # where predict_observed() says -- letting an alignment run recover all seven terms.
+            "mount_pointing_model": {},         # e.g. {"IA":0.4,"IE":-0.2,"AN":0.05,...} (degrees)
+            "sim_refraction": False,            # add atmospheric refraction to the apparent elevation
+            "sim_refraction_pressure_mbar": 1010.0,
+            "sim_refraction_temperature_c": 10.0,
+            # Equatorial-mode polar-axis misalignment (degrees) the polar-alignment routine
+            # must measure: the sim's TRUE polar axis = (north + az_err, latitude + alt_err).
+            "sim_pole_az_err_deg": 0.0,
+            "sim_pole_alt_err_deg": 0.0,
+            # Injected equatorial residual pointing model (IH/ID/NP/CH/ME/MA/TF, degrees) the
+            # Eq-mode alignment must recover -- applied in HA/Dec before the pole geometry.
+            "mount_eq_pointing_model": {},
             "cam2_offset_rotation_deg": 0.0,    # inter-camera misalignment
             "cam2_offset_x_px": 0.0,
             "cam2_offset_y_px": 0.0,
@@ -202,8 +239,13 @@ class ConfigState:
             "plate_solve_enabled": self.plate_solve_enabled,
             "plate_solve_camera_index": self.plate_solve_camera_index,
             "alignment_grid_search_cells": self.alignment_grid_search_cells,
+            "alignment_settle_tol_deg": self.alignment_settle_tol_deg,
+            "alignment_settle_cycles": self.alignment_settle_cycles,
+            "alignment_target_rms_arcmin": self.alignment_target_rms_arcmin,
             "pointing_model_enabled": self.pointing_model_enabled,
             "pointing_model_terms": self.pointing_model_terms,
+            "eq_pointing_model_enabled": self.eq_pointing_model_enabled,
+            "eq_pointing_model_terms": self.eq_pointing_model_terms,
             "azm_offset": self.azm_offset_str,
             "alt_offset": self.alt_offset_str,
             "azm_limit_min": self.azm_limit_min_str,
@@ -252,9 +294,15 @@ class ConfigState:
         self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)
         self.plate_solve_camera_index = config_dict.get("plate_solve_camera_index", self.plate_solve_camera_index)
         self.alignment_grid_search_cells = config_dict.get("alignment_grid_search_cells", self.alignment_grid_search_cells)
+        self.alignment_settle_tol_deg = config_dict.get("alignment_settle_tol_deg", self.alignment_settle_tol_deg)
+        self.alignment_settle_cycles = config_dict.get("alignment_settle_cycles", self.alignment_settle_cycles)
+        self.alignment_target_rms_arcmin = config_dict.get("alignment_target_rms_arcmin", self.alignment_target_rms_arcmin)
         self.pointing_model_enabled = config_dict.get("pointing_model_enabled", self.pointing_model_enabled)
         if isinstance(config_dict.get("pointing_model_terms"), dict):
             self.pointing_model_terms.update(config_dict["pointing_model_terms"])
+        self.eq_pointing_model_enabled = config_dict.get("eq_pointing_model_enabled", self.eq_pointing_model_enabled)
+        if isinstance(config_dict.get("eq_pointing_model_terms"), dict):
+            self.eq_pointing_model_terms.update(config_dict["eq_pointing_model_terms"])
         self.azm_offset_str = config_dict.get("azm_offset", self.azm_offset_str)
         self.alt_offset_str = config_dict.get("alt_offset", self.alt_offset_str)
 

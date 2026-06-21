@@ -102,22 +102,14 @@ class PointingModel:
 
     # ---- fitting -----------------------------------------------------------
     @classmethod
-    def fit(cls, samples, remove_refraction=False):
-        """Fit a model from samples.
-
-        samples: iterable of (az_cmd, el_cmd, az_obs, el_obs) in degrees, where *_cmd is
-        the nominal commanded sky position and *_obs is the plate-solved truth.
-
-        Returns (model, stats). stats includes per-term coefficients, the sample count,
-        and sky RMS before/after the fit (great-circle, az weighted by cos(el)).
-        """
-        rows = []
-        b = []
-        cmd = []
+    def _solve(cls, samples, remove_refraction, seed_terms, free_terms):
+        """Core least-squares solve for a fixed sample set. Returns
+        (model, cmd, design_cond) where ``cmd`` is the per-sample (az, el, d_az, d_el)
+        raw-error list and ``design_cond`` is the condition number of the (free) design
+        matrix -- a high value flags an ill-posed grid (terms the points can't separate)."""
+        rows, b, cmd = [], [], []
         for az_cmd, el_cmd, az_obs, el_obs in samples:
-            el_obs_geo = el_obs
-            if remove_refraction:
-                el_obs_geo = el_obs - bennett_refraction_deg(el_obs)
+            el_obs_geo = el_obs - bennett_refraction_deg(el_obs) if remove_refraction else el_obs
             d_az = _wrap180(az_obs - az_cmd)
             d_el = el_obs_geo - el_cmd
             row_az, row_el = _design_rows(az_cmd, el_cmd)
@@ -127,10 +119,61 @@ class PointingModel:
 
         A = np.array(rows)
         b = np.array(b)
-        coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-        model = cls({k: coeffs[i] for i, k in enumerate(TERM_NAMES)})
 
-        # RMS before (raw error) and after (residual), great-circle.
+        free_idx = None
+        if free_terms is not None:
+            free_idx = [i for i, k in enumerate(TERM_NAMES) if k in set(free_terms)]
+        if not free_idx:  # full fit (free_terms None, empty, or unrecognised)
+            A_used = A
+            coeffs, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            model = cls({k: coeffs[i] for i, k in enumerate(TERM_NAMES)})
+        else:
+            # Partial fit: hold the non-free terms at their seed values and solve only the
+            # free columns against the residual error they don't explain.
+            seed = {k: 0.0 for k in TERM_NAMES}
+            if seed_terms:
+                seed.update({k: float(v) for k, v in seed_terms.items() if k in seed})
+            p_fixed = np.array([0.0 if i in free_idx else seed[TERM_NAMES[i]] for i in range(len(TERM_NAMES))])
+            A_used = A[:, free_idx]
+            c_free, _, _, _ = np.linalg.lstsq(A_used, b - A @ p_fixed, rcond=None)
+            terms = dict(seed)
+            for j, i in enumerate(free_idx):
+                terms[TERM_NAMES[i]] = float(c_free[j])
+            model = cls(terms)
+
+        try:
+            design_cond = float(np.linalg.cond(A_used)) if A_used.size else float('inf')
+        except np.linalg.LinAlgError:
+            design_cond = float('inf')
+        return model, cmd, design_cond
+
+    @classmethod
+    def fit(cls, samples, remove_refraction=False, seed_terms=None, free_terms=None,
+            robust=False, robust_sigma=4.0, robust_floor_deg=30.0 / 3600.0):
+        """Fit a model from samples.
+
+        samples: iterable of (az_cmd, el_cmd, az_obs, el_obs) in degrees, where *_cmd is
+        the nominal commanded sky position and *_obs is the plate-solved truth.
+
+        ``free_terms`` enables a *partial* (nightly-refresh) fit: only the named terms are
+        solved for, the rest are held fixed at ``seed_terms`` (the previous night's model).
+        The mount's mechanical terms (AN/AW/NPAE/CA/TF) are stable across nights -- only the
+        index errors IA/IE drift with re-leveling/re-homing -- so seeding from last night
+        and refitting just ``["IA", "IE"]`` reaches a good model with a handful of points.
+        When ``free_terms`` is None all seven terms are fit (the full alignment).
+
+        ``robust`` does a second pass that rejects samples whose post-fit sky residual
+        exceeds BOTH ``robust_sigma`` * (MAD-scaled) sigma AND ``robust_floor_deg`` (an
+        absolute floor so tight, clean fits never reject good points), then re-fits on the
+        survivors -- so a single bad plate solve (a mis-match, a satellite/plane in the field)
+        can't drag the whole model. Skipped if it would drop below the minimum fittable count.
+
+        Returns (model, stats). stats includes per-term coefficients, the sample count, the
+        design-matrix condition number, the number of rejected samples (robust), and sky RMS
+        before/after the fit (great-circle, az weighted by cos(el)).
+        """
+        samples = list(samples)
+
         def sky_rms(pairs):
             sq = 0.0
             for az_cmd, el_cmd, d_az, d_el in pairs:
@@ -138,16 +181,38 @@ class PointingModel:
                 sq += (d_az * cE) ** 2 + d_el ** 2
             return math.sqrt(sq / max(1, len(pairs)))
 
+        def residuals(model, cmd):
+            out = []
+            for az_cmd, el_cmd, d_az, d_el in cmd:
+                pr_az, pr_el = model.error(az_cmd, el_cmd)
+                out.append((az_cmd, el_cmd, _wrap180(d_az - pr_az), d_el - pr_el))
+            return out
+
+        model, cmd, design_cond = cls._solve(samples, remove_refraction, seed_terms, free_terms)
+        n_rejected = 0
+        MIN_FIT = 4  # below this a 7-term (or even 2-term) fit is meaningless
+        if robust and len(samples) > MIN_FIT:
+            resid = residuals(model, cmd)
+            # Per-sample sky residual magnitude (same great-circle metric as sky_rms).
+            mags = np.array([math.hypot(d_az * math.cos(math.radians(el_cmd)), d_el)
+                             for az_cmd, el_cmd, d_az, d_el in resid])
+            med = float(np.median(mags))
+            mad = float(np.median(np.abs(mags - med))) or 1e-9
+            thresh = max(med + robust_sigma * 1.4826 * mad, robust_floor_deg)
+            keep = [s for s, m in zip(samples, mags) if m <= thresh]
+            if MIN_FIT < len(keep) < len(samples):
+                n_rejected = len(samples) - len(keep)
+                samples = keep
+                model, cmd, design_cond = cls._solve(samples, remove_refraction, seed_terms, free_terms)
+
         rms_before = sky_rms(cmd)
-        resid = []
-        for az_cmd, el_cmd, d_az, d_el in cmd:
-            pr_az, pr_el = model.error(az_cmd, el_cmd)
-            resid.append((az_cmd, el_cmd, _wrap180(d_az - pr_az), d_el - pr_el))
-        rms_after = sky_rms(resid)
+        rms_after = sky_rms(residuals(model, cmd))
 
         stats = {
             "terms": model.to_config(),
             "n_samples": len(cmd),
+            "n_rejected": n_rejected,
+            "design_cond": design_cond,
             "rms_before_deg": rms_before,
             "rms_after_deg": rms_after,
             "rms_before_arcmin": rms_before * 60.0,

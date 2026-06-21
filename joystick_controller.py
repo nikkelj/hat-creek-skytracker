@@ -200,6 +200,9 @@ class JoystickModeState:
 
         # Tracking mode state
         self.tracking_mode = TrackingMode.STANDBY  # Default to standby mode (user preference)
+        # Tracks the launch_launched edge so pressing "launch" can auto-engage
+        # PROGRAM tracking of the rocket (overriding any selected satellite target).
+        self._prev_launch_launched = False
 
         # Telescope connection state
         self.telescope_connected = False
@@ -420,6 +423,35 @@ class JoystickModeState:
             except Exception as e:
                 print(f"Error sending stop commands: {e}")
             return
+
+        # A launched rocket overrides any current target AND any tracking mode:
+        # drive the launch trajectory directly, every cycle it stays active.
+        # Dispatching here (instead of relying on mode==PROGRAM + the launch
+        # priority inside program_track) makes "launch overrides the selected
+        # satellite" unconditional -- it cannot be defeated by a stray satellite
+        # selection or by whatever mode the operator last left it in. Emergency
+        # STOP still wins (it returned above); toggling the launch off hands
+        # control back to the normal mode dispatch.
+        launch_active = bool(
+            self.tracking_vis_state
+            and getattr(self.tracking_vis_state, 'selected_launch', None)
+            and getattr(self.tracking_vis_state, 'launch_launched', False)
+        )
+        if launch_active:
+            # Drop any selected satellite so it neither competes as a target nor
+            # lingers as the highlighted "selected" object in the sky plots.
+            if getattr(self.tracking_vis_state, 'selected_satellite', None) is not None:
+                self.tracking_vis_state.selected_satellite = None
+            if self.tracking_mode != TrackingMode.PROGRAM:
+                self.tracking_mode = TrackingMode.PROGRAM  # reflect override in the UI
+                self._prev_dispatch_mode = TrackingMode.PROGRAM
+                self._standby_motion_stopped = False
+            if not self._prev_launch_launched:
+                print("LAUNCH: rocket launched -> overriding target, tracking launch trajectory")
+            self._prev_launch_launched = True
+            self._program_track_launch()
+            return
+        self._prev_launch_launched = False
 
         # Reset the STANDBY one-shot stop guard whenever we are in any active
         # mode, so re-entering STANDBY will again issue a single stop.
@@ -890,8 +922,8 @@ class JoystickModeState:
                     # Debug output (throttled)
                     if int(current_time) % 5 == 0:  # Every 5 seconds
                         print(f"PROGRAM TRACK: {selected_sat} | "
-                              f"AZ:{current_azm:.2f}→{target_az_deg:.2f}({az_error:+.2f}) | "
-                              f"EL:{current_alt:.2f}→{target_el_deg:.2f}({el_error:+.2f}) | "
+                              f"AZ:{current_azm:.2f}->{target_az_deg:.2f}({az_error:+.2f}) | "
+                              f"EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | "
                               f"CMD AZ:{az_command} EL:{el_command}")
 
         except Exception as e:
@@ -1070,7 +1102,7 @@ class JoystickModeState:
 
             # Debug output (throttled)
             if int(current_time) % 5 == 0:  # Every 5 seconds
-                print(f"LAUNCH TRACK: {launch_name} | AZ:{current_azm:.2f}→{az_deg:.2f}({az_error:+.2f}) | EL:{current_alt:.2f}→{target_el_deg:.2f}({el_error:+.2f}) | CMD AZ:{az_command} EL:{el_command}")
+                print(f"LAUNCH TRACK: {launch_name} | AZ:{current_azm:.2f}->{az_deg:.2f}({az_error:+.2f}) | EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | CMD AZ:{az_command} EL:{el_command}")
 
         except Exception as e:
             print(f"LAUNCH TRACK: Error in tracking loop: {e}")
@@ -2852,8 +2884,12 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             if event.type == pygame.MOUSEMOTION:
                 tracking_vis_state.hovered_satellite = hovered_sat
 
-            # Handle satellite selection on click
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Handle satellite selection on click. While a launch is active it is
+            # the sole target, so plot clicks must not select/track a satellite
+            # (this also covers a launch-button press that lands over the plot).
+            launch_active = bool(getattr(tracking_vis_state, 'selected_launch', None)
+                                 and getattr(tracking_vis_state, 'launch_launched', False))
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not launch_active:
                 if hovered_sat is not None:
                     if tracking_vis_state.selected_satellite == hovered_sat:
                         tracking_vis_state.selected_satellite = None  # Deselect if clicking same

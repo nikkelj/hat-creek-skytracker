@@ -153,9 +153,16 @@ cython_debug/
 # Project data
 data/
 
+# Post-processing MP4 exports (clips / stabilized movies)
+exports/
+
 # Cached ephemeris
 tle_cache.tle*
 de421.bsp*
+# Disk-backed trajectory cache (regenerated at launch; ~16 MB)
+trajectory_disk_cache.npz*
+# Binary cache of parsed launch/tracking trajectory files (regenerated from sources)
+launches/.traj_cache/
 # Hipparcos star catalogue (downloaded by skyfield for star_catalog.py / tetra3 DB build)
 hip_main.dat*
 # Tycho catalogue (downloaded from CDS for deep/narrow-FOV star rendering + tetra3 DB)

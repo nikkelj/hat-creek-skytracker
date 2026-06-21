@@ -717,6 +717,10 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
     if not satellites_to_draw:
         return
 
+    # While a rocket is actively launched, suppress satellite labels: the launch
+    # is the focus and the dense label cloud is just visual noise (the dots stay).
+    hide_labels = bool(getattr(state, 'launch_launched', False) and getattr(state, 'selected_launch', None))
+
     for sat, (px, py, alt, _) in satellites_to_draw.items():
         # Satellite positions are absolute screen coordinates
         # Convert to surface coordinates based on mode
@@ -774,8 +778,8 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
         if sat == state.hovered_satellite or sat == state.selected_satellite:
             pygame.draw.circle(surface, (255, 255, 0), (draw_px, draw_py), 5, 1)
 
-        # Draw satellite labels efficiently with caching
-        if hasattr(state, 'satellite_labels') and sat in state.satellite_labels:
+        # Draw satellite labels efficiently with caching (hidden during a launch)
+        if not hide_labels and hasattr(state, 'satellite_labels') and sat in state.satellite_labels:
             global SATELLITE_LABEL_FONT, SATELLITE_LABEL_CACHE
 
             # Initialize font if not already done

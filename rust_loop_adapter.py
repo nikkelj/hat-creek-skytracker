@@ -123,6 +123,21 @@ class RustCoreLoopAdapter:
             for msg in loop.drain_status():
                 st.update_status_callback(msg)
 
+        # Launch override: a launched rocket is the sole target. Force PROGRAM and
+        # drive the launch setpoint regardless of the operator's current mode or
+        # any satellite selection -- the Rust loop otherwise only knows satellite
+        # setpoints. Mirrors JoystickModeState.tracking_control()'s launch override
+        # (which the Rust path bypasses entirely).
+        vis = st.tracking_vis_state
+        launch_active = bool(
+            vis and getattr(vis, "selected_launch", None)
+            and getattr(vis, "launch_launched", False)
+        )
+        if launch_active:
+            if getattr(vis, "selected_satellite", None) is not None:
+                vis.selected_satellite = None
+            st.tracking_mode = TrackingMode.PROGRAM
+
         # 2) Push connection/stop/mode + static config.
         loop.set_connected(bool(st.telescope_connected))
         loop.set_stopped(bool(st.stopped))
@@ -134,7 +149,10 @@ class RustCoreLoopAdapter:
         if mode == TrackingMode.RATE_CONTROL:
             self._push_rate(st)
         elif mode == TrackingMode.PROGRAM:
-            self._push_program_setpoint(st)
+            if launch_active:
+                self._push_launch_setpoint(st, cfg)
+            else:
+                self._push_program_setpoint(st)
         elif mode == TrackingMode.HANDOFF:
             # HANDOFF needs BOTH the program setpoint (it keeps program-tracking)
             # and camera frames + hotspot params (it detects in parallel).
@@ -220,9 +238,9 @@ class RustCoreLoopAdapter:
         self.loop.set_rate_cmd(axis_to_rate(axis(2)), axis_to_rate(axis(3)))
 
     def _push_program_setpoint(self, st):
-        """Satellite tracking setpoint. NOTE: launch tracking and below-horizon
-        mask-exit (handled in JoystickModeState.program_track) are deferred; in
-        those cases we clear the setpoint so the loop holds rather than misbehave.
+        """Satellite tracking setpoint. (Launch tracking is handled separately by
+        _push_launch_setpoint, which takes priority in _pump when a launch is
+        active.) A below-horizon satellite clears the setpoint so the loop holds.
         """
         vis = st.tracking_vis_state
         trajectories = getattr(vis, "satellite_trajectories", {}) if vis else {}
@@ -262,6 +280,64 @@ class RustCoreLoopAdapter:
         from control import apply_pointing_model
         biased_az, biased_el = apply_pointing_model(self.config_state, biased_az, biased_el)
         self.loop.set_setpoint(biased_az, biased_el, az_rate_f, el_rate_f)
+
+    def _push_launch_setpoint(self, st, cfg):
+        """Push the active launch trajectory as the program setpoint, so the Rust
+        loop slews to and tracks the rocket. Mirrors
+        JoystickModeState._program_track_launch:
+
+          * Below the elevation mask the rocket isn't trackable yet, so aim at the
+            horizon point nearest the rocket -- its current azimuth at the mask
+            elevation -- and follow that azimuth so the mount is pre-positioned and
+            ready when it rises.
+          * Above the mask, follow the rocket directly with feed-forward + bias.
+        """
+        vis = st.tracking_vis_state
+        name = getattr(vis, "selected_launch", None) if vis else None
+        traj = vis.launch_trajectories.get(name) if (vis and name and getattr(vis, "launch_trajectories", None)) else None
+        if not traj:
+            self.loop.clear_setpoint()
+            return
+
+        # launched=True applies the relative-time indexing (file T-0 + elapsed).
+        px, py, alt, dist, az, az_rate, el_rate = interpolate_position_data_and_rates(
+            traj, vis.current_tt,
+            getattr(vis, "launch_start_time", 0) or 0,
+            bool(getattr(vis, "launch_launched", False)),
+        )
+        if px is None or az is None or alt is None:
+            self.loop.clear_setpoint()
+            return
+
+        try:
+            mask = float(getattr(cfg, "elevation_mask_str", None) or getattr(cfg, "elevation_mask", 10.0) or 10.0)
+        except (TypeError, ValueError):
+            mask = 10.0
+
+        az_rate_f = float(az_rate) if az_rate is not None else 0.0
+        el_rate_f = float(el_rate) if el_rate is not None else 0.0
+
+        below = float(alt) <= mask
+        # Below the mask: hold elevation at the mask (horizon point), still follow
+        # the rocket's azimuth; above it: track the rocket's actual elevation.
+        set_el = mask if below else float(alt)
+        set_el_rate = 0.0 if below else el_rate_f
+
+        # Cache target sky-velocity / elevation for the camera bias-direction axes.
+        st.target_az_rate = az_rate_f
+        st.target_el_rate = set_el_rate
+        st.target_el_deg = set_el
+
+        self.loop.set_ff_enabled(
+            bool(st.feed_forward_azm_enabled), bool(st.feed_forward_alt_enabled)
+        )
+        biased_az, biased_el = st._apply_bias_to_target(
+            float(az), set_el, az_rate_f, set_el_rate
+        )
+        # Pointing-model pre-correction (Rust runs the plain geometric transform).
+        from control import apply_pointing_model
+        biased_az, biased_el = apply_pointing_model(self.config_state, biased_az, biased_el)
+        self.loop.set_setpoint(biased_az, biased_el, az_rate_f, set_el_rate)
 
     def _push_hotspot(self, st, cfg):
         import camera_manager

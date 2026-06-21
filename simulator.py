@@ -131,6 +131,30 @@ def add_noise(frame, read_noise, rng):
     np.clip(frame, 0, None, out=frame)
 
 
+def injected_boresight(config_state, nominal_az_deg, nominal_el_deg):
+    """Where the boresight ACTUALLY lands on the sky (what a plate solve sees) when the
+    mount's encoders nominally read sky (az, el), given the sim's injected error sources.
+
+    Models, in order: the repeatable 7-term alt-az pointing model
+    (``sim_config['mount_pointing_model']``) via PointingModel.predict_observed, then
+    atmospheric refraction (``sim_config['sim_refraction']``) which lifts the apparent
+    elevation. A no-op (returns the input) when neither is configured. This is the inverse
+    problem the alignment routine solves -- injecting it here lets a sim alignment run
+    recover all seven terms end-to-end (not just the encoder-bias IA/IE)."""
+    s = getattr(config_state, 'sim_config', {}) or {}
+    az, el = float(nominal_az_deg), float(nominal_el_deg)
+    terms = s.get('mount_pointing_model') or None
+    if terms and any(abs(float(v)) > 0.0 for v in terms.values()):
+        from pointing_model import PointingModel
+        az, el = PointingModel(terms).predict_observed(az, el)
+    if s.get('sim_refraction', False):
+        from pointing_model import bennett_refraction_deg
+        p = float(s.get('sim_refraction_pressure_mbar', 1010.0))
+        t = float(s.get('sim_refraction_temperature_c', 10.0))
+        el = el + bennett_refraction_deg(el, p, t)  # apparent elevation is higher than geometric
+    return az % 360.0, el
+
+
 # ---------------------------------------------------------------------------
 # Sim mount
 # ---------------------------------------------------------------------------
@@ -480,10 +504,31 @@ class HardwareSimulator:
             cam_az, cam_el = self.mount.az_true_deg, self.mount.el_true_deg
             sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
         else:
-            from transformations import AzAlt2AzEl
-            cam_az, cam_el = AzAlt2AzEl(
-                self.mount.az_true_deg, self.mount.el_true_deg, align_az, align_el)
+            # Equatorial: mount AZM=hour angle, ALT=declination, rotating about the TRUE
+            # polar axis. The sim's true pole can be mis-set (sim_pole_az/alt_err) so a
+            # polar-alignment run has a real error to measure; it defaults to the assumed
+            # pole (north, latitude) -> perfect alignment.
+            from transformations import eq_mount_to_azel
+            lat = float(getattr(cfg, 'lat_str', 0.0) or 0.0)
+            true_pole_az = align_az + float(s.get('sim_pole_az_err_deg', 0.0))
+            base_alt = align_el if align_el != 0.0 else lat
+            true_pole_alt = base_alt + float(s.get('sim_pole_alt_err_deg', 0.0))
+            # Residual mount errors (cone/index/flexure) on top of the polar misalignment:
+            # distort the mount HA/Dec by the injected equatorial model before the pole geometry.
+            h_m, d_m = self.mount.az_true_deg, self.mount.el_true_deg
+            eqterms = s.get('mount_eq_pointing_model') or None
+            if eqterms and any(abs(float(v)) > 0.0 for v in eqterms.values()):
+                from eq_pointing_model import EquatorialPointingModel
+                h_m, d_m = EquatorialPointingModel(eqterms, lat_deg=lat).predict_observed(h_m, d_m)
+            cam_az, cam_el = eq_mount_to_azel(h_m, d_m, true_pole_az, true_pole_alt)
             sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
+
+        # Inject the repeatable pointing-model + refraction error (alt-az only): the boresight
+        # actually lands where predict_observed() says, so the whole rendered field shifts by
+        # the pointing error and an alignment run can recover the seven terms end-to-end.
+        if mount_mode == 'AltAz':
+            cam_az, cam_el = injected_boresight(cfg, cam_az, cam_el)
+
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 
         brightness = float(s.get('target_brightness', 200.0))

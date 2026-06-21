@@ -13,6 +13,7 @@ import pygame
 
 from pointing_model import TERM_NAMES
 import alignment as al
+import polar_align as pa
 
 
 def _btn(surface, rect, label, font, bg=(70, 70, 70), fg=(255, 255, 255)):
@@ -164,10 +165,6 @@ def draw_alignment_options(display, config_state, align_state, joystick_state=No
     screen.blit(display.large_font.render("Pointing-Model Alignment", True, (255, 255, 255)), (x0, y0))
 
     mount_mode = getattr(config_state, 'mount_mode', 'AltAz')
-    if mount_mode != 'AltAz':
-        screen.blit(display.font.render(
-            f"Alignment supports AltAz mount mode only (current: {mount_mode}).",
-            True, (255, 180, 120)), (x0, y0 + 44))
 
     running = align_state.phase in (al.RUNNING, al.BACKTEST)
 
@@ -195,6 +192,23 @@ def draw_alignment_options(display, config_state, align_state, joystick_state=No
          bg=(110, 50, 50) if connected else (60, 60, 60))
     display.align_connect_rect = conn_rect
     display.align_disconnect_rect = disc_rect
+
+    # This button slot is mode-dependent: in Eq mode it runs plate-solve POLAR ALIGNMENT (the
+    # fast dusk tool for field-rotation-free imaging); in AltAz mode it runs a QUICK REFIT of
+    # the index errors (IA/IE) holding the stable mechanical terms at the configured model.
+    is_eq = mount_mode == 'Eq'
+    quick_rect = pygame.Rect(x0 + 676, y0 + 44, 150, 34)
+    polar_running = bool(getattr(align_state, 'polar', None)) and align_state.polar.phase == pa.RUNNING
+    if is_eq:
+        _btn(screen, quick_rect, "Polar Align", display.small_font,
+             bg=(120, 90, 40) if (not polar_running and not running) else (90, 80, 50))
+    else:
+        pm_terms = getattr(config_state, 'pointing_model_terms', None) or {}
+        has_model = any(abs(float(pm_terms.get(k, 0.0))) > 1e-9 for k in ("AN", "AW", "NPAE", "CA", "TF"))
+        _btn(screen, quick_rect, "Quick Refit (IA/IE)", display.small_font,
+             bg=(40, 110, 110) if (has_model and not running) else (60, 60, 60))
+    display.align_quick_rect = quick_rect
+
     readout = "mount: not connected"
     if connected:
         try:
@@ -206,7 +220,7 @@ def draw_alignment_options(display, config_state, align_state, joystick_state=No
             readout = f"mount  Az {saz:6.1f}°  El {sel:5.1f}°"
         except Exception:
             readout = "mount: connected"
-    screen.blit(display.small_font.render(readout, True, (170, 200, 230)), (x0 + 676, y0 + 54))
+    screen.blit(display.small_font.render(readout, True, (170, 200, 230)), (x0, y0 + 184))
 
     # n_points stepper.
     npts = int(getattr(align_state, 'requested_points', 18))
@@ -221,8 +235,9 @@ def draw_alignment_options(display, config_state, align_state, joystick_state=No
     display.align_points_minus = minus
     display.align_points_plus = plus
 
-    # Pointing-model master toggle.
-    pm_on = bool(getattr(config_state, 'pointing_model_enabled', False))
+    # Pointing-model master toggle (mode-aware: alt-az or equatorial model).
+    pm_attr = 'eq_pointing_model_enabled' if is_eq else 'pointing_model_enabled'
+    pm_on = bool(getattr(config_state, pm_attr, False))
     pm_rect = pygame.Rect(x0 + 250, y0 + 86, 130, 26)
     _btn(screen, pm_rect, f"Model: {'ON' if pm_on else 'OFF'}", display.small_font,
          bg=(20, 110, 60) if pm_on else (90, 60, 60))
@@ -300,19 +315,29 @@ def draw_alignment_options(display, config_state, align_state, joystick_state=No
         pass  # the manual banner already owns the right-header band
     elif align_state.stats is not None:
         st = align_state.stats
+        nrej = int(st.get('n_rejected', 0) or 0)
+        rej_txt = f"  (-{nrej} outlier{'s' if nrej != 1 else ''})" if nrej else ""
         screen.blit(display.font.render(
             f"Fit RMS: {st['rms_before_arcmin']:.2f}'  ->  {st['rms_after_arcmin']:.2f}'  "
-            f"(n={st['n_samples']})", True, (200, 255, 200)), (rhx, y0 + 40))
+            f"(n={st['n_samples']}{rej_txt})", True, (200, 255, 200)), (rhx, y0 + 40))
         if align_state.backtest_rms_deg is not None:
             screen.blit(display.font.render(
                 f"Backtest RMS (held-out): {align_state.backtest_rms_deg * 60.0:.2f}'",
                 True, (180, 230, 255)), (rhx, y0 + 64))
         terms = align_state.model.terms
-        for i, k in enumerate(TERM_NAMES):
+        for i, k in enumerate(terms):  # alt-az (IA/IE/...) or equatorial (IH/ID/...) by model
             col = rhx + (i % 3) * 150
             row = (y0 + 94) + (i // 3) * 22
             screen.blit(display.small_font.render(f"{k}: {terms[k]:+.4f}°", True, (230, 230, 200)),
                         (col, row))
+        # Warn when the sampled geometry can't cleanly separate the terms (ill-conditioned).
+        cond = float(st.get('design_cond', 0.0) or 0.0)
+        if cond > 1e3:
+            screen.blit(display.small_font.render(
+                f"⚠ ill-conditioned grid (cond {cond:.0f}) - spread points wider in az/el",
+                True, (255, 200, 120)), (rhx, (y0 + 94) + 3 * 22))
+    elif is_eq:
+        _draw_polar_results(display, align_state, rhx, y0 + 40)
     else:
         _draw_prereqs(display, config_state, joystick_state, rhx, y0 + 40)
 
@@ -345,10 +370,12 @@ def handle_alignment_click(pos, display, config_state, align_state, joystick_sta
         return True
 
     if getattr(display, 'align_model_toggle_rect', None) and display.align_model_toggle_rect.collidepoint(pos):
-        config_state.pointing_model_enabled = not bool(getattr(config_state, 'pointing_model_enabled', False))
+        attr = ('eq_pointing_model_enabled' if getattr(config_state, 'mount_mode', 'AltAz') == 'Eq'
+                else 'pointing_model_enabled')
+        setattr(config_state, attr, not bool(getattr(config_state, attr, False)))
         config_state.save_to_file()
-        status_messages.append(
-            f"Pointing model {'ENABLED' if config_state.pointing_model_enabled else 'DISABLED'}")
+        kind = 'Equatorial' if attr.startswith('eq_') else 'Alt-az'
+        status_messages.append(f"{kind} pointing model {'ENABLED' if getattr(config_state, attr) else 'DISABLED'}")
         return True
 
     # View toggle (camera <-> tables) for the right panel.
@@ -394,7 +421,10 @@ def handle_alignment_click(pos, display, config_state, align_state, joystick_sta
         runner = getattr(align_state, 'runner', None)
         if runner is not None:
             runner.abort()
-            status_messages.append("Alignment abort requested")
+        pstate = getattr(align_state, 'polar', None)
+        if pstate is not None and getattr(pstate, 'runner', None) is not None:
+            pstate.runner.abort()
+        status_messages.append("Alignment abort requested")
         return True
 
     if getattr(display, 'align_accept_rect', None) and display.align_accept_rect.collidepoint(pos):
@@ -409,6 +439,14 @@ def handle_alignment_click(pos, display, config_state, align_state, joystick_sta
         _retry_failed(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages)
         return True
 
+    # Mode-dependent button: Polar Align (Eq) or Quick Refit IA/IE (AltAz).
+    if getattr(display, 'align_quick_rect', None) and display.align_quick_rect.collidepoint(pos):
+        if getattr(config_state, 'mount_mode', 'AltAz') == 'Eq':
+            _start_polar_align(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages)
+        else:
+            _start_quick_refit(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages)
+        return True
+
     if getattr(display, 'align_start_rect', None) and display.align_start_rect.collidepoint(pos):
         _start_alignment(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages)
         return True
@@ -420,8 +458,9 @@ def _start_alignment(config_state, align_state, joystick_state, tracking_vis_sta
     if align_state.phase in (al.RUNNING, al.BACKTEST):
         status_messages.append("Alignment already running")
         return
-    if getattr(config_state, 'mount_mode', 'AltAz') != 'AltAz':
-        status_messages.append("Alignment requires AltAz mount mode")
+    mode = getattr(config_state, 'mount_mode', 'AltAz')
+    if mode not in ('AltAz', 'Eq'):
+        status_messages.append("Alignment requires AltAz or Eq mount mode")
         return
 
     sampler = _prepare_alignment_run(config_state, align_state, joystick_state,
@@ -435,8 +474,105 @@ def _start_alignment(config_state, align_state, joystick_state, tracking_vis_sta
     runner = al.AlignmentRunner(align_state, config_state, sampler, n_points=npts)
     align_state.runner = runner
     runner.start()
-    status_messages.append(f"Alignment started ({npts} points, cam{sampler.cam_index + 1}, "
-                           f"DB {sampler.solver.db_name})")
+    model_kind = "equatorial" if mode == 'Eq' else "alt-az"
+    status_messages.append(f"{model_kind.capitalize()} alignment started ({npts} points, "
+                           f"cam{sampler.cam_index + 1}, DB {sampler.solver.db_name})")
+
+
+def _start_polar_align(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages):
+    """Plate-solve polar alignment (Eq mode): rotate the RA axis through a span, solve each,
+    fit the RA-axis direction, and report the az/alt knob correction to the true pole."""
+    pstate = getattr(align_state, 'polar', None)
+    if pstate is not None and pstate.phase == pa.RUNNING:
+        status_messages.append("Polar align already running")
+        return
+    if getattr(config_state, 'mount_mode', 'AltAz') != 'Eq':
+        status_messages.append("Polar align is for Eq mount mode")
+        return
+    lat = float(getattr(config_state, 'lat_str', 0.0) or 0.0)
+    if lat == 0.0:
+        status_messages.append("Set site latitude first (Config) - needed for the pole direction")
+        return
+
+    gs = _prepare_alignment_run(config_state, align_state, joystick_state,
+                                tracking_vis_state, ts, status_messages)
+    if gs is None:
+        return
+    # True celestial pole in the local horizontal frame: north (az 0) at altitude=|lat| in the
+    # northern hemisphere, south (az 180) in the southern.
+    target_az = 0.0 if lat >= 0 else 180.0
+    target_alt = abs(lat)
+    sampler = pa.make_polar_sampler(gs.joystick_state, gs.config_state, gs.solver, gs.ts,
+                                    gs.ephemeris, gs.cam_index, state=None)
+    pstate = pa.PolarAlignState()
+    align_state.polar = pstate
+    sampler.state = pstate
+    runner = pa.PolarAlignRunner(pstate, config_state, sampler, target_az, target_alt,
+                                 n_points=6, dec_deg=20.0, ha_span_deg=90.0)
+    pstate.runner = runner
+    runner.start()
+    status_messages.append(f"Polar align started (6 RA steps, cam{gs.cam_index + 1})")
+
+
+def _draw_polar_results(display, align_state, x, y):
+    """Render polar-alignment status / measured error in the right-header band (Eq mode)."""
+    screen = display.menu_screen
+    pstate = getattr(align_state, 'polar', None)
+    if pstate is None:
+        screen.blit(display.font.render("Polar Align (Eq): rotate RA axis, solve, fit the pole.",
+                                        True, (210, 220, 235)), (x, y))
+        screen.blit(display.small_font.render(
+            "Press Polar Align to measure the polar-axis error, then dial it out on the knobs.",
+            True, (160, 175, 195)), (x, y + 26))
+        return
+    screen.blit(display.font.render(f"Polar Align: {pstate.status or pstate.phase}",
+                                    True, (210, 230, 255)), (x, y))
+    done, total = pstate.progress
+    if total:
+        screen.blit(display.small_font.render(f"step {done}/{total}", True, (200, 210, 220)),
+                    (x, y + 26))
+    r = getattr(pstate, 'result', None)
+    if r is not None:
+        screen.blit(display.font.render(f"Polar error: {r['total_deg']:.2f}°",
+                                        True, (200, 255, 200)), (x, y + 48))
+        screen.blit(display.small_font.render(
+            f"Azimuth: move pole {abs(r['az_error']):.2f}° {r['az_dir']}",
+            True, (235, 225, 200)), (x, y + 74))
+        screen.blit(display.small_font.render(
+            f"Altitude: move pole {abs(r['alt_error']):.2f}° {r['alt_dir']}",
+            True, (235, 225, 200)), (x, y + 94))
+
+
+def _start_quick_refit(config_state, align_state, joystick_state, tracking_vis_state, ts, status_messages):
+    """Fast nightly refresh: re-fit only the index errors IA/IE from a handful of points,
+    holding the stable mechanical terms at the currently-configured model. Mechanical terms
+    (axis tilts, non-perpendicularity, collimation, flexure) don't change night to night --
+    only the zero-points drift with re-leveling -- so this reaches a good model in ~1 minute."""
+    if align_state.phase in (al.RUNNING, al.BACKTEST):
+        status_messages.append("Alignment already running")
+        return
+    if getattr(config_state, 'mount_mode', 'AltAz') != 'AltAz':
+        status_messages.append("Alignment requires AltAz mount mode")
+        return
+    seed = dict(getattr(config_state, 'pointing_model_terms', None) or {})
+    if not any(abs(float(seed.get(k, 0.0))) > 1e-9 for k in ("AN", "AW", "NPAE", "CA", "TF")):
+        status_messages.append("No baseline model to seed - run a full Start Alignment first")
+        return
+
+    sampler = _prepare_alignment_run(config_state, align_state, joystick_state,
+                                     tracking_vis_state, ts, status_messages)
+    if sampler is None:
+        return
+
+    npts = 8  # IA/IE need only a small, well-spread set of points
+    align_state.reset()
+    align_state.requested_points = npts
+    runner = al.AlignmentRunner(align_state, config_state, sampler, n_points=npts,
+                                holdout_frac=0.25, seed_terms=seed, free_terms=["IA", "IE"],
+                                target_rms_arcmin=0.0)
+    align_state.runner = runner
+    runner.start()
+    status_messages.append(f"Quick refit started (IA/IE, {npts} points, cam{sampler.cam_index + 1})")
 
 
 def _prepare_alignment_run(config_state, align_state, joystick_state, tracking_vis_state,

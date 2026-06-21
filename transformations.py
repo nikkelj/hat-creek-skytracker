@@ -273,6 +273,49 @@ def AzEl2AzAlt_Passthrough(az, el):
     # Passthrough: sky coordinates are mount coordinates
     return az, el
 
+def _eq_basis(pole_az_deg, pole_alt_deg):
+    """Orthonormal equatorial basis (z=pole, x=upper-meridian equator, y=west) in the local
+    horizontal frame, for a polar axis pointing at (pole_az, pole_alt).
+
+    For a correctly polar-aligned mount in the northern hemisphere pole_az=0 (north) and
+    pole_alt=latitude. Letting the pole be an arbitrary direction is what makes this model
+    able to represent (and the polar-alignment routine able to measure) a mis-set polar axis.
+    """
+    p = cartesian_from_az_el(pole_az_deg, pole_alt_deg)        # celestial pole (z_eq)
+    up = np.array([0.0, 0.0, 1.0])
+    x = up - np.dot(up, p) * p                                 # H=0, dec=0 (upper meridian)
+    nx = np.linalg.norm(x)
+    if nx < 1e-9:                                              # pole at zenith: pick a meridian
+        x = np.array([1.0, 0.0, 0.0]) - p[0] * p
+        x /= np.linalg.norm(x)
+    else:
+        x /= nx
+    y = np.cross(p, x)                                         # west on the equator
+    return p, x, y
+
+
+def eq_mount_to_azel(ha_deg, dec_deg, pole_az_deg, pole_alt_deg):
+    """Equatorial mount axes (hour angle, declination) -> true horizontal (az, el).
+
+    AZM motor = hour angle (increases westward), ALT motor = declination. The mapping is a
+    pure rotation about the polar axis, so a sidereal target is tracked by turning HA alone.
+    """
+    p, x, y = _eq_basis(pole_az_deg, pole_alt_deg)
+    H = math.radians(ha_deg)
+    d = math.radians(dec_deg)
+    v = (math.cos(d) * math.cos(H)) * x + (math.cos(d) * math.sin(H)) * y + math.sin(d) * p
+    return az_el_from_cartesian(v)
+
+
+def azel_to_eq_mount(az_deg, el_deg, pole_az_deg, pole_alt_deg):
+    """Inverse of :func:`eq_mount_to_azel`: true horizontal (az, el) -> (hour angle, dec)."""
+    p, x, y = _eq_basis(pole_az_deg, pole_alt_deg)
+    v = cartesian_from_az_el(az_deg, el_deg)
+    dec = math.degrees(math.asin(float(np.clip(np.dot(v, p), -1.0, 1.0))))
+    ha = math.degrees(math.atan2(float(np.dot(v, y)), float(np.dot(v, x))))
+    return ha, dec
+
+
 def compute_fov_for_camera(pixel_size_um, focal_length_mm, roi_width_pct, roi_height_pct,
                           camera_width_pixels, camera_height_pixels):
     """

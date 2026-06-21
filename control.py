@@ -298,6 +298,24 @@ def apply_pointing_model(config_state, target_az_deg, target_el_deg):
         return target_az_deg, target_el_deg
 
 
+def apply_eq_pointing_model(config_state, target_ha_deg, target_dec_deg):
+    """Correct a desired (hour-angle, dec) through the configured equatorial pointing model.
+
+    Returns the commanded (HA, Dec) to feed the mount transform. A no-op when disabled.
+    The Eq counterpart of apply_pointing_model; applied in HA/Dec space in the Eq branch.
+    """
+    if not getattr(config_state, 'eq_pointing_model_enabled', False):
+        return target_ha_deg, target_dec_deg
+    try:
+        from eq_pointing_model import EquatorialPointingModel
+        lat = float(getattr(config_state, 'lat_str', 0.0) or 0.0)
+        model = EquatorialPointingModel(getattr(config_state, 'eq_pointing_model_terms', None), lat_deg=lat)
+        return model.correct(target_ha_deg, target_dec_deg)
+    except Exception as e:
+        print(f"Eq pointing-model correction skipped: {e}")
+        return target_ha_deg, target_dec_deg
+
+
 def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg, target_az_deg, target_el_deg):
     """
     Compute position error between current mount position and target position.
@@ -317,7 +335,7 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
         tuple: (az_error_deg, el_error_deg) - errors in degrees
     """
     # Check mount mode and use appropriate transformation
-    mount_mode = getattr(config_state, 'mount_mode', 'Eq')
+    mount_mode = getattr(config_state, 'mount_mode', 'AltAz')
 
     if mount_mode == 'AltAz':
         # Import here to avoid circular import
@@ -345,18 +363,21 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
             target_el_deg
         )
     else:
-        # Use full equatorial transformation for Eq mode
-        # Import here to avoid circular import
-        from transformations import local_elev_az_to_telescope #AzEl2AzAlt
-        local_elev_az_to_telescope(target_el_deg, target_az_deg, lat_deg=float(config_state.alignment_elevation_str))
-
-        # Convert target sky position to mount coordinates 
-        # target_azm_deg, target_alt_deg = AzEl2AzAlt(
-        #    target_az_deg,
-        #    target_el_deg,
-        #    float(config_state.alignment_azimuth_str),
-        #    float(config_state.alignment_elevation_str)
-        #)
+        # Equatorial mode: convert the target sky position to mount (hour-angle, dec) axes
+        # for a polar axis pointing at (pole_az, pole_alt). pole_az defaults to due north
+        # (alignment_azimuth) and pole_alt to the site latitude unless an explicit polar-axis
+        # elevation has been entered (alignment_elevation, the "Eq" field in the config UI).
+        from transformations import azel_to_eq_mount
+        pole_az = float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0)
+        pole_alt = float(getattr(config_state, 'alignment_elevation_str', 0.0) or 0.0)
+        if pole_alt == 0.0:
+            pole_alt = float(getattr(config_state, 'lat_str', 0.0) or 0.0)
+        target_ha_deg, target_dec_deg = azel_to_eq_mount(
+            target_az_deg, target_el_deg, pole_az, pole_alt)
+        # Pointing-model pre-step (HA/Dec space): correct the desired axes so the imperfect
+        # mount lands the boresight on target. Kept Python-only, like the AltAz path.
+        target_azm_deg, target_alt_deg = apply_eq_pointing_model(
+            config_state, target_ha_deg, target_dec_deg)
 
     # Compute error in mount coordinates
     azm_error_deg = target_azm_deg - current_azm_deg

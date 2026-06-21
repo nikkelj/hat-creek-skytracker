@@ -85,6 +85,24 @@ class TestObjectSamplerPath(unittest.TestCase):
         self.assertEqual(len(state.samples), len(state.fit_points))
 
 
+class TestSolveFailures(unittest.TestCase):
+    def test_total_solve_failure_errors_gracefully(self):
+        """When nothing solves (clouds / wrong DB / no stars) and grid search is disabled,
+        the run fails cleanly with a helpful message and every point is retryable -- it must
+        not crash or fit garbage."""
+        from alignment import ERROR
+        state = AlignmentState()
+        state.pause_on_fail = False
+        sampler = FakeSampler(fail_until=10_000)  # never solves
+        runner = AlignmentRunner(state, _cfg(), sampler, n_points=20, grid_cells=0)
+        runner.run()
+        self.assertEqual(state.phase, ERROR)
+        self.assertIsNone(state.model)
+        self.assertLess(len(state.samples), MIN_SAMPLES)
+        self.assertGreater(len(state.failed_points), 0)
+        self.assertIn("failed", state.error)
+
+
 class TestRetryFailed(unittest.TestCase):
     def test_failed_point_then_retry_appends_and_refits(self):
         # With a 12-cell grid search, fail the nominal + all 12 grid offsets of point 1

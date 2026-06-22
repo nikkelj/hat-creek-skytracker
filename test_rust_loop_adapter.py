@@ -29,8 +29,10 @@ class FakeMount:
     def __init__(self):
         self.az = 0.0
         self.el = 0.0
+        self.focus = 0.0
         self.azr = 0.0
         self.elr = 0.0
+        self.focusr = 0.0
         self.t = time.time()
         self.lock = threading.Lock()
 
@@ -40,11 +42,17 @@ class FakeMount:
         self.t = now
         self.az = (self.az + self.azr * dt) % 360.0
         self.el += self.elr * dt
+        self.focus = (self.focus + self.focusr * dt) % 360.0
 
     def hc_get_position(self, target):
         with self.lock:
             self._adv()
-            v = self.el if target == Targets.ALT else self.az
+            if target == Targets.ALT:
+                v = self.el
+            elif target == Targets.FOCUS:
+                v = self.focus
+            else:
+                v = self.az
             return (v % 360.0) / 360.0
 
     def hc_slew_fixed(self, target, rate):
@@ -53,6 +61,8 @@ class FakeMount:
             dps = (1.0 if rate >= 0 else -1.0) * RATES.get(abs(int(rate)), 0.0) * 360.0
             if target == Targets.ALT:
                 self.elr = dps
+            elif target == Targets.FOCUS:
+                self.focusr = dps
             else:
                 self.azr = dps
             return True
@@ -95,8 +105,8 @@ def fake_config():
 
 
 def fake_state(controller, mode, joystick=None):
-    from joystick_controller import TrackingMode
-    return types.SimpleNamespace(
+    from joystick_controller import JoystickModeState, TrackingMode
+    st = types.SimpleNamespace(
         telescope_connected=True,
         telescope_controller=controller,
         update_status_callback=None,
@@ -114,7 +124,17 @@ def fake_state(controller, mode, joystick=None):
         azm_pid_output=0.0, alt_pid_output=0.0,
         hotspot_snr=0.0, hotspot_status="", hotspot_acquired=False, hotspot_centroid=None,
         azm_display_str="--", alt_display_str="--",
+        # Focus motor state: the adapter drives focus directly off the controller
+        # via the real JoystickModeState methods (bound below). Triggers are
+        # pre-"seen" so a pressed value commands immediately in the test.
+        focus_axis_forward=5, focus_axis_backward=4,
+        _focus_trigger_seen={4: True, 5: True}, _focus_last_rate=0,
+        focus_rate=0, current_focus=0,
     )
+    # Exercise the production focus code (not stubs) through the adapter.
+    st._handle_focus_control = types.MethodType(JoystickModeState._handle_focus_control, st)
+    st._poll_focus_position = types.MethodType(JoystickModeState._poll_focus_position, st)
+    return st
 
 
 @unittest.skipUnless(_HAVE_CORE, "skytracker_core not built (run `maturin develop`)")
@@ -138,6 +158,27 @@ class AdapterTests(unittest.TestCase):
         self.assertGreater(fm.az, 0.5, "fake mount AZM should have advanced")
         self.assertTrue(st.position_fresh)
         self.assertGreater(st.current_azm, 0.5, "read-back should reflect motion")
+
+    def test_focus_driven_on_rust_path(self):
+        # The Rust loop doesn't own the focus axis, so the adapter must command it
+        # directly off the controller and read its position back. Hold R2 (axis 5
+        # = +1) and confirm the focus advances and the read-back reflects it.
+        from joystick_controller import TrackingMode
+        from rust_loop_adapter import RustCoreLoopAdapter
+
+        fm = FakeMount()
+        joy = FakeJoystick([0.0, 0.0, 0.0, 0.0, -1.0, 1.0])  # axis 5 (R2) = full +
+        st = fake_state(fm, TrackingMode.STANDBY, joystick=joy)
+        adapter = RustCoreLoopAdapter(st, fake_config(), target_hz=50)
+        adapter.start()
+        try:
+            time.sleep(1.2)
+        finally:
+            adapter.stop()
+            adapter.join(timeout=2.0)
+        self.assertGreater(fm.focus, 0.5, "focus axis should have advanced under +R2")
+        self.assertEqual(st.focus_rate, 9, "R2 fully pressed maps to focus rate +9")
+        self.assertGreater(st.current_focus, 0, "focus position should read back")
 
     def test_disconnected_is_safe(self):
         from joystick_controller import TrackingMode

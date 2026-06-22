@@ -98,6 +98,12 @@ class MountControlThread(threading.Thread):
         azm_raw = controller.hc_get_position(Targets.AZM) * 360.0
         alt_raw = controller.hc_get_position(Targets.ALT) * 360.0
 
+        # Focus encoder read-back for the joystick-mode display. The focus motor
+        # is commanded from the triggers inside tracking_control() below; this
+        # only reads its position back. (Commanding lives there so this poll stays
+        # a pure read.)
+        state._poll_focus_position()
+
         offset_azm = float(getattr(cfg, 'azm_offset_str', 0.0) or 0.0)
         offset_alt = float(getattr(cfg, 'alt_offset_str', 0.0) or 0.0)
 

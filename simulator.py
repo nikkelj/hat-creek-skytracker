@@ -173,6 +173,12 @@ class SimMount:
         self.el_true_deg = el0_deg
         self._az_rate_dps = 0.0   # signed deg/sec
         self._el_rate_dps = 0.0
+        # Focus motor: a third rate-commanded axis on the same encoder/rate
+        # convention as az/el. It carries no misalignment/backlash/periodic
+        # error (those model the two mechanical mount axes), just a clean
+        # integrator so the focus read-back tracks the trigger commands.
+        self.focus_true_deg = 0.0
+        self._focus_rate_dps = 0.0
         self._last_t = time.time()
         self._t0 = self._last_t
         self._lock = threading.RLock()
@@ -228,6 +234,8 @@ class SimMount:
         self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
         self.az_true_deg = (self.az_true_deg + d_az) % 360.0
         self.el_true_deg = self.el_true_deg + d_el
+        # Focus integrates straight from its commanded rate (no backlash/PE).
+        self.focus_true_deg = (self.focus_true_deg + self._focus_rate_dps * dt) % 360.0
 
     def _apply_backlash(self, attr, delta, band):
         """Pass a commanded delta through a backlash dead-zone of total width
@@ -273,6 +281,8 @@ class SimMount:
             s = self._sim()
             if target == Targets.ALT:
                 val = self._encoder(self.el_true_deg, float(s.get('mount_misalignment_el_deg', 0.0)))
+            elif target == Targets.FOCUS:
+                val = self.focus_true_deg
             else:
                 val = self._encoder(self.az_true_deg, float(s.get('mount_misalignment_az_deg', 0.0)))
             return (val % 360.0) / 360.0
@@ -284,6 +294,8 @@ class SimMount:
             dps = sign * RATES.get(abs(int(rate)), 0.0) * 360.0
             if target == Targets.ALT:
                 self._el_rate_dps = dps
+            elif target == Targets.FOCUS:
+                self._focus_rate_dps = dps
             else:
                 self._az_rate_dps = dps
             return True
@@ -296,6 +308,9 @@ class SimMount:
             if target == Targets.ALT:
                 self.el_true_deg = deg
                 self._el_rate_dps = 0.0
+            elif target == Targets.FOCUS:
+                self.focus_true_deg = deg % 360.0
+                self._focus_rate_dps = 0.0
             else:
                 self.az_true_deg = deg % 360.0
                 self._az_rate_dps = 0.0

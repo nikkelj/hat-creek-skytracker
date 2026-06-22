@@ -137,8 +137,13 @@ impl Clock {
 pub struct SimResponder {
     pub az_true_deg: f64,
     pub el_true_deg: f64,
+    /// Focus motor: a third rate-commanded axis on the same encoder/rate
+    /// convention as az/el, integrated cleanly (no misalignment) so a focus
+    /// read-back follows the focus move commands.
+    pub focus_true_deg: f64,
     az_rate_dps: f64,
     el_rate_dps: f64,
+    focus_rate_dps: f64,
     last_t: f64,
     clock: Clock,
     pub mis_az_deg: f64,
@@ -150,8 +155,10 @@ impl SimResponder {
         Self {
             az_true_deg: az0_deg,
             el_true_deg: el0_deg,
+            focus_true_deg: 0.0,
             az_rate_dps: 0.0,
             el_rate_dps: 0.0,
+            focus_rate_dps: 0.0,
             last_t: 0.0,
             clock: Clock::Wall(std::time::Instant::now()),
             mis_az_deg: 0.0,
@@ -183,6 +190,7 @@ impl SimResponder {
         }
         self.az_true_deg = (self.az_true_deg + self.az_rate_dps * dt).rem_euclid(360.0);
         self.el_true_deg += self.el_rate_dps * dt;
+        self.focus_true_deg = (self.focus_true_deg + self.focus_rate_dps * dt).rem_euclid(360.0);
     }
 
     /// Decode one 8-byte 'P' request and produce the response bytes
@@ -202,6 +210,8 @@ impl SimResponder {
             self.advance();
             let (true_deg, mis) = if dest == protocol::targets::ALT {
                 (self.el_true_deg, self.mis_el_deg)
+            } else if dest == protocol::targets::FOCUS {
+                (self.focus_true_deg, 0.0)
             } else {
                 (self.az_true_deg, self.mis_az_deg)
             };
@@ -215,6 +225,8 @@ impl SimResponder {
             let dps = sign * protocol::rate(data[0]) * 360.0;
             if dest == protocol::targets::ALT {
                 self.el_rate_dps = dps;
+            } else if dest == protocol::targets::FOCUS {
+                self.focus_rate_dps = dps;
             } else {
                 self.az_rate_dps = dps;
             }
@@ -232,6 +244,8 @@ impl SimResponder {
             let dps = sign * protocol::unpack_int3(&data) * 360.0;
             if dest == protocol::targets::ALT {
                 self.el_rate_dps = dps;
+            } else if dest == protocol::targets::FOCUS {
+                self.focus_rate_dps = dps;
             } else {
                 self.az_rate_dps = dps;
             }
@@ -242,6 +256,9 @@ impl SimResponder {
             if dest == protocol::targets::ALT {
                 self.el_true_deg = deg;
                 self.el_rate_dps = 0.0;
+            } else if dest == protocol::targets::FOCUS {
+                self.focus_true_deg = deg.rem_euclid(360.0);
+                self.focus_rate_dps = 0.0;
             } else {
                 self.az_true_deg = deg.rem_euclid(360.0);
                 self.az_rate_dps = 0.0;

@@ -2,6 +2,7 @@ import pygame
 import serial
 import serial.tools.list_ports
 import math
+import numpy as np
 import time
 import threading
 from collections import deque
@@ -138,10 +139,10 @@ def joystick_center_layout(display):
     ch = bottom - top
     valid = cw >= 120 and ch >= 220
 
-    nb_side = max(60, min(cw, int(ch * 0.42), 150))
+    nb_side = max(60, min(cw, int(ch * 0.52), 210))
     navball = pygame.Rect(left + (cw - nb_side) // 2, top + 6, nb_side, nb_side)
 
-    charts_top = navball.bottom + 24
+    charts_top = navball.bottom + 28
     chart_h = max(40, (bottom - charts_top - 8) // 2)
     chart_rate = pygame.Rect(left, charts_top, cw, chart_h)
     chart_err = pygame.Rect(left, charts_top + chart_h + 8, cw, chart_h)
@@ -3378,6 +3379,68 @@ def render_tracking_strip_charts(display, joystick_state):
     ], active, scale=err_scale)
 
 
+_NAVBALL_GRID_CACHE = {}
+
+
+def _navball_grid(R):
+    """Per-pixel orthographic backprojection grid for a navball of radius R,
+    cached because R only changes on window resize. For each pixel inside the
+    disc, (NX, NY) are its camera-plane coords in [-1, 1] and NZ is the implied
+    front-hemisphere depth (sqrt(1 - NX^2 - NY^2)); MASK marks in-disc pixels.
+    The hemisphere fill is then a single vectorized sign test per frame."""
+    g = _NAVBALL_GRID_CACHE.get(R)
+    if g is None:
+        size = 2 * R
+        ix = np.arange(size, dtype=np.float32)
+        PX, PY = np.meshgrid(ix, ix, indexing='ij')   # [screen_x, screen_y]
+        NX = (PX - R + 0.5) / R
+        NY = (R - PY - 0.5) / R                        # +Y is screen-up
+        RR = NX * NX + NY * NY
+        MASK = RR <= 1.0
+        NZ = np.sqrt(np.clip(1.0 - RR, 0.0, 1.0))
+        g = (NX, NY, NZ, MASK)
+        _NAVBALL_GRID_CACHE[R] = g
+    return g
+
+
+def _navball_active_target(tvs):
+    """Resolve the target the navball should overlay, mirroring how PROGRAM
+    tracking picks one: a selected satellite first, then a selected launch.
+
+    Returns (traj_data, cur_tt, sunlit_list, tgt_az, tgt_el) or None. traj_data
+    is the (rows, times_array) pair whose rows carry [1]=elevation, [2]=azimuth
+    (true sky frame, same as the navball). sunlit_list is the per-point sunlit
+    cache when available (satellites), else None."""
+    if tvs is None:
+        return None
+    cur_tt = getattr(tvs, 'current_tt', None)
+
+    sat = getattr(tvs, 'selected_satellite', None)
+    sat_trajs = getattr(tvs, 'satellite_trajectories', None) or {}
+    if sat is not None and sat_trajs.get(sat):
+        traj = sat_trajs[sat]
+        try:
+            sunlit = getattr(tvs, 'sunlit_status_cache', {}).get(sat.name)
+        except Exception:
+            sunlit = None
+        res = interpolate_position_data_and_rates(traj, cur_tt)
+        tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
+        return traj, cur_tt, sunlit, tgt[0], tgt[1]
+
+    lname = getattr(tvs, 'selected_launch', None)
+    launch_trajs = getattr(tvs, 'launch_trajectories', None) or {}
+    if lname and launch_trajs.get(lname):
+        traj = launch_trajs[lname]
+        res = interpolate_position_data_and_rates(
+            traj, cur_tt,
+            getattr(tvs, 'launch_start_time', 0) or 0,
+            getattr(tvs, 'launch_launched', False))
+        tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
+        return traj, cur_tt, None, tgt[0], tgt[1]
+
+    return None
+
+
 def render_navball(display, joystick_state):
     """Render a KSP-style navball in the center of the upper-left quadrant,
     showing the mount's current attitude (azimuth = heading tape, elevation =
@@ -3413,65 +3476,212 @@ def render_navball(display, joystick_state):
             az, el = AzAlt2AzEl(joystick_state.current_azm,
                                 joystick_state.current_alt, align_az, align_el)
         az = az % 360.0
-        el = max(-90.0, min(90.0, el))
+        # Do NOT clamp elevation. Past-zenith / past-nadir mount angles are
+        # valid orientations (e.g. ALT=350 -> el=100, i.e. 10 deg past zenith on
+        # the far side). The spherical projection below rotates correctly through
+        # the poles; the readout normalizes a copy for human-readable Az/El.
     else:
         az = el = 0.0
 
     # Title above the ball.
     display.menu_screen.blit(display.small_font.render("Navball", True, (220, 220, 230)),
-                             (rect.x, rect.y - 18))
+                             (rect.x, rect.y - 20))
 
-    ball = pygame.Surface((2 * R, 2 * R), pygame.SRCALPHA)
+    # KSP-style palette.
+    SKY = (86, 150, 220)          # upper hemisphere (light blue)
+    GROUND = (150, 110, 70)       # lower hemisphere (tan/brown)
+    HORIZON = (250, 250, 252)     # equator (horizon) great circle
+    SKY_LINE = (225, 234, 246)    # parallels above the horizon
+    GND_LINE = (212, 196, 176)    # parallels below the horizon
+    MERIDIAN = (206, 210, 222)    # azimuth meridians (vertical tines)
+    CARDINAL = (255, 230, 110)    # N / E / S / W
+    INTER = (214, 218, 228)       # NE / SE / SW / NW
+    BEZEL = (188, 190, 200)
+    YELLOW = (255, 214, 0)        # boresight aircraft reticle
+    COLORKEY = (1, 2, 3)          # transparent sentinel for the square fill
+
     bcx, bcy = R, R
 
-    # Sky / ground split at the horizon; pitch-up drives the horizon downward.
-    horizon_y = int(bcy + (el / 90.0) * R)
-    ball.fill((60, 110, 200))                                   # sky
-    pygame.draw.rect(ball, (150, 95, 55), (0, horizon_y, 2 * R, 2 * R))  # ground
-    pygame.draw.line(ball, (255, 255, 255), (0, horizon_y), (2 * R, horizon_y), 2)
+    # --- Camera basis from the current pointing direction (az, el) -----------
+    # World axes: X=east, Y=up, Z=north. A sky point (a, e) is the unit vector
+    # v = (cos e sin a, sin e, cos e cos a). The ball is oriented so the current
+    # pointing sits at the front center; screen-up follows increasing elevation.
+    a0, e0 = math.radians(az), math.radians(el)
+    ce0, se0 = math.cos(e0), math.sin(e0)
+    sa0, ca0 = math.sin(a0), math.cos(a0)
+    Zc = (ce0 * sa0, se0, ce0 * ca0)                       # out of screen (front)
+    Yc = (-se0 * sa0, ce0, -se0 * ca0)                     # screen up (+pitch)
+    Xc = (Yc[1] * Zc[2] - Yc[2] * Zc[1],                   # screen right = Yc x Zc
+          Yc[2] * Zc[0] - Yc[0] * Zc[2],
+          Yc[0] * Zc[1] - Yc[1] * Zc[0])
 
-    # Pitch ladder (ticks every 30 deg; current pitch sits at center).
-    for a in range(-60, 91, 30):
-        if a == 0:
+    def proj(az_deg, el_deg):
+        """Orthographic projection of a sky point to ball-local pixels.
+        Returns (sx, sy, z); the point is on the visible front hemisphere when
+        z > 0 (and is then guaranteed to fall inside the disc)."""
+        ar, er = math.radians(az_deg), math.radians(el_deg)
+        ce = math.cos(er)
+        vx, vy, vz = ce * math.sin(ar), math.sin(er), ce * math.cos(ar)
+        z = vx * Zc[0] + vy * Zc[1] + vz * Zc[2]
+        x = vx * Xc[0] + vy * Xc[1] + vz * Xc[2]
+        y = vx * Yc[0] + vy * Yc[1] + vz * Yc[2]
+        return bcx + x * R, bcy - y * R, z
+
+    def draw_curve(samples, color, width):
+        """Draw a sky curve (list of (az, el)), broken into runs at the limb."""
+        run = []
+        for a_deg, e_deg in samples:
+            sx, sy, z = proj(a_deg, e_deg)
+            if z > 0.0:
+                run.append((int(sx), int(sy)))
+            elif len(run) >= 2:
+                pygame.draw.lines(ball, color, False, run, width)
+                run = []
+            else:
+                run = []
+        if len(run) >= 2:
+            pygame.draw.lines(ball, color, False, run, width)
+
+    # --- Hemisphere fill (vectorized backprojection) -------------------------
+    # A pixel's world-up component is up.(NX*Xc + NY*Yc + NZ*Zc); its sign tells
+    # sky from ground. (Xc[1], Yc[1], Zc[1]) is world-up expressed in the camera
+    # frame, so the whole disc resolves in one numpy expression.
+    NX, NY, NZ, MASK = _navball_grid(R)
+    vy_grid = Xc[1] * NX + Yc[1] * NY + Zc[1] * NZ
+    size = 2 * R
+    rgb = np.empty((size, size, 3), dtype=np.uint8)
+    rgb[:] = COLORKEY
+    rgb[MASK & (vy_grid >= 0.0)] = SKY
+    rgb[MASK & (vy_grid < 0.0)] = GROUND
+    ball = pygame.surfarray.make_surface(rgb)
+    ball.set_colorkey(COLORKEY)
+
+    # --- Grid: alt parallels (rings) + azimuth meridians (tines) -------------
+    az_samples = range(0, 361, 5)
+    el_samples = range(-85, 86, 5)
+    for az_line in range(0, 360, 30):                       # vertical az tines
+        draw_curve([(az_line, e) for e in el_samples], MERIDIAN, 1)
+    for el_line in range(-80, 81, 10):                      # horizontal alt rings
+        if el_line == 0:
             continue
-        y = bcy + ((el - a) / 90.0) * R
-        if 2 <= y <= 2 * R - 2:
-            half = R * 0.22
-            pygame.draw.line(ball, (225, 225, 225), (bcx - half, y), (bcx + half, y), 1)
-            t = display.tiny_font.render(f"{a}", True, (225, 225, 225))
-            ball.blit(t, (bcx + half + 2, y - 5))
+        col = SKY_LINE if el_line > 0 else GND_LINE
+        draw_curve([(a, el_line) for a in az_samples],
+                   col, 2 if el_line % 30 == 0 else 1)
+    draw_curve([(a, 0) for a in az_samples], HORIZON, 3)    # horizon last, bright
 
-    # Heading tape across the upper third; current azimuth at center, 90 deg ~ R.
-    tape_y = int(R * 0.30)
-    for h, lbl in ((0, "N"), (45, "NE"), (90, "E"), (135, "SE"),
-                   (180, "S"), (225, "SW"), (270, "W"), (315, "NW")):
-        d = ((h - az + 180) % 360) - 180
-        x = bcx + (d / 90.0) * R
-        if 2 <= x <= 2 * R - 2:
-            cardinal = len(lbl) == 1
-            col = (255, 235, 130) if cardinal else (190, 190, 200)
-            t = display.tiny_font.render(lbl, True, col)
-            ball.blit(t, (x - t.get_width() // 2, tape_y))
-            pygame.draw.line(ball, col, (x, tape_y + 12), (x, tape_y + 17), 1)
+    # Pitch numerals: green-on-dark chips parked in a gap between two azimuth
+    # tines (off the central column where the reticle/meridian hid them).
+    LABEL_FG, LABEL_BG = (130, 255, 140), (16, 26, 18)
+    gap_az = math.floor(az / 30.0) * 30.0 + 15.0       # midway between tines
+    for el_line in range(-60, 61, 30):
+        if el_line == 0:
+            continue
+        sx, sy, z = proj(gap_az, el_line)
+        if z > 0.0:
+            t = display.tiny_font.render(f"{el_line:+d}", True, LABEL_FG, LABEL_BG)
+            ball.blit(t, (int(sx) - t.get_width() // 2, int(sy) - t.get_height() // 2))
 
-    # Clip the square down to a disc via an alpha mask.
-    mask = pygame.Surface((2 * R, 2 * R), pygame.SRCALPHA)
-    pygame.draw.circle(mask, (255, 255, 255, 255), (R, R), R)
-    ball.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    # Cardinal / intercardinal letters sit where their meridian meets the horizon.
+    HEADINGS = {0: "N", 45: "NE", 90: "E", 135: "SE",
+                180: "S", 225: "SW", 270: "W", 315: "NW"}
+    for h, lbl in HEADINGS.items():
+        sx, sy, z = proj(h, 0)
+        if z <= 0.0:
+            continue
+        col = CARDINAL if len(lbl) == 1 else INTER
+        t = display.tiny_font.render(lbl, True, col)
+        ball.blit(t, (int(sx) - t.get_width() // 2,
+                      int(sy) - t.get_height() - 2))
+
+    # --- Target trajectory + current target crosshair (mirrors the skyplot) --
+    # Painted onto the ball surface so it is clipped to the disc and rides under
+    # the boresight reticle. Trajectory: grey=past, yellow=sunlit future,
+    # red=shadowed future. Target: purple crosshair at the live target az/el.
+    PURPLE = (205, 95, 255)
+    target = _navball_active_target(getattr(joystick_state, 'tracking_vis_state', None)) \
+        if connected else None
+    if target is not None:
+        traj, cur_tt, sunlit, tgt_az, tgt_el = target
+        rows, times_array = traj
+        prev = None                                    # previous visible point
+        for i, row in enumerate(rows):
+            t_el, t_az = float(row[1]), float(row[2])
+            sx, sy, z = proj(t_az, t_el)
+            if t_el <= 0.0 or z <= 0.0:                 # below horizon / back side
+                prev = None
+                continue
+            pt = (int(sx), int(sy))
+            if prev is not None:
+                future = (cur_tt is None) or (times_array[i] > cur_tt)
+                if not future:
+                    col = (130, 130, 130)
+                elif sunlit is not None and i < len(sunlit):
+                    col = (255, 255, 0) if sunlit[i] else (255, 80, 80)
+                else:
+                    col = (255, 255, 0)
+                pygame.draw.line(ball, col, prev, pt, 2)
+            prev = pt
+
+        if tgt_az is not None:
+            sx, sy, z = proj(tgt_az, tgt_el)
+            if z > 0.0:
+                tx, ty = int(sx), int(sy)
+                rr = max(6, int(R * 0.075))
+                pygame.draw.circle(ball, PURPLE, (tx, ty), rr, 2)
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    pygame.draw.line(ball, PURPLE, (tx + dx * rr, ty + dy * rr),
+                                     (tx + dx * (rr + 6), ty + dy * (rr + 6)), 2)
+                pygame.draw.circle(ball, PURPLE, (tx, ty), 1)
+
     display.menu_screen.blit(ball, (cx - R, cy - R))
 
-    # Bezel + fixed boresight reticle.
-    pygame.draw.circle(display.menu_screen, (180, 180, 190), (cx, cy), R, 2)
-    pygame.draw.circle(display.menu_screen, (255, 255, 0), (cx, cy), 3, 1)
-    pygame.draw.line(display.menu_screen, (255, 255, 0), (cx - 13, cy), (cx - 4, cy), 2)
-    pygame.draw.line(display.menu_screen, (255, 255, 0), (cx + 4, cy), (cx + 13, cy), 2)
-    pygame.draw.line(display.menu_screen, (255, 255, 0), (cx, cy - 13), (cx, cy - 4), 2)
+    # Bezel ring with 30-deg tick marks and a fixed heading index at the top.
+    pygame.draw.circle(display.menu_screen, BEZEL, (cx, cy), R, 2)
+    for deg in range(0, 360, 30):
+        ang = math.radians(deg - 90)
+        ca, sa = math.cos(ang), math.sin(ang)
+        pygame.draw.line(display.menu_screen, BEZEL,
+                         (int(cx + (R + 1) * ca), int(cy + (R + 1) * sa)),
+                         (int(cx + (R + 7) * ca), int(cy + (R + 7) * sa)), 2)
+    pygame.draw.polygon(display.menu_screen, CARDINAL,
+                        [(cx, cy - R + 1), (cx - 6, cy - R - 9), (cx + 6, cy - R - 9)])
 
-    # Readout below the ball.
-    readout = f"Az {az:5.1f}°  El {el:+5.1f}°" if connected else "Az --   El --"
-    rc = (200, 255, 200) if connected else (150, 150, 150)
-    t = display.tiny_font.render(readout, True, rc)
-    display.menu_screen.blit(t, (cx - t.get_width() // 2, cy + R + 4))
+    # Fixed boresight reticle: KSP-style yellow aircraft "waterline" marker.
+    r0 = max(4, int(R * 0.055))
+    wing = max(10, int(R * 0.20))
+    drop = max(3, wing // 3)
+    pygame.draw.circle(display.menu_screen, YELLOW, (cx, cy), r0, 2)
+    for sx in (-1, 1):
+        x_in = cx + sx * (r0 + 2)
+        x_out = cx + sx * (r0 + wing)
+        pygame.draw.line(display.menu_screen, YELLOW, (x_in, cy), (x_out, cy), 3)
+        pygame.draw.line(display.menu_screen, YELLOW, (x_out, cy), (x_out, cy + drop), 3)
+    pygame.draw.line(display.menu_screen, YELLOW,
+                     (cx, cy - r0 - 2), (cx, cy - r0 - max(5, wing // 2)), 3)
+
+    # Green HDG / PITCH readout box below the ball (KSP instrument styling).
+    box_w, box_h = int(2 * R * 0.92), 20
+    box_x, box_y = cx - box_w // 2, cy + R + 8
+    pygame.draw.rect(display.menu_screen, (16, 26, 18), (box_x, box_y, box_w, box_h))
+    pygame.draw.rect(display.menu_screen, (70, 110, 80), (box_x, box_y, box_w, box_h), 1)
+    if connected:
+        # Normalize for display: fold past-pole orientations back into a valid
+        # azimuth/elevation pair (el in [-90, 90], az flipped 180 over a pole).
+        el_disp = ((el + 180.0) % 360.0) - 180.0
+        az_disp = az
+        if el_disp > 90.0:
+            el_disp, az_disp = 180.0 - el_disp, az_disp + 180.0
+        elif el_disp < -90.0:
+            el_disp, az_disp = -180.0 - el_disp, az_disp + 180.0
+        az_disp %= 360.0
+        readout = f"HDG {az_disp:05.1f}°   PITCH {el_disp:+5.1f}°"
+        rc = (130, 255, 140)
+    else:
+        readout = "HDG ---.-°   PITCH --.-°"
+        rc = (110, 130, 110)
+    t = display.small_font.render(readout, True, rc)
+    display.menu_screen.blit(t, (cx - t.get_width() // 2,
+                                 box_y + (box_h - t.get_height()) // 2))
 
     if not connected:
         scrim = pygame.Surface((2 * R, 2 * R), pygame.SRCALPHA)

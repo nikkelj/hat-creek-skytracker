@@ -115,6 +115,28 @@ class RenderDetectTests(unittest.TestCase):
         streaked = sim.render_frame(0).astype(np.int32).sum()
         self.assertGreater(streaked, static)
 
+    def test_stars_render_past_zenith(self):
+        # Regression: ALT past zero tips the boresight just past the zenith, where
+        # the AltAz transform el = 90 - ALT leaves [-90, 90] (ALT=355 -> el=-265).
+        # Un-normalized, every star failed the visibility gate and a near-zenith
+        # frame rendered empty even though the FOV was pointed at the sky.
+        sim = self._sim((999.0, 999.0, None, False))  # stars only, no target
+        sim.config_state.sim_config["star_density"] = 1500
+        sim._stars = None  # force regen at the higher density
+        bg = float(sim.config_state.sim_config.get("background_level", 6.0))
+        thr = bg + 15.0
+
+        def star_pixels(az, alt):
+            sim.mount.az_true_deg, sim.mount.el_true_deg = az, alt
+            return int((sim.render_frame(0) > thr).sum())
+
+        baseline = star_pixels(100.0, 60.0)     # el 30, well above horizon (sanity)
+        past_zenith = star_pixels(0.0, 355.0)    # ALT 355 == -5 -> el 85, near zenith
+
+        self.assertGreater(baseline, 0, "sanity: stars should render above horizon")
+        self.assertGreater(past_zenith, 0,
+                           "stars must render with ALT past zero (boresight near zenith)")
+
 
 class InjectedErrorTests(unittest.TestCase):
     """The sim can inject a full pointing model + refraction so an alignment run recovers

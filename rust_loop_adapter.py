@@ -138,6 +138,16 @@ class RustCoreLoopAdapter:
                 vis.selected_satellite = None
             st.tracking_mode = TrackingMode.PROGRAM
 
+        # 1b) Focus motor. The Rust loop doesn't own the focus axis, so drive it
+        #     directly off the Python controller (its internal lock serializes
+        #     these calls with the loop's own traffic). Mirrors the Python loop,
+        #     where focus is commanded in tracking_control() and read back in the
+        #     poll cycle -- neither of which runs on the Rust path.
+        joy = st.joysticks.get(st.connected_joystick) if st.connected_joystick is not None else None
+        if joy is not None:
+            st._handle_focus_control(joy)
+        st._poll_focus_position()
+
         # 2) Push connection/stop/mode + static config.
         loop.set_connected(bool(st.telescope_connected))
         loop.set_stopped(bool(st.stopped))

@@ -76,6 +76,33 @@ fn program_tracks_a_moving_setpoint() {
 }
 
 #[test]
+fn focus_axis_moves_and_reads_back_independently() {
+    // A focus move (MC_MOVE on Targets::FOCUS) integrates a separate focus axis
+    // and must NOT disturb az/el — the regression this guards is FOCUS being
+    // folded into the azimuth branch.
+    use skytracker_core::protocol::targets::{ALT, AZM, FOCUS};
+    let mut mount = Mount::new(LoopbackTransport::new(SimResponder::new_manual(0.0, 0.0)));
+
+    mount.hc_slew_fixed(FOCUS, 9).unwrap(); // max forward focus rate (10 deg/s)
+    mount.io.responder.advance_time(1.0);
+
+    let focus = mount.hc_get_position(FOCUS).unwrap() * 360.0;
+    let az = mount.hc_get_position(AZM).unwrap() * 360.0;
+    let alt = mount.hc_get_position(ALT).unwrap() * 360.0;
+    // Tolerance is the 24-bit encoder LSB (360/2^24 ≈ 2.1e-5 deg) from the
+    // pack/unpack round-trip, not a physics error.
+    assert!((focus - 10.0).abs() < 1e-3, "focus advanced to {}", focus);
+    assert!(az.abs() < 1e-6, "azimuth must be undisturbed, got {}", az);
+    assert!(alt.abs() < 1e-6, "altitude must be undisturbed, got {}", alt);
+
+    // Stopping the focus rate freezes the position.
+    mount.hc_slew_fixed(FOCUS, 0).unwrap();
+    mount.io.responder.advance_time(1.0);
+    let focus2 = mount.hc_get_position(FOCUS).unwrap() * 360.0;
+    assert!((focus2 - 10.0).abs() < 1e-3, "focus held at {}", focus2);
+}
+
+#[test]
 fn poll_fault_skips_cycle_safely() {
     // A short-read transport makes every poll fail; the loop must skip cycles
     // and never panic or publish a fresh position.

@@ -40,6 +40,30 @@ def wrap180(deg):
     return (deg + 180.0) % 360.0 - 180.0
 
 
+def normalize_azel(az_deg, el_deg):
+    """Fold an (az, el) pointing to canonical horizontal coordinates: az in
+    [0, 360) and el in [-90, 90].
+
+    The AltAz mount transform is ``el = 90 - ALT``, which is unbounded: e.g.
+    ALT=350 (= -10, i.e. tipped 10 deg past zenith) yields el = -260 rather than
+    a physical elevation. Left un-normalized that breaks every consumer that
+    treats el as a sky elevation -- the star/target visibility gate (which
+    compares against el in [-90, 90]), cos(el), and the refraction model -- so a
+    near-zenith frame renders empty. Tipping past the zenith (|el| > 90) points
+    the boresight at the opposite azimuth, so fold el back into range and flip az
+    by 180 deg accordingly.
+    """
+    el = (el_deg + 180.0) % 360.0 - 180.0   # wrap to (-180, 180]
+    az = az_deg
+    if el > 90.0:
+        el = 180.0 - el
+        az += 180.0
+    elif el < -90.0:
+        el = -180.0 - el
+        az += 180.0
+    return az % 360.0, el
+
+
 # ---------------------------------------------------------------------------
 # Geometry (pure)
 # ---------------------------------------------------------------------------
@@ -173,6 +197,12 @@ class SimMount:
         self.el_true_deg = el0_deg
         self._az_rate_dps = 0.0   # signed deg/sec
         self._el_rate_dps = 0.0
+        # Focus motor: a third rate-commanded axis on the same encoder/rate
+        # convention as az/el. It carries no misalignment/backlash/periodic
+        # error (those model the two mechanical mount axes), just a clean
+        # integrator so the focus read-back tracks the trigger commands.
+        self.focus_true_deg = 0.0
+        self._focus_rate_dps = 0.0
         self._last_t = time.time()
         self._t0 = self._last_t
         self._lock = threading.RLock()
@@ -228,6 +258,8 @@ class SimMount:
         self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
         self.az_true_deg = (self.az_true_deg + d_az) % 360.0
         self.el_true_deg = self.el_true_deg + d_el
+        # Focus integrates straight from its commanded rate (no backlash/PE).
+        self.focus_true_deg = (self.focus_true_deg + self._focus_rate_dps * dt) % 360.0
 
     def _apply_backlash(self, attr, delta, band):
         """Pass a commanded delta through a backlash dead-zone of total width
@@ -273,6 +305,8 @@ class SimMount:
             s = self._sim()
             if target == Targets.ALT:
                 val = self._encoder(self.el_true_deg, float(s.get('mount_misalignment_el_deg', 0.0)))
+            elif target == Targets.FOCUS:
+                val = self.focus_true_deg
             else:
                 val = self._encoder(self.az_true_deg, float(s.get('mount_misalignment_az_deg', 0.0)))
             return (val % 360.0) / 360.0
@@ -284,6 +318,8 @@ class SimMount:
             dps = sign * RATES.get(abs(int(rate)), 0.0) * 360.0
             if target == Targets.ALT:
                 self._el_rate_dps = dps
+            elif target == Targets.FOCUS:
+                self._focus_rate_dps = dps
             else:
                 self._az_rate_dps = dps
             return True
@@ -296,6 +332,9 @@ class SimMount:
             if target == Targets.ALT:
                 self.el_true_deg = deg
                 self._el_rate_dps = 0.0
+            elif target == Targets.FOCUS:
+                self.focus_true_deg = deg % 360.0
+                self._focus_rate_dps = 0.0
             else:
                 self.az_true_deg = deg % 360.0
                 self._az_rate_dps = 0.0
@@ -319,6 +358,8 @@ class SimMount:
             q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
             if target == Targets.ALT:
                 self._el_rate_dps = q
+            elif target == Targets.FOCUS:
+                self._focus_rate_dps = q
             else:
                 self._az_rate_dps = q
             return True
@@ -327,6 +368,7 @@ class SimMount:
         with self._lock:
             self._az_rate_dps = 0.0
             self._el_rate_dps = 0.0
+            self._focus_rate_dps = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +564,12 @@ class HardwareSimulator:
                 h_m, d_m = EquatorialPointingModel(eqterms, lat_deg=lat).predict_observed(h_m, d_m)
             cam_az, cam_el = eq_mount_to_azel(h_m, d_m, true_pole_az, true_pole_alt)
             sky_az_rate, sky_el_rate = self.mount.az_rate_dps, self.mount.el_rate_dps
+
+        # Fold the boresight to canonical (az in [0,360), el in [-90,90]) so the
+        # downstream visibility gate / cos(el) / refraction see a physical
+        # elevation. Without this, an ALT past zero (el = 90 - ALT goes out of
+        # range) renders an empty field even though the FOV is near zenith.
+        cam_az, cam_el = normalize_azel(cam_az, cam_el)
 
         # Inject the repeatable pointing-model + refraction error (alt-az only): the boresight
         # actually lands where predict_observed() says, so the whole rendered field shifts by

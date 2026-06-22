@@ -148,6 +148,10 @@ def main():
     jms.current_alt = 90.0 - hw.mount.el_true_deg
     jms.azm_display_str = f"{jms.current_azm:.1f}"
     jms.alt_display_str = f"{jms.current_alt:.1f}"
+    # Focus motor: show it mid-travel with a small extend command so the focus
+    # readout in joystick mode isn't blank in the screenshot.
+    jms.focus_rate = 3
+    jms.current_focus = int(round(hw.mount.focus_true_deg / 360.0 * (2 ** 24)))
 
     cur_tt = ts.now().tt
 

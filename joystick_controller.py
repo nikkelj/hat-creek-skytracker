@@ -301,6 +301,10 @@ class JoystickModeState:
         self._focus_last_rate = 0
         self._focus_trigger_seen = {4: False, 5: False}
         self.focus_rate = 0              # last commanded rate (for display)
+        # Focus encoder read-back for display: raw 24-bit position counts
+        # (hc_get_position returns a fraction of a revolution; *2**24 is the
+        # underlying MC_GET_POSITION count). Refreshed each control cycle.
+        self.current_focus = 0
 
         # HANDOFF mode: run PROGRAM track while the hotspot detector evaluates the
         # frame in parallel; auto-engage HOTSPOT after N consecutive detections.
@@ -570,6 +574,19 @@ class JoystickModeState:
                 self.focus_rate = rate
             except Exception as e:
                 print(f"Focus control error: {e}")
+
+    def _poll_focus_position(self):
+        """Refresh the focus encoder read-back for the UI. Cheap single read of
+        the FOCUS axis position, stored as raw 24-bit counts. Driven directly off
+        the controller so it works under either control loop; a read fault just
+        leaves the last value in place (never stalls the caller)."""
+        if self.telescope_controller is None or not self.telescope_connected:
+            return
+        try:
+            frac = self.telescope_controller.hc_get_position(Targets.FOCUS)
+            self.current_focus = int(round(frac * (2 ** 24)))
+        except Exception:
+            pass
 
     def _handle_rate_control(self, joy):
         """Handle the original rate control logic with hardware safety limits"""
@@ -1820,6 +1837,39 @@ def render_joystick_status(display, joystick_state):
         val_text = display.tiny_font.render(f"{ax_label}: {axis_val:+.2f}", True, (255, 255, 255))
         display.menu_screen.blit(val_text, (slider_x + slider_width + 10, slider_y))
         current_y += slider_height + 8
+
+    # Focus motor: the L2/R2 triggers above drive it (L2 = retract/-, R2 = extend
+    # /+). Show the commanded rate as a centre-zero bar plus the live encoder
+    # read-back so the operator can see focus moving.
+    tele_connected = joystick_state.telescope_connected
+    focus_rate = int(getattr(joystick_state, 'focus_rate', 0))
+    focus_pos = int(getattr(joystick_state, 'current_focus', 0))
+
+    focus_label = display.small_font.render("Focus (L2-/R2+):", True, (255, 255, 255))
+    display.menu_screen.blit(focus_label, (base_x, current_y))
+    current_y += 20
+
+    bar_w, bar_h = 100, 12
+    bar_x, bar_y = base_x, current_y
+    pygame.draw.rect(display.menu_screen, (80, 80, 80), (bar_x, bar_y, bar_w, bar_h))
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), (bar_x, bar_y, bar_w, bar_h), 1)
+    center_x = bar_x + bar_w // 2
+    pygame.draw.line(display.menu_screen, (150, 150, 150),
+                     (center_x, bar_y), (center_x, bar_y + bar_h), 1)
+    pos_color, neg_color, idle_color = (0, 220, 0), (240, 140, 0), (200, 200, 200)
+    if focus_rate != 0:
+        fill = int(max(-1.0, min(1.0, focus_rate / 9.0)) * (bar_w // 2))
+        fill_color = pos_color if focus_rate > 0 else neg_color
+        x0 = center_x if fill >= 0 else center_x + fill
+        pygame.draw.rect(display.menu_screen, fill_color, (x0, bar_y + 1, abs(fill), bar_h - 1))
+
+    rate_color = pos_color if focus_rate > 0 else neg_color if focus_rate < 0 else idle_color
+    rate_text = display.tiny_font.render(f"rate {focus_rate:+d}", True, rate_color)
+    display.menu_screen.blit(rate_text, (bar_x + bar_w + 10, bar_y - 2))
+    pos_str = f"pos {focus_pos}" if tele_connected else "pos --"
+    pos_text = display.tiny_font.render(pos_str, True, (0, 255, 0) if tele_connected else (160, 160, 160))
+    display.menu_screen.blit(pos_text, (bar_x + bar_w + 10, bar_y + 9))
+    current_y += bar_h + 10
 
     # Hat information
     num_hats = joy.get_numhats() if connected else 0

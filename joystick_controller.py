@@ -78,6 +78,10 @@ def button_function_map(joystick_state=None):
 JL_LEAD_MIN = 0.0
 JL_LEAD_MAX = 0.5
 
+# ADS-B linear-fit slider: number of recent fixes fit for trajectory prediction.
+JL_ADSB_FIT_MIN = 2
+JL_ADSB_FIT_MAX = 20
+
 
 def _draw_disabled_scrim(display, rect):
     """Draw a translucent grey scrim over a panel to show it is visible but
@@ -114,11 +118,23 @@ def joystick_panel_layout(display):
     plate_x = qx + qw - plate_w - 12
     plate_y = max(qy + 104, diag_y - plate_h - 12)
 
+    # ADS-B pane: top-center band, above the navball and between the left
+    # status block and the right-hand panes / position-display box (which already
+    # own the top-left and top-right corners).
+    center_left = qx + 280
+    center_right = qx + qw - 250 - 14
+    center_w = max(150, center_right - center_left)
+    adsb_w = min(260, center_w)
+    adsb_x = center_left + (center_w - adsb_w) // 2
+    adsb_y = qy + 4
+    adsb_h = 82
+
     return {
         'pid': pygame.Rect(pid_x, pid_y, pid_w, pid_h),
         'bias': pygame.Rect(bias_x, bias_y, bias_w, bias_h),
         'diag': pygame.Rect(diag_x, diag_y, diag_w, diag_h),
         'plate': pygame.Rect(plate_x, plate_y, plate_w, plate_h),
+        'adsb': pygame.Rect(adsb_x, adsb_y, adsb_w, adsb_h),
     }
 
 
@@ -224,6 +240,24 @@ class JoystickModeState:
         self.last_solve = None        # dict: result, az, el, align_az, t, mount_azm/alt
         self.plate_solve_status = ""
         self.ps_button_rects = []
+
+        # ADS-B receiver (RTL-SDR aircraft tracking). The receiver owns the SDR
+        # source thread + the aircraft tracker; it's created lazily on first
+        # connect so the app starts without the SDR libs installed.
+        self.adsb = None                       # AdsbReceiver instance (lazy)
+        self.adsb_connected = False
+        self.adsb_status = ""
+        self.adsb_connect_button_hover = False
+        self.adsb_disconnect_button_hover = False
+        self.adsb_button_rects = {}            # {'connect': rect, 'disconnect': rect}
+
+        # Skyplot "Targets" overlay (filters + sortable passes/launches table) in
+        # the upper-right quadrant. Always-on toggle strip; panel opens on demand.
+        self.targets_panel_open = False
+        self.jl_target_btn_rects = {}          # {'targets'|'sats'|'labels': rect}
+        self.jl_filter_rects = {}              # {'filter'|'filter_above_alt'|'filter_below_alt': rect}
+        self.jl_clear_filters_rect = None
+        self.jl_pass_table_rect = None         # table bounding box (for wheel hit-test)
 
         # UI state
         self.connect_button_hover = False
@@ -405,6 +439,30 @@ class JoystickModeState:
         self.telescope_controller = None
         self.telescope_connected = False
         print("Disconnected from telescope")
+
+    def connect_adsb(self):
+        """Connect the RTL-SDR ADS-B receiver and start sampling aircraft. The
+        receiver is created on first use (deps imported lazily there)."""
+        if self.adsb is None:
+            from adsb_receiver import AdsbReceiver
+            self.adsb = AdsbReceiver(
+                self.config_state, self.tracking_vis_state,
+                ts=getattr(self.tracking_vis_state, 'ts', None) or self.ts,
+                update_status=self.update_status_callback)
+            if self.tracking_vis_state is not None:
+                self.tracking_vis_state.adsb_tracker = self.adsb.tracker
+        ok = self.adsb.connect()
+        self.adsb_connected = self.adsb.connected
+        self.adsb_status = self.adsb.status
+        return ok
+
+    def disconnect_adsb(self):
+        """Stop the ADS-B receiver (the tracked aircraft fade out via pruning)."""
+        if self.adsb is not None:
+            self.adsb.disconnect()
+            self.adsb_status = self.adsb.status
+        self.adsb_connected = False
+        print("Disconnected from ADS-B receiver")
 
     def tracking_control(self):
         """Handle tracking control based on connected joystick and tracking mode"""
@@ -760,14 +818,17 @@ class JoystickModeState:
             # Launch is actively tracking - follow launch trajectory
             return self._program_track_launch()
 
-        # Check if satellite is selected
-        if self.tracking_vis_state is None or self.tracking_vis_state.selected_satellite is None:
-            # No satellite selected - switch to STANDBY and send message
+        # Resolve the program target: a selected satellite first, then a selected
+        # aircraft (ADS-B). Both supply the same 8-column trajectory format, so the
+        # rest of the loop (bias, feed-forward, limits, PID) is target-agnostic.
+        target_traj, target_kind, target_key = active_program_trajectory(self.tracking_vis_state)
+        if target_traj is None:
+            # Nothing selected - switch to STANDBY and send message
             self.tracking_mode = TrackingMode.STANDBY
             if self.update_status_callback:
-                self.update_status_callback("Select a satellite for PROGRAM tracking")
+                self.update_status_callback("Select a satellite or aircraft for PROGRAM tracking")
             else:
-                print("PROGRAM TRACK: No satellite selected - switched to STANDBY mode")
+                print("PROGRAM TRACK: No target selected - switched to STANDBY mode")
             return
 
         # Ensure PID controllers are initialized
@@ -809,12 +870,11 @@ class JoystickModeState:
             current_azm = self.current_azm
             current_alt = self.current_alt
 
-            # Get target position from satellite trajectory
-            selected_sat = self.tracking_vis_state.selected_satellite
-            if self.tracking_vis_state and selected_sat in self.tracking_vis_state.satellite_trajectories:
-                # Interpolate current satellite position and rates
+            # Get target position from the resolved trajectory (satellite or aircraft)
+            if target_traj is not None:
+                # Interpolate current target position and rates
                 px, py, target_alt, dist, target_az_deg, az_rate, el_rate = interpolate_position_data_and_rates(
-                    self.tracking_vis_state.satellite_trajectories[selected_sat],
+                    target_traj,
                     self.tracking_vis_state.current_tt
                 )
 
@@ -939,7 +999,7 @@ class JoystickModeState:
 
                     # Debug output (throttled)
                     if int(current_time) % 5 == 0:  # Every 5 seconds
-                        print(f"PROGRAM TRACK: {selected_sat} | "
+                        print(f"PROGRAM TRACK: {target_kind}:{target_key} | "
                               f"AZ:{current_azm:.2f}->{target_az_deg:.2f}({az_error:+.2f}) | "
                               f"EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | "
                               f"CMD AZ:{az_command} EL:{el_command}")
@@ -1725,6 +1785,260 @@ def render_connection_controls(display, joystick_state):
     else:
         status_text = display.small_font.render("Status: Disconnected", True, (255, 0, 0))
     display.menu_screen.blit(status_text, (display.sub_x + 10, status_y))
+
+def render_adsb_connection_controls(display, joystick_state):
+    """Render the ADS-B (RTL-SDR) connect/disconnect controls, status, and the
+    linear-fit-points slider in a compact pane at the top-right of the joystick
+    quadrant. Mirrors the telescope connection controls."""
+    layout = joystick_panel_layout(display)
+    pane = layout['adsb']
+    cfg = getattr(joystick_state, 'config_state', None)
+    mouse_pos = pygame.mouse.get_pos()
+
+    # Mirror live receiver state so async failures (missing deps, device unplugged)
+    # show immediately and the buttons reflect the real connection state.
+    if joystick_state.adsb is not None:
+        joystick_state.adsb_connected = joystick_state.adsb.connected
+        joystick_state.adsb_status = joystick_state.adsb.status
+
+    # Pane background + border.
+    pygame.draw.rect(display.menu_screen, (28, 30, 38), pane)
+    pygame.draw.rect(display.menu_screen, (90, 95, 110), pane, 1)
+
+    mode = str(getattr(cfg, 'adsb_source_mode', 'rtlsdr')) if cfg else 'rtlsdr'
+    title = display.small_font.render(f"ADS-B ({mode})", True, (200, 210, 230))
+    display.menu_screen.blit(title, (pane.x + 6, pane.y + 2))
+
+    # Connect / Disconnect buttons.
+    bw, bh = 84, 20
+    by = pane.y + 18
+    connect_rect = pygame.Rect(pane.x + 6, by, bw, bh)
+    disconnect_rect = pygame.Rect(pane.x + 6 + bw + 6, by, bw, bh)
+    joystick_state.adsb_connect_button_hover = connect_rect.collidepoint(mouse_pos)
+    joystick_state.adsb_disconnect_button_hover = disconnect_rect.collidepoint(mouse_pos)
+    joystick_state.adsb_button_rects = {'connect': connect_rect, 'disconnect': disconnect_rect}
+
+    if joystick_state.adsb_connected:
+        c_color = (100, 100, 100)
+    else:
+        c_color = (100, 150, 100) if joystick_state.adsb_connect_button_hover else (100, 120, 100)
+    pygame.draw.rect(display.menu_screen, c_color, connect_rect)
+    display.menu_screen.blit(display.small_font.render("Connect", True, (255, 255, 255)),
+                             (connect_rect.x + 6, connect_rect.y + 4))
+
+    if not joystick_state.adsb_connected:
+        d_color = (100, 100, 100)
+    else:
+        d_color = (150, 100, 100) if joystick_state.adsb_disconnect_button_hover else (120, 100, 100)
+    pygame.draw.rect(display.menu_screen, d_color, disconnect_rect)
+    display.menu_screen.blit(display.small_font.render("Disconnect", True, (255, 255, 255)),
+                             (disconnect_rect.x + 4, disconnect_rect.y + 4))
+
+    # Status line (connected count + receiver status).
+    status_y = by + bh + 2
+    n_ac = 0
+    tvs = getattr(joystick_state, 'tracking_vis_state', None)
+    if tvs is not None:
+        n_ac = len(getattr(tvs, 'aircraft_positions', None) or {})
+    if joystick_state.adsb_connected:
+        stat = f"Connected - {n_ac} aircraft"
+        col = (0, 220, 0)
+    else:
+        stat = "Disconnected"
+        col = (220, 90, 90)
+    display.menu_screen.blit(display.tiny_font.render(stat, True, col), (pane.x + 6, status_y))
+    if joystick_state.adsb_status:
+        display.menu_screen.blit(
+            display.tiny_font.render(joystick_state.adsb_status[:42], True, (150, 155, 170)),
+            (pane.x + 120, status_y))
+
+    # Fit-points slider (number of recent fixes fit for linear prediction).
+    fit_val = int(getattr(cfg, 'adsb_fit_points', 5)) if cfg else 5
+    slider_y = status_y + 16
+    display.menu_screen.blit(display.tiny_font.render("Fit pts:", True, (255, 200, 100)),
+                             (pane.x + 6, slider_y))
+    display.menu_screen.blit(display.tiny_font.render(f"{fit_val}", True, (255, 255, 255)),
+                             (pane.x + 52, slider_y))
+    track = pygame.Rect(pane.x + 78, slider_y + 6, pane.width - 90, 4)
+    display.joystick_adsb_fit_slider_rect = track
+    pygame.draw.rect(display.menu_screen, (150, 150, 150), track)
+    ratio = 0.0
+    if JL_ADSB_FIT_MAX > JL_ADSB_FIT_MIN:
+        ratio = min(1.0, max(0.0, (fit_val - JL_ADSB_FIT_MIN) / (JL_ADSB_FIT_MAX - JL_ADSB_FIT_MIN)))
+    handle_x = track.x + int(ratio * track.width)
+    hover = pygame.Rect(handle_x - 3, track.y - 4, 6, 12).collidepoint(mouse_pos)
+    pygame.draw.rect(display.menu_screen, (255, 0, 0) if hover else (200, 0, 0),
+                     (handle_x - 3, track.y - 4, 6, 12))
+
+
+def _adsb_fit_from_track_x(track, x):
+    """Map an x pixel on the ADS-B fit slider track to an integer fit-points count."""
+    rel = min(max(x - track.x, 0), track.width)
+    frac = rel / track.width if track.width else 0.0
+    return int(round(JL_ADSB_FIT_MIN + frac * (JL_ADSB_FIT_MAX - JL_ADSB_FIT_MIN)))
+
+
+def handle_adsb_fit_slider_mouse_events(joystick_state, display, mouse_pos):
+    """Click/drag on the ADS-B fit-points slider sets config.adsb_fit_points live.
+    Returns True if the click hit the track."""
+    if not hasattr(display, 'joystick_adsb_fit_slider_rect'):
+        return False
+    track = display.joystick_adsb_fit_slider_rect
+    cfg = getattr(joystick_state, 'config_state', None)
+    if cfg is None or not track.collidepoint(mouse_pos):
+        return False
+    cfg.adsb_fit_points = _adsb_fit_from_track_x(track, mouse_pos[0])
+    return True
+
+
+def render_joystick_target_panel(display, joystick_state, tracking_vis_state, config_state):
+    """Skyplot 'Targets' overlay in the joystick upper-right quadrant.
+
+    Always-on toggle strip (Targets panel open/close, Sats show/hide, Labels
+    show/hide). When the panel is open, draws the name/alt filter boxes and the
+    sortable satellite-passes + launches table over the skyplot. Selection,
+    sorting and filtering reuse the tracking-vis machinery (draw_filters /
+    draw_satellite_pass_table / filter_and_sort_pass_table), so behaviour matches
+    the full-screen tracking visualization mode."""
+    if tracking_vis_state is None:
+        return
+    screen = display.menu_screen
+    font = display.small_font
+    mouse_pos = pygame.mouse.get_pos()
+    qx = display.sub_x + display.sub_width // 2
+    qy = display.sub_y
+    qw = display.sub_width // 2
+    qh = display.sub_height // 2
+
+    strip_x, strip_y, bh = qx + 8, qy + 6, 22
+
+    def _btn(label, x, w, active, on_color, off_color):
+        rect = pygame.Rect(x, strip_y, w, bh)
+        base = on_color if active else off_color
+        col = tuple(min(255, c + 25) for c in base) if rect.collidepoint(mouse_pos) else base
+        pygame.draw.rect(screen, col, rect)
+        pygame.draw.rect(screen, (150, 150, 160), rect, 1)
+        screen.blit(font.render(label, True, (255, 255, 255)), (rect.x + 6, rect.y + 4))
+        return rect
+
+    t_rect = _btn("Targets " + ("▲" if joystick_state.targets_panel_open else "▼"),
+                  strip_x, 96, joystick_state.targets_panel_open, (70, 90, 120), (60, 70, 90))
+    sats_on = getattr(config_state, 'satellites_enabled', True)
+    s_rect = _btn("Sats " + ("On" if sats_on else "Off"), strip_x + 102, 66, sats_on,
+                  (70, 110, 70), (90, 70, 70))
+    labels_on = getattr(config_state, 'satellite_labels_enabled', True)
+    l_rect = _btn("Labels " + ("On" if labels_on else "Off"), strip_x + 172, 84, labels_on,
+                  (70, 110, 70), (90, 70, 70))
+    joystick_state.jl_target_btn_rects = {'targets': t_rect, 'sats': s_rect, 'labels': l_rect}
+
+    if not joystick_state.targets_panel_open:
+        joystick_state.jl_filter_rects = {}
+        joystick_state.jl_clear_filters_rect = None
+        joystick_state.jl_pass_table_rect = None
+        joystick_state.jl_panel_rect = None
+        return
+
+    # Overlay panel over the skyplot.
+    panel_x = qx + 6
+    panel_y = strip_y + bh + 6
+    panel_w = min(380, qw - 12)
+    panel_h = qh - (panel_y - qy) - 10
+    panel = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+    joystick_state.jl_panel_rect = panel
+    scrim = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
+    scrim.fill((18, 20, 28, 235))
+    screen.blit(scrim, (panel.x, panel.y))
+    pygame.draw.rect(screen, (90, 95, 110), panel, 1)
+
+    # Filter boxes (reuse draw_filters with quadrant-local rects).
+    fx, fw, fhgt = panel.x + 12, 150, 28
+    jl_filter_rects = {
+        'filter': pygame.Rect(fx, panel.y + 24, fw, fhgt),
+        'filter_above_alt': pygame.Rect(fx, panel.y + 78, fw, fhgt),
+        'filter_below_alt': pygame.Rect(fx, panel.y + 132, fw, fhgt),
+    }
+    joystick_state.jl_filter_rects = jl_filter_rects
+    from tracking_visuals import draw_filters, draw_satellite_pass_table, filter_and_sort_pass_table
+    draw_filters(display, tracking_vis_state, rects=jl_filter_rects)
+
+    # Clear-filters button.
+    clr = pygame.Rect(fx + fw + 14, panel.y + 24, 90, 24)
+    joystick_state.jl_clear_filters_rect = clr
+    pygame.draw.rect(screen, (110, 90, 90) if clr.collidepoint(mouse_pos) else (90, 75, 75), clr)
+    pygame.draw.rect(screen, (160, 150, 150), clr, 1)
+    screen.blit(font.render("Clear", True, (255, 255, 255)), (clr.x + 8, clr.y + 4))
+
+    # Sortable passes + launches table. Apply live filter/sort each frame, then
+    # draw into a quadrant-local box (clickable areas are absolute -> selection
+    # and header-sort clicks work via the shared handle_pass_table_click).
+    tracking_vis_state.satellite_pass_table = filter_and_sort_pass_table(tracking_vis_state)
+    table_top = panel.y + 172
+    table_h = max(120, panel.bottom - table_top - 96)  # leave room for launch box
+    table_box = pygame.Rect(panel.x + 8, table_top, panel_w - 16, table_h)
+    joystick_state.jl_pass_table_rect = table_box
+    draw_satellite_pass_table(display, tracking_vis_state, box=table_box)
+
+
+def handle_joystick_target_panel_click(joystick_state, tracking_vis_state, config_state, pos):
+    """Handle clicks on the skyplot Targets overlay (toggle strip + panel). Returns
+    True if the click was consumed. Called before skyplot selection so panel
+    interactions take precedence over selecting objects behind the panel."""
+    btns = getattr(joystick_state, 'jl_target_btn_rects', {}) or {}
+    t = btns.get('targets')
+    if t and t.collidepoint(pos):
+        joystick_state.targets_panel_open = not joystick_state.targets_panel_open
+        return True
+    if config_state is not None:
+        s = btns.get('sats')
+        if s and s.collidepoint(pos):
+            config_state.satellites_enabled = not getattr(config_state, 'satellites_enabled', True)
+            return True
+        lbl = btns.get('labels')
+        if lbl and lbl.collidepoint(pos):
+            config_state.satellite_labels_enabled = not getattr(config_state, 'satellite_labels_enabled', True)
+            return True
+
+    if not joystick_state.targets_panel_open or tracking_vis_state is None:
+        return False
+
+    # Filter boxes -> focus for text entry (reuses tracking_vis_state.focused_field).
+    for field, rect in (getattr(joystick_state, 'jl_filter_rects', {}) or {}).items():
+        if rect.collidepoint(pos):
+            tracking_vis_state.focused_field = field
+            tracking_vis_state.cursor_pos[field] = len(_filter_field_text(tracking_vis_state, field))
+            tracking_vis_state.selection_start[field] = None
+            return True
+
+    clr = getattr(joystick_state, 'jl_clear_filters_rect', None)
+    if clr and clr.collidepoint(pos):
+        tracking_vis_state.filter_text = ""
+        tracking_vis_state.filter_above_alt_text = ""
+        tracking_vis_state.filter_below_alt_text = ""
+        tracking_vis_state.cursor_pos.update({"filter": 0, "filter_above_alt": 0, "filter_below_alt": 0})
+        tracking_vis_state.selection_start.update({"filter": None, "filter_above_alt": None, "filter_below_alt": None})
+        tracking_vis_state.focused_field = None
+        return True
+
+    # Table row / header / launch clicks (shared handler).
+    from events import handle_pass_table_click
+    if handle_pass_table_click(tracking_vis_state, pos):
+        tracking_vis_state.focused_field = None
+        return True
+
+    # Click anywhere else inside the panel: consume so it doesn't select an object
+    # on the skyplot behind the panel, and drop filter-box focus.
+    panel = getattr(joystick_state, 'jl_panel_rect', None)
+    if panel and panel.collidepoint(pos):
+        tracking_vis_state.focused_field = None
+        return True
+    return False
+
+
+def _filter_field_text(state, field):
+    return {'filter': state.filter_text,
+            'filter_above_alt': state.filter_above_alt_text,
+            'filter_below_alt': state.filter_below_alt_text}.get(field, "")
+
 
 def render_joystick_status(display, joystick_state):
     """Render the joystick status (button map + axes) below the connection
@@ -2872,6 +3186,19 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             joystick_state.disconnect_telescope()
             print("Telescope disconnected")
 
+        # ADS-B connect/disconnect buttons (rects stored by the renderer).
+        adsb_rects = getattr(joystick_state, 'adsb_button_rects', {}) or {}
+        adsb_connect = adsb_rects.get('connect')
+        adsb_disconnect = adsb_rects.get('disconnect')
+        if adsb_connect and adsb_connect.collidepoint(pos) and not joystick_state.adsb_connected:
+            if joystick_state.connect_adsb():
+                print("ADS-B receiver connected")
+            else:
+                print(f"ADS-B connect failed: {joystick_state.adsb_status}")
+        if adsb_disconnect and adsb_disconnect.collidepoint(pos) and joystick_state.adsb_connected:
+            joystick_state.disconnect_adsb()
+            print("ADS-B receiver disconnected")
+
         # Port dropdown (simplified - click to cycle through ports)
         dropdown_rect = pygame.Rect(display.sub_x + 50, display.sub_y + 50, 120, 25)
         if dropdown_rect.collidepoint(pos):
@@ -2888,6 +3215,12 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                 next_index = (current_index + 1) % len(joystick_state.available_ports)
                 joystick_state.selected_port = joystick_state.available_ports[next_index]['device']
                 print(f"Selected port: {joystick_state.selected_port}")
+
+        # Skyplot "Targets" overlay (toggle strip + filters/passes/launches panel).
+        # Checked before skyplot selection so panel clicks take precedence over
+        # selecting objects behind the panel.
+        if handle_joystick_target_panel_click(joystick_state, tracking_vis_state, config_state, pos):
+            return True
 
         # Handle satellite selection/hover in polar plot area
         quadrant_x = display.sub_x + display.sub_width // 2
@@ -2931,28 +3264,58 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                             print(f"  -> Hit! Distance: {dist_to_sat}")
                         break
 
+            # Same hit-test for ADS-B aircraft (positions stored as full-screen
+            # coords like satellites). Aircraft take selection priority over
+            # satellites since their markers are sparser/explicitly chosen.
+            hovered_ac = None
+            for icao, acpos in list(tracking_vis_state.aircraft_positions.items()):
+                try:
+                    apx, apy, ael, aaz, arng = acpos
+                except (TypeError, ValueError):
+                    continue
+                if ael is None or ael <= 0:
+                    continue
+                rel_x = apx - full_screen_center_x
+                rel_y = apy - full_screen_center_y
+                trans_x = quadrant_center_x + rel_x * scale_factor
+                trans_y = quadrant_center_y + rel_y * scale_factor
+                if math.hypot(pos[0] - trans_x, pos[1] - trans_y) <= 15:
+                    hovered_ac = icao
+                    break
+
             # Update hover state on motion
             if event.type == pygame.MOUSEMOTION:
                 tracking_vis_state.hovered_satellite = hovered_sat
+                tracking_vis_state.hovered_aircraft = hovered_ac
 
-            # Handle satellite selection on click. While a launch is active it is
-            # the sole target, so plot clicks must not select/track a satellite
-            # (this also covers a launch-button press that lands over the plot).
+            # Handle satellite/aircraft selection on click. While a launch is
+            # active it is the sole target, so plot clicks must not select/track
+            # anything (this also covers a launch-button press over the plot).
             launch_active = bool(getattr(tracking_vis_state, 'selected_launch', None)
                                  and getattr(tracking_vis_state, 'launch_launched', False))
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not launch_active:
-                if hovered_sat is not None:
+                if hovered_ac is not None:
+                    if tracking_vis_state.selected_aircraft == hovered_ac:
+                        tracking_vis_state.selected_aircraft = None  # toggle off
+                        print("Deselected aircraft")
+                    else:
+                        tracking_vis_state.selected_aircraft = hovered_ac
+                        tracking_vis_state.selected_satellite = None  # mutual exclusivity
+                        print(f"Selected aircraft: {hovered_ac}")
+                elif hovered_sat is not None:
                     if tracking_vis_state.selected_satellite == hovered_sat:
                         tracking_vis_state.selected_satellite = None  # Deselect if clicking same
                         print("Deselected satellite")
                     else:
                         tracking_vis_state.selected_satellite = hovered_sat  # Select new satellite
+                        tracking_vis_state.selected_aircraft = None  # mutual exclusivity
                         print(f"Selected satellite: {hovered_sat.name}")
                 else:
                     print("  -> Clicked empty area")
                     # Click in empty area - deselect current selection
                     tracking_vis_state.selected_satellite = None
-                    print("Deselected satellite (empty area clicked)")
+                    tracking_vis_state.selected_aircraft = None
+                    print("Deselected target (empty area clicked)")
         else:
             # Mouse not over polar plot area - clear hover state
             if event.type == pygame.MOUSEMOTION:
@@ -3001,6 +3364,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
 
         # Handle Lead-time slider clicks
         if handle_lead_slider_mouse_events(joystick_state, display, mouse_pos):
+            return True
+
+        # Handle ADS-B fit-points slider clicks
+        if handle_adsb_fit_slider_mouse_events(joystick_state, display, mouse_pos):
             return True
 
 def _handle_capture_toggle(joystick_state, tracking_vis_state, config_state, tracking_surface=None):
@@ -3403,9 +3770,30 @@ def _navball_grid(R):
     return g
 
 
+def active_program_trajectory(tvs):
+    """Resolve the trajectory the PROGRAM loop should track: a selected satellite
+    first, then a selected aircraft (ADS-B). Launch tracking is handled separately
+    by the launch override, so it is not considered here. Returns
+    (traj_tuple, kind, key) or (None, None, None); traj_tuple is the
+    (rows, times_array) pair in the canonical 8-column format. Shared by the
+    Python program_track loop and the Rust adapter so both agree on the target."""
+    if tvs is None:
+        return None, None, None
+    sat = getattr(tvs, 'selected_satellite', None)
+    sat_trajs = getattr(tvs, 'satellite_trajectories', None) or {}
+    if sat is not None and sat_trajs.get(sat):
+        return sat_trajs[sat], 'satellite', sat
+    icao = getattr(tvs, 'selected_aircraft', None)
+    ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
+    if icao is not None and ac_trajs.get(icao):
+        return ac_trajs[icao], 'aircraft', icao
+    return None, None, None
+
+
 def _navball_active_target(tvs):
     """Resolve the target the navball should overlay, mirroring how PROGRAM
-    tracking picks one: a selected satellite first, then a selected launch.
+    tracking picks one: a selected satellite first, then a selected aircraft,
+    then a selected launch.
 
     Returns (traj_data, cur_tt, sunlit_list, tgt_az, tgt_el) or None. traj_data
     is the (rows, times_array) pair whose rows carry [1]=elevation, [2]=azimuth
@@ -3426,6 +3814,14 @@ def _navball_active_target(tvs):
         res = interpolate_position_data_and_rates(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, sunlit, tgt[0], tgt[1]
+
+    icao = getattr(tvs, 'selected_aircraft', None)
+    ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
+    if icao is not None and ac_trajs.get(icao):
+        traj = ac_trajs[icao]
+        res = interpolate_position_data_and_rates(traj, cur_tt)
+        tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
+        return traj, cur_tt, None, tgt[0], tgt[1]
 
     lname = getattr(tvs, 'selected_launch', None)
     launch_trajs = getattr(tvs, 'launch_trajectories', None) or {}
@@ -3632,6 +4028,31 @@ def render_navball(display, joystick_state):
                     pygame.draw.line(ball, PURPLE, (tx + dx * rr, ty + dy * rr),
                                      (tx + dx * (rr + 6), ty + dy * (rr + 6)), 2)
                 pygame.draw.circle(ball, PURPLE, (tx, ty), 1)
+
+    # --- ADS-B aircraft markers (all tracked aircraft, on the visible hemisphere)
+    # Small orange diamonds; the selected aircraft gets a white ring. Drawn onto
+    # the ball so they clip to the disc like the satellite/target overlays.
+    if connected:
+        tvs = getattr(joystick_state, 'tracking_vis_state', None)
+        ac_positions = getattr(tvs, 'aircraft_positions', None) or {} if tvs else {}
+        sel_ac = getattr(tvs, 'selected_aircraft', None) if tvs else None
+        AC_COLOR = (255, 170, 60)
+        for icao, pos in list(ac_positions.items()):
+            try:
+                _, _, ac_el, ac_az, _ = pos
+            except (TypeError, ValueError):
+                continue
+            if ac_el is None or ac_el <= 0.0:
+                continue
+            sx, sy, z = proj(ac_az, ac_el)
+            if z <= 0.0:
+                continue
+            ax, ay = int(sx), int(sy)
+            d = max(3, int(R * 0.03))
+            pygame.draw.polygon(ball, AC_COLOR,
+                                [(ax, ay - d), (ax + d, ay), (ax, ay + d), (ax - d, ay)])
+            if icao == sel_ac:
+                pygame.draw.circle(ball, (255, 255, 255), (ax, ay), d + 3, 2)
 
     display.menu_screen.blit(ball, (cx - R, cy - R))
 

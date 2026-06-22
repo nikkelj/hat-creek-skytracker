@@ -169,3 +169,17 @@ hip_main.dat*
 tyc_main.dat*
 # Local config backup written by ConfigState.save_to_file()
 config.json.bak
+
+# RTL-SDR / librtlsdr native binaries (provided by the pyrtlsdrlib wheel, or
+# dropped in locally for the ADS-B receiver). Platform-specific; never commit.
+rtlsdr.dll
+rtlsdr*.lib
+rtlsdr.exp
+libusb-1.0.dll
+libusb-1.0.lib
+libusb-1.0.exp
+libusb-1.0.pdb
+convenience_static.lib
+libgetopt_static.lib
+pthreadVC2.dll
+msvcr100.dll

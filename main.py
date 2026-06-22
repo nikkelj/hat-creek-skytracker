@@ -34,7 +34,7 @@ from alignment import AlignmentState
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
-from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel
+from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel, render_adsb_connection_controls, handle_adsb_fit_slider_mouse_events, render_joystick_target_panel
 from lib.auxstar import Targets
 from rendering_threads import TrackingVisualizationThread, JoystickVisualizationThread
 from mount_control import MountControlThread
@@ -169,6 +169,7 @@ def update_status_callback(message):
 # Joystick Mode State Management (initialize after update_status_callback is defined)
 global joystick_mode_state
 joystick_mode_state = JoystickModeState(tracking_vis_state, config_state, update_status_callback)
+joystick_mode_state.ts = ts  # share the app timescale (used by the ADS-B receiver)
 
 # Hardware simulator (mount + cameras). Inert unless sim_config.enabled; when
 # enabled, connect_telescope / connect_camera hand back simulated devices so the
@@ -407,6 +408,11 @@ while running:
                 # atomic rebind (never leaves a partially-built/empty window).
                 tracking_vis_state.satellite_positions = {}
 
+            # Refresh ADS-B aircraft positions/trajectories (prune stale, rebuild
+            # dirty predictions) when the receiver is connected. Cheap when idle.
+            if joystick_mode_state.adsb is not None and joystick_mode_state.adsb_connected:
+                joystick_mode_state.adsb.update(display, current_tt)
+
             # Update launch positions if any launch trajectories are loaded
             if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:
                 update_launch_positions(tracking_vis_state, current_tt)
@@ -473,6 +479,10 @@ while running:
                 running = False
             elif current_mode == "config_options" and config_state.focused_field:
                 handle_input(event, config_state)
+            elif current_mode == "joystick_loop" and tracking_vis_state.focused_field in ("filter", "filter_above_alt", "filter_below_alt"):
+                # Targets-overlay filter boxes (shares tracking-vis text editing).
+                from events import handle_tracking_vis_keyboard_events
+                handle_tracking_vis_keyboard_events(event, tracking_vis_state)
             elif current_mode == "joystick_loop" and (hasattr(joystick_mode_state, 'config_state') and joystick_mode_state.config_state.focused_field):
                 handle_input(event, joystick_mode_state.config_state)
             elif current_mode == "tracking_vis":
@@ -696,6 +706,8 @@ while running:
                     # range logic stays in one place)
                     if joystick_mode_state is not None:
                         handle_lead_slider_mouse_events(joystick_mode_state, display, current_pos)
+                        # ADS-B fit-points slider drag (same click-handler reuse)
+                        handle_adsb_fit_slider_mouse_events(joystick_mode_state, display, current_pos)
 
 
         elif event.type == pygame.MOUSEMOTION:
@@ -772,6 +784,13 @@ while running:
             elif current_mode == "tracking_vis":
                 from tracking_visuals import get_pass_table_rect
                 if get_pass_table_rect(display).collidepoint(wheel_pos):
+                    max_scroll = getattr(tracking_vis_state, 'pass_table_max_scroll', 0)
+                    tracking_vis_state.pass_table_scroll_offset = max(
+                        0, min(tracking_vis_state.pass_table_scroll_offset - event.y, max_scroll))
+            # Scroll the joystick-mode Targets overlay pass table when hovering it
+            elif current_mode == "joystick_loop":
+                jl_box = getattr(joystick_mode_state, 'jl_pass_table_rect', None)
+                if jl_box is not None and jl_box.collidepoint(wheel_pos):
                     max_scroll = getattr(tracking_vis_state, 'pass_table_max_scroll', 0)
                     tracking_vis_state.pass_table_scroll_offset = max(
                         0, min(tracking_vis_state.pass_table_scroll_offset - event.y, max_scroll))
@@ -954,6 +973,7 @@ while running:
 
         # Render connection controls and joystick status (not threaded)
         render_connection_controls(display, joystick_mode_state)
+        render_adsb_connection_controls(display, joystick_mode_state)
         render_joystick_status(display, joystick_mode_state)
         render_position_display(display, joystick_mode_state)
 
@@ -981,6 +1001,11 @@ while running:
 
         # Render camera feeds
         render_camera_feeds(display, joystick_mode_state)
+
+        # Skyplot "Targets" overlay (filters + sortable passes/launches table +
+        # show/hide toggles) over the upper-right quadrant skyplot. Drawn last so
+        # the panel overlays the skyplot.
+        render_joystick_target_panel(display, joystick_mode_state, tracking_vis_state, config_state)
 
         # Mount control and position polling run on MountControlThread
         # (see mount_control.py), decoupled from this render loop. The thread
@@ -1015,6 +1040,11 @@ print("Shutting down mount control thread...")
 if mount_control_thread:
     mount_control_thread.stop()
     mount_control_thread.join(timeout=2.0)
+
+# Stop the ADS-B receiver (SDR source thread) if it was started.
+if joystick_mode_state is not None and getattr(joystick_mode_state, 'adsb', None) is not None:
+    print("Shutting down ADS-B receiver...")
+    joystick_mode_state.adsb.disconnect()
 
 # Stop post-process decode/export worker threads if the screen was opened
 if post_process_state is not None:

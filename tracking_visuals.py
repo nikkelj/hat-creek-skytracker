@@ -60,6 +60,16 @@ class TrackingVisState:
         self.hovered_satellite = None
         self.satellite_positions = {}
 
+        # ADS-B aircraft state (parallel to the satellite structures so aircraft
+        # drop into the same draw / select / slew / track machinery). Populated by
+        # adsb_receiver.AdsbTracker.update_positions each frame.
+        self.adsb_tracker = None              # AdsbTracker (set by main on startup)
+        self.aircraft = {}                    # icao -> Aircraft
+        self.aircraft_positions = {}          # icao -> (px, py, el, az, range_km)
+        self.aircraft_trajectories = {}       # icao -> (rows, times_array), 8-col format
+        self.selected_aircraft = None         # icao of the selected/tracked aircraft
+        self.hovered_aircraft = None          # icao under the cursor
+
         # Starfield state (Hipparcos catalogue rendered on the skyplot).
         # star_screen_positions is published by the render thread each frame as
         # (sx, sy, hip) tuples and consumed by the main thread for hover hit-testing.
@@ -348,14 +358,22 @@ def draw_triangle(surface, x, y, color, size=5):
     points = [(x, y - size), (x - size * math.sin(math.radians(60)), y + size * 0.5), (x + size * math.sin(math.radians(60)), y + size * 0.5)]
     pygame.draw.polygon(surface, color, points)
 
-def draw_filters(display, state):
+def draw_filters(display, state, rects=None):
     """
     State-direct mutation function for drawing filter inputs.
     Takes display and state objects directly instead of individual parameters.
+
+    `rects` optionally overrides the three filter-box positions (keys 'filter',
+    'filter_above_alt', 'filter_below_alt') so the same control can be drawn in
+    the joystick-mode skyplot overlay; defaults to the full-screen display rects.
     """
+    if rects is None:
+        rects = {'filter': display.filter_rect,
+                 'filter_above_alt': display.filter_above_alt_rect,
+                 'filter_below_alt': display.filter_below_alt_rect}
     # Name filter
     filter_label = display.small_font.render("Name Filter:", True, (255, 255, 255))
-    filter_rect = display.filter_rect
+    filter_rect = rects['filter']
     display.menu_screen.blit(filter_label, (filter_rect.x, filter_rect.y - filter_label.get_height() - 5))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_rect)
     filter_text_surface = display.small_font.render(state.filter_text, True, (0, 0, 0))
@@ -375,7 +393,7 @@ def draw_filters(display, state):
 
     # Filter Above Altitude
     filter_above_alt_label = display.small_font.render("Filter Above Alt (km):", True, (255, 255, 255))
-    filter_above_alt_rect = display.filter_above_alt_rect
+    filter_above_alt_rect = rects['filter_above_alt']
     display.menu_screen.blit(filter_above_alt_label, (filter_above_alt_rect.x, filter_above_alt_rect.y - filter_above_alt_label.get_height() - 5))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_above_alt_rect)
     filter_above_alt_text_surface = display.small_font.render(state.filter_above_alt_text, True, (0, 0, 0))
@@ -395,7 +413,7 @@ def draw_filters(display, state):
 
     # Filter Below Altitude
     filter_below_alt_label = display.small_font.render("Filter Below Alt (km):", True, (255, 255, 255))
-    filter_below_alt_rect = display.filter_below_alt_rect
+    filter_below_alt_rect = rects['filter_below_alt']
     display.menu_screen.blit(filter_below_alt_label, (filter_below_alt_rect.x, filter_below_alt_rect.y - filter_below_alt_label.get_height() - 5))
     pygame.draw.rect(display.menu_screen, (255, 255, 255), filter_below_alt_rect)
     filter_below_alt_text_surface = display.small_font.render(state.filter_below_alt_text, True, (0, 0, 0))
@@ -636,18 +654,24 @@ def get_pass_table_rect(display):
     return pygame.Rect(table_x, top, PASS_TABLE_WIDTH, height)
 
 
-def draw_satellite_pass_table(display, state):
+def draw_satellite_pass_table(display, state, box=None):
     """
     Draw the scrollable, multi-sortable satellite pass table plus the launch box.
     State-direct mutation: rebuilds state.pass_table_clickable_areas each call.
     Row clickable areas store the absolute index into state.satellite_pass_table.
+
+    `box` optionally overrides the table's bounding rect (e.g. for the joystick
+    skyplot overlay); defaults to the full-screen get_pass_table_rect(display).
+    Clickable areas are stored in absolute screen coords, so click handling is
+    position-independent regardless of where the table is drawn.
     """
     state.pass_table_clickable_areas = []
     have_launches = hasattr(state, 'launch_trajectories') and state.launch_trajectories
     if not state.satellite_pass_table and not have_launches:
         return
 
-    box = get_pass_table_rect(display)
+    if box is None:
+        box = get_pass_table_rect(display)
     table_x, table_y, table_width, table_height = box.x, box.y, box.width, box.height
     row_height = PASS_TABLE_ROW_HEIGHT
     title_h = 22

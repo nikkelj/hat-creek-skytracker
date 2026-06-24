@@ -27,6 +27,9 @@ SATELLITE_LABEL_FONT = None
 # Cache for rendered satellite label surfaces to avoid expensive re-rendering
 SATELLITE_LABEL_CACHE = {}
 
+# Font for ADS-B aircraft labels (created lazily off the main thread).
+AIRCRAFT_LABEL_FONT = None
+
 # Font + label-surface cache for star names (created off the main thread).
 STAR_LABEL_FONT = None
 STAR_LABEL_CACHE = {}
@@ -700,6 +703,11 @@ def draw_fov_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMo
 def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """Draw satellites on a specified surface with given bounds."""
 
+    # Honor the skyplot satellite-visibility toggle (joystick overlay control).
+    if config_state is not None and not getattr(config_state, 'satellites_enabled', True):
+        return
+    show_labels = config_state is None or getattr(config_state, 'satellite_labels_enabled', True)
+
     surface_center_x = surface.get_width() // 2
     surface_center_y = surface.get_height() // 2
 
@@ -778,8 +786,9 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
         if sat == state.hovered_satellite or sat == state.selected_satellite:
             pygame.draw.circle(surface, (255, 255, 0), (draw_px, draw_py), 5, 1)
 
-        # Draw satellite labels efficiently with caching (hidden during a launch)
-        if not hide_labels and hasattr(state, 'satellite_labels') and sat in state.satellite_labels:
+        # Draw satellite labels efficiently with caching (hidden during a launch
+        # or when the skyplot label toggle is off)
+        if show_labels and not hide_labels and hasattr(state, 'satellite_labels') and sat in state.satellite_labels:
             global SATELLITE_LABEL_FONT, SATELLITE_LABEL_CACHE
 
             # Initialize font if not already done
@@ -807,6 +816,87 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
             if label_surface:
                 # Only render labels for selected/selected satellites to reduce rendering overhead
                 surface.blit(label_surface, (int(draw_px + 5), int(draw_py)))
+
+def _aircraft_to_surface_xy(px, py, surface, display_bounds, mode):
+    """Map a full-screen polar-plot pixel (px, py) into surface coords, matching
+    the satellite/arc transforms for both full-screen and quadrant modes."""
+    if mode == PolarPlotMode.FULL_SCREEN:
+        return px - display_bounds['sub_x'], py - display_bounds['sub_y']
+    full_center_x = display_bounds['sub_x'] + display_bounds['sub_width'] // 2
+    full_center_y = display_bounds['sub_y'] + display_bounds['sub_height'] // 2
+    scale_factor = 0.45
+    draw_px = surface.get_width() // 2 + (px - full_center_x) * scale_factor
+    draw_py = surface.get_height() // 2 + (py - full_center_y) * scale_factor
+    return draw_px, draw_py
+
+
+def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN):
+    """Draw ADS-B aircraft on the skyplot: an orange diamond + label per aircraft,
+    a yellow ring on the selected/hovered one, and the selected aircraft's
+    predicted track (grey past, orange future). Mirrors draw_satellites_on_surface
+    coordinate handling so aircraft and satellites line up exactly.
+
+    For the quadrant (joystick) mode `display_bounds` is the full-screen bounds,
+    as passed at the call site (same convention as the satellite draw)."""
+    global AIRCRAFT_LABEL_FONT
+
+    positions = getattr(state, 'aircraft_positions', None) or {}
+    if not positions:
+        return
+
+    selected = getattr(state, 'selected_aircraft', None)
+    hovered = getattr(state, 'hovered_aircraft', None)
+    aircraft = getattr(state, 'aircraft', None) or {}
+    AC_COLOR = (255, 170, 60)
+
+    # Predicted track for the selected aircraft (drawn under the markers).
+    trajectories = getattr(state, 'aircraft_trajectories', None) or {}
+    if selected is not None and selected in trajectories:
+        rows, times_array = trajectories[selected]
+        prev = None
+        for i, row in enumerate(rows):
+            el, az, rpx, rpy = row[1], row[2], row[4], row[5]
+            if el is None or el <= 0:
+                prev = None
+                continue
+            dx, dy = _aircraft_to_surface_xy(rpx, rpy, surface, display_bounds, mode)
+            pt = (int(dx), int(dy))
+            if prev is not None:
+                is_future = (current_tt is None) or (times_array[i] > current_tt)
+                color = AC_COLOR if is_future else (120, 120, 120)
+                pygame.draw.line(surface, color, prev, pt, 1)
+            prev = pt
+
+    if AIRCRAFT_LABEL_FONT is None:
+        try:
+            AIRCRAFT_LABEL_FONT = pygame.font.Font(None, 14)
+        except pygame.error:
+            AIRCRAFT_LABEL_FONT = None
+
+    for icao, pos in list(positions.items()):
+        try:
+            px, py, el, az, rng = pos
+        except (TypeError, ValueError):
+            continue
+        if el is None or el <= 0:
+            continue
+        draw_px, draw_py = _aircraft_to_surface_xy(px, py, surface, display_bounds, mode)
+        ix, iy = int(draw_px), int(draw_py)
+        d = 4
+        pygame.draw.polygon(surface, AC_COLOR,
+                            [(ix, iy - d), (ix + d, iy), (ix, iy + d), (ix - d, iy)])
+        if icao == selected or icao == hovered:
+            pygame.draw.circle(surface, (255, 255, 0), (ix, iy), d + 3, 1)
+
+        if AIRCRAFT_LABEL_FONT is not None:
+            ac = aircraft.get(icao)
+            label = (ac.label if ac is not None else icao)[:10]
+            try:
+                surf = AIRCRAFT_LABEL_FONT.render(label, True, AC_COLOR)
+                surface.blit(surf, (ix + 6, iy - 4))
+            except pygame.error:
+                pass
+
 
 def draw_launch_trajectory_on_surface(surface, state, current_tt, display_bounds, mode=PolarPlotMode.FULL_SCREEN):
     """Draw selected launch trajectory on surface."""
@@ -1006,7 +1096,7 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                 current_tt = self.ts.now().tt
 
                 # Capture consistent snapshot of shared state to avoid race conditions
-                if hasattr(self.tracking_vis_state, 'satellite_positions') and self.tracking_vis_state.satellite_positions:
+                if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):
                     # Capture state after satellite position updates are complete
                     # This may happen after the main thread's position update
                     satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
@@ -1066,6 +1156,8 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, None)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
+                    # Draw ADS-B aircraft + selected aircraft track
+                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, display_bounds, current_tt, PolarPlotMode.FULL_SCREEN)
                     # Draw launch trajectory if one is selected
                     draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, display_bounds, PolarPlotMode.FULL_SCREEN)
                     # Draw launch position marker
@@ -1231,7 +1323,7 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                 current_tt = self.ts.now().tt
 
                 # Capture consistent snapshot of shared state to avoid race conditions
-                if hasattr(self.tracking_vis_state, 'satellite_positions') and self.tracking_vis_state.satellite_positions:
+                if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):
                     # Capture state after satellite position updates are complete
                     # This may happen after the main thread's position update
                     satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
@@ -1299,6 +1391,8 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, None)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
+                    # Draw ADS-B aircraft + selected aircraft track
+                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, full_screen_bounds, current_tt, PolarPlotMode.UPPER_RIGHT_QUADRANT)
                     # Draw launch trajectory if one is selected
                     draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT)
                     # Draw launch position marker

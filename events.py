@@ -215,12 +215,44 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
             state.launch_start_time = load.timescale().now().tt
         return True
 
-    # Check pass table clicks
+    # Check pass table clicks (shared with joystick-mode skyplot overlay)
+    if handle_pass_table_click(state, pos):
+        return True
+
+    # While a launch is active it is the sole target -- don't let plot clicks
+    # select/track a satellite (a launched rocket overrides any satellite target).
+    if getattr(state, 'selected_launch', None) and getattr(state, 'launch_launched', False):
+        return False
+
+    # Satellite selection - if no table click
+    if state.selected_satellite and state.satellite_positions.get(state.selected_satellite):
+        px, py, _, _ = state.satellite_positions[state.selected_satellite]
+        if math.hypot(px - pos[0], py - pos[1]) < 10:
+            state.selected_satellite = None
+            return True
+
+    # Select new satellite
+    for sat, (px, py, _, _) in state.satellite_positions.items():
+        if math.hypot(px - pos[0], py - pos[1]) < 10:
+            state.selected_satellite = sat
+            return True
+
+    return False
+
+
+def handle_pass_table_click(state, pos):
+    """Handle a click on the satellite pass table / launch box (row select,
+    column-header sort, launch select). Returns True if consumed. Shared by the
+    full-screen tracking-vis handler and the joystick-mode skyplot overlay; works
+    off state.pass_table_clickable_areas (absolute screen rects), so it is
+    independent of where the table was drawn."""
     if hasattr(state.pass_table_clickable_areas, '__iter__') and state.pass_table_clickable_areas:
         for area_type, index, rect in state.pass_table_clickable_areas:
             if rect.collidepoint(pos):
                 if area_type == 'row' and state.satellite_pass_table and index < len(state.satellite_pass_table):
                     state.selected_satellite = state.satellite_pass_table[index]['satellite']
+                    if hasattr(state, 'selected_aircraft'):
+                        state.selected_aircraft = None  # mutual exclusivity
                     return True
                 elif area_type == 'header':
                     # Column-header sort. Plain click = single-column sort (re-click
@@ -268,24 +300,6 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
                         state.launch_start_time = None
                     return True
                 break
-
-    # While a launch is active it is the sole target -- don't let plot clicks
-    # select/track a satellite (a launched rocket overrides any satellite target).
-    if getattr(state, 'selected_launch', None) and getattr(state, 'launch_launched', False):
-        return False
-
-    # Satellite selection - if no table click
-    if state.selected_satellite and state.satellite_positions.get(state.selected_satellite):
-        px, py, _, _ = state.satellite_positions[state.selected_satellite]
-        if math.hypot(px - pos[0], py - pos[1]) < 10:
-            state.selected_satellite = None
-            return True
-
-    # Select new satellite
-    for sat, (px, py, _, _) in state.satellite_positions.items():
-        if math.hypot(px - pos[0], py - pos[1]) < 10:
-            state.selected_satellite = sat
-            return True
 
     return False
 

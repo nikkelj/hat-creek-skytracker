@@ -136,6 +136,18 @@ dependencies:
     - pygame==2.5.2
     - pygame-menu==4.4.3
     - pyperclip==1.8.2
+    # ADS-B (RTL-SDR aircraft tracking). Only the native "rtlsdr" source needs
+    # these; the app runs fine without them (dump1090/sim sources, or SDR off).
+    # IMPORTANT: pin pyModeS<3 -- v3 removed both the function-per-field API and
+    # the built-in RTL-SDR reader (extra.rtlreader) this uses, and v3 forces a
+    # numpy>=1.26 upgrade that breaks the numpy 1.25.2 / opencv / scipy stack.
+    # Install pyModeS with --no-deps so it cannot pull a newer numpy.
+    # pyrtlsdrlib ships prebuilt librtlsdr binaries so no manual DLL / PATH setup
+    # is needed (Python 3.8+ stopped searching PATH for ctypes DLLs, and pyrtlsdr
+    # looks for rtlsdr.dll); pyrtlsdr's loader tries pyrtlsdrlib first.
+    - pyModeS==2.18  # install via: pip install pyModeS==2.18 --no-deps
+    - pyrtlsdr==0.4.0
+    - pyrtlsdrlib==0.0.4
     - pyserial==3.5
     - pytz==2024.1
     - pyyaml==6.0.1

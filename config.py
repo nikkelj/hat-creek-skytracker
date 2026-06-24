@@ -23,6 +23,11 @@ class ConfigState:
         self.alignment_azimuth_str = "0.0"
         self.alignment_elevation_str = "0.0"
 
+        # Skyplot satellite display toggles (hide/show satellites + their labels;
+        # surfaced as toggle buttons in the joystick-mode skyplot overlay).
+        self.satellites_enabled = True          # draw satellite markers on the skyplot
+        self.satellite_labels_enabled = True    # draw satellite name labels
+
         # Star catalogue / starfield configuration
         self.starfield_enabled = True          # draw catalogue stars on the skyplot
         self.max_rendered_star_count = 2000    # brightest-N cap (skyplot + sim images)
@@ -31,6 +36,18 @@ class ConfigState:
         # Plate solver (tetra3) configuration
         self.plate_solve_enabled = False       # background plate-solve worker on/off
         self.plate_solve_camera_index = 0      # which camera the solver reads (0=wide/finder)
+
+        # ADS-B (RTL-SDR aircraft tracking) configuration
+        self.adsb_source_mode = "rtlsdr"       # "rtlsdr" (native SDR) | "dump1090" | "sim"
+        self.adsb_device_index = 0             # RTL-SDR device index when multiple dongles
+        self.adsb_gain = "auto"                # RTL-SDR tuner gain ("auto" or dB)
+        self.adsb_dump1090_host = "127.0.0.1"  # SBS feed host (dump1090 mode)
+        self.adsb_dump1090_port = 30003        # SBS/BaseStation TCP port
+        self.adsb_fit_points = 5               # # of recent fixes fit for linear prediction (UI slider)
+        self.adsb_predict_horizon_sec = 60.0   # how far ahead to propagate the trajectory
+        self.adsb_predict_step_sec = 2.0       # spacing of propagated trajectory points
+        self.adsb_history_seconds = 120.0      # observed-fix tail kept per aircraft
+        self.adsb_stale_timeout_sec = 30.0     # drop aircraft not heard from in this long
 
         # Automated alignment: when a sample point won't plate-solve, the runner spirals
         # outward over this many grid cells (~0.5x FOV each) searching for a solve before
@@ -233,11 +250,23 @@ class ConfigState:
             "elevation_mask": self.elevation_mask_str,
             "alignment_azimuth": self.alignment_azimuth_str,
             "alignment_elevation": self.alignment_elevation_str,
+            "satellites_enabled": self.satellites_enabled,
+            "satellite_labels_enabled": self.satellite_labels_enabled,
             "starfield_enabled": self.starfield_enabled,
             "max_rendered_star_count": self.max_rendered_star_count,
             "star_limiting_magnitude": self.star_limiting_magnitude,
             "plate_solve_enabled": self.plate_solve_enabled,
             "plate_solve_camera_index": self.plate_solve_camera_index,
+            "adsb_source_mode": self.adsb_source_mode,
+            "adsb_device_index": self.adsb_device_index,
+            "adsb_gain": self.adsb_gain,
+            "adsb_dump1090_host": self.adsb_dump1090_host,
+            "adsb_dump1090_port": self.adsb_dump1090_port,
+            "adsb_fit_points": self.adsb_fit_points,
+            "adsb_predict_horizon_sec": self.adsb_predict_horizon_sec,
+            "adsb_predict_step_sec": self.adsb_predict_step_sec,
+            "adsb_history_seconds": self.adsb_history_seconds,
+            "adsb_stale_timeout_sec": self.adsb_stale_timeout_sec,
             "alignment_grid_search_cells": self.alignment_grid_search_cells,
             "alignment_settle_tol_deg": self.alignment_settle_tol_deg,
             "alignment_settle_cycles": self.alignment_settle_cycles,
@@ -288,11 +317,23 @@ class ConfigState:
         self.elevation_mask_str = config_dict.get("elevation_mask", self.elevation_mask_str)
         self.alignment_azimuth_str = config_dict.get("alignment_azimuth", self.alignment_azimuth_str)
         self.alignment_elevation_str = config_dict.get("alignment_elevation", self.alignment_elevation_str)
+        self.satellites_enabled = config_dict.get("satellites_enabled", self.satellites_enabled)
+        self.satellite_labels_enabled = config_dict.get("satellite_labels_enabled", self.satellite_labels_enabled)
         self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
         self.max_rendered_star_count = config_dict.get("max_rendered_star_count", self.max_rendered_star_count)
         self.star_limiting_magnitude = config_dict.get("star_limiting_magnitude", self.star_limiting_magnitude)
         self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)
         self.plate_solve_camera_index = config_dict.get("plate_solve_camera_index", self.plate_solve_camera_index)
+        self.adsb_source_mode = config_dict.get("adsb_source_mode", self.adsb_source_mode)
+        self.adsb_device_index = config_dict.get("adsb_device_index", self.adsb_device_index)
+        self.adsb_gain = config_dict.get("adsb_gain", self.adsb_gain)
+        self.adsb_dump1090_host = config_dict.get("adsb_dump1090_host", self.adsb_dump1090_host)
+        self.adsb_dump1090_port = config_dict.get("adsb_dump1090_port", self.adsb_dump1090_port)
+        self.adsb_fit_points = config_dict.get("adsb_fit_points", self.adsb_fit_points)
+        self.adsb_predict_horizon_sec = config_dict.get("adsb_predict_horizon_sec", self.adsb_predict_horizon_sec)
+        self.adsb_predict_step_sec = config_dict.get("adsb_predict_step_sec", self.adsb_predict_step_sec)
+        self.adsb_history_seconds = config_dict.get("adsb_history_seconds", self.adsb_history_seconds)
+        self.adsb_stale_timeout_sec = config_dict.get("adsb_stale_timeout_sec", self.adsb_stale_timeout_sec)
         self.alignment_grid_search_cells = config_dict.get("alignment_grid_search_cells", self.alignment_grid_search_cells)
         self.alignment_settle_tol_deg = config_dict.get("alignment_settle_tol_deg", self.alignment_settle_tol_deg)
         self.alignment_settle_cycles = config_dict.get("alignment_settle_cycles", self.alignment_settle_cycles)

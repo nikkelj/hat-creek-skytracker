@@ -248,18 +248,19 @@ class RustCoreLoopAdapter:
         self.loop.set_rate_cmd(axis_to_rate(axis(2)), axis_to_rate(axis(3)))
 
     def _push_program_setpoint(self, st):
-        """Satellite tracking setpoint. (Launch tracking is handled separately by
-        _push_launch_setpoint, which takes priority in _pump when a launch is
-        active.) A below-horizon satellite clears the setpoint so the loop holds.
-        """
+        """Satellite/aircraft tracking setpoint. (Launch tracking is handled
+        separately by _push_launch_setpoint, which takes priority in _pump when a
+        launch is active.) A below-horizon target clears the setpoint so the loop
+        holds. Uses the shared active_program_trajectory resolver so the Rust and
+        Python loops agree on the target (selected satellite first, then aircraft)."""
         vis = st.tracking_vis_state
-        trajectories = getattr(vis, "satellite_trajectories", {}) if vis else {}
-        sat = getattr(vis, "selected_satellite", None) if vis else None
-        if vis is None or sat is None or sat not in trajectories:
+        from joystick_controller import active_program_trajectory
+        target_traj, _kind, _key = active_program_trajectory(vis)
+        if vis is None or target_traj is None:
             self.loop.clear_setpoint()
             return
         px, py, target_alt, dist, target_az, az_rate, el_rate = (
-            interpolate_position_data_and_rates(trajectories[sat], vis.current_tt)
+            interpolate_position_data_and_rates(target_traj, vis.current_tt)
         )
         if px is None or target_az is None or target_alt is None or target_alt <= 0:
             self.loop.clear_setpoint()

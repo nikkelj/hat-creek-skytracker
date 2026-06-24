@@ -40,6 +40,16 @@ capture.
   microsecond-precision UTC timestamps; labeled `.png` + per-frame metadata capture.
 - Real-time annotated polar sky plot, satellite pass tables, and camera FOV
   overlays. Render threads publish complete, double-buffered frames (no flicker).
+- A KSP-style **navball** shows live mount attitude with the target's trajectory,
+  a target crosshair, and ADS-B aircraft markers overlaid.
+- **ADS-B aircraft tracking** (RTL-SDR / Nooelec): nearby aircraft appear on the
+  skyplot and navball and can be selected, slewed to, and tracked like a satellite.
+
+**Rendering performance.** The render thread invariant-caches its expensive
+per-frame work so it doesn't starve the GIL the camera capture thread needs: the
+navball's hemisphere/grid is cached on quantized pointing (~33× cheaper when the
+mount is stationary) and each processed camera feed is cached on its capture
+sequence so an unchanged frame isn't re-scaled. See [`LEARNINGS.md`](LEARNINGS.md).
 
 **Hardware simulator** (see below) — run the entire tracking loop without any
 physical hardware present.
@@ -52,9 +62,9 @@ orbital elements, camera FOV footprints, and a scrollable pass table.
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
 **Joystick Loop** — the operational screen: live camera feeds (with boresight
-crosshairs), a polar-plot quadrant, mount connection/position status, tracking
-mode, and PID diagnostics. Shown here in simulation with the mount and both
-cameras connected.
+crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
+strip charts, mount connection/position status, tracking mode, and PID
+diagnostics. Shown here in simulation with the mount and both cameras connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 

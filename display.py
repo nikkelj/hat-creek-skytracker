@@ -37,8 +37,11 @@ class DisplaySetup:
     COLOR_INPUT_TEXT = (0, 0, 0)
     COLOR_FOCUS_BLUE = (0, 0, 255)
 
-    # Frame rate and window settings
-    FPS_TARGET = 60
+    # Frame rate and window settings. The main loop redraws the whole UI
+    # synchronously on one (GIL-bound) thread, so a 30 Hz cap halves per-frame
+    # CPU/GIL pressure vs 60 Hz and leaves headroom for the camera capture
+    # thread -- 30 Hz is plenty for this control UI and was the intended rate.
+    FPS_TARGET = 30
     WINDOW_POSITION = "0,0"
 
     def __init__(self):

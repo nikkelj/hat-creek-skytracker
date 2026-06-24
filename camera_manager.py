@@ -23,6 +23,12 @@ class CameraState:
 
         # Camera frame
         self.frame = None
+        # Monotonic sequence of the latest displayed frame (from the capture
+        # thread's buffer_sequence) and a one-deep cache of its processed
+        # display surface, so the render loop can skip re-gamma/scale/rotate
+        # when the same frame is shown across multiple UI frames.
+        self.frame_seq = None
+        self._feed_cache = None
 
         # ROI settings
         self.roi_size = -1  # -1 = no ROI selected
@@ -474,6 +480,7 @@ def update_camera_frames_from_buffers():
             latest_frame = camera.thread.get_latest_frame()  # Use direct method instead of buffer
             if latest_frame is not None:
                 camera.frame = latest_frame['frame']
+                camera.frame_seq = latest_frame.get('buffer_sequence')
                 camera.thread.calculate_fps()  # Calculate and update FPS internally
                 camera.fps = camera.thread.fps  # Get the updated FPS value
                 camera.utc_ts = camera.thread.get_utc_timestamp()

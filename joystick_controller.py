@@ -2443,7 +2443,22 @@ def _joystick_camera_layout(display):
 
 
 def _process_feed_surface(camera, frame, width, height):
-    """Apply gamma + scale + alignment rotation, matching the Sensor Calibration view."""
+    """Apply gamma + scale + alignment rotation, matching the Sensor Calibration view.
+
+    The processed surface is cached per camera and reused while the source frame
+    (identified by its capture sequence) and every processing parameter are
+    unchanged. The UI loop runs faster than the capture thread, so without this
+    the same frame would be re-gamma'd, re-scaled and re-rotated on every render
+    -- wasted GIL-holding work that starves the capture thread. Callers only blit
+    (read) the result, so it is safe to hand back the shared cached surface.
+    """
+    seq = getattr(camera, 'frame_seq', None)
+    key = (seq, width, height, camera.gamma_enabled, camera.gamma,
+           camera.alignment_rotation)
+    cache = getattr(camera, '_feed_cache', None)
+    if seq is not None and cache is not None and cache[0] == key:
+        return cache[1]
+
     processed = frame
     if camera.gamma_enabled:
         processed = apply_gamma_correction(frame, camera.gamma)
@@ -2454,6 +2469,8 @@ def _process_feed_surface(camera, frame, width, height):
         surface.fill((0, 0, 0))
         surface.blit(rotated, (width // 2 - rotated.get_width() // 2,
                                height // 2 - rotated.get_height() // 2))
+    if seq is not None:
+        camera._feed_cache = (key, surface)
     return surface
 
 
@@ -3748,6 +3765,14 @@ def render_tracking_strip_charts(display, joystick_state):
 
 _NAVBALL_GRID_CACHE = {}
 
+# One-deep cache of the rendered navball "base" (hemisphere fill + grid + static
+# labels), keyed on (R, quantized az, quantized el). The base is the expensive
+# part -- a full per-pixel hemisphere fill plus ~1700 pure-Python trig
+# projections for the grid -- and it only changes when the pointing or size
+# changes. Reusing it whenever the mount is stationary keeps the main render
+# thread from saturating the GIL and starving the camera capture thread.
+_NAVBALL_BASE_CACHE = {}
+
 
 def _navball_grid(R):
     """Per-pixel orthographic backprojection grid for a navball of radius R,
@@ -3902,7 +3927,13 @@ def render_navball(display, joystick_state):
     # World axes: X=east, Y=up, Z=north. A sky point (a, e) is the unit vector
     # v = (cos e sin a, sin e, cos e cos a). The ball is oriented so the current
     # pointing sits at the front center; screen-up follows increasing elevation.
-    a0, e0 = math.radians(az), math.radians(el)
+    # Geometry is snapped to a small angular grid (QSTEP) so the expensive base
+    # render below can be cached and reused frame-to-frame; the snap is sub-pixel
+    # on screen but lets a stationary mount skip the rebuild entirely.
+    QSTEP = 0.5
+    gaz = round(az / QSTEP) * QSTEP
+    gel = round(el / QSTEP) * QSTEP
+    a0, e0 = math.radians(gaz), math.radians(gel)
     ce0, se0 = math.cos(e0), math.sin(e0)
     sa0, ca0 = math.sin(a0), math.cos(a0)
     Zc = (ce0 * sa0, se0, ce0 * ca0)                       # out of screen (front)
@@ -3923,7 +3954,7 @@ def render_navball(display, joystick_state):
         y = vx * Yc[0] + vy * Yc[1] + vz * Yc[2]
         return bcx + x * R, bcy - y * R, z
 
-    def draw_curve(samples, color, width):
+    def draw_curve(target, samples, color, width):
         """Draw a sky curve (list of (az, el)), broken into runs at the limb."""
         run = []
         for a_deg, e_deg in samples:
@@ -3931,63 +3962,78 @@ def render_navball(display, joystick_state):
             if z > 0.0:
                 run.append((int(sx), int(sy)))
             elif len(run) >= 2:
-                pygame.draw.lines(ball, color, False, run, width)
+                pygame.draw.lines(target, color, False, run, width)
                 run = []
             else:
                 run = []
         if len(run) >= 2:
-            pygame.draw.lines(ball, color, False, run, width)
+            pygame.draw.lines(target, color, False, run, width)
 
-    # --- Hemisphere fill (vectorized backprojection) -------------------------
-    # A pixel's world-up component is up.(NX*Xc + NY*Yc + NZ*Zc); its sign tells
-    # sky from ground. (Xc[1], Yc[1], Zc[1]) is world-up expressed in the camera
-    # frame, so the whole disc resolves in one numpy expression.
-    NX, NY, NZ, MASK = _navball_grid(R)
-    vy_grid = Xc[1] * NX + Yc[1] * NY + Zc[1] * NZ
-    size = 2 * R
-    rgb = np.empty((size, size, 3), dtype=np.uint8)
-    rgb[:] = COLORKEY
-    rgb[MASK & (vy_grid >= 0.0)] = SKY
-    rgb[MASK & (vy_grid < 0.0)] = GROUND
-    ball = pygame.surfarray.make_surface(rgb)
-    ball.set_colorkey(COLORKEY)
+    # --- Base ball (hemisphere fill + grid + static labels), cached -----------
+    # Everything here depends only on (R, gaz, gel), so a one-deep cache makes a
+    # stationary navball nearly free: on a hit we copy the cached surface instead
+    # of rebuilding the per-pixel hemisphere and ~1700 trig projections. Only the
+    # dynamic overlays (trajectory, target, aircraft) are redrawn every frame.
+    base_key = (R, gaz, gel)
+    if _NAVBALL_BASE_CACHE.get('key') == base_key and _NAVBALL_BASE_CACHE.get('surface') is not None:
+        base = _NAVBALL_BASE_CACHE['surface']
+    else:
+        # Hemisphere fill (vectorized backprojection). A pixel's world-up
+        # component is up.(NX*Xc + NY*Yc + NZ*Zc); its sign tells sky from
+        # ground. (Xc[1], Yc[1], Zc[1]) is world-up in the camera frame, so the
+        # whole disc resolves in one numpy expression.
+        NX, NY, NZ, MASK = _navball_grid(R)
+        vy_grid = Xc[1] * NX + Yc[1] * NY + Zc[1] * NZ
+        size = 2 * R
+        rgb = np.empty((size, size, 3), dtype=np.uint8)
+        rgb[:] = COLORKEY
+        rgb[MASK & (vy_grid >= 0.0)] = SKY
+        rgb[MASK & (vy_grid < 0.0)] = GROUND
+        base = pygame.surfarray.make_surface(rgb)
+        base.set_colorkey(COLORKEY)
 
-    # --- Grid: alt parallels (rings) + azimuth meridians (tines) -------------
-    az_samples = range(0, 361, 5)
-    el_samples = range(-85, 86, 5)
-    for az_line in range(0, 360, 30):                       # vertical az tines
-        draw_curve([(az_line, e) for e in el_samples], MERIDIAN, 1)
-    for el_line in range(-80, 81, 10):                      # horizontal alt rings
-        if el_line == 0:
-            continue
-        col = SKY_LINE if el_line > 0 else GND_LINE
-        draw_curve([(a, el_line) for a in az_samples],
-                   col, 2 if el_line % 30 == 0 else 1)
-    draw_curve([(a, 0) for a in az_samples], HORIZON, 3)    # horizon last, bright
+        # Grid: alt parallels (rings) + azimuth meridians (tines).
+        az_samples = range(0, 361, 5)
+        el_samples = range(-85, 86, 5)
+        for az_line in range(0, 360, 30):                  # vertical az tines
+            draw_curve(base, [(az_line, e) for e in el_samples], MERIDIAN, 1)
+        for el_line in range(-80, 81, 10):                 # horizontal alt rings
+            if el_line == 0:
+                continue
+            col = SKY_LINE if el_line > 0 else GND_LINE
+            draw_curve(base, [(a, el_line) for a in az_samples],
+                       col, 2 if el_line % 30 == 0 else 1)
+        draw_curve(base, [(a, 0) for a in az_samples], HORIZON, 3)  # horizon last
 
-    # Pitch numerals: green-on-dark chips parked in a gap between two azimuth
-    # tines (off the central column where the reticle/meridian hid them).
-    LABEL_FG, LABEL_BG = (130, 255, 140), (16, 26, 18)
-    gap_az = math.floor(az / 30.0) * 30.0 + 15.0       # midway between tines
-    for el_line in range(-60, 61, 30):
-        if el_line == 0:
-            continue
-        sx, sy, z = proj(gap_az, el_line)
-        if z > 0.0:
-            t = display.tiny_font.render(f"{el_line:+d}", True, LABEL_FG, LABEL_BG)
-            ball.blit(t, (int(sx) - t.get_width() // 2, int(sy) - t.get_height() // 2))
+        # Pitch numerals: green-on-dark chips parked in a gap between two azimuth
+        # tines (off the central column where the reticle/meridian hid them).
+        LABEL_FG, LABEL_BG = (130, 255, 140), (16, 26, 18)
+        gap_az = math.floor(gaz / 30.0) * 30.0 + 15.0      # midway between tines
+        for el_line in range(-60, 61, 30):
+            if el_line == 0:
+                continue
+            sx, sy, z = proj(gap_az, el_line)
+            if z > 0.0:
+                t = display.tiny_font.render(f"{el_line:+d}", True, LABEL_FG, LABEL_BG)
+                base.blit(t, (int(sx) - t.get_width() // 2, int(sy) - t.get_height() // 2))
 
-    # Cardinal / intercardinal letters sit where their meridian meets the horizon.
-    HEADINGS = {0: "N", 45: "NE", 90: "E", 135: "SE",
-                180: "S", 225: "SW", 270: "W", 315: "NW"}
-    for h, lbl in HEADINGS.items():
-        sx, sy, z = proj(h, 0)
-        if z <= 0.0:
-            continue
-        col = CARDINAL if len(lbl) == 1 else INTER
-        t = display.tiny_font.render(lbl, True, col)
-        ball.blit(t, (int(sx) - t.get_width() // 2,
-                      int(sy) - t.get_height() - 2))
+        # Cardinal / intercardinal letters where their meridian meets the horizon.
+        HEADINGS = {0: "N", 45: "NE", 90: "E", 135: "SE",
+                    180: "S", 225: "SW", 270: "W", 315: "NW"}
+        for h, lbl in HEADINGS.items():
+            sx, sy, z = proj(h, 0)
+            if z <= 0.0:
+                continue
+            col = CARDINAL if len(lbl) == 1 else INTER
+            t = display.tiny_font.render(lbl, True, col)
+            base.blit(t, (int(sx) - t.get_width() // 2,
+                          int(sy) - t.get_height() - 2))
+
+        _NAVBALL_BASE_CACHE['key'] = base_key
+        _NAVBALL_BASE_CACHE['surface'] = base
+
+    # Dynamic overlays paint onto a throwaway copy so the cached base stays clean.
+    ball = base.copy()
 
     # --- Target trajectory + current target crosshair (mirrors the skyplot) --
     # Painted onto the ball surface so it is clipped to the disc and rides under

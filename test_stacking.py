@@ -169,6 +169,18 @@ def test_crop_centered_size_and_padding():
     print("ok  crop_centered fixed-size + edge padding")
 
 
+def test_crop_centered_odd_size_is_centered():
+    """The target must land on the centre pixel (out//2) for even AND odd sizes."""
+    img = np.zeros((60, 60, 3), np.uint8)
+    img[33, 21] = 255                                # single bright px at (x=21,y=33)
+    for size in (40, 41):                            # even and odd
+        out = crop_centered(img, (21, 33), size)
+        g = cv2.cvtColor(out, cv2.COLOR_RGB2GRAY)
+        peak_y, peak_x = np.unravel_index(int(g.argmax()), g.shape)
+        assert (peak_x, peak_y) == (size // 2, size // 2), (size, peak_x, peak_y)
+    print("ok  crop_centered centres even + odd sizes on out//2")
+
+
 def test_recenter_moves_target_to_middle():
     img = _blob(center=(150, 40), radius=10, seed=8)
     out = recenter_frame(img)
@@ -185,9 +197,15 @@ def test_alignment_grid_shape():
     grid = AlignmentPointGrid.over((400, 600), spacing=100)
     assert grid.rows >= 2 and grid.cols >= 2
     assert len(grid) == grid.rows * grid.cols
-    # points lie inside the frame
-    assert grid.points[:, 0].max() <= 600 and grid.points[:, 1].max() <= 400
-    print(f"ok  alignment grid {grid.rows}x{grid.cols} = {len(grid)} pts")
+    # Nodes span the full frame edge-to-edge (so cv2.resize lands each shift on
+    # the pixel it was measured at), not an inset sub-region.
+    assert grid.points[:, 0].min() == 0 and grid.points[:, 1].min() == 0
+    assert grid.points[:, 0].max() == 599 and grid.points[:, 1].max() == 399
+    # A tiny frame still yields a non-degenerate >=2x2 grid (no collapsed axis).
+    tiny = AlignmentPointGrid.over((3, 3), spacing=80)
+    assert tiny.rows >= 2 and tiny.cols >= 2
+    assert tiny.points[:, 0].min() != tiny.points[:, 0].max()
+    print(f"ok  alignment grid {grid.rows}x{grid.cols} = {len(grid)} pts, spans edges")
 
 
 def test_warp_by_grid_constant_field_is_translation():
@@ -206,15 +224,16 @@ def test_warp_by_grid_constant_field_is_translation():
 
 def test_measure_local_shifts_recovers_translation():
     """Phase-correlation shift sign is consistent with warp_by_grid's convention."""
-    ref = _textured(size=160, seed=11)
+    ref = _textured(size=200, seed=11)
     dx, dy = 4, -3
-    moved = np.roll(np.roll(ref, dx, axis=1), dy, axis=0)  # content shifted by (dx,dy)
+    M = np.float32([[1, 0, dx], [0, 1, dy]])         # warp (not roll) -> no wrap
+    moved = cv2.warpAffine(ref, M, (200, 200), borderMode=cv2.BORDER_REFLECT)
     grid = AlignmentPointGrid.over(ref.shape, spacing=50)
     shifts = measure_local_shifts(ref, moved, grid.points, patch=64)
     med = np.median(shifts, axis=0)
     # Re-warping 'moved' by the measured field should land back on 'ref'.
     fixed = warp_by_grid(moved, grid, shifts)
-    inner = slice(20, -20)
+    inner = slice(30, -30)
     before = np.abs(moved[inner, inner].astype(int) - ref[inner, inner].astype(int)).mean()
     after = np.abs(fixed[inner, inner].astype(int) - ref[inner, inner].astype(int)).mean()
     assert after < before * 0.4, (before, after, med)
@@ -258,9 +277,12 @@ def test_stacker_improves_snr():
     assert stack_err < single_err * 0.6, (single_err, stack_err)
     assert corner_std(master) < corner_std(frames[0]) * 0.7
     st = stacker.stats
-    assert st.n_stacked >= int(0.7 * (len(frames) + 1)), st
+    # Reference + all added frames are accounted for, and the counts reconcile.
+    assert st.n_total == len(frames) + 1, st
+    assert st.n_stacked + st.n_rejected == st.n_total, st
+    assert st.n_stacked >= int(0.7 * st.n_total), st
     print(f"ok  stacker SNR: err {single_err:.1f} -> {stack_err:.1f}, "
-          f"stacked {st.n_stacked}/{st.n_total + 1}")
+          f"stacked {st.n_stacked}/{st.n_total}")
 
 
 def test_stacker_local_runs_and_stacks():
@@ -292,6 +314,37 @@ def test_stacker_rejects_unalignable():
     assert stacker.stats.n_stacked == good       # not added
     assert stacker.stats.n_rejected >= 1
     print(f"ok  stacker rejects unalignable frame ({stacker.stats.n_rejected} rejected)")
+
+
+def test_stacker_no_border_vignette():
+    """Coverage weighting must keep shifted black borders out of the master.
+
+    Every frame is translated by a large, same-direction shift, so a naive
+    sum/count average would darken one whole border band. Per-pixel coverage
+    weighting (the reference covers everything) must keep edges near the truth.
+    """
+    truth = _starfield(size=160, seed=40)
+    shift = 16
+    frames = []
+    for i in range(8):
+        M = np.float32([[1, 0, shift], [0, 1, shift]])
+        frames.append(cv2.warpAffine(truth, M, (160, 160),
+                                     borderMode=cv2.BORDER_CONSTANT, borderValue=0))
+    stacker = LuckyStacker(method="orb")
+    stacker.set_reference(truth)
+    for f in frames:
+        stacker.add(f)
+    master = stacker.result()
+    assert master is not None
+    # The top-left band is where every shifted frame contributed black; with
+    # coverage weighting it should still track the reference, not collapse to 0.
+    band_master = master[:shift, :shift].astype(np.float64).mean()
+    band_truth = truth[:shift, :shift].astype(np.float64).mean()
+    assert abs(band_master - band_truth) < 12.0, (band_master, band_truth)
+    # And no all-black pixels anywhere (a naive average would zero the corner).
+    assert master.sum(axis=2).min() > 0
+    print(f"ok  stacker coverage avoids border vignette "
+          f"(band {band_master:.0f} vs truth {band_truth:.0f})")
 
 
 def test_stacker_empty_result_is_none():

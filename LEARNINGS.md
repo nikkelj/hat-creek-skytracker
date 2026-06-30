@@ -6,6 +6,36 @@ Newest entries first.
 
 ---
 
+## 2026-06-30 — Lucky-imaging stacking (PIPP/AutoStakkert) gotchas
+
+Adding the stacking pipeline ([`stacking.py`](stacking.py)) surfaced three
+non-obvious traps, all caught by an adversarial review pass before merge:
+
+- **Alignment-point grid must span edge-to-edge.** AutoStakkert-style local
+  warping measures a per-point shift on a coarse grid, then upsamples it to a
+  dense field with `cv2.resize`. `resize` maps grid node 0 → pixel 0 and the
+  last node → pixel `size-1`, so if the grid is *inset* by a margin, every
+  measured shift is re-applied ~margin px away from where it was measured — it
+  actively warps detail to the wrong place near the borders. Fix: place nodes on
+  `linspace(0, size-1, n)` and let `measure_local_shifts` clamp each patch
+  inward at the edges instead of insetting the nodes.
+- **Stacking must be per-pixel coverage weighted, not sum/count.** Aligning a
+  jittered frame shifts real pixels in and leaves `BORDER_CONSTANT` black at the
+  revealed edge. A naive `sum / frame_count` average then darkens a whole border
+  band proportional to the jitter. Accumulate a per-pixel coverage mask (warp an
+  all-ones image by the same transform) alongside the sum and divide by it; the
+  reference covers the whole frame so every pixel keeps a valid average.
+- **Derive reconciling stats.** Tracking `n_total` as its own counter drifted
+  out of sync with `n_stacked`/`n_rejected` (the directly-set reference frame
+  was never counted), yielding "stacked 10 of 9". Derive
+  `n_total = n_stacked + n_rejected` so the counts can't disagree.
+
+General principle reaffirmed: any "coarse grid → dense field via resize" step has
+an off-by-the-margin registration trap, and any align-then-average step needs a
+coverage denominator, not a frame count.
+
+---
+
 ## 2026-06-24 — Recovering joystick-mode render & sim-imaging FPS
 
 **Symptom.** After the navball rebuild and the ADS-B additions, the Joystick Loop

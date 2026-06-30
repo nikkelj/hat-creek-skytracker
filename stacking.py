@@ -166,10 +166,8 @@ class QualityGrader:
         """Grade an iterable of frames, returning ``FrameGrade`` in input order."""
         grades = []
         for i, f in enumerate(frames):
-            arr = _as_array(f)
-            s = 0.0 if arr is None else sharpness(arr, self.method, self.roi)
             src = f if not isinstance(f, np.ndarray) else None
-            grades.append(FrameGrade(i, s, src))
+            grades.append(FrameGrade(i, self.score(f), src))
         return grades
 
 
@@ -197,11 +195,17 @@ def select_best(grades, fraction=None, count=None, min_keep=1):
 # ---------------------------------------------------------------------------
 # PIPP stage: target finding, centering, cropping
 # ---------------------------------------------------------------------------
+def _default_threshold(gray):
+    """The shared 'sky' cut: pixels above ``mean + 2*std`` count as target."""
+    g = gray.astype(np.float64)
+    return float(g.mean() + 2.0 * g.std())
+
+
 def _foreground(gray, threshold):
     """Background-subtracted foreground weights (>=0) and the threshold used."""
     g = gray.astype(np.float64)
     if threshold is None:
-        threshold = float(g.mean() + 2.0 * g.std())
+        threshold = _default_threshold(g)
     return np.clip(g - threshold, 0.0, None), threshold
 
 
@@ -238,7 +242,7 @@ def bounding_box(frame, threshold=None, pad=0):
     _require_cv2()
     gray = _to_gray(frame).astype(np.float64)
     if threshold is None:
-        threshold = float(gray.mean() + 2.0 * gray.std())
+        threshold = _default_threshold(gray)
     mask = gray > threshold
     if not mask.any():
         return None
@@ -270,9 +274,10 @@ def crop_centered(frame, center, size, pad_value=0):
     shape = (out_h, out_w) + arr.shape[2:]
     canvas = np.full(shape, pad_value, dtype=arr.dtype)
 
-    # Source top-left so that ``center`` lands at the output centre.
-    sx0 = int(round(cx - out_w / 2.0))
-    sy0 = int(round(cy - out_h / 2.0))
+    # Source top-left so that ``center`` lands on the output's centre pixel
+    # (index ``out//2`` -- correct for odd sizes, not biased by a 0.5 round).
+    sx0 = int(round(cx)) - out_w // 2
+    sy0 = int(round(cy)) - out_h // 2
     src_h, src_w = arr.shape[:2]
 
     # Overlap of the requested source window with the actual image.
@@ -332,35 +337,42 @@ class AlignmentPointGrid:
         return len(self.points)
 
     @classmethod
-    def over(cls, shape, spacing=80, margin=None):
+    def over(cls, shape, spacing=80):
         """Build a grid spanning ``shape`` (h, w) at roughly ``spacing`` px apart.
 
-        At least a 2x2 grid is produced so the displacement field can be
-        bilinearly upsampled.
+        Nodes run edge-to-edge (the first/last sit on pixel 0 and ``size-1``) so
+        that upsampling the coarse shift grid with :func:`cv2.resize` lands each
+        node's displacement back on the pixel it was measured at -- an inset grid
+        would be stretched to the borders and apply every shift ~inset px off.
+        Patches near an edge are clamped inward by :func:`measure_local_shifts`,
+        so edge nodes are safe. At least a 2x2 grid is produced so the field can
+        be bilinearly upsampled.
         """
         h, w = shape[:2]
         spacing = max(1, int(spacing))
-        if margin is None:
-            margin = spacing // 2
-        margin = int(max(0, min(margin, (min(h, w) - 1) // 2)))
-        cols = max(2, 1 + (w - 2 * margin) // spacing)
-        rows = max(2, 1 + (h - 2 * margin) // spacing)
-        xs = np.linspace(margin, w - 1 - margin, cols)
-        ys = np.linspace(margin, h - 1 - margin, rows)
+        cols = max(2, 1 + (w - 1) // spacing)
+        rows = max(2, 1 + (h - 1) // spacing)
+        xs = np.linspace(0, w - 1, cols)
+        ys = np.linspace(0, h - 1, rows)
         gx, gy = np.meshgrid(xs, ys)
         points = np.column_stack([gx.ravel(), gy.ravel()])
         return cls(points, rows, cols, shape)
 
 
-def measure_local_shifts(ref_gray, frame_gray, points, patch=48, min_response=0.0):
+def measure_local_shifts(ref_gray, frame_gray, points, patch=48, min_response=0.0,
+                         max_shift=None):
     """Per-point sub-pixel shift of ``frame`` vs ``ref`` at each alignment point.
 
     For each point a square patch (side ``patch``) is cut from both images and
     registered with phase correlation. The returned ``(N, 2)`` array holds the
     ``(dx, dy)`` that maps a reference location to where that content sits in the
     frame -- i.e. ``frame`` sampled at ``ref_xy + shift`` lands back on ``ref``.
-    Points whose correlation response is below ``min_response`` (or that fall too
-    near an edge) report a zero shift.
+    Points whose correlation response is below ``min_response`` report a zero
+    shift. ``max_shift`` (px) rejects implausibly large per-point shifts -- a
+    structureless sky patch can phase-correlate to garbage, and without this
+    guard one bad node would smear a whole band of the master via the upsampled
+    field; such points fall back to a zero shift, mirroring how
+    :class:`stabilizer.Stabilizer` rejects implausible global fits.
     """
     _require_cv2()
     ref = ref_gray if ref_gray.ndim == 2 else _to_gray(ref_gray)
@@ -387,6 +399,8 @@ def measure_local_shifts(ref_gray, frame_gray, points, patch=48, min_response=0.
         (dx, dy), response = cv2.phaseCorrelate(a, b, win)
         if response < min_response:
             continue
+        if max_shift is not None and (abs(dx) > max_shift or abs(dy) > max_shift):
+            continue  # implausible -> treat as no local correction at this node
         shifts[i] = (dx, dy)
     return shifts
 
@@ -432,12 +446,19 @@ class LuckyStacker:
     is the low-noise master. Frames that fail to align are dropped (counted in
     :attr:`stats`) rather than smeared into the result.
 
+    Averaging is **per-pixel coverage weighted**: aligning a frame shifts real
+    pixels in and leaves black (BORDER_CONSTANT) at the revealed edge, so each
+    contribution is masked and a per-pixel weight is accumulated alongside the
+    sum. Dividing sum by weight (rather than a single frame count) keeps the
+    shifted black borders from darkening the master's edges -- the reference
+    covers the whole frame, so every pixel keeps a valid average.
+
     Typical use is to feed only the sharpest top X% (see :func:`select_best`),
     with the sharpest frame as the reference.
     """
 
     def __init__(self, method="orb", local=False, ap_spacing=80, ap_patch=48,
-                 full_affine=False, min_local_response=0.0):
+                 full_affine=False, min_local_response=0.0, max_local_shift=None):
         _require_cv2()
         self.method = method
         self.local = bool(local)
@@ -445,13 +466,16 @@ class LuckyStacker:
         self.ap_patch = int(ap_patch)
         self.full_affine = bool(full_affine)
         self.min_local_response = float(min_local_response)
+        # Default cap on a single alignment point's shift: a quarter of the patch.
+        self.max_local_shift = (self.ap_patch / 4.0 if max_local_shift is None
+                                else float(max_local_shift))
 
         self._stab = None
         self._ref_gray = None
         self._grid = None
-        self._accum = None
+        self._accum = None       # float64 HxWx3 weighted sum
+        self._weight = None      # float64 HxW per-pixel coverage
         self._count = 0
-        self.n_total = 0
         self.n_rejected = 0
 
     # ------------------------------------------------------------- reference
@@ -464,6 +488,7 @@ class LuckyStacker:
         self._stab.set_reference(arr)
         self._ref_gray = _to_gray(arr).astype(np.float32)
         self._accum = arr.astype(np.float64).copy()
+        self._weight = np.ones(arr.shape[:2], dtype=np.float64)  # full coverage
         self._count = 1
         if self.local:
             self._grid = AlignmentPointGrid.over(arr.shape, self.ap_spacing)
@@ -479,24 +504,36 @@ class LuckyStacker:
         The first ``add`` with no reference set adopts the frame as reference.
         """
         arr = _as_array(frame)
-        self.n_total += 1
+        if not self.has_reference:
+            if arr is None:
+                self.n_rejected += 1
+                return False
+            self.set_reference(arr)
+            return True
         if arr is None:
             self.n_rejected += 1
             return False
-        if not self.has_reference:
-            self.set_reference(arr)
-            return True
 
-        warped, _ = self._stab.stabilize(arr)
+        warped, M = self._stab.stabilize(arr)
         if not self._stab.last_ok:
             self.n_rejected += 1
             return False
+
+        # Coverage mask: where the aligning warp brought in real (non-border) px.
+        h, w = arr.shape[:2]
+        cover = cv2.warpAffine(
+            np.ones((h, w), np.float32), M.astype(np.float32), (w, h),
+            flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         if self.local and self._grid is not None:
             shifts = measure_local_shifts(
                 self._ref_gray, _to_gray(warped), self._grid.points,
-                patch=self.ap_patch, min_response=self.min_local_response)
+                patch=self.ap_patch, min_response=self.min_local_response,
+                max_shift=self.max_local_shift)
             warped = warp_by_grid(warped, self._grid, shifts)
-        self._accum += warped.astype(np.float64)
+            cover = warp_by_grid(cover, self._grid, shifts, border=cv2.BORDER_CONSTANT)
+        cover = np.clip(cover, 0.0, 1.0)
+        self._accum += warped.astype(np.float64) * cover[..., None]
+        self._weight += cover
         self._count += 1
         return True
 
@@ -511,11 +548,14 @@ class LuckyStacker:
         """The averaged master frame (uint8 RGB), or None if nothing stacked."""
         if self._count == 0 or self._accum is None:
             return None
-        return np.clip(self._accum / self._count, 0, 255).astype(np.uint8)
+        denom = np.maximum(self._weight, 1e-6)[..., None]
+        return np.clip(self._accum / denom, 0, 255).astype(np.uint8)
 
     @property
     def stats(self):
-        return StackStats(self.n_total, self._count, self.n_rejected)
+        # n_total is derived so it always reconciles: every frame offered to the
+        # stacker is either stacked (incl. the reference) or rejected.
+        return StackStats(self._count + self.n_rejected, self._count, self.n_rejected)
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +596,8 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
     if not grades:
         return StackResult(None, StackStats(0, 0, 0), [], [], None)
 
-    kept = select_best(grades, fraction=None if keep_count else keep_fraction,
+    kept = select_best(grades,
+                       fraction=keep_fraction if keep_count is None else None,
                        count=keep_count)
     reference_index = kept[0].index  # sharpest frame anchors the stack
 

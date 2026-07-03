@@ -998,7 +998,8 @@ class StackExporter:
 
     def __init__(self, run, cam_index, t_start, t_end, out_path,
                  keep_fraction=0.5, quality="laplacian", method="orb",
-                 local=False, roi=None, max_frames=None):
+                 local=False, roi=None, max_frames=None, workers=None,
+                 grade_scale=1.0, prefilter=True):
         self.run = run
         self.cam_index = cam_index
         self.t_start = t_start
@@ -1010,6 +1011,9 @@ class StackExporter:
         self.local = local
         self.roi = roi
         self.max_frames = max_frames
+        self.workers = workers          # None -> all cores
+        self.grade_scale = grade_scale  # <1 grades at reduced res for speed
+        self.prefilter = prefilter      # conservative garbage pre-cull
 
         self.progress = 0.0
         self.done = False
@@ -1044,7 +1048,9 @@ class StackExporter:
             self.run, self.cam_index, keep_fraction=self.keep_fraction,
             quality=self.quality, method=self.method, local=self.local,
             roi=self.roi, t_start=self.t_start, t_end=self.t_end,
-            max_frames=self.max_frames, progress=_progress)
+            max_frames=self.max_frames, workers=self.workers,
+            grade_scale=self.grade_scale, prefilter=self.prefilter,
+            progress=_progress)
         if result.master is None:
             raise RuntimeError("No alignable frames in the selected range to stack")
         self.out_path = save_master(result.master, self.out_path)

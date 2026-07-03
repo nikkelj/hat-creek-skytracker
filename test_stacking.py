@@ -18,6 +18,7 @@ import cv2
 
 from stacking import (
     sharpness, SHARPNESS_METHODS, QualityGrader, FrameGrade, select_best,
+    content_score, prefilter_garbage,
     brightness_centroid, bounding_box, crop_centered, recenter_frame,
     AlignmentPointGrid, measure_local_shifts, warp_by_grid,
     LuckyStacker, stack_run, save_master, _decode,
@@ -87,6 +88,61 @@ def test_sharpness_orders_blur():
     for m in SHARPNESS_METHODS:
         assert sharpness(crisp, m) > sharpness(soft, m), m
     print("ok  sharpness orders crisp > blurred (all metrics)")
+
+
+def test_sharpness_scale_preserves_order():
+    """Reduced-resolution grading still ranks crisp above blurred (for speed)."""
+    crisp = _textured(seed=4, blur=0.0)
+    soft = _textured(seed=4, blur=7.0)
+    assert sharpness(crisp, scale=0.5) > sharpness(soft, scale=0.5)
+    assert sharpness(crisp, scale=0.25) > sharpness(soft, scale=0.25)
+    print("ok  sharpness ranking preserved at reduced scale")
+
+
+def test_sharpness_is_fooled_by_noise_but_content_is_not():
+    """The core reason the pre-cull exists: sharpness rewards noise.
+
+    A pure-noise frame scores HIGHER on sharpness than a faint but real target,
+    so a naive top-X% cull would keep junk and drop good data. content_score
+    must invert that ordering.
+    """
+    faint = _blob(size=200, center=(100, 100), radius=22, amp=45, bg=12, blur=2.0, seed=1)
+    noise = cv2.cvtColor((np.random.default_rng(2).normal(30, 26, (200, 200))
+                          ).clip(0, 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    assert sharpness(noise) > sharpness(faint)              # the trap
+    assert content_score(faint) > content_score(noise)      # the fix
+    print(f"ok  sharpness fooled by noise, content_score not "
+          f"(sharp n>{sharpness(noise):.0f}>f{sharpness(faint):.0f}; "
+          f"content f>{content_score(faint):.1f}>n{content_score(noise):.1f})")
+
+
+def test_content_score_separates_signal():
+    real = _starfield(size=200, seed=3)
+    faint = _blob(size=200, center=(100, 100), radius=20, amp=50, bg=12, blur=2.0, seed=3)
+    noise = cv2.cvtColor((np.random.default_rng(4).normal(30, 25, (200, 200))
+                          ).clip(0, 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+    blank = np.full((200, 200, 3), 15, np.uint8)
+    assert content_score(real) > content_score(faint) > content_score(noise)
+    assert content_score(noise) > content_score(blank) - 1e-6  # blank ~ 0
+    assert content_score(blank) < 1.0
+    print("ok  content_score orders real > faint > noise > blank")
+
+
+def test_prefilter_drops_only_garbage():
+    """Pre-cull removes noise/blank but keeps every real frame (incl. faint)."""
+    frames = [_starfield(size=200, seed=s) for s in range(6)]         # 0..5 real
+    frames.append(_blob(size=200, center=(100, 100), radius=20,       # 6 faint real
+                        amp=48, bg=12, blur=2.0, seed=9))
+    frames.append(cv2.cvtColor((np.random.default_rng(7).normal(30, 26, (200, 200))
+                                ).clip(0, 255).astype(np.uint8), cv2.COLOR_GRAY2RGB))  # 7 noise
+    frames.append(np.full((200, 200, 3), 15, np.uint8))              # 8 blank
+    grades = QualityGrader(with_content=True).grade(frames)
+    survivors, dropped = prefilter_garbage(grades)
+    kept_idx = {g.index for g in survivors}
+    drop_idx = {g.index for g in dropped}
+    assert drop_idx == {7, 8}, (drop_idx, kept_idx)          # only noise + blank
+    assert {0, 1, 2, 3, 4, 5, 6} <= kept_idx                 # all real survive
+    print(f"ok  prefilter drops garbage {sorted(drop_idx)}, keeps real+faint")
 
 
 def test_sharpness_roi():
@@ -243,10 +299,25 @@ def test_measure_local_shifts_recovers_translation():
 # ---------------------------------------------------------------------------
 # AutoStakkert: the stacker
 # ---------------------------------------------------------------------------
-def _jittered_noisy_set(n=24, size=160, noise=30, seed=0):
-    """A static starfield captured n times with random sub-pixel jitter + noise."""
+def _texture_scene(size=200, seed=0):
+    """A fixed extended-texture target (like a resolved planet/lunar surface).
+
+    Unlike a point-source starfield, this has stable features at every scale, so
+    it survives downscaling -- the case where half-res alignment is appropriate.
+    """
     rng = np.random.default_rng(seed)
-    truth = _starfield(size=size, seed=seed)
+    img = cv2.GaussianBlur((rng.random((size, size)) * 255).astype(np.uint8), (3, 3), 0)
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+
+
+def _jittered_noisy_set(n=24, size=160, noise=30, seed=0, base=None):
+    """A static scene captured n times with random sub-pixel jitter + noise.
+
+    Defaults to a starfield; pass ``base`` (e.g. :func:`_texture_scene`) for an
+    extended-texture target.
+    """
+    rng = np.random.default_rng(seed)
+    truth = _starfield(size=size, seed=seed) if base is None else base
     frames = []
     for i in range(n):
         jx, jy = rng.normal(0, 3, 2)
@@ -354,6 +425,50 @@ def test_stacker_empty_result_is_none():
     print("ok  empty stacker -> None")
 
 
+def test_seed_stack_and_merge_counts_reference_once():
+    """Map-reduce: only the seeding worker holds the reference; merge joins sums."""
+    truth = _starfield(size=160, seed=50)
+    frames = [truth.copy() for _ in range(5)]        # identity -> all align cleanly
+    a = LuckyStacker(method="orb"); a.set_reference(truth, seed_stack=True)
+    b = LuckyStacker(method="orb"); b.set_reference(truth, seed_stack=False)
+    for f in frames[:3]:
+        a.add(f)
+    for f in frames[3:]:
+        b.add(f)
+    a.merge(b)
+    # Reference counted exactly once: 1 (ref) + 5 identical adds = 6.
+    assert a.stats.n_stacked == 6, a.stats
+    assert a.stats.n_total == a.stats.n_stacked + a.stats.n_rejected
+    assert int(a._weight.max()) == 6                 # peak coverage == frames summed
+    master = a.result()
+    assert np.abs(master.astype(int) - truth.astype(int)).mean() < 1.0
+    print("ok  seed_stack=False + merge counts reference once")
+
+
+def test_align_scale_half_still_improves_snr():
+    """Estimating the transform at half-res still aligns + denoises the stack.
+
+    Uses an extended-texture target (resolved planet/lunar-like), which is where
+    half-res alignment applies -- point-source star fields blur away when
+    downscaled. This is the speed/quality trade the align_scale knob exposes; it
+    must still stack most frames and cut noise.
+    """
+    base = _texture_scene(size=240, seed=51)
+    truth, frames = _jittered_noisy_set(n=18, size=240, noise=22, seed=51, base=base)
+    stk = LuckyStacker(method="orb", align_scale=0.5)
+    stk.set_reference(truth)
+    for f in frames:
+        stk.add(f)
+    master = stk.result()
+    assert master is not None
+    single = np.abs(frames[0].astype(int) - truth.astype(int)).mean()
+    stack_err = np.abs(master.astype(int) - truth.astype(int)).mean()
+    assert stack_err < single * 0.7, (single, stack_err)
+    assert stk.stats.n_stacked >= int(0.6 * stk.stats.n_total), stk.stats
+    print(f"ok  align_scale=0.5 improves SNR ({single:.1f} -> {stack_err:.1f}, "
+          f"stacked {stk.stats.n_stacked}/{stk.stats.n_total})")
+
+
 # ---------------------------------------------------------------------------
 # Run-level glue
 # ---------------------------------------------------------------------------
@@ -412,6 +527,34 @@ def test_stack_run_keep_count_and_window():
         assert all(2 <= g.source["t"] <= 5 for g in res2.grades)
         assert len(res2.grades) == 4
     print("ok  stack_run keep_count + time window")
+
+
+def test_stack_run_parallel_matches_serial():
+    """workers>1 (map-reduce) yields the same stacked set and ~same master."""
+    truth, frames = _jittered_noisy_set(n=16, size=200, noise=18, seed=52)
+    with tempfile.TemporaryDirectory() as d:
+        run = _FakeRun(frames, times=range(len(frames)), directory=d)
+        r1 = stack_run(run, 0, keep_fraction=1.0, workers=1, prefilter=False)
+        r4 = stack_run(run, 0, keep_fraction=1.0, workers=4, prefilter=False)
+        assert r1.stats == r4.stats, (r1.stats, r4.stats)
+        diff = np.abs(r1.master.astype(int) - r4.master.astype(int)).mean()
+        assert diff < 2.0, diff
+    print(f"ok  parallel stack matches serial (stats {r4.stats}, master diff {diff:.2f})")
+
+
+def test_stack_run_prefilter_drops_garbage_end_to_end():
+    """Injected noise/blank frames are pre-culled before ranking + stacking."""
+    truth, frames = _jittered_noisy_set(n=14, size=200, noise=18, seed=53)
+    frames.append(cv2.cvtColor((np.random.default_rng(1).normal(30, 26, (200, 200))
+                                ).clip(0, 255).astype(np.uint8), cv2.COLOR_GRAY2RGB))
+    frames.append(np.full((200, 200, 3), 15, np.uint8))
+    with tempfile.TemporaryDirectory() as d:
+        run = _FakeRun(frames, times=range(len(frames)), directory=d)
+        res = stack_run(run, 0, keep_fraction=1.0, prefilter=True)
+        dropped_idx = {g.index for g in res.dropped}
+        assert {14, 15} <= dropped_idx, dropped_idx     # noise + blank removed
+        assert res.master is not None
+    print(f"ok  stack_run pre-culls garbage end-to-end (dropped {sorted(dropped_idx)})")
 
 
 def test_stack_run_max_frames_subsample():

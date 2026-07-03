@@ -34,7 +34,9 @@ alignment) and the on-disk frame indexing in :class:`post_process.Run`.
 """
 
 import os
+import threading
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -96,7 +98,7 @@ def _clamp_roi(shape, roi):
 SHARPNESS_METHODS = ("laplacian", "tenengrad", "fft")
 
 
-def sharpness(frame, method="laplacian", roi=None):
+def sharpness(frame, method="laplacian", roi=None, scale=1.0):
     """Estimate a frame's sharpness as a single non-negative score.
 
     Higher means sharper. The score is only meaningful *relative* to other
@@ -111,19 +113,31 @@ def sharpness(frame, method="laplacian", roi=None):
         optional (x, y, w, h) sub-box (full-frame px) to score only the target
         region -- keeps a bright, sharp target from being averaged out by a
         large empty sky.
+    scale
+        <1.0 downsamples the (gray, ROI-cropped) frame before scoring. Since the
+        score is used only to *rank* frames, a reduced-resolution pass is far
+        cheaper and preserves ordering; use 1.0 for the most discriminating pass.
+
+    Uses single-precision (``CV_32F``) accumulators -- the variance/energy is
+    identical to double precision for ranking but roughly halves the cost on a
+    full-frame image.
     """
     _require_cv2()
     gray = _to_gray(frame)
     if roi is not None:
         x, y, w, h = _clamp_roi(gray.shape, roi)
         gray = gray[y:y + h, x:x + w]
+    if scale != 1.0 and gray.size:
+        gh, gw = gray.shape
+        nw, nh = max(1, int(gw * scale)), max(1, int(gh * scale))
+        gray = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
     if gray.size == 0:
         return 0.0
     if method == "laplacian":
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return float(cv2.Laplacian(gray, cv2.CV_32F).var())
     if method == "tenengrad":
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         return float(np.mean(gx * gx + gy * gy))
     if method == "fft":
         return _fft_sharpness(gray)
@@ -144,31 +158,81 @@ def _fft_sharpness(gray):
     return high / total
 
 
+def content_score(frame, scale=0.25, blur=2.0):
+    """A noise-robust "is there real signal here" score (higher = more signal).
+
+    Sharpness metrics are *fooled by noise*: a pure sensor-noise or hot-pixel
+    frame has a huge Laplacian variance and would be ranked as the sharpest,
+    while a faint but real target scores near zero -- so a naive top-X% cull
+    would keep the junk and discard the good frames. This score instead measures
+    the *prominence* of the brightest structure after denoising: the frame is
+    reduced (``scale``, area-averaging beats down noise) and Gaussian-blurred
+    (``blur``), then scored as ``max - median``. A real target/starfield keeps a
+    prominent peak; uniform sky and structureless noise collapse toward zero.
+
+    It is deliberately cheap (runs at reduced resolution) and is used only as a
+    *conservative* first-pass gate to drop obviously empty/garbage frames, never
+    to rank the good ones -- that is what :func:`sharpness` is for.
+    """
+    _require_cv2()
+    gray = _to_gray(frame)
+    if gray.size == 0:
+        return 0.0
+    gh, gw = gray.shape
+    nw, nh = max(1, int(gw * scale)), max(1, int(gh * scale))
+    small = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA).astype(np.float32)
+    if blur > 0:
+        small = cv2.GaussianBlur(small, (0, 0), blur)
+    return float(small.max() - np.median(small))
+
+
 #: One graded frame. ``index`` is the position in the input sequence, ``score``
-#: its sharpness, and ``source`` the original path/dict (None for raw arrays).
-FrameGrade = namedtuple("FrameGrade", ["index", "score", "source"])
+#: its sharpness, ``source`` the original path/dict (None for raw arrays), and
+#: ``content`` its :func:`content_score` (None when not computed).
+FrameGrade = namedtuple("FrameGrade", ["index", "score", "source", "content"])
 
 
 class QualityGrader:
-    """Score and rank a sequence of frames by sharpness (PIPP-style sorting)."""
+    """Score and rank a sequence of frames by sharpness (PIPP-style sorting).
 
-    def __init__(self, method="laplacian", roi=None):
+    ``scale`` (<1.0) grades at reduced resolution for speed; the ordering is
+    preserved so it is safe for ranking. When ``with_content`` is set, each grade
+    also carries a :func:`content_score` for the garbage pre-cull.
+    """
+
+    def __init__(self, method="laplacian", roi=None, scale=1.0, with_content=False):
         if method not in SHARPNESS_METHODS:
             raise ValueError(f"unknown method {method!r}")
         self.method = method
         self.roi = roi
+        self.scale = float(scale)
+        self.with_content = bool(with_content)
 
     def score(self, frame):
         arr = _as_array(frame)
-        return 0.0 if arr is None else sharpness(arr, self.method, self.roi)
+        return 0.0 if arr is None else sharpness(arr, self.method, self.roi, self.scale)
 
-    def grade(self, frames):
-        """Grade an iterable of frames, returning ``FrameGrade`` in input order."""
-        grades = []
-        for i, f in enumerate(frames):
-            src = f if not isinstance(f, np.ndarray) else None
-            grades.append(FrameGrade(i, self.score(f), src))
-        return grades
+    def _grade_one(self, i, frame):
+        arr = _as_array(frame)
+        src = frame if not isinstance(frame, np.ndarray) else None
+        if arr is None:
+            return FrameGrade(i, 0.0, src, 0.0 if self.with_content else None)
+        s = sharpness(arr, self.method, self.roi, self.scale)
+        c = content_score(arr) if self.with_content else None
+        return FrameGrade(i, s, src, c)
+
+    def grade(self, frames, workers=1):
+        """Grade frames, returning ``FrameGrade`` in input order.
+
+        ``workers`` >1 decodes+scores frames on a thread pool. OpenCV releases
+        the GIL during decode and the metric filters, so this scales close to
+        linearly with cores on the decode-bound full-frame workload.
+        """
+        frames = list(frames)
+        if workers and workers > 1 and len(frames) > 1:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                return list(ex.map(lambda p: self._grade_one(*p), enumerate(frames)))
+        return [self._grade_one(i, f) for i, f in enumerate(frames)]
 
 
 def select_best(grades, fraction=None, count=None, min_keep=1):
@@ -190,6 +254,36 @@ def select_best(grades, fraction=None, count=None, min_keep=1):
         k = n
     k = max(int(min_keep), min(k, n))
     return ordered[:k]
+
+
+def prefilter_garbage(grades, ratio=0.12, min_keep=1):
+    """Drop only *obviously* empty/garbage frames by :func:`content_score`.
+
+    Returns ``(survivors, dropped)``. A frame is dropped when its content score
+    falls below ``ratio`` times a robust "good frame" reference (the median of
+    the top half of scores), so the cut adapts to the capture's signal level and
+    is intentionally lenient -- a faint-but-real target sits well above the floor
+    while structureless noise and blank sky fall below it. This runs *before* the
+    precise sharpness ranking so noise frames (which score high on sharpness) can
+    never sneak into the kept set. Grades lacking a content score are all kept.
+
+    ``min_keep`` guarantees at least that many survivors (the highest-content
+    frames) so a mostly-garbage capture still yields something to stack.
+    """
+    scored = [g for g in grades if g.content is not None]
+    if not scored:
+        return list(grades), []
+    vals = np.sort([g.content for g in scored])
+    ref = float(np.median(vals[len(vals) // 2:]))  # median of the top half
+    floor = ratio * ref
+    survivors = [g for g in grades if g.content is None or g.content >= floor]
+    dropped = [g for g in grades if g.content is not None and g.content < floor]
+    if len(survivors) < min_keep:  # keep the best-content frames regardless
+        keep = sorted(scored, key=lambda g: g.content, reverse=True)[:min_keep]
+        keep_ids = {id(g) for g in keep}
+        survivors = [g for g in grades if id(g) in keep_ids]
+        dropped = [g for g in grades if id(g) not in keep_ids]
+    return survivors, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +552,8 @@ class LuckyStacker:
     """
 
     def __init__(self, method="orb", local=False, ap_spacing=80, ap_patch=48,
-                 full_affine=False, min_local_response=0.0, max_local_shift=None):
+                 full_affine=False, min_local_response=0.0, max_local_shift=None,
+                 align_scale=1.0):
         _require_cv2()
         self.method = method
         self.local = bool(local)
@@ -469,6 +564,12 @@ class LuckyStacker:
         # Default cap on a single alignment point's shift: a quarter of the patch.
         self.max_local_shift = (self.ap_patch / 4.0 if max_local_shift is None
                                 else float(max_local_shift))
+        # <1.0 estimates the global transform on a downscaled frame (feature
+        # detection is the dominant cost and scales ~quadratically), then warps
+        # the FULL-res frame -- so the master stays full resolution. Only the
+        # global-shift *estimate* loses precision; measured quality loss is small
+        # (see tests), but 1.0 is the default when maximum sharpness matters.
+        self.align_scale = float(align_scale)
 
         self._stab = None
         self._ref_gray = None
@@ -479,23 +580,84 @@ class LuckyStacker:
         self.n_rejected = 0
 
     # ------------------------------------------------------------- reference
-    def set_reference(self, frame):
-        """Anchor the stack on ``frame`` (also the first stacked frame)."""
+    def set_reference(self, frame, seed_stack=True):
+        """Anchor the stack on ``frame``.
+
+        With ``seed_stack`` (default) the reference is also the first stacked
+        frame. Pass ``seed_stack=False`` to build only the alignment anchor with
+        an empty accumulator -- used by the parallel map-reduce path so several
+        worker stackers can share one reference without counting it N times; one
+        worker seeds it, the rest start empty and are :meth:`merge`\\ d in.
+        """
         arr = _as_array(frame)
         if arr is None:
             raise ValueError("reference frame could not be decoded")
         self._stab = Stabilizer(method=self.method, full_affine=self.full_affine)
-        self._stab.set_reference(arr)
+        # Detect features at align_scale so incoming frames match; keep the
+        # full-res gray for local alignment-point measurement.
+        self._stab.set_reference(self._align_gray(arr))
         self._ref_gray = _to_gray(arr).astype(np.float32)
-        self._accum = arr.astype(np.float64).copy()
-        self._weight = np.ones(arr.shape[:2], dtype=np.float64)  # full coverage
-        self._count = 1
+        if seed_stack:
+            self._accum = arr.astype(np.float64).copy()
+            self._weight = np.ones(arr.shape[:2], dtype=np.float64)  # full coverage
+            self._count = 1
+        else:
+            self._accum = np.zeros(arr.shape, dtype=np.float64)
+            self._weight = np.zeros(arr.shape[:2], dtype=np.float64)
+            self._count = 0
         if self.local:
             self._grid = AlignmentPointGrid.over(arr.shape, self.ap_spacing)
+
+    def merge(self, other):
+        """Fold another stacker's partial sums into this one (map-reduce join).
+
+        Both must share the same reference frame shape. Used to recombine the
+        per-worker partial stacks produced by the parallel path.
+        """
+        if other._accum is None:
+            return self
+        if self._accum is None:
+            self._accum = other._accum.copy()
+            self._weight = other._weight.copy()
+        else:
+            self._accum += other._accum
+            self._weight += other._weight
+        self._count += other._count
+        self.n_rejected += other.n_rejected
+        return self
 
     @property
     def has_reference(self):
         return self._stab is not None and self._stab.has_reference
+
+    def _align_gray(self, arr):
+        """Gray frame at the alignment scale (identity RGB when align_scale==1)."""
+        if self.align_scale == 1.0:
+            return arr
+        g = _to_gray(arr)
+        nh = max(1, int(g.shape[0] * self.align_scale))
+        nw = max(1, int(g.shape[1] * self.align_scale))
+        return cv2.resize(g, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    def _align(self, arr):
+        """Return (warped_full_res, M_full_res, ok) aligning ``arr`` to the ref."""
+        if self.align_scale == 1.0:
+            warped, M = self._stab.stabilize(arr)
+            return warped, M, self._stab.last_ok
+        # Estimate on the downscaled frame, then apply to the full-res frame.
+        M, _ = self._stab.estimate_transform(self._align_gray(arr))
+        if M is None:
+            return None, None, False
+        M = M.copy()
+        M[0, 2] /= self.align_scale     # only translation is resolution-dependent
+        M[1, 2] /= self.align_scale
+        if not self._stab._validate(M, arr.shape):
+            return None, None, False
+        h, w = arr.shape[:2]
+        warped = cv2.warpAffine(
+            arr, M.astype(np.float32), (w, h), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        return warped, M, True
 
     # --------------------------------------------------------------- adding
     def add(self, frame):
@@ -514,8 +676,8 @@ class LuckyStacker:
             self.n_rejected += 1
             return False
 
-        warped, M = self._stab.stabilize(arr)
-        if not self._stab.last_ok:
+        warped, M, ok = self._align(arr)
+        if not ok:
             self.n_rejected += 1
             return False
 
@@ -562,23 +724,80 @@ class LuckyStacker:
 # Run-level glue: PIPP -> AutoStakkert over an on-disk Run
 # ---------------------------------------------------------------------------
 StackResult = namedtuple(
-    "StackResult", ["master", "stats", "grades", "kept", "reference_index"])
+    "StackResult",
+    ["master", "stats", "grades", "kept", "reference_index", "dropped"])
+
+
+def _stack_parallel(ref_arr, frame_specs, method, local, workers, on_advance=None,
+                    align_scale=1.0):
+    """Map-reduce stack: K workers each align+accumulate a slice, then merge.
+
+    All workers share one alignment reference (built K times, a one-off cost);
+    only worker 0 seeds the reference into its accumulator so the merged master
+    counts it exactly once. Accumulation is per-worker (no shared mutable state),
+    so there is no lock on the hot path -- the partial float sums are added at
+    the end. OpenCV releases the GIL during detect/warp, so this scales with
+    cores on the align-bound stack pass.
+    """
+    n = len(frame_specs)
+    k = max(1, min(int(workers or 1), n if n else 1))
+    stackers = []
+    for i in range(k):
+        s = LuckyStacker(method=method, local=local, align_scale=align_scale)
+        s.set_reference(ref_arr, seed_stack=(i == 0))
+        stackers.append(s)
+    chunks = [frame_specs[i::k] for i in range(k)]
+
+    def work(i):
+        s = stackers[i]
+        for spec in chunks[i]:
+            s.add(spec)
+            if on_advance:
+                on_advance()
+        return s
+
+    if k == 1:
+        work(0)
+    else:
+        # Trim OpenCV's own thread pool so K Python workers don't oversubscribe.
+        old = cv2.getNumThreads()
+        cv2.setNumThreads(max(1, old // k))
+        try:
+            with ThreadPoolExecutor(max_workers=k) as ex:
+                list(ex.map(work, range(k)))
+        finally:
+            cv2.setNumThreads(old)
+
+    master = stackers[0]
+    for s in stackers[1:]:
+        master.merge(s)
+    return master
 
 
 def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
               quality="laplacian", method="orb", local=False, roi=None,
-              t_start=None, t_end=None, max_frames=None, progress=None):
+              t_start=None, t_end=None, max_frames=None, progress=None,
+              workers=None, grade_scale=1.0, prefilter=True, prefilter_ratio=0.12,
+              align_scale=1.0):
     """Run the full lucky-imaging pipeline over one camera of a :class:`Run`.
 
-    Steps: gather frames in the (optional) ``[t_start, t_end]`` window, grade
-    them by ``quality`` sharpness (optionally within ``roi``), keep the sharpest
-    ``keep_fraction`` (or ``keep_count``), use the single sharpest frame as the
-    alignment reference, then align + average the kept set with
-    :class:`LuckyStacker`.
+    Two-tier culling keeps a fast first pass from throwing away good data:
+
+    1. **Grade** every frame in the ``[t_start, t_end]`` window in parallel --
+       a precise ``quality`` sharpness score (optionally at ``grade_scale`` for
+       speed, within ``roi``) plus a noise-robust :func:`content_score`.
+    2. **Pre-cull garbage** (``prefilter``): drop only frames with essentially no
+       signal (blank sky, structureless noise) via :func:`prefilter_garbage`.
+       This must precede ranking because sharpness *rewards* noise, so a naive
+       top-X% would otherwise keep hot-pixel/noise frames and discard faint but
+       real ones.
+    3. **Rank & keep** the sharpest ``keep_fraction`` (or ``keep_count``) of the
+       survivors; the single sharpest anchors the alignment.
+    4. **Align + average** the kept set into a high-SNR master, fanned out across
+       ``workers`` cores (defaults to all).
 
     ``progress`` is an optional ``callback(done, total)`` for UIs. Returns a
-    :class:`StackResult` whose ``master`` is the stacked image (None if no usable
-    frames).
+    :class:`StackResult`; ``dropped`` lists the frames the pre-cull removed.
     """
     frames = run.frames(cam_index)
     if t_start is not None or t_end is not None:
@@ -591,27 +810,45 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
         idx = np.linspace(0, len(frames) - 1, int(max_frames)).round().astype(int)
         frames = [frames[i] for i in sorted(set(idx.tolist()))]
 
-    grader = QualityGrader(method=quality, roi=roi)
-    grades = grader.grade(frames)
-    if not grades:
-        return StackResult(None, StackStats(0, 0, 0), [], [], None)
+    if workers is None:
+        workers = max(1, os.cpu_count() or 1)
 
-    kept = select_best(grades,
+    grader = QualityGrader(method=quality, roi=roi, scale=grade_scale,
+                           with_content=prefilter)
+    grades = grader.grade(frames, workers=workers)
+    if not grades:
+        return StackResult(None, StackStats(0, 0, 0), [], [], None, [])
+
+    if prefilter:
+        survivors, dropped = prefilter_garbage(grades, ratio=prefilter_ratio)
+    else:
+        survivors, dropped = list(grades), []
+
+    kept = select_best(survivors,
                        fraction=keep_fraction if keep_count is None else None,
                        count=keep_count)
-    reference_index = kept[0].index  # sharpest frame anchors the stack
+    reference_index = kept[0].index  # sharpest survivor anchors the stack
+    ref_arr = _as_array(frames[reference_index])  # decode the reference once
 
-    stacker = LuckyStacker(method=method, local=local)
-    stacker.set_reference(frames[reference_index]["path"])
     total = len(kept)
+    counter = {"n": 1}
+    lock = threading.Lock()
     if progress:
         progress(1, total)
-    for n, g in enumerate(kept[1:], start=2):
-        stacker.add(frames[g.index]["path"])
-        if progress:
-            progress(n, total)
 
-    return StackResult(stacker.result(), stacker.stats, grades, kept, reference_index)
+    def advance():
+        if not progress:
+            return
+        with lock:
+            counter["n"] += 1
+            progress(counter["n"], total)
+
+    to_stack = [frames[g.index] for g in kept[1:]]
+    stacker = _stack_parallel(ref_arr, to_stack, method, local, workers, advance,
+                              align_scale=align_scale)
+
+    return StackResult(stacker.result(), stacker.stats, grades, kept,
+                       reference_index, dropped)
 
 
 def save_master(master, out_path):

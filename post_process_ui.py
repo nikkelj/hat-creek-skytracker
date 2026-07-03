@@ -24,7 +24,8 @@ import pygame
 
 from utils import draw_button
 from post_process import (
-    RunLibrary, ReplayEngine, Mp4Exporter, fmt_utc, compute_track_vectors,
+    RunLibrary, ReplayEngine, Mp4Exporter, StackExporter, fmt_utc,
+    compute_track_vectors,
 )
 
 # Colors
@@ -513,6 +514,18 @@ def _draw_controls(display, state, x, y, w):
         _button(display, r, label)
         state.rects[key] = r
         cy += 34
+
+    # Stack (lucky imaging: cull sharpest frames -> align -> average to a master)
+    pygame.draw.line(screen, (80, 80, 90), (cx, cy), (x + w - 12, cy)); cy += 8
+    _text(display, "Stack best frames (In->Out):", cx, cy, display.small_font, _MUTED)
+    cy += 22
+    for key, label in (("stack_25", "Stack best 25%"),
+                       ("stack_50", "Stack best 50%"),
+                       ("stack_50_local", "Stack 50% (align points)")):
+        r = pygame.Rect(cx, cy, w - 24, 28)
+        _button(display, r, label)
+        state.rects[key] = r
+        cy += 34
     if state.exporter is not None:
         msg = (f"Exporting... {state.exporter.progress * 100:.0f}%"
                if not state.exporter.done else state.export_msg)
@@ -684,6 +697,14 @@ def _click_replay(pos, display, state, status_messages):
         _start_export(state, status_messages, eng.t0, eng.t1,
                       stabilize=eng.stabilize_on, tag="full"); return
 
+    # Stack (In->Out range)
+    if _hit(R, "stack_25", pos):
+        _start_stack_export(state, status_messages, 0.25, local=False, tag="stack25"); return
+    if _hit(R, "stack_50", pos):
+        _start_stack_export(state, status_messages, 0.50, local=False, tag="stack50"); return
+    if _hit(R, "stack_50_local", pos):
+        _start_stack_export(state, status_messages, 0.50, local=True, tag="stack50ap"); return
+
 
 def _hit(R, key, pos):
     r = R.get(key)
@@ -731,6 +752,25 @@ def _start_export(state, status_messages, t_start, t_end, stabilize, tag):
     state.exporter.start()
     state.export_msg = ""
     status_messages.append(f"Post: exporting {os.path.basename(out)}")
+
+
+def _start_stack_export(state, status_messages, keep_fraction, local, tag):
+    if state.exporter is not None:
+        status_messages.append("Post: export already running"); return
+    os.makedirs(_EXPORT_DIR, exist_ok=True)
+    eng = state.engine
+    cam = state.active_cam
+    safe = state.run.folder.replace(os.sep, "_")
+    out = os.path.join(_EXPORT_DIR, f"{safe}_cam{cam + 1}_{tag}.png")
+    # Stack the marked In->Out range; the master is intentionally linear (no
+    # gamma/brightness/contrast baked in) so it feeds a later sharpening step.
+    state.exporter = StackExporter(
+        state.run, cam, eng.in_marker, eng.out_marker, out,
+        keep_fraction=keep_fraction, local=local, method=eng.stab_method)
+    state.exporter.start()
+    state.export_msg = ""
+    status_messages.append(f"Post: stacking best {int(keep_fraction * 100)}% "
+                           f"-> {os.path.basename(out)}")
 
 
 def handle_pp_motion(pos, display, state, buttons):

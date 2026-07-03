@@ -976,3 +976,84 @@ class Mp4Exporter:
                 self.progress = (i + 1) / total
         finally:
             writer.release()
+
+
+# ---------------------------------------------------------------------------
+# Lucky-imaging stack export (PIPP cull/centre + AutoStakkert align/average)
+# ---------------------------------------------------------------------------
+class StackExporter:
+    """Export a high-SNR stacked master from a camera's frame range.
+
+    This is the AutoStakkert end of the pipeline wired to the replay UI: grade
+    the frames in ``[t_start, t_end]`` by sharpness, keep the sharpest
+    ``keep_fraction``, align them to the sharpest frame and average them into one
+    low-noise image (optionally with alignment-point local warping). Image
+    adjustments are intentionally *not* baked in -- a stacked master is the
+    linear input to a later wavelet/deconvolution sharpening step.
+
+    Mirrors :class:`Mp4Exporter`'s threading contract: call :meth:`start`, then
+    poll :attr:`progress` / :attr:`done` / :attr:`error` and read
+    :attr:`out_path` / :attr:`stats` when finished.
+    """
+
+    def __init__(self, run, cam_index, t_start, t_end, out_path,
+                 keep_fraction=0.5, quality="laplacian", method="orb",
+                 local=False, roi=None, max_frames=None, workers=None,
+                 grade_scale=1.0, prefilter=True):
+        self.run = run
+        self.cam_index = cam_index
+        self.t_start = t_start
+        self.t_end = t_end
+        self.out_path = out_path
+        self.keep_fraction = keep_fraction
+        self.quality = quality
+        self.method = method
+        self.local = local
+        self.roi = roi
+        self.max_frames = max_frames
+        self.workers = workers          # None -> all cores
+        self.grade_scale = grade_scale  # <1 grades at reduced res for speed
+        self.prefilter = prefilter      # conservative garbage pre-cull
+
+        self.progress = 0.0
+        self.done = False
+        self.error = None
+        self.stats = None
+        self.frames_written = 0
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def _worker(self):
+        try:
+            self._export()
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self.done = True
+
+    def _export(self):
+        # Imported lazily so post_process stays importable without the stacker.
+        from stacking import stack_run, save_master
+
+        def _progress(done, total):
+            self.progress = done / total if total else 1.0
+
+        result = stack_run(
+            self.run, self.cam_index, keep_fraction=self.keep_fraction,
+            quality=self.quality, method=self.method, local=self.local,
+            roi=self.roi, t_start=self.t_start, t_end=self.t_end,
+            max_frames=self.max_frames, workers=self.workers,
+            grade_scale=self.grade_scale, prefilter=self.prefilter,
+            progress=_progress)
+        if result.master is None:
+            raise RuntimeError("No alignable frames in the selected range to stack")
+        self.out_path = save_master(result.master, self.out_path)
+        self.stats = result.stats
+        self.frames_written = result.stats.n_stacked
+        self.progress = 1.0

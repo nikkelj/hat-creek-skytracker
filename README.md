@@ -159,7 +159,10 @@ than alt-tabbing between many GUI programs.
   acquisition, tracked-object handoff, click-in-image selection, and labeled
   capture (UTC, mount az/el, rate, centroid per frame).
 - **Post-processing** — quick-look and product generation to get a good shot
-  posted fast.
+  posted fast. A PIPP-style prep stage (sharpness grading, "lucky" frame
+  culling, target centring/cropping) feeds an AutoStakkert-style stacker that
+  aligns and averages the best frames — optionally with alignment-point local
+  warping — into one high-SNR master ready for wavelet sharpening.
 
 We deliberately don't try to re-create everything existing tools (Heavens-Above,
 SkyTrack, KStars, etc.) already do well — the focus is the niche capabilities

@@ -6,6 +6,74 @@ Newest entries first.
 
 ---
 
+## 2026-07-03 — Stacking performance + the "sharpness rewards noise" trap
+
+Profiling the stacking pipeline ([`stacking.py`](stacking.py)) on realistic
+1920×1080 frames overturned two assumptions and surfaced a correctness trap that
+matters more than the speed.
+
+**Where the time actually goes.** Decode of the uncompressed BMPs is ~1.6 ms/frame
+(and OpenCV's `IMREAD_REDUCED_*` does *not* help BMP — it's already memory-bound),
+so the earlier "double-decode" worry was a non-issue. The real costs are the
+**sharpness metric** (`cv2.Laplacian` at `CV_64F` ≈ 11 ms/frame) and **ORB
+feature detection** (≈ 25 ms/frame, the dominant stack cost). Fixes: `CV_64F →
+CV_32F` (~2×, variance identical for ranking); optional reduced-res grading
+(5–10×, ranking-preserving); a `ThreadPoolExecutor` over frames (OpenCV releases
+the GIL, so ~1.7× on the align-bound pass across 4 cores even though cv2 already
+threads internally); and an opt-in half-res *alignment* (`align_scale`, ~2× on
+detect for **extended/textured** targets — point-source star fields blur away
+when downscaled, so it's target-dependent and defaults off).
+
+**The trap: Laplacian variance rewards noise.** A pure sensor-noise / hot-pixel
+frame scores a *huge* sharpness (measured ~10 000) while a faint but real target
+scores ~0. So a naive "keep the top X% by sharpness" first pass does the opposite
+of its job — it **keeps the junk and discards the good frames**, and then the
+stacker can't align the noise so it stacks almost nothing (measured 1/60). The
+fix is a two-tier cull: a cheap, noise-robust `content_score` (reduce with
+area-averaging → Gaussian blur → `max − median` prominence) gates out frames with
+*no signal* first, *then* the precise sharpness metric ranks the survivors.
+Structure survives denoising; noise collapses — so faint real frames are kept and
+noise/blank frames are dropped before ranking ever sees them.
+
+**Parallel stacking without locks.** The align+average pass is parallelized as a
+map-reduce: K worker stackers share one read-only alignment reference (only one
+*seeds* it into its accumulator, so the merged master counts it once), each
+accumulates its own slice, and the partial float sums are added at the end — no
+lock on the hot path. Trim `cv2.setNumThreads` while the Python pool runs so the
+two thread pools don't oversubscribe the cores.
+
+---
+
+## 2026-06-30 — Lucky-imaging stacking (PIPP/AutoStakkert) gotchas
+
+Adding the stacking pipeline ([`stacking.py`](stacking.py)) surfaced three
+non-obvious traps, all caught by an adversarial review pass before merge:
+
+- **Alignment-point grid must span edge-to-edge.** AutoStakkert-style local
+  warping measures a per-point shift on a coarse grid, then upsamples it to a
+  dense field with `cv2.resize`. `resize` maps grid node 0 → pixel 0 and the
+  last node → pixel `size-1`, so if the grid is *inset* by a margin, every
+  measured shift is re-applied ~margin px away from where it was measured — it
+  actively warps detail to the wrong place near the borders. Fix: place nodes on
+  `linspace(0, size-1, n)` and let `measure_local_shifts` clamp each patch
+  inward at the edges instead of insetting the nodes.
+- **Stacking must be per-pixel coverage weighted, not sum/count.** Aligning a
+  jittered frame shifts real pixels in and leaves `BORDER_CONSTANT` black at the
+  revealed edge. A naive `sum / frame_count` average then darkens a whole border
+  band proportional to the jitter. Accumulate a per-pixel coverage mask (warp an
+  all-ones image by the same transform) alongside the sum and divide by it; the
+  reference covers the whole frame so every pixel keeps a valid average.
+- **Derive reconciling stats.** Tracking `n_total` as its own counter drifted
+  out of sync with `n_stacked`/`n_rejected` (the directly-set reference frame
+  was never counted), yielding "stacked 10 of 9". Derive
+  `n_total = n_stacked + n_rejected` so the counts can't disagree.
+
+General principle reaffirmed: any "coarse grid → dense field via resize" step has
+an off-by-the-margin registration trap, and any align-then-average step needs a
+coverage denominator, not a frame count.
+
+---
+
 ## 2026-06-24 — Recovering joystick-mode render & sim-imaging FPS
 
 **Symptom.** After the navball rebuild and the ADS-B additions, the Joystick Loop

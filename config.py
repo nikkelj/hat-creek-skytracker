@@ -1,7 +1,6 @@
 import os
 import json
 import pygame
-from tkinter import Tk
 
 # ==============================================================================
 # CONFIG STATE CLASS

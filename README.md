@@ -130,19 +130,21 @@ screens.
 
 ## Testing
 
-The control/detection/simulation logic is covered by headless unit tests (run
-under the `track` env), including a sim-in-the-loop test that asserts the hot-spot
-loop drives a simulated object to frame center:
+The control/detection/simulation logic is covered by headless unit tests,
+including a sim-in-the-loop test that asserts the hot-spot loop drives a
+simulated object to frame center. The whole suite runs under pytest:
 
 ```
-python test_serial_transact.py        # serial transaction layer (lock, timeouts)
-python test_pid_control.py             # PID: feed-forward units, anti-windup, derivative
-python test_render_buffer.py           # render double-buffering (no flicker)
-python test_hotspot.py                 # hot-spot detection + pixel->angle geometry
-python test_hotspot_integration.py     # HOTSPOT acquire / coast / fallback
-python test_simulator.py               # sim mount dynamics, geometry, sim-in-the-loop
-python test_hw_sim_ui.py               # HW Sim panel logic
+pip install -r requirements.txt
+pytest                                 # ~250 tests, headless, < 1 minute
 ```
+
+Suites with missing prerequisites are skipped automatically with a reason
+(see `conftest.py`): the Rust parity tests need the `skytracker_core` wheel
+(`maturin build rust/skytracker_core`), the star-catalog tests need
+`hip_main.dat` (CDS I/239) in the repo root, and plate-solve tests need
+`tetra3`. `de421.bsp` is auto-provisioned from the `skyfield-data` package.
+Individual files still run standalone, e.g. `python test_simulator.py`.
 
 ## Project Goals & Roadmap
 

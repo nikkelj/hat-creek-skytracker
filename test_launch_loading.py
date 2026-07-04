@@ -1,56 +1,56 @@
 #!/usr/bin/env python3
 """
-Simple test script to verify launch trajectory loading functionality.
+Launch-trajectory loading tests against the committed launches/ fixtures.
+Converted from a print-only script (which returned success even on
+questionable data) to real assertions.
 """
 
-import sys
 import os
+import unittest
 
-# Add the current directory to the Python path
-sys.path.insert(0, os.path.dirname(__file__))
+import numpy as np
 
 from trajectory import read_launch_trajectories
 
-def test_launch_loading():
-    """Test the launch trajectory loading functionality."""
-    print("Testing launch trajectory loading...")
+LAUNCHES_DIR = os.path.join(os.path.dirname(__file__), "launches")
 
-    # Test with existing launches directory
-    launches_dir = "./launches"
 
-    try:
-        # Read launch trajectories
-        launch_trajectories = read_launch_trajectories(launches_dir)
+class LaunchLoadingTests(unittest.TestCase):
 
-        print(f"Found {len(launch_trajectories)} launch trajectories:")
+    @classmethod
+    def setUpClass(cls):
+        cls.trajectories = read_launch_trajectories(LAUNCHES_DIR)
+        cls.names = [n for n in cls.trajectories if not n.endswith("_arcs")]
 
-        for launch_name in sorted(launch_trajectories.keys()):
-            if not launch_name.endswith('_arcs'):
-                trajectory_data, times_array = launch_trajectories[launch_name]
-                arc_data = launch_trajectories.get(launch_name + '_arcs', [])
+    def test_fixture_launches_load(self):
+        self.assertGreater(len(self.names), 0,
+                           f"no launch trajectories parsed from {LAUNCHES_DIR}")
 
-                print(f"  {launch_name}:")
-                print(f"    Trajectory points: {len(trajectory_data)}")
-                print(f"    Time range: {times_array[0]:.2f} to {times_array[-1]:.2f}")
-                print(f"    Arc segments: {len(arc_data)}")
+    def test_each_launch_is_well_formed(self):
+        for name in self.names:
+            with self.subTest(launch=name):
+                trajectory_data, times = self.trajectories[name]
+                self.assertGreater(len(trajectory_data), 1)
+                self.assertEqual(len(trajectory_data), len(times))
 
-                # Check first few data points
-                if trajectory_data:
-                    first_point = trajectory_data[0]
-                    print(f"    First point: time={first_point[0]:.2f}, alt={first_point[1]:.2f}°, az={first_point[2]:.2f}°, range={first_point[3]:.2f}km")
-                    print(f"    Pixel coords: ({first_point[4]:.1f}, {first_point[5]:.1f})")
-                    if len(first_point) > 6:
-                        print(f"    Rates: az={first_point[6]:.4f} °/s, el={first_point[7]:.4f} °/s")
+                times = np.asarray(times, dtype=float)
+                self.assertTrue(np.all(np.diff(times) >= 0),
+                                "times must be non-decreasing")
 
-        print("\nLaunch trajectory loading test completed successfully!")
-        return True
+                for point in (trajectory_data[0], trajectory_data[-1]):
+                    # (time, alt, az, range_km, px, py, az_rate, el_rate, ...)
+                    self.assertGreaterEqual(len(point), 6)
+                    _, alt, az, rng = point[0], point[1], point[2], point[3]
+                    self.assertTrue(-90.0 <= alt <= 90.0, f"alt {alt}")
+                    self.assertTrue(-360.0 <= az <= 720.0, f"az {az}")
+                    self.assertGreaterEqual(rng, 0.0, f"range {rng}")
 
-    except Exception as e:
-        print(f"Error testing launch trajectory loading: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    def test_arc_segments_present(self):
+        # Every launch gets an <name>_arcs companion (possibly empty list).
+        for name in self.names:
+            with self.subTest(launch=name):
+                self.assertIn(name + "_arcs", self.trajectories)
+
 
 if __name__ == "__main__":
-    success = test_launch_loading()
-    sys.exit(0 if success else 1)
+    unittest.main(verbosity=2)

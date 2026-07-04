@@ -1,14 +1,23 @@
 """Headless tests for the post-processing core (post_process.py + stabilizer.py).
 
-Run with the track env:
-    C:\\Users\\nikke\\anaconda3\\envs\\track\\python.exe test_post_process.py
+Run: python test_post_process.py
 
 These exercise run discovery/grouping, the synced timeline, the image pipeline,
 stabilization, sidecar round-trips, and a real MP4 export -- all without the UI.
+
+HERMETIC: the tests build synthetic capture runs (BMP frames named exactly as
+capture_manager writes them + a trajectory.csv) in a temp directory, so they
+run on a fresh checkout / CI with no real `data/` captures -- and never mutate
+real run sidecars.
 """
 
+import atexit
+import csv as _csv
 import os
+import shutil
 import tempfile
+from datetime import datetime, timezone
+
 import numpy as np
 import cv2
 
@@ -18,7 +27,72 @@ from post_process import (
 )
 from stabilizer import Stabilizer
 
-DATA_DIR = "data"
+
+# ---------------------------------------------------------------------------
+# Synthetic run fixtures
+# ---------------------------------------------------------------------------
+_T0 = datetime(2026, 7, 3, 1, 2, 3, tzinfo=timezone.utc).timestamp()
+
+
+def _frame_name(cam, seq, t):
+    dt = datetime.fromtimestamp(t, tz=timezone.utc)
+    stamp = dt.strftime("%Y_%m_%d_%H_%M_%S") + f".{dt.microsecond:06d}"
+    return f"Camera{cam}_{seq:06d}__{stamp}.bmp"
+
+
+def _write_frames(run_dir, cam, n, fps=5.0, w=96, h=64, seed=7):
+    """Textured frames with a small per-frame shift (so ORB/stabilize works)."""
+    rng = np.random.default_rng(seed)
+    base = cv2.GaussianBlur((rng.random((h * 2, w * 2, 3)) * 255).astype(np.uint8),
+                            (3, 3), 0)
+    for i in range(n):
+        t = _T0 + i / fps
+        ox, oy = 4 + i, 6 + (i % 2)  # jitter: crop window drifts
+        img = base[oy:oy + h, ox:ox + w]
+        cv2.imwrite(os.path.join(run_dir, _frame_name(cam, i + 1, t)), img)
+
+
+def _write_trajectory(run_dir, n=8, fps=2.0):
+    path = os.path.join(run_dir, "trajectory.csv")
+    fields = ["timestamp", "satellite_name", "altitude_deg", "azimuth_deg",
+              "distance_km", "pixel_x", "pixel_y", "sequence_in_capture",
+              "camera_index"]
+    with open(path, "w", newline="") as f:
+        w = _csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for i in range(n):
+            t = datetime.fromtimestamp(_T0 - 1 + i / fps, tz=timezone.utc)
+            w.writerow({
+                "timestamp": t.isoformat(),
+                "satellite_name": "TESTSAT",
+                "altitude_deg": 40.0 + i * 0.5,
+                "azimuth_deg": 120.0 + i * 1.0,
+                "distance_km": 800.0 - i * 5.0,
+                "pixel_x": 100.0 + i * 2.0,
+                "pixel_y": 80.0 - i * 1.0,
+                "sequence_in_capture": -1,
+                "camera_index": -1,
+            })
+    return path
+
+
+def _build_synthetic_data():
+    root = tempfile.mkdtemp(prefix="pp_test_data_")
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+
+    sat_run = os.path.join(root, "TESTSAT_99999_2026_07_03_01_02_03")
+    os.makedirs(sat_run)
+    _write_frames(sat_run, cam=1, n=6)
+    _write_frames(sat_run, cam=2, n=4, fps=3.0, seed=11)
+    _write_trajectory(sat_run)
+
+    manual_run = os.path.join(root, "manual_2026_07_03_02_00_00")
+    os.makedirs(manual_run)
+    _write_frames(manual_run, cam=1, n=2, seed=3)
+    return root
+
+
+DATA_DIR = _build_synthetic_data()
 
 
 def _first_real_run(lib):

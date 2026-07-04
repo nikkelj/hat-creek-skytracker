@@ -587,6 +587,8 @@ impl SimCoreLoop {
         let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
         let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
         let _ = d.set_item("status_msgs", o.status_msgs.clone());
+        let _ = d.set_item("cycle_count", o.cycle_count);
+        let _ = d.set_item("loop_dead", o.loop_dead);
         d
     }
 
@@ -727,6 +729,8 @@ fn h_snapshot<'py>(py: Python<'py>, sh: &Shared) -> Bound<'py, PyDict> {
     let _ = d.set_item("status_msgs", o.status_msgs.clone());
     let _ = d.set_item("actual_hz", o.actual_hz);
     let _ = d.set_item("cycle_ms", o.cycle_ms);
+    let _ = d.set_item("cycle_count", o.cycle_count);
+    let _ = d.set_item("loop_dead", o.loop_dead);
     d
 }
 

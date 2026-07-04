@@ -191,6 +191,11 @@ pub struct LoopState {
 
     // HANDOFF: consecutive-detection counter toward the auto hand-off.
     handoff_detection_count: u32,
+
+    // PROGRAM: whether a setpoint was active on the previous step, so a
+    // cleared setpoint (target set / deselected) commands an explicit stop
+    // once instead of silently leaving the mount at its last commanded rate.
+    program_had_setpoint: bool,
 }
 
 impl LoopState {
@@ -207,6 +212,7 @@ impl LoopState {
             hotspot_last_detection_time: 0.0,
             hotspot_entry_time: 0.0,
             handoff_detection_count: 0,
+            program_had_setpoint: false,
         }
     }
 
@@ -304,8 +310,24 @@ impl LoopState {
         out: &mut StepOutput,
     ) {
         let sp = match inputs.setpoint {
-            Some(s) => s,
-            None => return, // no target yet
+            Some(s) => {
+                self.program_had_setpoint = true;
+                s
+            }
+            None => {
+                // No target. If we *were* tracking one (it set below the
+                // horizon, or was deselected), command an explicit stop once —
+                // issuing no new command would leave the mount at its last
+                // rate, which is a slow-motion runaway, not a hold.
+                if self.program_had_setpoint {
+                    self.program_had_setpoint = false;
+                    out.azm_rate_cmd = Some(0);
+                    out.alt_rate_cmd = Some(0);
+                    out.status_msg =
+                        Some("PROGRAM: setpoint cleared - motion stopped".to_string());
+                }
+                return;
+            }
         };
 
         // Lead/extrapolate the sky setpoint by lead_time using the trajectory
@@ -326,6 +348,25 @@ impl LoopState {
             inputs.alignment_az,
             inputs.alignment_el,
         );
+
+        // Safety: abort to STANDBY if the MOUNT-frame target exceeds the
+        // configured axis limits (they gate encoder positions, so the check
+        // must happen after sky_to_mount). Mirrors program_track.
+        let (azm_min, azm_max) = inputs.azm_limit;
+        let (alt_min, alt_max) = inputs.alt_limit;
+        if target_azm > azm_max
+            || target_azm < azm_min
+            || target_alt > alt_max
+            || target_alt < alt_min
+        {
+            out.azm_rate_cmd = Some(0);
+            out.alt_rate_cmd = Some(0);
+            out.requested_mode = Some(Mode::Standby);
+            out.status_msg = Some(format!(
+                "PROGRAM: target (mount AZM:{target_azm:.1} ALT:{target_alt:.1}) exceeds safety limits - switched to STANDBY"
+            ));
+            return;
+        }
 
         let azm_error = wrap180(target_azm - current_azm);
         // ALT is wrapped too: the ALT encoder is modular ([0, 360)) and in AltAz

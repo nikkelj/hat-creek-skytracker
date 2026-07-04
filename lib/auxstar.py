@@ -130,10 +130,15 @@ def dms2f(dd,mm,ss, sign=1):
     Returns:
         float: signed fraction of full rotation
     """
-    assert dd < 360
+    assert abs(dd) < 360
     assert mm < 60
     assert ss < 60
-    return sign * ( ss/3600 + mm/60 + dd/360 )
+    # mm/ss are arcminutes/arcseconds, i.e. fractions of a *degree*, so the
+    # whole angle in degrees is |dd| + mm/60 + ss/3600; divide by 360 for the
+    # fraction of a rotation. (The sign convention matches f2dms, which puts
+    # the sign on the degrees term only.)
+    axis_sign = -1 if dd < 0 else 1
+    return sign * axis_sign * (abs(dd) + mm / 60 + ss / 3600) / 360
 
 def parse_pos(d):
     '''
@@ -319,7 +324,7 @@ class NexstarHandController:
         """
         fofr = pack_int3(dms2f(dd,mm,ss, 1))
         # HC, expected command bytes including msgid, target, id, data, expected response bytes
-        request = '50{:02x}{:02x}{:02x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_SET_POSITION'][2])
+        request = '50{:02x}{:02x}{:02x}'.format(COMMANDS['MC_SET_POSITION'][1], target.value, COMMANDS['MC_SET_POSITION'][0]) + ''.join(['%02x' % c for c in fofr]) + '{:02x}'.format(COMMANDS['MC_SET_POSITION'][2])
         binary = bytearray.fromhex(request)
         binary_response = self._transact(binary, COMMANDS['MC_SET_POSITION'][2]+1)
         return binary_response == b'#'
@@ -347,7 +352,9 @@ class NexstarHandController:
             # what gets packed (packing a negative through pack_int3 would corrupt
             # the 3-byte value).
             packed_rate = pack_int3(abs(rate))
-            request = '50{:02x}{:02x}{:02x}{:06x}{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0], packed_rate, COMMANDS[cmd][2])
+            # packed_rate is 3 raw bytes -- hex-encode them like every other
+            # command builder ('{:06x}' on bytes raises TypeError).
+            request = '50{:02x}{:02x}{:02x}'.format(COMMANDS[cmd][1], target.value, COMMANDS[cmd][0]) + packed_rate.hex() + '{:02x}'.format(COMMANDS[cmd][2])
         binary = bytearray.fromhex(request)
         binary_response = self._transact(binary, COMMANDS[cmd][2]+1)
         return binary_response == b'#'

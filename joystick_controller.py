@@ -31,7 +31,7 @@ from camera_manager import apply_gamma_correction, roi_sizes, roi_label_texts
 from utils import draw_button
 
 # Import PID controller and helper functions
-from control import create_pid_controllers, compute_mount_position_error
+from control import create_pid_controllers, compute_mount_position_error, sky_target_to_mount
 from trajectory import interpolate_position_data_and_rates
 from hotspot import detect_hotspot, pixel_offset_to_angles
 
@@ -921,12 +921,21 @@ class JoystickModeState:
                         return
 
                     # Satellite is above horizon - use PID control for tracking
-                    # Check hardware safety limits against target position first
-                    # If target exceeds limits, abort tracking immediately
-                    if (target_az_deg > azm_limit_max or target_az_deg < azm_limit_min or
-                        target_el_deg > alt_limit_max or target_el_deg < alt_limit_min):
+                    # Check hardware safety limits against target position first.
+                    # The azm/alt_limit_* values are MOUNT-axis limits (they gate
+                    # encoder positions in RATE/HOTSPOT modes), so convert the sky
+                    # target through the command transform before comparing --
+                    # in AltAz mode mount ALT = 90 - el, so gating raw sky el
+                    # against a mount limit is checking the wrong quantity.
+                    target_azm_mount, target_alt_mount = sky_target_to_mount(
+                        self.config_state, target_az_deg, target_el_deg)
+                    if (target_azm_mount > azm_limit_max or target_azm_mount < azm_limit_min or
+                        target_alt_mount > alt_limit_max or target_alt_mount < alt_limit_min):
                         self.tracking_mode = TrackingMode.STANDBY
-                        target_info = f"AZ:{target_az_deg:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° EL:{target_el_deg:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}°"
+                        target_info = (
+                            f"mount AZM:{target_azm_mount:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° "
+                            f"ALT:{target_alt_mount:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}° "
+                            f"(sky AZ:{target_az_deg:.1f}° EL:{target_el_deg:.1f}°)")
                         if self.update_status_callback:
                             self.update_status_callback(f"Satellite target ({target_info}) exceeds safety limits - switched to STANDBY")
                         return
@@ -1114,11 +1123,17 @@ class JoystickModeState:
                 return
 
             # Launch is above horizon - use PID control for tracking
-            # Check hardware safety limits against target position first
-            if (az_deg > azm_limit_max or az_deg < azm_limit_min or
-                target_el_deg > alt_limit_max or target_el_deg < alt_limit_min):
+            # Check hardware safety limits against target position first, in the
+            # MOUNT frame (see program_track: the limits gate encoder positions).
+            target_azm_mount, target_alt_mount = sky_target_to_mount(
+                self.config_state, az_deg, target_el_deg)
+            if (target_azm_mount > azm_limit_max or target_azm_mount < azm_limit_min or
+                target_alt_mount > alt_limit_max or target_alt_mount < alt_limit_min):
                 self.tracking_mode = TrackingMode.STANDBY
-                target_info = f"AZ:{az_deg:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° EL:{target_el_deg:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}°"
+                target_info = (
+                    f"mount AZM:{target_azm_mount:.1f}°/{azm_limit_min:.0f}-{azm_limit_max:.0f}° "
+                    f"ALT:{target_alt_mount:.1f}°/{alt_limit_min:.0f}-{alt_limit_max:.0f}° "
+                    f"(sky AZ:{az_deg:.1f}° EL:{target_el_deg:.1f}°)")
                 if self.update_status_callback:
                     self.update_status_callback(f"Launch target ({target_info}) exceeds safety limits - switched to STANDBY")
                 return

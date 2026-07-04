@@ -54,6 +54,13 @@ pub struct Outputs {
 
     pub actual_hz: f64,
     pub cycle_ms: f64,
+
+    /// Monotonic count of loop cycles (including idle/faulted ones). The
+    /// Python adapter watches this to detect a dead loop thread — a snapshot
+    /// whose cycle_count stops advancing is stale no matter what `fresh` says.
+    pub cycle_count: u64,
+    /// Set when the loop thread has exited (clean stop or contained panic).
+    pub loop_dead: bool,
 }
 
 /// State shared between the Python shim (writers) and the loop thread (reader/
@@ -96,29 +103,55 @@ fn apply_command<T: Transport>(mount: &mut Mount<T>, cmd: &Command) {
     };
 }
 
+/// What a single call to `run_cycle` did, so the loop thread can apply the
+/// consecutive-fault safety policy from MountControlThread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleOutcome {
+    /// Full cycle ran (poll + step + actuate + publish).
+    Ran,
+    /// Not connected — nothing to do.
+    Idle,
+    /// Comm fault (short read / timeout); the cycle was skipped.
+    Fault,
+}
+
+fn bump_cycle_count(shared: &Shared) {
+    let mut o = shared.outputs.lock().unwrap();
+    o.cycle_count += 1;
+}
+
 /// One control cycle: poll position, drain commands, run the decision step,
 /// actuate, publish outputs. A failed poll (short read) skips the cycle without
 /// leaving the mount open-loop — the safety stance from MountControlThread.
+/// The caller is responsible for acting on repeated `Fault` outcomes (the
+/// threaded loop stops motion after `MAX_CONSECUTIVE_FAULTS`).
 pub fn run_cycle<T: Transport>(
     mount: &mut Mount<T>,
     state: &mut LoopState,
     shared: &Shared,
     now: f64,
-) {
+) -> CycleOutcome {
+    bump_cycle_count(shared);
     let inputs = shared.inputs.lock().unwrap().clone();
 
     if !inputs.connected {
-        return;
+        return CycleOutcome::Idle;
     }
 
-    // 1) Single position poll per cycle (degrees), offset-applied.
+    // 1) Single position poll per cycle (degrees), offset-applied. On a comm
+    //    fault, mark the snapshot stale so readers don't keep trusting the
+    //    last position, and report the fault to the caller.
+    let fault = |shared: &Shared| {
+        shared.outputs.lock().unwrap().fresh = false;
+        CycleOutcome::Fault
+    };
     let azm_raw = match mount.hc_get_position(targets::AZM) {
         Ok(v) => v * 360.0,
-        Err(_) => return, // skip cycle on comm fault
+        Err(_) => return fault(shared),
     };
     let alt_raw = match mount.hc_get_position(targets::ALT) {
         Ok(v) => v * 360.0,
-        Err(_) => return,
+        Err(_) => return fault(shared),
     };
     let current_azm = azm_raw - inputs.offsets.0;
     let current_alt = alt_raw - inputs.offsets.1;
@@ -186,7 +219,13 @@ pub fn run_cycle<T: Transport>(
     if let Some(msg) = out.status_msg {
         o.status_msgs.push(msg);
     }
+    drop(o);
+    CycleOutcome::Ran
 }
+
+/// Consecutive comm faults before the loop stops motion (MountControlThread's
+/// safety watchdog, ported).
+pub const MAX_CONSECUTIVE_FAULTS: u32 = 3;
 
 /// The owning handle for the running loop thread.
 pub struct CoreLoop {
@@ -213,10 +252,55 @@ impl CoreLoop {
                 let start = Instant::now();
                 let mut count = 0u32;
                 let mut window = Instant::now();
+                let mut consecutive_faults = 0u32;
                 while !thread_shared.stop.load(Ordering::Relaxed) {
                     let cycle_start = Instant::now();
                     let now = start.elapsed().as_secs_f64();
-                    run_cycle(&mut mount, &mut state, &thread_shared, now);
+
+                    // Contain panics (e.g. from pathological camera frames):
+                    // an unwinding loop thread must never skip the safe-stop
+                    // below and leave the mount slewing while Python keeps
+                    // reading a stale-but-plausible snapshot.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || run_cycle(&mut mount, &mut state, &thread_shared, now),
+                    ));
+                    match outcome {
+                        Ok(CycleOutcome::Ran) | Ok(CycleOutcome::Idle) => {
+                            consecutive_faults = 0;
+                        }
+                        Ok(CycleOutcome::Fault) => {
+                            // Ported MountControlThread policy: after a few
+                            // consecutive comm faults, never leave the mount
+                            // running open-loop — keep commanding a stop
+                            // (best effort on a possibly-dead link).
+                            consecutive_faults += 1;
+                            if consecutive_faults >= MAX_CONSECUTIVE_FAULTS {
+                                apply_command(&mut mount, &Command::Stop);
+                                if consecutive_faults == MAX_CONSECUTIVE_FAULTS {
+                                    if let Ok(mut o) = thread_shared.outputs.lock() {
+                                        o.status_msgs.push(format!(
+                                            "CoreLoop: {consecutive_faults} consecutive comm faults - motion stopped"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // A cycle panicked. Stop the mount, mark the loop
+                            // dead so the adapter's watchdog surfaces it, and
+                            // halt — the loop's state can no longer be trusted.
+                            apply_command(&mut mount, &Command::Stop);
+                            if let Ok(mut o) = thread_shared.outputs.lock() {
+                                o.fresh = false;
+                                o.loop_dead = true;
+                                o.status_msgs.push(
+                                    "CoreLoop: cycle panicked - motion stopped, loop halted"
+                                        .to_string(),
+                                );
+                            }
+                            return;
+                        }
+                    }
 
                     let elapsed = cycle_start.elapsed();
                     // rate stats
@@ -235,6 +319,9 @@ impl CoreLoop {
                 }
                 // On shutdown, never leave the mount slewing.
                 apply_command(&mut mount, &Command::Stop);
+                if let Ok(mut o) = thread_shared.outputs.lock() {
+                    o.loop_dead = true;
+                }
             })
             .expect("spawn CoreLoop");
 

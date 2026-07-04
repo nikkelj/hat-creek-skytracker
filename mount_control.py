@@ -132,16 +132,34 @@ class MountControlThread(threading.Thread):
         self.last_poll_ms = (time.perf_counter() - poll_start) * 1000.0
 
     # --------------------------------------------------------------- safety
-    def _safe_stop_motion(self):
+    def _safe_stop_motion(self, retries=3):
+        """Stop both axes, retrying briefly. Returns True when the stop was
+        acknowledged. A stop that keeps failing is the one fault the operator
+        MUST hear about -- the mount may still be slewing on a dead link -- so
+        it is surfaced through the status callback instead of swallowed.
+        """
         state = self.state
         controller = state.telescope_controller
         if controller is None or not state.telescope_connected:
-            return
+            return True
+        last_err = None
+        for _ in range(max(1, retries)):
+            try:
+                controller.hc_slew_fixed(Targets.AZM, 0)
+                controller.hc_slew_fixed(Targets.ALT, 0)
+                return True
+            except Exception as e:
+                last_err = e
+                time.sleep(0.05)
+        msg = (f"MountControlThread: FAILED to stop motion after {retries} attempts "
+               f"({last_err}) - mount may still be slewing! Check serial link/power.")
+        print(msg)
         try:
-            controller.hc_slew_fixed(Targets.AZM, 0)
-            controller.hc_slew_fixed(Targets.ALT, 0)
+            if getattr(state, 'update_status_callback', None):
+                state.update_status_callback(msg)
         except Exception:
             pass
+        return False
 
     def _update_rate_stats(self):
         self._cycle_count += 1

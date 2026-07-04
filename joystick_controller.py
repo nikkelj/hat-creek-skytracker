@@ -304,11 +304,17 @@ class JoystickModeState:
         self.hotspot_snr = 0.0               # diagnostics
         self.hotspot_centroid = None
         self.hotspot_status = ""
+        self.hotspot_last_frame_seq = None   # last camera frame processed (stale gate)
 
         # PID controllers for PROGRAM track mode
         self.azm_pid = None
         self.alt_pid = None
         self.pid_last_update = 0.0
+
+        # Park request, set by the UI thread and serviced by the control
+        # thread (tracking_control) so no blocking serial happens on the UI.
+        self.park_requested = False
+        self._park_state = None
 
         # Feed-forward and bias control state. Honor the saved config flags so
         # feed-forward (which supplies the target's trajectory rate and removes
@@ -480,11 +486,21 @@ class JoystickModeState:
 
         # Universal stop check - stop movement in any mode when stopped
         if self.stopped:
+            self.park_requested = False   # STOP cancels an in-flight park
+            self._park_state = None
             try:
                 self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
                 self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
             except Exception as e:
                 print(f"Error sending stop commands: {e}")
+            return
+
+        # Park request (Triangle button). Serviced HERE on the control thread:
+        # the UI thread only sets the flag, so a slow/parked/dead serial link
+        # can no longer freeze the pygame loop, and all wire traffic keeps a
+        # single owner. Park preempts tracking until it converges or times out.
+        if self.park_requested:
+            self._service_park()
             return
 
         # A launched rocket overrides any current target AND any tracking mode:
@@ -1311,6 +1327,7 @@ class JoystickModeState:
         self.hotspot_last_detection_time = 0.0
         self.hotspot_centroid = None
         self.hotspot_snr = 0.0
+        self.hotspot_last_frame_seq = None
         if self.azm_pid:
             self.azm_pid.reset()
         if self.alt_pid:
@@ -1344,8 +1361,24 @@ class JoystickModeState:
         cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
         camera = camera_manager.get_camera(cam_index)
         raw = None
+        frame_seq = None
         if camera is not None and getattr(camera, 'thread', None) is not None:
             raw = camera.thread.get_latest_raw()
+            frame_seq = getattr(camera.thread, 'latest_raw_seq', None)
+
+        # Stale-frame gate: with real exposures longer than the control period
+        # the same frame stays "latest" across several cycles. Re-detecting it
+        # would feed the PID the same centroid with an advancing dt (integral
+        # windup / overshoot), so treat a stale frame as "no new measurement":
+        # skip detection this cycle and let the time-based coast/loss logic
+        # below decide (a camera that stops producing frames entirely still
+        # coasts out and falls back rather than tracking a frozen image).
+        frame_is_stale = (frame_seq is not None
+                          and frame_seq == self.hotspot_last_frame_seq)
+        if frame_seq is not None and not frame_is_stale:
+            self.hotspot_last_frame_seq = frame_seq
+        if frame_is_stale:
+            raw = None
 
         # Mount position cached by the control thread this cycle.
         current_azm = self.current_azm
@@ -1436,8 +1469,10 @@ class JoystickModeState:
                     print(f"HOTSPOT: error sending slew commands: {e}")
             return
 
-        # No detection this cycle.
-        self.hotspot_miss_count += 1
+        # No detection this cycle. A stale frame is "no new information", not a
+        # miss -- only count misses against frames we actually examined.
+        if not frame_is_stale:
+            self.hotspot_miss_count += 1
         coast_time = float(getattr(cfg, 'hotspot_coast_time_sec', 1.0))
 
         if self.hotspot_acquired:
@@ -1480,6 +1515,62 @@ class JoystickModeState:
                 self.telescope_controller.hc_set_rate_dps(target, dps)
                 return
         self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+
+    PARK_TIMEOUT_SEC = 90.0
+    PARK_TOLERANCE_DEG = 1.0
+    PARK_REISSUE_SEC = 1.0
+
+    def _service_park(self):
+        """One control-thread cycle of the park sequence.
+
+        Drives both axes to the configured offsets (raw encoder frame, like
+        the goto command itself) with wrap-aware convergence and a timeout --
+        the old UI-thread busy-loop compared unwrapped angles, so an offset
+        near 0 with the encoder reading 359.9 looped forever while the UI was
+        frozen. Uses the position already polled this cycle instead of extra
+        serial reads. Serial faults propagate to MountControlThread's
+        consecutive-fault watchdog like any other cycle fault.
+        """
+        cfg = self.config_state
+        try:
+            target_azm = float(getattr(cfg, 'azm_offset_str', 0.0) or 0.0)
+            target_alt = float(getattr(cfg, 'alt_offset_str', 0.0) or 0.0)
+        except (TypeError, ValueError):
+            target_azm = target_alt = 0.0
+
+        now = time.time()
+        if self._park_state is None:
+            self._park_state = {'start': now, 'last_cmd': 0.0}
+            if self.update_status_callback:
+                self.update_status_callback(
+                    f"Parking to AZM {target_azm:.1f}° / ALT {target_alt:.1f}°...")
+        ps = self._park_state
+
+        if now - ps['start'] > self.PARK_TIMEOUT_SEC:
+            self.park_requested = False
+            self._park_state = None
+            if self.update_status_callback:
+                self.update_status_callback(
+                    f"Park TIMED OUT after {self.PARK_TIMEOUT_SEC:.0f}s - check the mount")
+            return
+
+        # Wrap-aware error in the raw encoder frame (goto targets raw degrees).
+        err_azm = (target_azm - self.current_azm_raw + 180.0) % 360.0 - 180.0
+        err_alt = (target_alt - self.current_alt_raw + 180.0) % 360.0 - 180.0
+        if abs(err_azm) <= self.PARK_TOLERANCE_DEG and abs(err_alt) <= self.PARK_TOLERANCE_DEG:
+            self.park_requested = False
+            self._park_state = None
+            if self.update_status_callback:
+                self.update_status_callback("Park complete")
+            print("Park complete")
+            return
+
+        # Goto is a persistent command; re-issue at a gentle cadence rather
+        # than every cycle so the wire isn't saturated while the mount slews.
+        if now - ps['last_cmd'] >= self.PARK_REISSUE_SEC:
+            self.telescope_controller.hc_goto_fast(Targets.AZM, target_azm, 0, 0)
+            self.telescope_controller.hc_goto_fast(Targets.ALT, target_alt, 0, 0)
+            ps['last_cmd'] = now
 
     def _hotspot_stop_motion(self):
         """Best-effort stop of both axes."""
@@ -1536,10 +1627,16 @@ class JoystickModeState:
                 self.stopped = not self.stopped
                 print(f"Stop toggled: {self.stopped}")
 
-                # Stop movement immediately when stopped
+                # Stop movement immediately when stopped. Guarded: a serial
+                # fault on the UI thread must not crash the app -- the control
+                # thread's stop check re-issues the stop every cycle anyway.
                 if self.stopped and self.telescope_connected:
-                    self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
-                    self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+                    try:
+                        self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
+                        self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
+                    except Exception as e:
+                        print(f"Stop command failed on UI thread ({e}) - "
+                              "control thread will retry")
 
             elif event.button == 2:  # Square button for tare
                 print(f"Taring joystick axes")
@@ -1547,20 +1644,11 @@ class JoystickModeState:
 
             elif event.button == 3:  # Triangle/Park button for park command
                 if self.telescope_connected:
-                    print("Parking telescope to 0, 0...")
-                    # Loop until parked
-                    angle = 1
-                    while abs(angle - float(config_state.azm_offset_str)) > 1:
-                        success = self.telescope_controller.hc_goto_fast(Targets.AZM, float(config_state.azm_offset_str), 0, 0)
-                        print("AZM Park command sent")
-                        time.sleep(0.1)
-                        angle = self.telescope_controller.hc_get_position(Targets.AZM) * 360
-                    angle = 1
-                    while abs(angle - float(config_state.alt_offset_str)) > 1: # keep trying until <1 degree
-                        success = self.telescope_controller.hc_goto_fast(Targets.ALT, float(config_state.alt_offset_str), 0, 0)
-                        print("ALT Park command sent")
-                        time.sleep(0.1)
-                        angle = self.telescope_controller.hc_get_position(Targets.ALT) * 360
+                    # Request only -- the control thread runs the park sequence
+                    # (_service_park) so the UI never blocks on serial I/O.
+                    self.park_requested = True
+                    print("Park requested - control thread will drive to the "
+                          "configured offsets")
                 else:
                     print("Cannot park: telescope not connected")
 

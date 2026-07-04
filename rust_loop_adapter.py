@@ -65,6 +65,8 @@ class RustCoreLoopAdapter:
         self._last_cycle_count = -1
         self._last_cycle_advance = time.monotonic()
         self._loop_fault_latched = False
+        self._last_pushed_frame_seq = None
+        self._park_state = None
 
     # ---- MountControlThread-compatible lifecycle ----
     def start(self):
@@ -213,6 +215,20 @@ class RustCoreLoopAdapter:
         # 2) Push connection/stop/mode + static config.
         loop.set_connected(bool(st.telescope_connected))
         loop.set_stopped(bool(st.stopped))
+
+        # Park request (mirrors tracking_control's control-thread park). STOP
+        # cancels it; while parking, hold the loop in standby so the tracking
+        # modes don't fight the goto, and drive/converge from here.
+        if st.stopped and getattr(st, "park_requested", False):
+            st.park_requested = False
+            self._park_state = None
+        if getattr(st, "park_requested", False):
+            loop.set_mode("standby")
+            self._push_static(cfg)
+            self._service_park(st, cfg)
+            return
+        self._park_state = None
+
         loop.set_mode(_MODE_TO_STR.get(st.tracking_mode, "standby"))
         self._push_static(cfg)
 
@@ -291,6 +307,49 @@ class RustCoreLoopAdapter:
             )
         except (ValueError, AttributeError):
             pass
+
+    def _service_park(self, st, cfg):
+        """Drive both axes to the configured offsets via the loop's goto queue,
+        with the same wrap-aware convergence + timeout as
+        JoystickModeState._service_park (which the Rust path bypasses)."""
+        now = time.monotonic()
+        try:
+            target_azm = float(getattr(cfg, "azm_offset_str", 0.0) or 0.0)
+            target_alt = float(getattr(cfg, "alt_offset_str", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            target_azm = target_alt = 0.0
+
+        if self._park_state is None:
+            self._park_state = {"start": now, "last_cmd": 0.0}
+            if st.update_status_callback:
+                st.update_status_callback(
+                    f"Parking to AZM {target_azm:.1f}° / ALT {target_alt:.1f}°...")
+        ps = self._park_state
+
+        timeout = float(getattr(st, "PARK_TIMEOUT_SEC", 90.0))
+        tol = float(getattr(st, "PARK_TOLERANCE_DEG", 1.0))
+        reissue = float(getattr(st, "PARK_REISSUE_SEC", 1.0))
+
+        if now - ps["start"] > timeout:
+            st.park_requested = False
+            self._park_state = None
+            if st.update_status_callback:
+                st.update_status_callback(
+                    f"Park TIMED OUT after {timeout:.0f}s - check the mount")
+            return
+
+        err_azm = (target_azm - st.current_azm_raw + 180.0) % 360.0 - 180.0
+        err_alt = (target_alt - st.current_alt_raw + 180.0) % 360.0 - 180.0
+        if abs(err_azm) <= tol and abs(err_alt) <= tol:
+            st.park_requested = False
+            self._park_state = None
+            if st.update_status_callback:
+                st.update_status_callback("Park complete")
+            return
+
+        if now - ps["last_cmd"] >= reissue:
+            self.loop.submit_goto(target_azm, target_alt)
+            ps["last_cmd"] = now
 
     def _push_rate(self, st):
         joy = None
@@ -431,5 +490,11 @@ class RustCoreLoopAdapter:
         camera = camera_manager.get_camera(cam_index)
         if camera is not None and getattr(camera, "thread", None) is not None:
             raw = camera.thread.get_latest_raw()
-            if raw is not None:
+            # Only push frames the camera hasn't already delivered: push_frame
+            # assigns a new seq per call, so re-pushing the same raw frame would
+            # defeat the loop's stale-frame gate (and costs a full-frame FFI
+            # copy every pump cycle for nothing).
+            seq = getattr(camera.thread, "latest_raw_seq", None)
+            if raw is not None and (seq is None or seq != self._last_pushed_frame_seq):
                 self.loop.push_frame(hs.to_intensity(raw).astype(np.float32))
+                self._last_pushed_frame_seq = seq

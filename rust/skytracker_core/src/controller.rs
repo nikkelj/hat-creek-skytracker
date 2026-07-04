@@ -188,6 +188,7 @@ pub struct LoopState {
     hotspot_miss_count: u32,
     hotspot_last_detection_time: f64,
     hotspot_entry_time: f64,
+    hotspot_last_frame_seq: Option<u64>,
 
     // HANDOFF: consecutive-detection counter toward the auto hand-off.
     handoff_detection_count: u32,
@@ -211,6 +212,7 @@ impl LoopState {
             hotspot_miss_count: 0,
             hotspot_last_detection_time: 0.0,
             hotspot_entry_time: 0.0,
+            hotspot_last_frame_seq: None,
             handoff_detection_count: 0,
             program_had_setpoint: false,
         }
@@ -265,6 +267,7 @@ impl LoopState {
                     self.hotspot_miss_count = 0;
                     self.hotspot_last_detection_time = 0.0;
                     self.hotspot_entry_time = now;
+                    self.hotspot_last_frame_seq = None;
                 }
                 Mode::Handoff => {
                     self.handoff_detection_count = 0;
@@ -478,6 +481,22 @@ impl LoopState {
             return;
         }
 
+        // Stale-frame gate (mirrors hotspot_track): a frame we already
+        // processed carries no new measurement, so don't re-detect it -- the
+        // PID would re-integrate the same centroid with an advancing dt. The
+        // time-based coast/loss logic below still runs, so a camera that
+        // stops producing frames coasts out and falls back.
+        let frame_is_stale = matches!(
+            (frame, self.hotspot_last_frame_seq),
+            (Some(f), Some(last)) if f.seq == last
+        );
+        if let Some(f) = frame {
+            if !frame_is_stale {
+                self.hotspot_last_frame_seq = Some(f.seq);
+            }
+        }
+        let frame = if frame_is_stale { None } else { frame };
+
         // Detect on this cycle's frame (gated to the last lock once acquired).
         let gate = self
             .hotspot_gate_center
@@ -542,8 +561,11 @@ impl LoopState {
             return;
         }
 
-        // No detection this cycle.
-        self.hotspot_miss_count += 1;
+        // No detection this cycle. A stale frame is "no new information",
+        // not a miss -- only count misses against frames actually examined.
+        if !frame_is_stale {
+            self.hotspot_miss_count += 1;
+        }
 
         if self.hotspot_acquired {
             // Coast: leave the last continuous slew running (no new command)

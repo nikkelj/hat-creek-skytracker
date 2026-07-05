@@ -84,9 +84,16 @@ in the HW-sim UI (item 4), which by nature can't be done headlessly.
    UI and on hardware, plus `x_sign`/`y_sign` calibration (the sim can't
    validate sign conventions).
 
-Deferred (use flag-off until ported): PROGRAM **launch tracking** and
-**below-horizon mask-exit** (the adapter holds in those cases); HANDOFF/MTI
-stubs. skyfield stays Python and feeds the setpoint.
+Deferred (updated 2026-07; use flag-off where these matter): satellite
+**below-horizon mask-exit** (the adapter now commands a safe stop on a cleared
+setpoint but doesn't pre-position at the mask-exit azimuth) and the **MTI**
+stub. Launch tracking and HANDOFF, listed as deferred in earlier versions of
+this note, have since been built (`_push_launch_setpoint`, `step_handoff`).
+skyfield stays Python and feeds the setpoint. The 2026-07 P0 sprint also added
+safety parity the port originally lacked: consecutive-fault safe-stop, panic
+containment + adapter liveness watchdog, NaN-tolerant detection, and a
+mount-frame target limit gate. See `doc/BENCH_CHECKLIST.md` for the ordered
+on-mount validation procedure and the Rust promotion gates.
 
 ## Performance
 

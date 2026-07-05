@@ -33,6 +33,29 @@ def _wrap180(deg):
     return (deg + 180.0) % 360.0 - 180.0
 
 
+def frame_skyfield_time(camera, ts):
+    """Skyfield time of the camera's latest captured frame (falls back to now()).
+
+    Plate solves must be paired with the time the FRAME was exposed, not the
+    time the solve finished: the sky rotates ~15 arcsec/s, so pairing with
+    now() biases every alignment sample by the frame's age (frame period +
+    solve latency) -- material against an arcmin-RMS pointing fit. The capture
+    thread already stamps every frame with a microsecond UTC timestamp
+    (back-dated to the exposure midpoint); use it.
+    """
+    try:
+        stamp = camera.thread.latest_frame.get('datetime_utc_microseconds', '')
+        if stamp:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return ts.from_datetime(dt)
+    except Exception:
+        pass
+    return ts.now()
+
+
 def _spiral_offsets(n):
     """First ``n`` integer (col, row) grid offsets in an outward square spiral, nearest
     first, excluding the origin. Used to order the grid search so it tries the cells
@@ -262,7 +285,7 @@ class GuiSampler:
                if camera is not None and getattr(camera, 'thread', None) is not None else None)
         if raw is None:
             return None
-        t = self.ts.now()
+        t = frame_skyfield_time(camera, self.ts)
         result = self.solver.solve(raw)
         if result is None or not result.solved:
             return None

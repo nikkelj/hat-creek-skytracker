@@ -416,6 +416,18 @@ class JoystickModeState:
         """Connect to telescope via serial port (or the sim mount in sim mode)."""
         # Simulation: hand back the sim mount, no serial port required.
         if self.hardware_sim is not None and self.hardware_sim.sim_enabled():
+            sim_cfg = getattr(self.config_state, 'sim_config', {}) or {}
+            if sim_cfg.get('sim_serial_transport', False):
+                # Byte-level sim: a REAL NexstarHandController drives the sim
+                # mount through the AUX wire protocol, so the app's encoders,
+                # parsers, timeouts and SerialCommError recovery are exercised
+                # in sim (they are bypassed by the method-level SimMount).
+                from simulator import make_sim_serial_controller
+                self.telescope_controller = make_sim_serial_controller(
+                    self.hardware_sim.mount, self.config_state)
+                self.telescope_connected = True
+                print("Connected to SIMULATED telescope (byte-level serial transport)")
+                return True
             self.telescope_controller = self.hardware_sim.mount
             self.telescope_connected = True
             print("Connected to SIMULATED telescope")

@@ -8,7 +8,22 @@ import time
 import numpy as np
 import pygame
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+
+def exposure_midpoint_utc(capture_time_s, now=None):
+    """UTC timestamp back-dated to the approximate exposure midpoint.
+
+    Frames used to be stamped with now() AFTER exposure + readout + numpy
+    conversion completed, so every timestamp lagged reality by the full
+    capture duration -- a bias that flows straight into the per-frame
+    trajectory-CSV interpolation (a LEO target moves ~1 deg/s; a 0.5 s
+    exposure stamped at readout end mislabels the frame by ~0.25-0.5 deg).
+    Back-dating by half the measured capture time lands on the exposure
+    midpoint to within the readout latency.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    return now - timedelta(seconds=max(0.0, capture_time_s) / 2.0)
 
 class CircularBuffer:
     """True circular buffer implementation with pre-allocated memory"""
@@ -363,9 +378,11 @@ class CameraThread(threading.Thread):
                     # Process frame - minimal error handling
                     surface = self._process_raw_frame(raw_frame)
                     if surface is not None:
-                        # Get microsecond-precision UTC timestamp
-                        utc_now = datetime.now(timezone.utc)
-                        local_now = datetime.now()
+                        # Microsecond-precision UTC timestamp, back-dated to
+                        # the exposure midpoint (see exposure_midpoint_utc).
+                        utc_now = exposure_midpoint_utc(capture_process_time)
+                        local_now = datetime.now() - timedelta(
+                            seconds=capture_process_time / 2.0)
 
                         # Prepare frame data for both latest frame and buffer
                         frame_data = {

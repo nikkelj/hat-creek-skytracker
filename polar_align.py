@@ -230,14 +230,14 @@ class PolarGuiSampler:
                 controller.hc_set_rate_dps(Targets.AZM, 0.0)
                 controller.hc_set_rate_dps(Targets.ALT, 0.0)
 
-        t0 = time.time(); stable = 0
+        t0 = time.time(); stable = 0; settled = False
         while time.time() - t0 < timeout:
             e_az = _w(azm_deg - controller.hc_get_position(Targets.AZM) * 360.0)
             e_alt = _w(alt_deg - controller.hc_get_position(Targets.ALT) * 360.0)
             if abs(e_az) < tol and abs(e_alt) < tol:
                 stable += 1
                 if stable >= cycles:
-                    stop(); break
+                    stop(); settled = True; break
             else:
                 stable = 0
                 cmd(Targets.AZM, e_az); cmd(Targets.ALT, e_alt)
@@ -245,7 +245,10 @@ class PolarGuiSampler:
         else:
             stop()
         time.sleep(self.settle_pause)
-        return True
+        # Report the truth: a timed-out settle is not a settle. (Callers may
+        # still choose to sample -- capture() pairs the solve with the actual
+        # encoder position -- but they can now tell the difference.)
+        return settled
 
     def capture(self):
         import camera_manager
@@ -255,7 +258,8 @@ class PolarGuiSampler:
                if camera is not None and getattr(camera, 'thread', None) is not None else None)
         if raw is None:
             return None
-        t = self.ts.now()
+        from alignment import frame_skyfield_time
+        t = frame_skyfield_time(camera, self.ts)
         result = self.solver.solve(raw)
         if result is None or not result.solved:
             return None

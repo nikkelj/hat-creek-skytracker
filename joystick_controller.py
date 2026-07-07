@@ -859,6 +859,15 @@ class JoystickModeState:
                 print("PROGRAM TRACK: No target selected - switched to STANDBY mode")
             return
 
+        # Reset the PIDs when the tracked target changes: integrator state and
+        # derivative history accumulated against the OLD target's error is
+        # wrong for the new one (it produces a burst of stale correction on
+        # switch). reset_program_tracking existed for exactly this but was
+        # never called.
+        if (target_kind, target_key) != getattr(self, '_last_program_target', (None, None)):
+            self._last_program_target = (target_kind, target_key)
+            self.reset_program_tracking()
+
         # Ensure PID controllers are initialized
         if self.azm_pid is None or self.alt_pid is None:
             if self.config_state is None:

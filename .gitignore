@@ -183,3 +183,9 @@ convenience_static.lib
 libgetopt_static.lib
 pthreadVC2.dll
 msvcr100.dll
+
+# Live user config (per-site coordinates, tuned gains). The committed
+# template is config.example.json; the app falls back to it when config.json
+# is absent and Save creates the real file.
+config.json
+config.json.bak

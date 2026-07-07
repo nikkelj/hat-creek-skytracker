@@ -2,6 +2,10 @@ import os
 import json
 import pygame
 
+# Bumped when the config file format changes incompatibly; saved into
+# config.json so an older app can warn instead of silently part-loading.
+CONFIG_VERSION = 1
+
 # ==============================================================================
 # CONFIG STATE CLASS
 # ==============================================================================
@@ -309,7 +313,22 @@ class ConfigState:
         }
 
     def load_from_dict(self, config_dict):
-        """Load configuration from dictionary."""
+        """Load configuration from dictionary.
+
+        Unknown keys are reported (a typo'd key otherwise silently falls back
+        to the default, which reads as "my setting doesn't work"), and a file
+        from a newer config_version gets a warning instead of quiet partial
+        loading.
+        """
+        ver = config_dict.get("config_version", 0)
+        if isinstance(ver, (int, float)) and ver > CONFIG_VERSION:
+            print(f"Config: file is version {ver}, this app knows version "
+                  f"{CONFIG_VERSION} - unknown settings will be ignored")
+        known = set(self.get_config_dict().keys()) | {"config_version"}
+        unknown = sorted(set(config_dict) - known)
+        if unknown:
+            print(f"Config: ignoring unknown keys (typo'd, or from a newer "
+                  f"version?): {unknown}")
         self.lat_str = config_dict.get("lat", self.lat_str)
         self.lon_str = config_dict.get("lon", self.lon_str)
         self.alt_str = config_dict.get("alt", self.alt_str)
@@ -449,27 +468,32 @@ class ConfigState:
         self.focused_field = None
 
     def load_from_file(self, file_path=None):
-        """Load configuration from file and update state directly."""
-        if file_path is None and os.path.exists("config.json"):
-            try:
-                with open("config.json", "r") as f:
-                    loaded_config = json.load(f)
-                    self.load_from_dict(loaded_config)
-            except Exception as e:
-                print(f"Debug: Error loading config.json: {e}")
-        elif file_path:
-            try:
-                with open(file_path, "r") as f:
-                    loaded_config = json.load(f)
-                    self.load_from_dict(loaded_config)
-            except Exception as e:
-                print(f"Debug: Error loading {file_path}: {e}")
+        """Load configuration from file and update state directly.
+
+        With no explicit path: config.json if present, else
+        config.example.json (a fresh checkout ships only the example; the
+        first Save writes a real config.json).
+        """
+        if file_path is None:
+            if os.path.exists("config.json"):
+                file_path = "config.json"
+            elif os.path.exists("config.example.json"):
+                file_path = "config.example.json"
+            else:
+                return
+        try:
+            with open(file_path, "r") as f:
+                loaded_config = json.load(f)
+                self.load_from_dict(loaded_config)
+        except Exception as e:
+            print(f"Debug: Error loading {file_path}: {e}")
 
     def save_to_file(self):
         """Save configuration to file, keeping a one-deep backup so an accidental
         overwrite (e.g. a default-valued ConfigState saving over a tuned config)
         is recoverable from config.json.bak."""
         config_dict = self.get_config_dict()
+        config_dict["config_version"] = CONFIG_VERSION
         if os.path.exists("config.json"):
             try:
                 import shutil
@@ -1211,17 +1235,3 @@ def load_config(file_path=None):
     return config_state
 
 
-def load_config_legacy(file_path=None):
-    """Legacy function for backward compatibility."""
-    config_state = ConfigState()
-    config_state.load_from_file(file_path)
-    return config_state.get_config_dict()
-
-
-def save_config(config):
-    """Legacy function for backward compatibility."""
-    if isinstance(config, ConfigState):
-        config.save_to_file()
-    else:
-        with open("config.json", "w") as f:
-            json.dump(config, f)

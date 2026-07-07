@@ -61,6 +61,7 @@ if not _HAVE_RUST:
         "test_rust_core_loop_bridge.py",
         "test_rust_loop_adapter.py",
         "test_rust_perf.py",
+        "test_loop_ab_parity.py",
     ]
 
 if not _HAVE_HIPPARCOS:

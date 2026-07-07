@@ -15,6 +15,12 @@ everything, including an in-flight Park**.
 ## 0. Prep (at the desk, before hardware)
 
 - [ ] `pytest` green locally; CI green on the branch you're about to run.
+- [ ] **If using the Rust loop: rebuild the wheel after every pull** —
+      `maturin build --release -m rust/skytracker_core/Cargo.toml && pip
+      install --force-reinstall rust/skytracker_core/target/wheels/skytracker_core-*.whl`.
+      A stale wheel runs but silently lacks new APIs (a pre-2026-07 wheel has
+      no liveness counter; the adapter now detects this and tells you to
+      rebuild instead of misreading it as a stalled loop).
 - [ ] Config sanity: site lat/lon/alt set (without them, per-frame trajectory
       CSV rows fall back to az=0 — they *are* written now, but with degraded
       azimuth); safety limits set to the mount frame values you actually mean

@@ -102,6 +102,31 @@ def _first_real_run(lib):
     return None
 
 
+def test_png_run_and_fractionless_timestamps_ingest():
+    # A PNG-format capture (config image_format=PNG / the capture fallback)
+    # and a frame whose timestamp landed on exactly .000000 microseconds
+    # (isoformat emits no fraction) must both be visible to the run indexer.
+    root = tempfile.mkdtemp(prefix="pp_png_run_")
+    try:
+        run_dir = os.path.join(root, "PNGSAT_1_2026_07_03_03_00_00")
+        os.makedirs(run_dir)
+        img = np.full((16, 16, 3), 40, dtype=np.uint8)
+        cv2.imwrite(os.path.join(
+            run_dir, "Camera1_000001__2026_07_03_03_00_00.png"), img)      # no fraction
+        cv2.imwrite(os.path.join(
+            run_dir, "Camera1_000002__2026_07_03_03_00_00.250000.png"), img)
+        run = Run(run_dir)
+        assert run.camera_indices, "PNG frames must be indexed"
+        cam = run.camera_indices[0]
+        assert run.frame_count(cam) == 2
+        ts = [f["t"] for f in run.frames(cam)]
+        assert ts[1] - ts[0] == 0.25, ts
+        assert decode_frame(run.frames(cam)[0]["path"]) is not None
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("ok  png + fractionless-timestamp ingest")
+
+
 def test_time_parsing():
     t = _parse_frame_time("2025_09_16_03_47_22.342929")
     assert abs(t - 1757994442.342929) < 1.0, t

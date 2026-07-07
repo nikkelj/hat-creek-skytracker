@@ -521,7 +521,8 @@ def _draw_controls(display, state, x, y, w):
     cy += 22
     for key, label in (("stack_25", "Stack best 25%"),
                        ("stack_50", "Stack best 50%"),
-                       ("stack_50_local", "Stack 50% (align points)")):
+                       ("stack_50_local", "Stack 50% (align points)"),
+                       ("stack_50_center", "Stack 50% centred (PIPP)")):
         r = pygame.Rect(cx, cy, w - 24, 28)
         _button(display, r, label)
         state.rects[key] = r
@@ -549,7 +550,14 @@ def draw_post_process(display, state):
         if state.exporter.error:
             state.export_msg = f"Export failed: {state.exporter.error}"
         else:
-            state.export_msg = f"Saved {state.exporter.frames_written} frames -> {state.exporter.out_path}"
+            exp = state.exporter
+            stats = getattr(exp, "stats", None)
+            detail = (f" ({stats.n_stacked}/{stats.n_total} stacked, "
+                      f"{getattr(exp, 'dropped', 0)} pre-culled)" if stats else "")
+            final = getattr(exp, "final_path", None)
+            tail = f" + {os.path.basename(final)}" if final else ""
+            state.export_msg = (f"Saved {os.path.basename(str(exp.out_path))}"
+                                f"{detail}{tail}")
         state.exporter = None
 
     if state.view == "replay" and state.run is not None:
@@ -704,6 +712,11 @@ def _click_replay(pos, display, state, status_messages):
         _start_stack_export(state, status_messages, 0.50, local=False, tag="stack50"); return
     if _hit(R, "stack_50_local", pos):
         _start_stack_export(state, status_messages, 0.50, local=True, tag="stack50ap"); return
+    if _hit(R, "stack_50_center", pos):
+        # PIPP centring: recenter each frame on the target and crop before
+        # aligning -- the quality/speed win for a fast-moving bright target.
+        _start_stack_export(state, status_messages, 0.50, local=False,
+                            tag="stack50c", center_size=512); return
 
 
 def _hit(R, key, pos):
@@ -754,7 +767,8 @@ def _start_export(state, status_messages, t_start, t_end, stabilize, tag):
     status_messages.append(f"Post: exporting {os.path.basename(out)}")
 
 
-def _start_stack_export(state, status_messages, keep_fraction, local, tag):
+def _start_stack_export(state, status_messages, keep_fraction, local, tag,
+                        center_size=None):
     if state.exporter is not None:
         status_messages.append("Post: export already running"); return
     os.makedirs(_EXPORT_DIR, exist_ok=True)
@@ -762,11 +776,13 @@ def _start_stack_export(state, status_messages, keep_fraction, local, tag):
     cam = state.active_cam
     safe = state.run.folder.replace(os.sep, "_")
     out = os.path.join(_EXPORT_DIR, f"{safe}_cam{cam + 1}_{tag}.png")
-    # Stack the marked In->Out range; the master is intentionally linear (no
-    # gamma/brightness/contrast baked in) so it feeds a later sharpening step.
+    # 16-bit linear master (archival) + a sharpened/stretched _final.png
+    # (share-ready) from the finishing stage. Grading runs at half resolution:
+    # it only RANKS frames, so ordering is preserved at a fraction of the cost.
     state.exporter = StackExporter(
         state.run, cam, eng.in_marker, eng.out_marker, out,
-        keep_fraction=keep_fraction, local=local, method=eng.stab_method)
+        keep_fraction=keep_fraction, local=local, method=eng.stab_method,
+        grade_scale=0.5, center_size=center_size, finish=True)
     state.exporter.start()
     state.export_msg = ""
     status_messages.append(f"Post: stacking best {int(keep_fraction * 100)}% "

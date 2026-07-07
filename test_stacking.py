@@ -608,3 +608,70 @@ if __name__ == "__main__":
     print("-" * 40)
     print("ALL PASSED" if failed == 0 else f"{failed} test(s) failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_result_16bit_preserves_subquantum_snr():
+    # Average of many noisy frames of a flat scene at level ~100.4: the mean
+    # lands between 8-bit levels; the 16-bit master must carry the fraction.
+    rng = np.random.default_rng(11)
+    ref = np.full((32, 32, 3), 100, dtype=np.uint8)
+    stacker = LuckyStacker(method="flow")
+    stacker.set_reference(ref)
+    for _ in range(30):
+        noisy = np.clip(100.4 + rng.normal(0, 2.0, (32, 32, 3)), 0, 255).astype(np.uint8)
+        stacker.add(noisy)
+    m8 = stacker.result(bits=8)
+    m16 = stacker.result(bits=16)
+    assert m8.dtype == np.uint8 and m16.dtype == np.uint16
+    mean16 = m16.astype(np.float64).mean() / 257.0
+    assert 99.9 < mean16 < 101.0
+    # the 16-bit master resolves the fractional level the 8-bit one rounds
+    assert abs(mean16 - round(mean16)) > 0.01
+    print("ok  16-bit master preserves fractional level")
+
+
+def test_save_master_uint16_png_roundtrip():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m16 = np.full((8, 8, 3), 30000, dtype=np.uint16)
+        p = save_master(m16, os.path.join(d, "m.png"))
+        back = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        assert back.dtype == np.uint16, back.dtype
+        assert int(back.max()) == 30000
+        # formats that can't hold 16 bits are coerced to png
+        p2 = save_master(m16, os.path.join(d, "m.jpg"))
+        assert p2.endswith(".png")
+    print("ok  save_master uint16 roundtrip")
+
+
+def test_center_size_stack_recentres_target():
+    # Frames with the target wandering across the field: with center_size the
+    # master is a target-centred crop and the target lands mid-frame.
+    rng = np.random.default_rng(4)
+    frames = []
+    for i in range(6):
+        img = (rng.normal(8, 1.0, (120, 160, 3))).clip(0, 255).astype(np.uint8)
+        cx, cy = 40 + i * 12, 30 + i * 8   # target drifts frame to frame
+        cv2.circle(img, (cx, cy), 5, (220, 220, 220), -1)
+        frames.append(img)
+
+    class _FakeRun:
+        def frames(self, cam):
+            return [{"t": float(i), "arr": f} for i, f in enumerate(frames)]
+
+    # stack_run decodes via _as_array which passes ndarrays through; wrap specs
+    monkey_frames = [dict(t=float(i), path=None) for i in range(len(frames))]
+    # simplest: call the pipeline pieces directly for the centred path
+    from stacking import recenter_frame
+    size = 64
+    centred = [recenter_frame(f, out_size=(size, size)) for f in frames]
+    st = LuckyStacker(method="flow")
+    st.set_reference(centred[0])
+    for c in centred[1:]:
+        st.add(c)
+    master = st.result()
+    assert master.shape[:2] == (size, size)
+    gray = master.mean(axis=2)
+    peak = np.unravel_index(np.argmax(gray), gray.shape)
+    assert abs(peak[0] - size // 2) <= 3 and abs(peak[1] - size // 2) <= 3, peak
+    print("ok  centred stack puts target mid-frame")

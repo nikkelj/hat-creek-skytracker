@@ -706,12 +706,22 @@ class LuckyStacker:
         return self.result()
 
     # --------------------------------------------------------------- output
-    def result(self):
-        """The averaged master frame (uint8 RGB), or None if nothing stacked."""
+    def result(self, bits=8):
+        """The averaged master frame (RGB), or None if nothing stacked.
+
+        ``bits=8`` (default) returns uint8. ``bits=16`` returns uint16 scaled
+        by 257 (255 -> 65535): a stack of N frames carries ~sqrt(N) more SNR
+        than one frame, and quantizing the mean back to 8 bits throws away
+        everything below 1 LSB -- the 16-bit master is the linear input the
+        sharpening/stretch stage (sharpen.py) is designed to consume.
+        """
         if self._count == 0 or self._accum is None:
             return None
         denom = np.maximum(self._weight, 1e-6)[..., None]
-        return np.clip(self._accum / denom, 0, 255).astype(np.uint8)
+        mean = self._accum / denom
+        if bits == 16:
+            return np.clip(mean * 257.0, 0, 65535).astype(np.uint16)
+        return np.clip(mean, 0, 255).astype(np.uint8)
 
     @property
     def stats(self):
@@ -778,7 +788,7 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
               quality="laplacian", method="orb", local=False, roi=None,
               t_start=None, t_end=None, max_frames=None, progress=None,
               workers=None, grade_scale=1.0, prefilter=True, prefilter_ratio=0.12,
-              align_scale=1.0):
+              align_scale=1.0, bits=8, center_size=None):
     """Run the full lucky-imaging pipeline over one camera of a :class:`Run`.
 
     Two-tier culling keeps a fast first pass from throwing away good data:
@@ -798,6 +808,16 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
 
     ``progress`` is an optional ``callback(done, total)`` for UIs. Returns a
     :class:`StackResult`; ``dropped`` lists the frames the pre-cull removed.
+
+    ``bits`` selects the master depth (8 or 16 -- see LuckyStacker.result).
+
+    ``center_size`` (int, e.g. 512) enables PIPP-style target centring: each
+    kept frame is recentred on its brightness centroid and cropped to a
+    ``center_size`` square before alignment. For a fast-moving target this is
+    both a quality win (alignment sees the target, not the star field the
+    mount is slewing across) and a large speed win (ORB cost scales with
+    area). Kept frames are decoded up-front in this mode, so budget
+    ``center_size^2 * 3 * n_kept`` bytes of RAM.
     """
     frames = run.frames(cam_index)
     if t_start is not None or t_end is not None:
@@ -830,6 +850,17 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
     reference_index = kept[0].index  # sharpest survivor anchors the stack
     ref_arr = _as_array(frames[reference_index])  # decode the reference once
 
+    if center_size:
+        size = int(center_size)
+
+        def _centred(arr):
+            return recenter_frame(arr, out_size=(size, size))
+
+        ref_arr = _centred(ref_arr)
+        to_stack = [_centred(_as_array(frames[g.index])) for g in kept[1:]]
+    else:
+        to_stack = [frames[g.index] for g in kept[1:]]
+
     total = len(kept)
     counter = {"n": 1}
     lock = threading.Lock()
@@ -843,23 +874,112 @@ def stack_run(run, cam_index, keep_fraction=0.5, keep_count=None,
             counter["n"] += 1
             progress(counter["n"], total)
 
-    to_stack = [frames[g.index] for g in kept[1:]]
     stacker = _stack_parallel(ref_arr, to_stack, method, local, workers, advance,
                               align_scale=align_scale)
 
-    return StackResult(stacker.result(), stacker.stats, grades, kept,
+    return StackResult(stacker.result(bits=bits), stacker.stats, grades, kept,
                        reference_index, dropped)
 
 
 def save_master(master, out_path):
-    """Write a stacked master (RGB uint8) to disk as PNG/TIFF/etc. by extension."""
+    """Write a stacked master (RGB uint8 or uint16) to disk by extension.
+
+    uint16 masters require a 16-bit-capable format (PNG/TIFF); the extension
+    is coerced to .png if the caller asked for one that can't hold 16 bits.
+    """
     _require_cv2()
     if master is None:
         raise ValueError("no master image to save")
     ext = os.path.splitext(out_path)[1].lower()
-    if ext not in (".png", ".tif", ".tiff", ".bmp", ".jpg", ".jpeg"):
+    if master.dtype == np.uint16:
+        if ext not in (".png", ".tif", ".tiff"):
+            out_path = os.path.splitext(out_path)[0] + ".png"
+    elif ext not in (".png", ".tif", ".tiff", ".bmp", ".jpg", ".jpeg"):
         out_path = out_path + ".png"
     bgr = cv2.cvtColor(master, cv2.COLOR_RGB2BGR)
     if not cv2.imwrite(out_path, bgr):
         raise RuntimeError(f"could not write master image to {out_path}")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# CLI: headless batch stacking ("good shot posted fast" from a terminal)
+# ---------------------------------------------------------------------------
+def _cli(argv=None):
+    """Stack one run directory -- or every run in a library directory -- to
+    16-bit linear masters plus sharpened/stretched share-ready finals.
+
+        python stacking.py data/MYSAT_12345_2026_07_03_01_02_03
+        python stacking.py data --all --keep 0.25 --center 512 --local
+    """
+    import argparse
+
+    from post_process import Run, RunLibrary
+    from sharpen import finish as _finish, save_final
+
+    p = argparse.ArgumentParser(
+        description="Lucky-imaging stack: cull -> align -> average -> sharpen.")
+    p.add_argument("path", help="a run directory, or a library dir with --all")
+    p.add_argument("--all", action="store_true",
+                   help="treat PATH as a library dir and stack every run in it")
+    p.add_argument("--cam", type=int, default=None,
+                   help="camera index (default: every camera in the run)")
+    p.add_argument("--keep", type=float, default=0.5,
+                   help="fraction of (non-garbage) frames to keep (default 0.5)")
+    p.add_argument("--local", action="store_true",
+                   help="alignment-point local warping (extended targets)")
+    p.add_argument("--center", type=int, default=None, metavar="PX",
+                   help="PIPP centring: recenter+crop each frame to PX square")
+    p.add_argument("--grade-scale", type=float, default=0.5,
+                   help="grade sharpness at this scale (default 0.5; 1.0 = full res)")
+    p.add_argument("--align-scale", type=float, default=1.0,
+                   help="estimate global alignment at this scale (default 1.0)")
+    p.add_argument("--workers", type=int, default=None,
+                   help="parallel workers (default: all cores)")
+    p.add_argument("--no-finish", action="store_true",
+                   help="skip the sharpened/stretched 8-bit final")
+    p.add_argument("--out", default="exports", help="output directory")
+    args = p.parse_args(argv)
+
+    if args.all:
+        lib = RunLibrary(args.path)
+        lib.scan()
+        runs = lib.runs
+    else:
+        runs = [Run(args.path)]
+    os.makedirs(args.out, exist_ok=True)
+
+    n_ok = 0
+    for run in runs:
+        cams = [args.cam] if args.cam is not None else list(run.camera_indices)
+        for cam in cams:
+            name = os.path.basename(os.path.normpath(run.path))
+            tag = f"{name}_cam{cam + 1}"
+            try:
+                result = stack_run(
+                    run, cam, keep_fraction=args.keep, local=args.local,
+                    center_size=args.center, grade_scale=args.grade_scale,
+                    align_scale=args.align_scale, workers=args.workers,
+                    bits=16)
+                if result.master is None:
+                    print(f"[skip] {tag}: nothing stackable")
+                    continue
+                master_path = save_master(
+                    result.master, os.path.join(args.out, f"{tag}_master16.png"))
+                line = (f"[ok]   {tag}: stacked {result.stats.n_stacked}"
+                        f"/{result.stats.n_total} (pre-culled {len(result.dropped)})"
+                        f" -> {master_path}")
+                if not args.no_finish:
+                    final_path = save_final(
+                        _finish(result.master),
+                        os.path.join(args.out, f"{tag}_final.png"))
+                    line += f" + {final_path}"
+                print(line)
+                n_ok += 1
+            except Exception as e:
+                print(f"[FAIL] {tag}: {e}")
+    return 0 if n_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

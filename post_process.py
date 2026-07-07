@@ -58,9 +58,13 @@ SIDECAR_NAME = "postproc.json"
 
 # Folder timestamp suffix: _YYYY_MM_DD_HH_MM_SS  (always 6 trailing numeric groups)
 _FOLDER_RE = re.compile(r"^(?P<prefix>.+?)_(?P<ts>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})$")
-# Frame file: Camera<N>_<seq>__<YYYY_MM_DD_HH_MM_SS.ffffff>[Z].bmp
+# Frame file: Camera<N>_<seq>__<YYYY_MM_DD_HH_MM_SS[.ffffff]>[Z].(bmp|png)
+# The fractional part is optional (a timestamp landing on exactly .000000
+# microseconds is written without a fraction) and both capture formats are
+# accepted (config image_format supports BMP and PNG) -- a PNG run must not be
+# silently invisible to post-processing.
 _FRAME_RE = re.compile(
-    r"^Camera(?P<cam>\d+)_(?P<seq>\d+)__(?P<ts>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}\.\d+)Z?\.bmp$",
+    r"^Camera(?P<cam>\d+)_(?P<seq>\d+)__(?P<ts>\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}(?:\.\d+)?)Z?\.(?:bmp|png)$",
     re.IGNORECASE,
 )
 
@@ -69,8 +73,11 @@ _FRAME_RE = re.compile(
 # Time helpers
 # ---------------------------------------------------------------------------
 def _parse_frame_time(ts):
-    """Parse a frame-filename timestamp 'YYYY_MM_DD_HH_MM_SS.ffffff' -> epoch sec (UTC)."""
-    date_part, frac = ts.split(".")
+    """Parse a frame-filename timestamp 'YYYY_MM_DD_HH_MM_SS[.ffffff]' -> epoch sec (UTC)."""
+    if "." in ts:
+        date_part, frac = ts.split(".")
+    else:
+        date_part, frac = ts, "0"
     dt = datetime.strptime(date_part, "%Y_%m_%d_%H_%M_%S")
     dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp() + float("0." + frac)
@@ -999,7 +1006,8 @@ class StackExporter:
     def __init__(self, run, cam_index, t_start, t_end, out_path,
                  keep_fraction=0.5, quality="laplacian", method="orb",
                  local=False, roi=None, max_frames=None, workers=None,
-                 grade_scale=1.0, prefilter=True):
+                 grade_scale=1.0, prefilter=True, align_scale=1.0,
+                 center_size=None, finish=True):
         self.run = run
         self.cam_index = cam_index
         self.t_start = t_start
@@ -1014,11 +1022,16 @@ class StackExporter:
         self.workers = workers          # None -> all cores
         self.grade_scale = grade_scale  # <1 grades at reduced res for speed
         self.prefilter = prefilter      # conservative garbage pre-cull
+        self.align_scale = align_scale  # <1 estimates alignment at reduced res
+        self.center_size = center_size  # PIPP centring crop (px), None = off
+        self.finish = finish            # also emit a sharpened/stretched final
 
         self.progress = 0.0
         self.done = False
         self.error = None
         self.stats = None
+        self.dropped = 0
+        self.final_path = None
         self.frames_written = 0
         self._thread = None
 
@@ -1041,19 +1054,31 @@ class StackExporter:
         # Imported lazily so post_process stays importable without the stacker.
         from stacking import stack_run, save_master
 
+        # The align pass is roughly the back 80% of wall time; reserve the
+        # front 20% for grading (which previously reported no progress at all).
         def _progress(done, total):
-            self.progress = done / total if total else 1.0
+            self.progress = 0.2 + 0.8 * (done / total if total else 1.0)
 
+        self.progress = 0.05  # grading...
+        # 16-bit linear master: keeps the stacked SNR through the finishing
+        # stretch instead of quantizing it away at 8 bits.
         result = stack_run(
             self.run, self.cam_index, keep_fraction=self.keep_fraction,
             quality=self.quality, method=self.method, local=self.local,
             roi=self.roi, t_start=self.t_start, t_end=self.t_end,
             max_frames=self.max_frames, workers=self.workers,
             grade_scale=self.grade_scale, prefilter=self.prefilter,
-            progress=_progress)
+            align_scale=self.align_scale, center_size=self.center_size,
+            bits=16, progress=_progress)
         if result.master is None:
             raise RuntimeError("No alignable frames in the selected range to stack")
         self.out_path = save_master(result.master, self.out_path)
         self.stats = result.stats
+        self.dropped = len(result.dropped)
         self.frames_written = result.stats.n_stacked
+        if self.finish:
+            from sharpen import finish as _finish, save_final
+            base, _ = os.path.splitext(self.out_path)
+            self.final_path = save_final(_finish(result.master),
+                                         base + "_final.png")
         self.progress = 1.0

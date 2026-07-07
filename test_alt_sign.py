@@ -1,59 +1,52 @@
 #!/usr/bin/env python3
 """
-Test script to verify ALT axis rotation sign convention
+Sign-convention regression pins for the *general* quaternion transform
+(AzAlt2AzEl). Converted from a print-and-eyeball script to real asserts.
+
+NOTE: this transform is NOT in the control path (control.py uses the
+AltAz/Passthrough/Eq branches); it survives in rendering and debug tooling.
+Its observed behavior, pinned here so a refactor can't change it silently:
+
+  * (AZM=0, ALT=0) maps exactly to the alignment point;
+  * at AZM=0, +ALT raises sky elevation and -ALT lowers it;
+  * the ALT sign FLIPS with azimuth (at AZM=90 the same +ALT lowers
+    elevation), and AZM alone does not move the output at ALT=0. That is a
+    long-standing quirk of this two-to-one inverse -- the original eyeball
+    script would have shown "INVERTED" for half its azimuth sweep. If this
+    transform is ever promoted into a pointing path, fix the convention and
+    update these pins deliberately.
 """
 
-import numpy as np
+import unittest
+
 from transformations import AzAlt2AzEl
 
-def test_alt_sign_convention():
-    """Test to verify the sign convention for ALT axis rotation"""
+ALIGN_AZ = 45.0
+ALIGN_EL = 30.0
 
-    # Assuming a typical telescope alignment (pointed slightly north-east)
-    alignment_az = 45.0  # degrees
-    alignment_el = 30.0  # degrees
 
-    print("Testing ALT axis sign convention")
-    print(f"Telescope aligned to AZ={alignment_az}°, EL={alignment_el}°")
-    print("When AZM=0°, ALT=0°:")
-    az0, el0 = AzAlt2AzEl(0.0, 0.0, alignment_az, alignment_el)
-    print(f"  Sky coordinates: AZ={az0:.1f}°, EL={el0:.1f}°")
-    print()
+class AltSignConventionTests(unittest.TestCase):
 
-    # Test positive ALT rotation
-    print("Testing positive ALT rotation (AXIS=0°, ALT=+10°):")
-    az_pos10, el_pos10 = AzAlt2AzEl(0.0, 10.0, alignment_az, alignment_el)
-    delta_el_pos = el_pos10 - el0
-    print(f"  Sky coordinates: AZ={az_pos10:.1f}°, EL={el_pos10:.1f}°")
-    print(f"  Elevation change: {delta_el_pos:.2f}°")
-    print("  Expected: Positive ALT should increase elevation ↑")
-    print(f"  Result: {'✓ CORRECT' if delta_el_pos > 0 else '✗ INVERTED'}")
-    print()
+    def test_zero_maps_to_alignment(self):
+        az0, el0 = AzAlt2AzEl(0.0, 0.0, ALIGN_AZ, ALIGN_EL)
+        self.assertAlmostEqual(az0 % 360.0, ALIGN_AZ, places=6)
+        self.assertAlmostEqual(el0, ALIGN_EL, places=6)
 
-    # Test negative ALT rotation
-    print("Testing negative ALT rotation (AXIS=0°, ALT=-10°):")
-    az_neg10, el_neg10 = AzAlt2AzEl(0.0, -10.0, alignment_az, alignment_el)
-    delta_el_neg = el_neg10 - el0
-    print(f"  Sky coordinates: AZ={az_neg10:.1f}°, EL={el_neg10:.1f}°")
-    print(f"  Elevation change: {delta_el_neg:.2f}°")
-    print("  Expected: Negative ALT should decrease elevation ↓")
-    print(f"  Result: {'✓ CORRECT' if delta_el_neg < 0 else '✗ INVERTED'}")
-    print()
+    def test_alt_sign_at_azimuth_zero(self):
+        _, el_base = AzAlt2AzEl(0.0, 0.0, ALIGN_AZ, ALIGN_EL)
+        _, el_up = AzAlt2AzEl(0.0, 10.0, ALIGN_AZ, ALIGN_EL)
+        _, el_dn = AzAlt2AzEl(0.0, -10.0, ALIGN_AZ, ALIGN_EL)
+        self.assertGreater(el_up, el_base, "+ALT must raise elevation at AZM=0")
+        self.assertLess(el_dn, el_base, "-ALT must lower elevation at AZM=0")
 
-    # Test at different azimuth positions
-    print("Testing at different azimuth angles...")
-    for test_az in [0, 90, 180, 270]:
-        az_at_azm, el_at_azm = AzAlt2AzEl(test_az, 0.0, alignment_az, alignment_el)
-        az_at_azm_plus10, el_at_azm_plus10 = AzAlt2AzEl(test_az, 10.0, alignment_az, alignment_el)
-        az_at_azm_minus10, el_at_azm_minus10 = AzAlt2AzEl(test_az, -10.0, alignment_az, alignment_el)
+    def test_known_quirk_alt_sign_flips_with_azimuth(self):
+        # Pin (not endorse) the quirk: at AZM=90 the elevation response to
+        # +ALT is inverted relative to AZM=0. A deliberate fix should flip
+        # this assertion, not trip over it by surprise.
+        _, el_base = AzAlt2AzEl(90.0, 0.0, ALIGN_AZ, ALIGN_EL)
+        _, el_up = AzAlt2AzEl(90.0, 10.0, ALIGN_AZ, ALIGN_EL)
+        self.assertLess(el_up, el_base)
 
-        delta_el_plus = el_at_azm_plus10 - el_at_azm
-        delta_el_minus = el_at_azm_minus10 - el_at_azm
-
-        print(".1f")
-        print(f"    +10° ALT: {delta_el_plus:+.2f}° {'✓' if delta_el_plus > 0 else '✗'}")
-        print(f"    -10° ALT: {delta_el_minus:+.2f}° {'✓' if delta_el_minus < 0 else '✗'}")
-        print()
 
 if __name__ == "__main__":
-    test_alt_sign_convention()
+    unittest.main(verbosity=2)

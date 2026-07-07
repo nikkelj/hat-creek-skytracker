@@ -255,3 +255,77 @@ fn hotspot_safety_limit_aborts_to_standby() {
     assert_eq!(o.azm_rate_cmd, Some(0));
     assert_eq!(o.alt_rate_cmd, Some(0));
 }
+
+#[test]
+fn program_setpoint_clear_commands_stop_once() {
+    // A tracked target that sets (or is deselected) must produce an explicit
+    // stop -- "no new command" leaves the mount at its last rate (runaway).
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.mount_mode = MountMode::Passthrough;
+    i.setpoint = Some(Setpoint {
+        az_deg: 50.0,
+        el_deg: 30.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let o = s.step(&i, None, 40.0, 20.0, 100.0);
+    assert!(o.azm_rate_cmd.is_some(), "tracking should command a rate");
+
+    i.setpoint = None;
+    let o = s.step(&i, None, 40.0, 20.0, 100.1);
+    assert_eq!(o.azm_rate_cmd, Some(0), "cleared setpoint must stop AZM");
+    assert_eq!(o.alt_rate_cmd, Some(0), "cleared setpoint must stop ALT");
+    assert!(o.status_msg.is_some());
+
+    // The stop is one-shot; subsequent no-target cycles stay quiet.
+    let o = s.step(&i, None, 40.0, 20.0, 100.2);
+    assert_eq!(o.azm_rate_cmd, None);
+    assert_eq!(o.alt_rate_cmd, None);
+}
+
+#[test]
+fn program_without_ever_having_setpoint_stays_quiet() {
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.setpoint = None;
+    let o = s.step(&i, None, 40.0, 20.0, 100.0);
+    assert_eq!(o.azm_rate_cmd, None);
+    assert_eq!(o.alt_rate_cmd, None);
+}
+
+#[test]
+fn program_target_beyond_mount_limits_aborts_to_standby() {
+    // The azm/alt limits gate MOUNT-frame positions; a target that transforms
+    // outside them must stop motion and hand back to STANDBY (mirrors
+    // program_track's gate, which also converts sky->mount before comparing).
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.mount_mode = MountMode::Passthrough; // mount alt == sky el
+    i.alt_limit = (0.0, 80.0);
+    i.setpoint = Some(Setpoint {
+        az_deg: 50.0,
+        el_deg: 85.0, // -> mount alt 85 > 80
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let o = s.step(&i, None, 40.0, 20.0, 100.0);
+    assert_eq!(o.requested_mode, Some(Mode::Standby));
+    assert_eq!(o.azm_rate_cmd, Some(0));
+    assert_eq!(o.alt_rate_cmd, Some(0));
+
+    // An in-limits target tracks normally.
+    let mut s = LoopState::new();
+    i.setpoint = Some(Setpoint {
+        az_deg: 50.0,
+        el_deg: 30.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let o = s.step(&i, None, 40.0, 20.0, 100.0);
+    assert_eq!(o.requested_mode, None);
+    assert!(o.azm_rate_cmd.is_some());
+}

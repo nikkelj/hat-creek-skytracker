@@ -1,76 +1,66 @@
 #!/usr/bin/env python3
 """
-Test script to verify PID error calculation for automatic tracking
+PID position-error sign/consistency tests for compute_mount_position_error.
+Converted from a print-and-eyeball script to real asserts.
 """
 
-import numpy as np
-from transformations import AzAlt2AzEl, AzEl2AzAlt
-from control import compute_mount_position_error
+import unittest
+
+from control import compute_mount_position_error, sky_target_to_mount
+from transformations import AzEl2AzAlt_AltAz
+
 
 class MockConfigState:
     def __init__(self, alignment_az=45.0, alignment_el=30.0):
         self.alignment_azimuth_str = str(alignment_az)
         self.alignment_elevation_str = str(alignment_el)
+        self.mount_mode = 'AltAz'
+        self.pointing_model_enabled = False
 
-def test_error_calculation():
-    """Test that error calculation produces correct signs for PID control"""
 
-    config = MockConfigState(alignment_az=45.0, alignment_el=30.0)
+class PidErrorTests(unittest.TestCase):
 
-    # Test case 1: Telescope pointing east of alignment (AZM > 0), target is west
-    print("=== Test Case 1: AZM correction ===")
-    current_azm = 10.0  # Telescope pointing 10° east of alignment (AZM=10°)
-    current_alt = 0.0   # Level (ALT=0°)
+    def setUp(self):
+        self.config = MockConfigState()
 
-    # Convert to sky coordinates
-    current_az, current_el = AzAlt2AzEl(current_azm, current_alt, 45.0, 30.0)
-    print(f"Current mount: AZM={current_azm}°, ALT={current_alt}°")
-    print(f"Current sky: AZ={current_az:.1f}°, EL={current_el:.1f}°")
+    def test_zero_error_at_target(self):
+        # Telescope already at the mount coordinates of the target -> ~0 error.
+        target_azm, target_alt = sky_target_to_mount(self.config, 45.0, 30.0)
+        azm_err, alt_err = compute_mount_position_error(
+            self.config, target_azm, target_alt, 45.0, 30.0)
+        self.assertAlmostEqual(azm_err, 0.0, places=9)
+        self.assertAlmostEqual(alt_err, 0.0, places=9)
 
-    # Target: Alignment position (AZ=45°, EL=30°)
-    target_az, target_el = 45.0, 30.0
-    print(f"Target sky: AZ={target_az}°, EL={target_el}°")
+    def test_azm_error_sign(self):
+        # Telescope 10 deg past the target in mount AZM -> negative correction.
+        target_azm, target_alt = sky_target_to_mount(self.config, 45.0, 30.0)
+        azm_err, _ = compute_mount_position_error(
+            self.config, target_azm + 10.0, target_alt, 45.0, 30.0)
+        self.assertAlmostEqual(azm_err, -10.0, places=9)
 
-    # Compute error using corrected function
-    azm_error, alt_error = compute_mount_position_error(
-        config, current_azm, current_alt, target_az, target_el
-    )
-    print(f"PID errors: AZM={azm_error:.2f}°, ALT={alt_error:.2f}°")
-    print("Expected: AZM negative (should move telescope left/west)")
-    print()
+    def test_alt_error_sign(self):
+        # Telescope 5 deg short of the target in mount ALT -> positive correction.
+        target_azm, target_alt = sky_target_to_mount(self.config, 45.0, 30.0)
+        _, alt_err = compute_mount_position_error(
+            self.config, target_azm, target_alt - 5.0, 45.0, 30.0)
+        self.assertAlmostEqual(alt_err, 5.0, places=9)
 
-    # Test case 2: ALT correction
-    print("=== Test Case 2: ALT correction ===")
-    current_azm = 0.0   # At alignment AZM
-    current_alt = -5.0  # Telescope pointing 5° below alignment (ALT=-5°)
+    def test_errors_are_shortest_arc(self):
+        # Across the wrap: current 350, target mount 10 -> +20, never +340.
+        cfg = MockConfigState(alignment_az=0.0, alignment_el=0.0)
+        target_azm, target_alt = sky_target_to_mount(cfg, 10.0, 30.0)
+        azm_err, _ = compute_mount_position_error(
+            cfg, target_azm + 340.0, target_alt, 10.0, 30.0)
+        self.assertAlmostEqual(azm_err, 20.0, places=6)
 
-    # Convert to sky coordinates
-    current_az, current_el = AzAlt2AzEl(current_azm, current_alt, 45.0, 30.0)
-    print(f"Current mount: AZM={current_azm}°, ALT={current_alt}°")
-    print(f"Current sky: AZ={current_az:.1f}°, EL={current_el:.1f}°")
+    def test_transform_matches_altaz_branch(self):
+        # sky_target_to_mount in AltAz mode must be exactly AzEl2AzAlt_AltAz
+        # (with the pointing model disabled).
+        got = sky_target_to_mount(self.config, 120.0, 40.0)
+        expected = AzEl2AzAlt_AltAz(120.0, 40.0, 45.0, 30.0)
+        self.assertAlmostEqual(got[0], expected[0], places=9)
+        self.assertAlmostEqual(got[1], expected[1], places=9)
 
-    # Target: Alignment position (AZ=45°, EL=30°)
-    target_az, target_el = 45.0, 30.0
-    print(f"Target sky: AZ={target_az}°, EL={target_el}°")
-
-    # Compute error
-    azm_error, alt_error = compute_mount_position_error(
-        config, current_azm, current_alt, target_az, target_el
-    )
-    print(f"PID errors: AZM={azm_error:.2f}°, ALT={alt_error:.2f}°")
-    print("Expected: ALT positive (should move telescope up)")
-    print()
-
-    # Test case 3: Verify that target -> mount -> back conversion works
-    print("=== Test Case 3: Round-trip consistency ===")
-    target_mount_azm, target_mount_alt = AzEl2AzAlt(45.0, 30.0, 45.0, 30.0)
-    print("Target sky (45°, 30°) -> Mount coordinates:", target_mount_azm, target_mount_alt)
-
-    # Test that we compute zero error when telescope is already at target
-    azm_error, alt_error = compute_mount_position_error(
-        config, target_mount_azm, target_mount_alt, 45.0, 30.0
-    )
-    print(f"Zero error test: AZM={azm_error:.6f}°, ALT={alt_error:.6f}°")
 
 if __name__ == "__main__":
-    test_error_calculation()
+    unittest.main(verbosity=2)

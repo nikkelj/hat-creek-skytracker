@@ -68,9 +68,12 @@ pub fn unpack_int3(d: &[u8]) -> f64 {
 }
 
 /// Signed fraction of a revolution from degrees/minutes/seconds
-/// (`auxstar.dms2f`).
+/// (`auxstar.dms2f`). mm/ss are arcminutes/arcseconds -- fractions of a
+/// *degree* -- so the angle in degrees is |dd| + mm/60 + ss/3600. The sign
+/// convention matches f2dms, which carries the sign on the degrees term.
 pub fn dms2f(dd: f64, mm: f64, ss: f64, sign: f64) -> f64 {
-    sign * (ss / 3600.0 + mm / 60.0 + dd / 360.0)
+    let axis_sign = if dd < 0.0 { -1.0 } else { 1.0 };
+    sign * axis_sign * (dd.abs() + mm / 60.0 + ss / 3600.0) / 360.0
 }
 
 /// Expected read length for a command: `resp_bytes + 1` for the trailing '#'.

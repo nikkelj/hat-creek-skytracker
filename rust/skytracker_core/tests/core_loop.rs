@@ -145,3 +145,53 @@ fn threaded_loop_spawns_runs_and_stops() {
     cl.stop();
     assert!(az > 0.0, "azm should have advanced under a +rate command, got {az}");
 }
+
+#[test]
+fn consecutive_poll_faults_stop_motion() {
+    // A transport whose reads always time out (short read) but whose writes
+    // are observable: after MAX_CONSECUTIVE_FAULTS the loop must command a
+    // stop on both axes and surface a status message -- BEFORE shutdown.
+    use skytracker_core::sim::Transport;
+    use std::sync::Mutex;
+
+    struct FailingRecorder {
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Transport for FailingRecorder {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.written.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+        fn read(&mut self, _n: usize) -> Vec<u8> {
+            Vec::new() // every poll short-reads -> comm fault
+        }
+    }
+
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let mount = skytracker_core::sim::Mount::new(FailingRecorder {
+        written: Arc::clone(&written),
+    });
+    let shared = Shared::new(program_inputs(50.0, 30.0));
+    let mut cl = CoreLoop::spawn(mount, Arc::clone(&shared), 50.0);
+
+    // Give the loop time for well over MAX_CONSECUTIVE_FAULTS cycles, then
+    // inspect the wire traffic BEFORE stop() (which also sends a stop).
+    thread::sleep(Duration::from_millis(400));
+    let wire: Vec<u8> = written.lock().unwrap().clone();
+    let msgs = shared.outputs.lock().unwrap().status_msgs.clone();
+    let fresh = shared.outputs.lock().unwrap().fresh;
+    cl.stop();
+
+    // MC_MOVE_POS rate 0 (stop): 50 02 <target> 24 00 00 00 00
+    let has_stop = |t: u8| {
+        wire.windows(8)
+            .any(|c| c == [0x50, 0x02, t, 0x24, 0x00, 0x00, 0x00, 0x00])
+    };
+    assert!(has_stop(0x10), "no AZM stop commanded under sustained faults");
+    assert!(has_stop(0x11), "no ALT stop commanded under sustained faults");
+    assert!(
+        msgs.iter().any(|m| m.contains("consecutive comm faults")),
+        "no fault status message: {msgs:?}"
+    );
+    assert!(!fresh, "snapshot must be marked stale under comm faults");
+}

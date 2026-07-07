@@ -23,7 +23,7 @@ class CaptureDumpThread(threading.Thread):
     def __init__(self, capture_info, buffer, trajectory_state, selected_satellite, config_state, tracking_surface=None, update_status_callback=None, dump_dir="./data"):
         super().__init__()
         self.capture_info = capture_info
-        self.buffer = buffer  # CircularBuffer containing frame data
+        self.buffer = buffer  # list snapshot of frame dicts (taken at stop_capture)
         self.trajectory_state = trajectory_state
         self.selected_satellite = selected_satellite
         self.config_state = config_state
@@ -318,30 +318,35 @@ class CaptureDumpThread(threading.Thread):
                                 except Exception as e:
                                     print(f"Warning: Could not calculate azimuth for {camera_utc_microseconds}: {e}")
 
-                            # Write interpolated point with camera-specific data
-                                writer.writerow({
-                                    'timestamp': camera_utc_microseconds,
-                                    'satellite_name': satellite_name,
-                                    'altitude_deg': alt,
-                                    'azimuth_deg': az_deg,
-                                    'distance_km': dist,
-                                    'pixel_x': px,
-                                    'pixel_y': py,
-                                    'sequence_in_capture': sequence_num,
-                                    'camera_index': camera_index
-                                })
+                            # Write interpolated point with camera-specific data.
+                            # NOTE: this must stay at the `if px` level, NOT inside
+                            # `if observer` -- without an observer (no site lat/lon
+                            # configured) the row is still written, with the az_deg
+                            # fallback above. An indentation slip here once silently
+                            # dropped every per-frame row of the labeled data product.
+                            writer.writerow({
+                                'timestamp': camera_utc_microseconds,
+                                'satellite_name': satellite_name,
+                                'altitude_deg': alt,
+                                'azimuth_deg': az_deg,
+                                'distance_km': dist,
+                                'pixel_x': px,
+                                'pixel_y': py,
+                                'sequence_in_capture': sequence_num,
+                                'camera_index': camera_index
+                            })
 
-                                # Use callback for significant progress updates
-                                if self.update_status_callback and len(captured_frame_data) > 100:
-                                    if captured_frame_data.index(frame_data) % 50 == 0:  # Update every 50 frames
-                                        cam_counts = frame_counts['by_camera']
-                                        cam_status = []
-                                        for cam_idx in sorted(cam_counts.keys()):
-                                            if cam_idx != 'unknown':
-                                                captured_count = cam_counts[cam_idx]['captured']
-                                                cam_status.append(f"C{cam_idx+1}: {captured_count}")
-                                        status_str = f"Processing CSV {len(captured_frame_data)-1}-{frame_data['sequence_in_capture']}/{total_frames} - {', '.join(cam_status)}"
-                                        self.update_status_callback(status_str)
+                            # Use callback for significant progress updates
+                            if self.update_status_callback and len(captured_frame_data) > 100:
+                                if captured_frame_data.index(frame_data) % 50 == 0:  # Update every 50 frames
+                                    cam_counts = frame_counts['by_camera']
+                                    cam_status = []
+                                    for cam_idx in sorted(cam_counts.keys()):
+                                        if cam_idx != 'unknown':
+                                            captured_count = cam_counts[cam_idx]['captured']
+                                            cam_status.append(f"C{cam_idx+1}: {captured_count}")
+                                    status_str = f"Processing CSV {len(captured_frame_data)-1}-{frame_data['sequence_in_capture']}/{total_frames} - {', '.join(cam_status)}"
+                                    self.update_status_callback(status_str)
 
                     except (ValueError, KeyError, AttributeError) as e:
                         print(f"Warning: Could not process frame timestamp {camera_utc_microseconds}: {e}")

@@ -8,7 +8,22 @@ import time
 import numpy as np
 import pygame
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+
+def exposure_midpoint_utc(capture_time_s, now=None):
+    """UTC timestamp back-dated to the approximate exposure midpoint.
+
+    Frames used to be stamped with now() AFTER exposure + readout + numpy
+    conversion completed, so every timestamp lagged reality by the full
+    capture duration -- a bias that flows straight into the per-frame
+    trajectory-CSV interpolation (a LEO target moves ~1 deg/s; a 0.5 s
+    exposure stamped at readout end mislabels the frame by ~0.25-0.5 deg).
+    Back-dating by half the measured capture time lands on the exposure
+    midpoint to within the readout latency.
+    """
+    now = now if now is not None else datetime.now(timezone.utc)
+    return now - timedelta(seconds=max(0.0, capture_time_s) / 2.0)
 
 class CircularBuffer:
     """True circular buffer implementation with pre-allocated memory"""
@@ -67,8 +82,11 @@ class CameraThread(threading.Thread):
 
         # Latest raw numpy frame (mono HxW or color HxWx3), kept for the
         # hot-spot detector which needs full-bit-depth intensity, not the
-        # RGB pygame Surface used for display.
+        # RGB pygame Surface used for display. latest_raw_seq increments with
+        # every new raw frame so detection loops can tell a fresh frame from
+        # a stale one (real exposures outlast the control period).
         self.latest_raw = None
+        self.latest_raw_seq = 0
 
         # MEMORY OPTIMIZATION: Pre-allocate frame data structure
         self._frame_data_template = {
@@ -147,30 +165,38 @@ class CameraThread(threading.Thread):
         print(f"Camera {self.camera_index}: Capture started at buffer index {self.capture_start_idx}")
 
     def stop_capture(self):
-        """Stop capture - return range of frames to dump"""
+        """Stop capture - return a SNAPSHOT of the frames to dump.
+
+        The snapshot (a plain list) is taken at stop time, because the capture
+        thread keeps appending to the live deque: once the deque is full each
+        append evicts the oldest entry and shifts every index, so the
+        start/end indices computed here would drift under the dump thread and
+        a long dump could save the wrong frames. A list also gives the dump
+        O(1) indexing instead of deque's O(n).
+        """
         if self.capture_active:
             self.capture_active = False
-            capture_end_idx = len(self.circular_buffer) - 1  # Last frame currently in buffer
 
-            # Calculate the actual number of frames captured
-            buffer_length = len(self.circular_buffer)
             if self.capture_frame_count == 0:
                 # No frames were captured during this session
                 print(f"Camera {self.camera_index}: No frames captured")
                 return None, None
 
+            frames = list(self.circular_buffer.buffer)
+            capture_end_idx = len(frames) - 1
+
             # Return buffer range and metadata for dump
             capture_info = {
                 'start_idx': self.capture_start_idx,
                 'end_idx': capture_end_idx,
-                'buffer_length': buffer_length,
+                'buffer_length': len(frames),
                 'capture_start_time': self.capture_start_time,
                 'capture_end_time': datetime.now(timezone.utc),
                 'captured_frame_count': self.capture_frame_count
             }
 
             print(f"Camera {self.camera_index}: Capture stopped - captured {self.capture_frame_count} frames, indices {self.capture_start_idx} to {capture_end_idx}")
-            return capture_info, self.circular_buffer
+            return capture_info, frames
 
         return None, None
 
@@ -348,12 +374,15 @@ class CameraThread(threading.Thread):
                 if raw_frame is not None and raw_frame.size > 0 and capture_process_time < self.capture_timeout:
                     # Keep the raw frame available for the hot-spot detector.
                     self.latest_raw = raw_frame
+                    self.latest_raw_seq += 1
                     # Process frame - minimal error handling
                     surface = self._process_raw_frame(raw_frame)
                     if surface is not None:
-                        # Get microsecond-precision UTC timestamp
-                        utc_now = datetime.now(timezone.utc)
-                        local_now = datetime.now()
+                        # Microsecond-precision UTC timestamp, back-dated to
+                        # the exposure midpoint (see exposure_midpoint_utc).
+                        utc_now = exposure_midpoint_utc(capture_process_time)
+                        local_now = datetime.now() - timedelta(
+                            seconds=capture_process_time / 2.0)
 
                         # Prepare frame data for both latest frame and buffer
                         frame_data = {
@@ -364,7 +393,11 @@ class CameraThread(threading.Thread):
                             'datetime_local': local_now.isoformat(),
                             'camera_index': self.camera_index,
                             'capture_time': capture_process_time,
-                            'sequence_in_capture': self.capture_sequence_counter if self.capture_active else 0,
+                            # 1-based: consumers use `sequence_in_capture > 0`
+                            # to mean "captured during the active session", so
+                            # a 0-based counter silently dropped the first
+                            # captured frame from the trajectory CSV.
+                            'sequence_in_capture': self.capture_sequence_counter + 1 if self.capture_active else 0,
                             'buffer_sequence': self.frame_count
                         }
 

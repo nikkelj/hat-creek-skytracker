@@ -31,7 +31,7 @@ import time
 
 import numpy as np
 
-from lib.auxstar import RATES, Targets
+from lib.auxstar import RATES, Targets, pack_int3, unpack_int3
 from trajectory import interpolate_position_data_and_rates
 
 
@@ -214,6 +214,14 @@ class SimMount:
         self._pe_prev_az = 0.0
         self._pe_prev_el = 0.0
         self._pe_init = False
+        # Cumulative signed axis travel (deg) -- drives worm angle for the
+        # travel-based periodic-error model.
+        self._az_travel_deg = 0.0
+        self._el_travel_deg = 0.0
+        # Finite-goto targets (None = no goto in progress). Instant when
+        # sim_goto_rate_dps is 0/absent (back-compat for tests).
+        self._az_goto = None
+        self._el_goto = None
 
     # --- sim params (read live from config so UI edits take effect) ---
     def _sim(self):
@@ -237,17 +245,54 @@ class SimMount:
         if dt <= 0:
             return
         s = self._sim()
-        jitter = float(s.get('mount_rate_noise_dps', 0.0))
-        az_rate = self._az_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
-        el_rate = self._el_rate_dps + (self._rng.normal(0, jitter) if jitter > 0 else 0.0)
+
+        # Finite goto: slew toward the target at sim_goto_rate_dps instead of
+        # teleporting, so settle loops / goto timeouts see a mount that takes
+        # real time to arrive. Rate 0 (default) keeps the legacy instant goto.
+        goto_rate = float(s.get('sim_goto_rate_dps', 0.0) or 0.0)
+        az_rate, el_rate = self._az_rate_dps, self._el_rate_dps
+        if self._az_goto is not None:
+            err = wrap180(self._az_goto - self.az_true_deg)
+            if abs(err) <= goto_rate * dt:
+                # arrival handled below by commanding exactly the remainder
+                az_rate = err / dt
+                self._az_goto = None
+            else:
+                az_rate = math.copysign(goto_rate, err)
+        if self._el_goto is not None:
+            err = wrap180(self._el_goto - self.el_true_deg)
+            if abs(err) <= goto_rate * dt:
+                el_rate = err / dt
+                self._el_goto = None
+            else:
+                el_rate = math.copysign(goto_rate, err)
+
         # Gear backlash: on a direction reversal the load (optical axis) stalls
         # until the lost motion is taken up. This is what makes discrete
         # rate-stepping hunt -- every time the rate command flips sign the mount
-        # sits in a dead-zone before it starts moving back.
+        # sits in a dead-zone before it starts moving back. Goto motion passes
+        # through the same gap, so approach direction matters like on hardware.
         b = float(s.get('mount_backlash_deg', 0.0))
         d_az = self._apply_backlash('_az_play', az_rate * dt, b)
         d_el = self._apply_backlash('_el_play', el_rate * dt, b)
-        # Periodic (worm) error: a slow sinusoid riding on the true pointing.
+
+        # Drive/rate noise as a physical random walk: the per-step position
+        # kick scales with sqrt(dt) so the walk's variance over a given time
+        # span is independent of how often the sim is polled (a plain
+        # rate-noise * dt kick made the walk amplitude a function of the
+        # caller's polling cadence, not of physics).
+        jitter = float(s.get('mount_rate_noise_dps', 0.0))
+        if jitter > 0:
+            sqdt = math.sqrt(dt)
+            d_az += self._rng.normal(0, jitter) * sqdt
+            d_el += self._rng.normal(0, jitter) * sqdt
+
+        # Accumulate signed axis travel (worm rotation) BEFORE adding PE: the
+        # worm turns when the axis is driven; PE rides on top of that.
+        self._az_travel_deg += d_az
+        self._el_travel_deg += d_el
+
+        # Periodic (worm) error: a sinusoid riding on the true pointing.
         # Inject the per-step delta so it adds to tracking instead of replacing it.
         pe_az, pe_el = self._periodic_error(now)
         if not self._pe_init:
@@ -256,8 +301,25 @@ class SimMount:
         d_az += pe_az - self._pe_prev_az
         d_el += pe_el - self._pe_prev_el
         self._pe_prev_az, self._pe_prev_el = pe_az, pe_el
+
         self.az_true_deg = (self.az_true_deg + d_az) % 360.0
         self.el_true_deg = self.el_true_deg + d_el
+
+        # Optional EL-axis hard stops (raw axis degrees): the mount stalls at
+        # a stop -- position clamps and the commanded rate is zeroed, so a
+        # loop that keeps pushing sees a mount that no longer responds (the
+        # condition the safety-limit abort paths exist for).
+        el_min = s.get('sim_el_stop_min_deg', None)
+        el_max = s.get('sim_el_stop_max_deg', None)
+        if el_min is not None and self.el_true_deg < float(el_min):
+            self.el_true_deg = float(el_min)
+            self._el_rate_dps = 0.0
+            self._el_goto = None
+        if el_max is not None and self.el_true_deg > float(el_max):
+            self.el_true_deg = float(el_max)
+            self._el_rate_dps = 0.0
+            self._el_goto = None
+
         # Focus integrates straight from its commanded rate (no backlash/PE).
         self.focus_true_deg = (self.focus_true_deg + self._focus_rate_dps * dt) % 360.0
 
@@ -282,13 +344,27 @@ class SimMount:
         return out
 
     def _periodic_error(self, now):
-        """Worm periodic error as a sinusoid (zero-to-peak amplitude, worm
-        period). The two axes run a quarter cycle apart so they don't move
-        identically. Returns (pe_az_deg, pe_el_deg)."""
+        """Worm periodic error as a sinusoid (zero-to-peak amplitude). The two
+        axes run a quarter cycle apart so they don't move identically.
+
+        Two phase models:
+          * travel-based (physical, used when `mount_pe_period_deg` is set):
+            the worm turns with axis TRAVEL, so PE speeds up during slews and
+            freezes when the axis is parked -- one PE cycle per
+            mount_pe_period_deg of axis motion (AVX-class worm: ~2 deg/rev).
+          * time-based (legacy fallback, `mount_pe_period_sec`): wall-clock
+            sinusoid, kept for existing configs/tests.
+        Returns (pe_az_deg, pe_el_deg)."""
         s = self._sim()
         amp = float(s.get('mount_pe_amplitude_deg', 0.0))
         if amp <= 0.0:
             return 0.0, 0.0
+        period_deg = s.get('mount_pe_period_deg', None)
+        if period_deg:
+            pdeg = float(period_deg)
+            ph_az = 2.0 * math.pi * self._az_travel_deg / pdeg
+            ph_el = 2.0 * math.pi * self._el_travel_deg / pdeg
+            return amp * math.sin(ph_az), amp * math.sin(ph_el + math.pi / 2.0)
         period = float(s.get('mount_pe_period_sec', 600.0)) or 600.0
         ph = 2.0 * math.pi * (now - self._t0) / period
         return amp * math.sin(ph), amp * math.sin(ph + math.pi / 2.0)
@@ -318,10 +394,12 @@ class SimMount:
             dps = sign * RATES.get(abs(int(rate)), 0.0) * 360.0
             if target == Targets.ALT:
                 self._el_rate_dps = dps
+                self._el_goto = None  # a manual rate overrides an in-flight goto
             elif target == Targets.FOCUS:
                 self._focus_rate_dps = dps
             else:
                 self._az_rate_dps = dps
+                self._az_goto = None
             return True
 
     def hc_goto_fast(self, target, dd, mm, ss):
@@ -329,15 +407,22 @@ class SimMount:
             self._advance()
             deg = abs(dd) + mm / 60.0 + ss / 3600.0
             deg = deg if dd >= 0 else -deg
+            finite = float(self._sim().get('sim_goto_rate_dps', 0.0) or 0.0) > 0.0
             if target == Targets.ALT:
-                self.el_true_deg = deg
                 self._el_rate_dps = 0.0
+                if finite:
+                    self._el_goto = deg
+                else:
+                    self.el_true_deg = deg
             elif target == Targets.FOCUS:
                 self.focus_true_deg = deg % 360.0
                 self._focus_rate_dps = 0.0
             else:
-                self.az_true_deg = deg % 360.0
                 self._az_rate_dps = 0.0
+                if finite:
+                    self._az_goto = deg % 360.0
+                else:
+                    self.az_true_deg = deg % 360.0
             return True
 
     def hc_set_position(self, target, dd, mm, ss):
@@ -358,10 +443,12 @@ class SimMount:
             q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
             if target == Targets.ALT:
                 self._el_rate_dps = q
+                self._el_goto = None
             elif target == Targets.FOCUS:
                 self._focus_rate_dps = q
             else:
                 self._az_rate_dps = q
+                self._az_goto = None
             return True
 
     def close(self):
@@ -369,6 +456,148 @@ class SimMount:
             self._az_rate_dps = 0.0
             self._el_rate_dps = 0.0
             self._focus_rate_dps = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Sim serial transport (byte-level)
+# ---------------------------------------------------------------------------
+
+class SimSerialDevice:
+    """serial.Serial stand-in that speaks the NexStar AUX byte protocol against
+    a SimMount.
+
+    SimMount alone duck-types the controller at the METHOD level, which means
+    the app's command encoders, response parsers, timeouts, and
+    SerialCommError recovery are never exercised in sim -- exactly the seam
+    where a real-hardware-only crash class lives (a '{:06x}'-on-bytes bug
+    shipped that way). Wrapping SimMount behind this device and handing the
+    app a REAL NexstarHandController closes that gap:
+
+        controller = NexstarHandController(SimSerialDevice(sim_mount))
+
+    Fault injection (all default off; read live from sim_config so the HW-sim
+    UI can drive them, or set the attributes directly in tests):
+      * sim_serial_latency_s        -- per-read latency (exercises the 0.25 s
+                                       transaction timeout budget at 15 Hz),
+      * sim_serial_short_read_prob  -- probability a response is truncated
+                                       (controller must raise SerialCommError,
+                                       flush, and skip the cycle),
+      * sim_serial_garbage_prob     -- probability a response byte is corrupted.
+    `fail_next(n)` deterministically short-reads the next n transactions.
+    """
+
+    def __init__(self, sim_mount, config_state=None, rng=None):
+        self.mount = sim_mount
+        self.config_state = config_state
+        self._rng = rng if rng is not None else np.random.default_rng()
+        self._pending = b""
+        self._fail_next = 0
+        self.reset_count = 0
+        # Direct-set fault knobs (config_state entries override when present).
+        self.latency_s = 0.0
+        self.short_read_prob = 0.0
+        self.garbage_prob = 0.0
+
+    # --- fault configuration -------------------------------------------------
+    def _sim(self):
+        if self.config_state is None:
+            return {}
+        return getattr(self.config_state, 'sim_config', {}) or {}
+
+    def _param(self, key, attr):
+        s = self._sim()
+        if key in s:
+            return float(s[key] or 0.0)
+        return getattr(self, attr)
+
+    def fail_next(self, n=1):
+        """Deterministically short-read the next n transactions."""
+        self._fail_next = int(n)
+
+    # --- AUX protocol --------------------------------------------------------
+    def _dispatch(self, msg_id, target_val, data):
+        """Execute one passthrough command against the SimMount; return the
+        response payload bytes (WITHOUT the trailing '#')."""
+        target = Targets(target_val)
+
+        if msg_id == 0x01:                       # MC_GET_POSITION
+            frac = self.mount.hc_get_position(target)
+            return pack_int3(frac)
+        if msg_id in (0x02, 0x04):               # MC_GOTO_FAST / MC_SET_POSITION
+            deg = unpack_int3(data) * 360.0
+            self.mount.hc_goto_fast(target, deg, 0, 0)
+            return b""
+        if msg_id in (0x06, 0x07):               # MC_SET_POS/NEG_GUIDERATE
+            sign = 1.0 if msg_id == 0x06 else -1.0
+            if data in (b"\xff\xff\x00", b"\xff\xfe\x00", b"\xff\xfd\x00"):
+                # sidereal / solar / lunar specials -- accept as an ack.
+                self.mount.hc_set_guide_rate(target, sign)
+            else:
+                dps = unpack_int3(data) * 360.0  # rev/s convention -> deg/s
+                self.mount.hc_set_rate_dps(target, sign * dps)
+            return b""
+        if msg_id in (0x24, 0x25):               # MC_MOVE_POS / MC_MOVE_NEG
+            step = data[0]
+            self.mount.hc_slew_fixed(target, step if msg_id == 0x24 else -step)
+            return b""
+        if msg_id == 0xfe:                       # MC_GET_VER
+            return b"\x04\x0f"
+        # Unknown/unmodeled command: ack with zero-filled payload of the
+        # requested length (permissive, like a quiet firmware).
+        return b""
+
+    # --- serial.Serial surface ------------------------------------------------
+    def write(self, request):
+        req = bytes(request)
+        # Passthrough frame: 'P', msg_len, dest, msg_id, d0, d1, d2, resp_len
+        if len(req) != 8 or req[0] != 0x50:
+            self._pending = b""
+            return len(req)
+        msg_id = req[3]
+        data = req[4:7]
+        resp_len = req[7]
+        try:
+            payload = self._dispatch(msg_id, req[2], data)
+        except Exception:
+            payload = b""
+        payload = (payload + b"\x00" * resp_len)[:resp_len]
+        self._pending = payload + b"#"
+
+        # Fault injection: truncate (short read) or corrupt the response.
+        short_p = self._param('sim_serial_short_read_prob', 'short_read_prob')
+        garb_p = self._param('sim_serial_garbage_prob', 'garbage_prob')
+        if self._fail_next > 0:
+            self._fail_next -= 1
+            self._pending = self._pending[:max(0, len(self._pending) - 1)]
+        elif short_p > 0 and self._rng.random() < short_p:
+            cut = int(self._rng.integers(0, len(self._pending)))
+            self._pending = self._pending[:cut]
+        elif garb_p > 0 and self._rng.random() < garb_p and self._pending:
+            i = int(self._rng.integers(0, len(self._pending)))
+            corrupted = bytearray(self._pending)
+            corrupted[i] ^= 0xFF
+            self._pending = bytes(corrupted)
+        return len(req)
+
+    def read(self, n):
+        lat = self._param('sim_serial_latency_s', 'latency_s')
+        if lat > 0:
+            time.sleep(lat)
+        out, self._pending = self._pending[:n], self._pending[n:]
+        return out
+
+    def reset_input_buffer(self):
+        self.reset_count += 1
+        self._pending = b""
+
+    def close(self):
+        self.mount.close()
+
+
+def make_sim_serial_controller(sim_mount, config_state=None, rng=None):
+    """A REAL NexstarHandController wired to the byte-level sim transport."""
+    from lib.auxstar import NexstarHandController
+    return NexstarHandController(SimSerialDevice(sim_mount, config_state, rng=rng))
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +912,15 @@ class SimCap:
         self._w = int(s.get('cam_width', 960))
         self._h = int(s.get('cam_height', 720))
         self._roi = [self._w, self._h, 1, None]  # img_type filled lazily
+        # Exposure-timing model (sim_exposure_timing, default ON): the real
+        # camera holds ASI_EXP_WORKING for the exposure duration plus a
+        # readout latency, which is precisely what makes frames arrive slower
+        # than the control loop cycles -- the regime the HOTSPOT stale-frame
+        # gate exists for. An instant-SUCCESS sim can never rehearse it.
+        self._exposure_us = 10_000.0  # updated by set_control_value
+        self._exp_start = None
+        self._exp_failed = False
+        self._rng = np.random.default_rng(int(s.get('seed', 0) or 0) + cam_index)
 
     def get_camera_property(self):
         return {'IsColorCam': False, 'MaxWidth': self._w, 'MaxHeight': self._h,
@@ -692,6 +930,13 @@ class SimCap:
         self._roi[3] = img_type
 
     def set_control_value(self, *a, **k):
+        # Track the exposure setting so the timing model honors it.
+        try:
+            import zwoasi as asi
+            if len(a) >= 2 and a[0] == asi.ASI_EXPOSURE:
+                self._exposure_us = float(a[1])
+        except Exception:
+            pass
         return None
 
     def get_roi_format(self):
@@ -707,10 +952,25 @@ class SimCap:
         return None
 
     def start_exposure(self, *a, **k):
+        s = self.simulator._sim()
+        self._exp_start = time.perf_counter()
+        fail_p = float(s.get('sim_exposure_failure_prob', 0.0) or 0.0)
+        self._exp_failed = fail_p > 0 and self._rng.random() < fail_p
         return None
 
     def get_exposure_status(self):
         import zwoasi as asi
+        s = self.simulator._sim()
+        if not bool(s.get('sim_exposure_timing', True)):
+            return asi.ASI_EXP_SUCCESS
+        if self._exp_start is None:
+            return asi.ASI_EXP_IDLE
+        if self._exp_failed:
+            return asi.ASI_EXP_FAILED
+        readout = float(s.get('sim_readout_latency_s', 0.005) or 0.0)
+        done_at = self._exp_start + self._exposure_us / 1e6 + readout
+        if time.perf_counter() < done_at:
+            return asi.ASI_EXP_WORKING
         return asi.ASI_EXP_SUCCESS
 
     def get_data_after_exposure(self, *a, **k):

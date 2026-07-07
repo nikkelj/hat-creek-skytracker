@@ -608,3 +608,53 @@ if __name__ == "__main__":
     print("-" * 40)
     print("ALL PASSED" if failed == 0 else f"{failed} test(s) failed")
     raise SystemExit(1 if failed else 0)
+
+
+def test_result_16bit_preserves_subquantum_snr():
+    # Stack frames of the same starfield whose mean level sits BETWEEN 8-bit
+    # levels: the 16-bit master must carry the fraction the 8-bit one rounds.
+    base = _starfield(size=120)
+    stacker = LuckyStacker(method="orb")
+    stacker.set_reference(base)
+    for i in range(1, 6):
+        bump = 1 if i % 2 else 0  # +1 DN on half the frames -> true mean +0.5
+        stacker.add(np.clip(base.astype(np.int16) + bump, 0, 255).astype(np.uint8))
+    assert stacker.stats.n_stacked >= 4, stacker.stats
+    m8 = stacker.result(bits=8)
+    m16 = stacker.result(bits=16)
+    assert m8.dtype == np.uint8 and m16.dtype == np.uint16
+    frac = (m16.astype(np.float64) / 257.0) - base.astype(np.float64)
+    med = float(np.median(frac))
+    assert 0.2 < med < 0.8, med  # fractional level survives at 16 bits
+    print("ok  16-bit master preserves fractional level")
+
+
+def test_save_master_uint16_png_roundtrip():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        m16 = np.full((8, 8, 3), 30000, dtype=np.uint16)
+        p = save_master(m16, os.path.join(d, "m.png"))
+        back = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        assert back.dtype == np.uint16, back.dtype
+        assert int(back.max()) == 30000
+        # formats that can't hold 16 bits are coerced to png
+        p2 = save_master(m16, os.path.join(d, "m.jpg"))
+        assert p2.endswith(".png")
+    print("ok  save_master uint16 roundtrip")
+
+
+def test_recenter_places_wandering_target_mid_frame():
+    # The PIPP-centring building block for stack_run(center_size=...): frames
+    # with the target wandering across the field recentre to put the target's
+    # CENTROID at the crop centre (a Gaussian blob, so the centroid -- not the
+    # argmax of a flat disc -- is the meaningful position).
+    size = 64
+    for i in range(6):
+        cx, cy = 40 + i * 12, 30 + i * 8
+        img = _blob(size=160, center=(cx, cy), radius=4, seed=i)[:120, :160]
+        centred = recenter_frame(img, out_size=(size, size))
+        assert centred.shape[:2] == (size, size)
+        c = brightness_centroid(centred)
+        assert c is not None
+        assert abs(c[0] - size / 2) <= 2 and abs(c[1] - size / 2) <= 2, (i, c)
+    print("ok  recentring puts wandering target mid-frame")

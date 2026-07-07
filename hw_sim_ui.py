@@ -22,6 +22,10 @@ ROWS = [
     ("Cam2 rotation (deg)",     "cam2_offset_rotation_deg",  0.5, "{:.1f}"),
     ("Cam2 offset X (px)",      "cam2_offset_x_px",          1,   "{:.0f}"),
     ("Cam2 offset Y (px)",      "cam2_offset_y_px",          1,   "{:.0f}"),
+    ("Goto slew rate (deg/s)",  "sim_goto_rate_dps",         0.5, "{:.1f}"),
+    ("Serial latency (s)",      "sim_serial_latency_s",      0.005, "{:.3f}"),
+    ("Serial short-read prob",  "sim_serial_short_read_prob", 0.01, "{:.2f}"),
+    ("Serial garbage prob",     "sim_serial_garbage_prob",   0.01, "{:.2f}"),
     ("Star density",            "star_density",              25,  "{:.0f}"),
     ("Background level",        "background_level",          1,   "{:.0f}"),
     ("Read noise",              "read_noise",                0.5, "{:.1f}"),
@@ -31,7 +35,9 @@ ROWS = [
 
 NON_NEGATIVE = {"mount_encoder_noise_deg", "mount_rate_noise_dps", "mount_backlash_deg",
                 "mount_pe_amplitude_deg", "mount_pe_period_sec", "star_density",
-                "background_level", "read_noise", "target_brightness", "seed"}
+                "background_level", "read_noise", "target_brightness", "seed",
+                "sim_goto_rate_dps", "sim_serial_latency_s",
+                "sim_serial_short_read_prob", "sim_serial_garbage_prob"}
 INTEGER_KEYS = {"star_density", "seed", "cam2_offset_x_px", "cam2_offset_y_px"}
 
 
@@ -112,8 +118,20 @@ def draw_hw_sim_options(display, config_state, hardware_sim=None):
         "(renders Hipparcos/Tycho stars into camera frames; needs a deep catalogue for narrow FOV)",
         True, (150, 150, 150)), (x0 + 370, y0 + 162))
 
+    # Byte-level sim serial transport: the app drives the sim mount through a
+    # REAL NexstarHandController over the AUX wire protocol, so command
+    # encoders / parsers / timeouts / SerialCommError recovery are exercised.
+    wire_on = bool(s.get("sim_serial_transport", False))
+    wire_rect = pygame.Rect(x0, y0 + 188, 360, 26)
+    _btn(screen, wire_rect, f"Mount link: {'BYTE-LEVEL SERIAL' if wire_on else 'DIRECT (method calls)'}",
+         display.font, bg=(20, 110, 150) if wire_on else (70, 70, 70))
+    display.hw_sim_serial_rect = wire_rect
+    screen.blit(display.small_font.render(
+        "(exercises the real serial layer in sim; reconnect telescope to apply)",
+        True, (150, 150, 150)), (x0 + 370, y0 + 194))
+
     display.hw_sim_rects = {}
-    ry = y0 + 196
+    ry = y0 + 228
     for label, key, step, fmt in ROWS:
         screen.blit(display.small_font.render(label, True, (230, 230, 230)), (x0, ry + 6))
         minus = pygame.Rect(x0 + 230, ry, 28, 26)
@@ -170,6 +188,15 @@ def handle_hw_sim_click(pos, display, config_state, hardware_sim, status_message
         s["sim_use_real_stars"] = not bool(s.get("sim_use_real_stars", False))
         status_messages.append(
             f"Sim stars: {'REAL catalogue' if s['sim_use_real_stars'] else 'random field'} (applies live)")
+        return True
+
+    if getattr(display, 'hw_sim_serial_rect', None) and display.hw_sim_serial_rect.collidepoint(pos):
+        s["sim_serial_transport"] = not bool(s.get("sim_serial_transport", False))
+        status_messages.append(
+            "Sim mount link: "
+            + ("BYTE-LEVEL serial (real controller + wire protocol)"
+               if s["sim_serial_transport"] else "direct method calls")
+            + " - reconnect telescope to apply")
         return True
 
     for key, (minus, plus, step) in getattr(display, 'hw_sim_rects', {}).items():

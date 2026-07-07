@@ -133,11 +133,6 @@ last_alt_duration = 0.0
 # Rendering Thread Management
 global tracking_viz_thread
 global joystick_viz_thread
-global position_update_lock
-
-# Thread safety for position updates
-position_update_lock = threading.Lock()
-
 # Initialize rendering threads
 print("Initializing rendering threads...")
 tracking_viz_thread = TrackingVisualizationThread(display, config_state, tracking_vis_state, target_fps=30)
@@ -369,53 +364,55 @@ while running:
 
     # Compute satellite positions at 10 Hz
     if current_time - last_update_time >= update_interval:
-        # Use lock to protect position updates for thread safety
-        with position_update_lock:
-            # NOTE: do not clear satellite_positions here. The rendering thread
-            # reads it live every frame; clearing it now and only repopulating
-            # at update_satellite_positions() below leaves an empty-dict window
-            # during the current_tt/slider math, and a render landing in that
-            # window paints a fully black frame -> visualization flicker. The
-            # update path below replaces the dict in a single atomic rebind, and
-            # the no-data branch clears it atomically, so no empty window exists.
+        # Thread-safety here comes from atomic dict rebinds (see NOTE below),
+        # not from a lock: the position_update_lock that used to wrap this
+        # block was acquired at exactly one site in the codebase, so it
+        # serialized nothing and only suggested false safety. Removed.
+        # NOTE: do not clear satellite_positions here. The rendering thread
+        # reads it live every frame; clearing it now and only repopulating
+        # at update_satellite_positions() below leaves an empty-dict window
+        # during the current_tt/slider math, and a render landing in that
+        # window paints a fully black frame -> visualization flicker. The
+        # update path below replaces the dict in a single atomic rebind, and
+        # the no-data branch clears it atomically, so no empty window exists.
 
-            # Calculate current time for trajectory interpolation - ensure it's never None
-            if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
-                # User is actively dragging slider - use slider position
-                fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
-                current_tt = tracking_vis_state.t0.tt + fraction * (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
-            elif tracking_vis_state.paused and tracking_vis_state.paused_tt is not None:
-                # Simulation is paused - use paused time
-                current_tt = tracking_vis_state.paused_tt
-            else:
-                # Default to current time
-                current_tt = ts.now().tt
+        # Calculate current time for trajectory interpolation - ensure it's never None
+        if tracking_vis_state.dragging_slider and tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None:
+            # User is actively dragging slider - use slider position
+            fraction = (display.slider_rect.x - display.scroll_bar_rect.x) / (display.scroll_bar_rect.width - display.slider_rect.width)
+            current_tt = tracking_vis_state.t0.tt + fraction * (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
+        elif tracking_vis_state.paused and tracking_vis_state.paused_tt is not None:
+            # Simulation is paused - use paused time
+            current_tt = tracking_vis_state.paused_tt
+        else:
+            # Default to current time
+            current_tt = ts.now().tt
 
-                # Update slider position to reflect real-time (only if trajectories are available)
-                if tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None and not tracking_vis_state.dragging_slider:
-                    fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
-                    display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
+            # Update slider position to reflect real-time (only if trajectories are available)
+            if tracking_vis_state.t0 is not None and tracking_vis_state.t1 is not None and not tracking_vis_state.dragging_slider:
+                fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
+                display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
 
-            # Update the current time in the state for use by other components (like PROGRAM tracking)
-            tracking_vis_state.current_tt = current_tt
+        # Update the current time in the state for use by other components (like PROGRAM tracking)
+        tracking_vis_state.current_tt = current_tt
 
-            # Use state-direct mutation approach for satellite position updates
-            # Only update positions if trajectories are available
-            if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
-                update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
-            else:
-                # No trajectory data available: clear positions in a single
-                # atomic rebind (never leaves a partially-built/empty window).
-                tracking_vis_state.satellite_positions = {}
+        # Use state-direct mutation approach for satellite position updates
+        # Only update positions if trajectories are available
+        if tracking_vis_state.tle_loaded and tracking_vis_state.satellites:
+            update_satellite_positions(tracking_vis_state, current_tt, elevation_mask_deg=float(config_state.elevation_mask_str or 0))
+        else:
+            # No trajectory data available: clear positions in a single
+            # atomic rebind (never leaves a partially-built/empty window).
+            tracking_vis_state.satellite_positions = {}
 
-            # Refresh ADS-B aircraft positions/trajectories (prune stale, rebuild
-            # dirty predictions) when the receiver is connected. Cheap when idle.
-            if joystick_mode_state.adsb is not None and joystick_mode_state.adsb_connected:
-                joystick_mode_state.adsb.update(display, current_tt)
+        # Refresh ADS-B aircraft positions/trajectories (prune stale, rebuild
+        # dirty predictions) when the receiver is connected. Cheap when idle.
+        if joystick_mode_state.adsb is not None and joystick_mode_state.adsb_connected:
+            joystick_mode_state.adsb.update(display, current_tt)
 
-            # Update launch positions if any launch trajectories are loaded
-            if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:
-                update_launch_positions(tracking_vis_state, current_tt)
+        # Update launch positions if any launch trajectories are loaded
+        if hasattr(tracking_vis_state, 'launch_trajectories') and tracking_vis_state.launch_trajectories:
+            update_launch_positions(tracking_vis_state, current_tt)
 
         last_update_time = current_time
 
@@ -618,8 +615,11 @@ while running:
                 display.button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
                 display.button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
             elif current_mode == "sensor_calib":
-                # Camera slider hover states handled by modular camera code
-                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback)
+                # Camera slider hover states handled by modular camera code.
+                # event.pos, NOT the stale `pos` bound by a previous
+                # MOUSEBUTTONDOWN iteration (NameError before any click,
+                # silently wrong coordinates after one).
+                handle_sensor_calib_events(event, event.pos, display, camera_manager, update_status_callback)
             elif current_mode == "tracking_vis":
                 display.button_states["clear_filters"]["hover"] = display.clear_filters_button.collidepoint(event.pos)
                 display.button_states["recompute"]["hover"] = display.recompute_button.collidepoint(event.pos)
@@ -710,40 +710,8 @@ while running:
                         handle_adsb_fit_slider_mouse_events(joystick_mode_state, display, current_pos)
 
 
-        elif event.type == pygame.MOUSEMOTION:
-            if current_mode is None:
-                # Handle main menu hover states
-                for btn in display.buttons:
-                    display.button_states[btn["mode"]]["hover"] = btn["rect"].collidepoint(event.pos)
-            elif current_mode == "post_process" and post_process_state is not None:
-                handle_pp_motion(event.pos, display, post_process_state, event.buttons)
-            elif current_mode == "config_options":
-                display.button_states["save"]["hover"] = display.save_button.collidepoint(event.pos)
-                display.button_states["load"]["hover"] = display.load_button.collidepoint(event.pos)
-            elif current_mode == "sensor_calib":
-                # Camera slider hover states handled by modular camera code
-                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback)
-            elif current_mode == "tracking_vis":
-                display.button_states["clear_filters"]["hover"] = display.clear_filters_button.collidepoint(event.pos)
-                display.button_states["recompute"]["hover"] = display.recompute_button.collidepoint(event.pos)
-                display.button_states["reset"]["hover"] = display.reset_button.collidepoint(event.pos)
-                display.button_states["pause"]["hover"] = display.pause_button.collidepoint(event.pos)
-                display.button_states["play"]["hover"] = display.play_button.collidepoint(event.pos)
-                if tracking_vis_state.dragging_slider:
-                    display.slider_rect.x = max(display.scroll_bar_rect.x, min(event.pos[0] - display.slider_rect.width // 2, display.scroll_bar_rect.x + display.scroll_bar_rect.width - display.slider_rect.width))
-                for sat, (px, py, _, _) in tracking_vis_state.satellite_positions.items():
-                    if math.hypot(px - event.pos[0], py - event.pos[1]) < 10:
-                        tracking_vis_state.hovered_satellite = sat
-                        break
-                # Starfield hover: star_screen_positions are in surface coords; the
-                # surface is blitted at (display.sub_x, display.sub_y).
-                tracking_vis_state.hovered_star = None
-                for sx, sy, hip in (tracking_vis_state.star_screen_positions or []):
-                    if math.hypot(sx + display.sub_x - event.pos[0],
-                                  sy + display.sub_y - event.pos[1]) < 8:
-                        tracking_vis_state.hovered_star = hip
-                        break
-
+        # (A second, unreachable MOUSEMOTION branch used to sit here -- the
+        # dispatch above already consumes the event type. Removed.)
         elif event.type == pygame.MOUSEBUTTONUP:
             # Reset all button clicked states - essential for UI feedback
             for btn in display.buttons:
@@ -756,8 +724,9 @@ while running:
                 display.button_states["save"]["clicked"] = False
                 display.button_states["load"]["clicked"] = False
             elif current_mode == "sensor_calib":
-                # Handle sensor calibration events using modular handler
-                handle_sensor_calib_events(event, pos, display, camera_manager, update_status_callback)
+                # Handle sensor calibration events (event.pos, not the stale
+                # `pos` bound by a previous MOUSEBUTTONDOWN iteration)
+                handle_sensor_calib_events(event, event.pos, display, camera_manager, update_status_callback)
             elif current_mode == "tracking_vis":
                 display.button_states["clear_filters"]["clicked"] = False
                 display.button_states["reset"]["clicked"] = False

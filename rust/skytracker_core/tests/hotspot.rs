@@ -93,3 +93,20 @@ fn geometry_zero_focal_length_safe() {
         (0.0, 0.0)
     );
 }
+
+#[test]
+fn nan_pixels_do_not_panic() {
+    // Real ASI frames can contain NaN after debayer/hot-column handling. The
+    // detector must never panic the control-loop thread over them.
+    let mut img = gaussian(256, 200, 130.3, 90.7, 200.0, 3.0, 10.0);
+    img[[0, 0]] = f32::NAN;
+    img[[50, 60]] = f32::NAN;
+    img[[199, 255]] = f32::NAN;
+    // A few NaNs must leave the real blob detectable.
+    let d = detect_hotspot(&img.view(), None, 5.0, 12, 0.5, 3).expect("detection");
+    assert!((d.cx - 130.3).abs() < 1.0, "cx={}", d.cx);
+
+    // Even an all-NaN frame must return cleanly (no detection is fine).
+    let all_nan = Array2::<f32>::from_elem((64, 64), f32::NAN);
+    let _ = detect_hotspot(&all_nan.view(), None, 5.0, 12, 0.5, 3);
+}

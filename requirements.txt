@@ -1,0 +1,23 @@
+# Cross-platform runtime dependencies (the Windows field install uses the
+# fully pinned conda environment.yml; this file exists so CI and non-Windows
+# dev boxes can run the app logic and the headless test suite).
+numpy
+scipy
+opencv-python-headless
+pygame
+skyfield
+sgp4
+pandas
+pyserial
+plotly
+matplotlib
+pillow
+zwoasi           # pure-python SDK binding; the ASI DLL itself is only needed for real cameras
+skyfield-data    # bundles de421.bsp (JPL's download host is blocked on many networks)
+
+# Optional extras (lazy-imported; features degrade gracefully without them):
+#   tetra3     - plate solving (see tools/build_tetra3_db.py)
+#   pyModeS    - ADS-B decoding for the aircraft tracker
+
+# Test/dev tooling
+pytest

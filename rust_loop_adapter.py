@@ -50,6 +50,11 @@ def _mount_mode_str(cfg):
 class RustCoreLoopAdapter:
     """Runs skytracker_core.CoreLoop and bridges it to the app state."""
 
+    # Loop-liveness watchdog: if the Rust loop's cycle_count stops advancing
+    # for this long (or the loop reports itself dead), stop the mount from
+    # Python and latch the fault until the telescope is reconnected.
+    WATCHDOG_STALL_SEC = 2.0
+
     def __init__(self, joystick_mode_state, config_state, target_hz=15):
         self.state = joystick_mode_state
         self.config_state = config_state
@@ -57,6 +62,11 @@ class RustCoreLoopAdapter:
         self.loop = None
         self._stop = threading.Event()
         self._thread = None
+        self._last_cycle_count = -1
+        self._last_cycle_advance = time.monotonic()
+        self._loop_fault_latched = False
+        self._last_pushed_frame_seq = None
+        self._park_state = None
 
     # ---- MountControlThread-compatible lifecycle ----
     def start(self):
@@ -96,13 +106,65 @@ class RustCoreLoopAdapter:
         """Build the Rust loop on connect; tear it down on disconnect."""
         st = self.state
         connected = bool(st.telescope_connected) and st.telescope_controller is not None
-        if self.loop is None and connected:
+        if not connected:
+            # Reconnecting is the operator's explicit reset of a latched
+            # loop fault (see _watchdog).
+            self._loop_fault_latched = False
+        if self.loop is None and connected and not self._loop_fault_latched:
             self.loop = rc.CoreLoop.wrap_mount(st.telescope_controller, self.target_hz)
+            self._last_cycle_count = -1
+            self._last_cycle_advance = time.monotonic()
             print("RustCoreLoopAdapter: bridged Rust loop to telescope controller")
         elif self.loop is not None and not connected:
             self.loop.stop()
             self.loop = None
         return self.loop is not None
+
+    def _watchdog(self, snap):
+        """Detect a dead/stalled loop thread and fail safe.
+
+        The loop increments snapshot['cycle_count'] every cycle and sets
+        'loop_dead' when its thread exits (including a contained panic). A
+        snapshot whose count stops advancing is stale no matter what 'fresh'
+        says, so: stop the mount from Python (the controller lock serializes
+        this with any remaining loop traffic), tear the loop down, and latch
+        the fault until the operator reconnects the telescope.
+
+        Returns True when the loop was torn down (pump must not keep using it).
+        """
+        now = time.monotonic()
+        count = snap.get("cycle_count", -1)
+        if count != self._last_cycle_count:
+            self._last_cycle_count = count
+            self._last_cycle_advance = now
+        dead = bool(snap.get("loop_dead"))
+        stalled = (now - self._last_cycle_advance) > self.WATCHDOG_STALL_SEC
+        if not (dead or stalled):
+            return False
+
+        reason = "loop thread died" if dead else (
+            f"loop stalled >{self.WATCHDOG_STALL_SEC:.0f}s")
+        msg = f"RustCoreLoopAdapter: {reason} - stopping mount, reverting to fault-latched state"
+        print(msg)
+        st = self.state
+        if st.update_status_callback:
+            st.update_status_callback(msg)
+        try:
+            controller = st.telescope_controller
+            if controller is not None:
+                from lib.auxstar import Targets
+                controller.hc_slew_fixed(Targets.AZM, 0)
+                controller.hc_slew_fixed(Targets.ALT, 0)
+        except Exception as e:
+            print(f"RustCoreLoopAdapter: python-side safe stop failed: {e}")
+        try:
+            self.loop.stop()
+        except Exception:
+            pass
+        self.loop = None
+        st.position_fresh = False
+        self._loop_fault_latched = True
+        return True
 
     def _pump(self):
         if not self._ensure_loop():
@@ -114,6 +176,8 @@ class RustCoreLoopAdapter:
         # 1) Read snapshot back into app state for display + apply loop-originated
         #    mode transitions (hotspot loss/limit) and status messages.
         snap = loop.snapshot()
+        if self._watchdog(snap):
+            return
         if snap.get("fresh"):
             self._read_back(st, snap)
         req = snap.get("requested_mode")
@@ -151,6 +215,20 @@ class RustCoreLoopAdapter:
         # 2) Push connection/stop/mode + static config.
         loop.set_connected(bool(st.telescope_connected))
         loop.set_stopped(bool(st.stopped))
+
+        # Park request (mirrors tracking_control's control-thread park). STOP
+        # cancels it; while parking, hold the loop in standby so the tracking
+        # modes don't fight the goto, and drive/converge from here.
+        if st.stopped and getattr(st, "park_requested", False):
+            st.park_requested = False
+            self._park_state = None
+        if getattr(st, "park_requested", False):
+            loop.set_mode("standby")
+            self._push_static(cfg)
+            self._service_park(st, cfg)
+            return
+        self._park_state = None
+
         loop.set_mode(_MODE_TO_STR.get(st.tracking_mode, "standby"))
         self._push_static(cfg)
 
@@ -229,6 +307,49 @@ class RustCoreLoopAdapter:
             )
         except (ValueError, AttributeError):
             pass
+
+    def _service_park(self, st, cfg):
+        """Drive both axes to the configured offsets via the loop's goto queue,
+        with the same wrap-aware convergence + timeout as
+        JoystickModeState._service_park (which the Rust path bypasses)."""
+        now = time.monotonic()
+        try:
+            target_azm = float(getattr(cfg, "azm_offset_str", 0.0) or 0.0)
+            target_alt = float(getattr(cfg, "alt_offset_str", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            target_azm = target_alt = 0.0
+
+        if self._park_state is None:
+            self._park_state = {"start": now, "last_cmd": 0.0}
+            if st.update_status_callback:
+                st.update_status_callback(
+                    f"Parking to AZM {target_azm:.1f}° / ALT {target_alt:.1f}°...")
+        ps = self._park_state
+
+        timeout = float(getattr(st, "PARK_TIMEOUT_SEC", 90.0))
+        tol = float(getattr(st, "PARK_TOLERANCE_DEG", 1.0))
+        reissue = float(getattr(st, "PARK_REISSUE_SEC", 1.0))
+
+        if now - ps["start"] > timeout:
+            st.park_requested = False
+            self._park_state = None
+            if st.update_status_callback:
+                st.update_status_callback(
+                    f"Park TIMED OUT after {timeout:.0f}s - check the mount")
+            return
+
+        err_azm = (target_azm - st.current_azm_raw + 180.0) % 360.0 - 180.0
+        err_alt = (target_alt - st.current_alt_raw + 180.0) % 360.0 - 180.0
+        if abs(err_azm) <= tol and abs(err_alt) <= tol:
+            st.park_requested = False
+            self._park_state = None
+            if st.update_status_callback:
+                st.update_status_callback("Park complete")
+            return
+
+        if now - ps["last_cmd"] >= reissue:
+            self.loop.submit_goto(target_azm, target_alt)
+            ps["last_cmd"] = now
 
     def _push_rate(self, st):
         joy = None
@@ -369,5 +490,11 @@ class RustCoreLoopAdapter:
         camera = camera_manager.get_camera(cam_index)
         if camera is not None and getattr(camera, "thread", None) is not None:
             raw = camera.thread.get_latest_raw()
-            if raw is not None:
+            # Only push frames the camera hasn't already delivered: push_frame
+            # assigns a new seq per call, so re-pushing the same raw frame would
+            # defeat the loop's stale-frame gate (and costs a full-frame FFI
+            # copy every pump cycle for nothing).
+            seq = getattr(camera.thread, "latest_raw_seq", None)
+            if raw is not None and (seq is None or seq != self._last_pushed_frame_seq):
                 self.loop.push_frame(hs.to_intensity(raw).astype(np.float32))
+                self._last_pushed_frame_seq = seq

@@ -31,7 +31,12 @@ fn median_inplace(v: &mut [f64]) -> f64 {
         return 0.0;
     }
     let mid = n / 2;
-    v.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    // total_cmp, not partial_cmp().unwrap(): a single NaN pixel in a camera
+    // frame (hot column, debayer edge) must not panic the control-loop thread.
+    // Under the total order NaNs sort to the top, so a handful of NaNs leaves
+    // the median of the real data intact; the detection thresholds themselves
+    // reject NaN via ordinary (false) comparisons.
+    v.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     if n % 2 == 1 {
         v[mid]
     } else {

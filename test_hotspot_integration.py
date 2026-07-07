@@ -123,6 +123,36 @@ class HotspotIntegrationTests(unittest.TestCase):
         self.assertEqual(state.tracking_mode, TrackingMode.HOTSPOT)
         self.assertEqual(state.hotspot_status, "coasting")
 
+    def test_stale_frame_is_not_reprocessed(self):
+        # With real exposures the same frame stays "latest" across several
+        # control cycles; re-detecting it would re-integrate the same centroid
+        # (PID windup). A camera thread that exposes latest_raw_seq enables the
+        # stale gate: same seq -> no new commands, no miss, lock retained.
+        state = self._make_state(blob_frame())
+        cam = _FakeCamera(blob_frame())
+        cam.thread.latest_raw_seq = 1  # persistent camera with a frame counter
+        jc.camera_manager.get_camera = lambda idx: cam
+
+        state.tracking_mode = TrackingMode.HOTSPOT
+        state._enter_hotspot_mode()
+        state.hotspot_track()  # fresh frame: acquire + command
+        self.assertTrue(state.hotspot_acquired)
+        n_cmds = len(state.telescope_controller.cmds)
+        self.assertGreater(n_cmds, 0)
+
+        # Same seq across cycles: stale -> no detection, no commands, no miss.
+        state.hotspot_track()
+        state.hotspot_track()
+        self.assertEqual(len(state.telescope_controller.cmds), n_cmds)
+        self.assertEqual(state.hotspot_miss_count, 0)
+        self.assertTrue(state.hotspot_acquired)
+
+        # A new frame (seq bump) is processed and commands again.
+        cam.thread.latest_raw_seq += 1
+        state.hotspot_track()
+        self.assertGreater(len(state.telescope_controller.cmds), n_cmds)
+        self.assertEqual(state.hotspot_status, "locked")
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

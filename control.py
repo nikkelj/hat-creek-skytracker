@@ -316,25 +316,22 @@ def apply_eq_pointing_model(config_state, target_ha_deg, target_dec_deg):
         return target_ha_deg, target_dec_deg
 
 
-def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg, target_az_deg, target_el_deg):
-    """
-    Compute position error between current mount position and target position.
+def sky_target_to_mount(config_state, target_az_deg, target_el_deg):
+    """Convert a desired sky (az, el) to mount-axis coordinates for the
+    configured mount mode, including the pointing-model pre-correction.
 
-    This function computes the error by converting the target sky position to mount coordinates
-    and then computing the difference in mount coordinate space. This ensures correct
-    sign conventions for control systems.
-
-    Args:
-        config_state: Configuration state with offsets and alignment
-        current_azm_deg: Current AZM position (degrees, already includes offsets)
-        current_alt_deg: Current ALT position (degrees, already includes offsets)
-        target_az_deg: Target azimuth (degrees)
-        target_el_deg: Target elevation (degrees)
+    This is the exact command transform compute_mount_position_error uses,
+    exposed separately so callers that reason about the *mount axes* -- most
+    importantly the safety-limit gates, whose azm/alt_limit_* config values
+    are mount-frame quantities (they gate encoder positions in RATE and
+    HOTSPOT modes) -- compare the target in the same frame. Gating the raw sky
+    az/el against mount limits is frame-inconsistent: in AltAz mode the ALT
+    axis runs opposite sky elevation (ALT = 90 - el), and in Eq mode the axes
+    are HA/Dec.
 
     Returns:
-        tuple: (az_error_deg, el_error_deg) - errors in degrees
+        tuple: (target_azm_deg, target_alt_deg) mount-axis coordinates
     """
-    # Check mount mode and use appropriate transformation
     mount_mode = getattr(config_state, 'mount_mode', 'AltAz')
 
     if mount_mode == 'AltAz':
@@ -378,6 +375,30 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
         # mount lands the boresight on target. Kept Python-only, like the AltAz path.
         target_azm_deg, target_alt_deg = apply_eq_pointing_model(
             config_state, target_ha_deg, target_dec_deg)
+
+    return target_azm_deg, target_alt_deg
+
+
+def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg, target_az_deg, target_el_deg):
+    """
+    Compute position error between current mount position and target position.
+
+    This function computes the error by converting the target sky position to mount coordinates
+    and then computing the difference in mount coordinate space. This ensures correct
+    sign conventions for control systems.
+
+    Args:
+        config_state: Configuration state with offsets and alignment
+        current_azm_deg: Current AZM position (degrees, already includes offsets)
+        current_alt_deg: Current ALT position (degrees, already includes offsets)
+        target_az_deg: Target azimuth (degrees)
+        target_el_deg: Target elevation (degrees)
+
+    Returns:
+        tuple: (az_error_deg, el_error_deg) - errors in degrees
+    """
+    target_azm_deg, target_alt_deg = sky_target_to_mount(
+        config_state, target_az_deg, target_el_deg)
 
     # Compute error in mount coordinates
     azm_error_deg = target_azm_deg - current_azm_deg

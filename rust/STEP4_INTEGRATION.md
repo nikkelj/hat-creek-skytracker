@@ -60,14 +60,26 @@ Enable the flag, then exercise each mode and confirm parity with flag-off:
 Compare the on-screen position/error/rate readouts and the tracking behavior
 against the flag-off (`MountControlThread`) path.
 
-## Known gaps (deferred — use flag-off for these until ported)
+## Known gaps (updated 2026-07 — earlier versions of this list were stale)
 
-- **PROGRAM launch tracking** and **below-horizon mask-exit**: handled by
-  `JoystickModeState.program_track` in Python. The adapter currently pushes the
-  satellite setpoint only; for the launch/mask-exit cases it clears the setpoint
-  so the loop **holds** (it won't misbehave, but it won't drive to a mask-exit
-  point). Porting that logic is the natural next step.
-- **HANDOFF / MTI**: stubs, as in the Python loop.
+Since built (no longer gaps):
+- **PROGRAM launch tracking**: `rust_loop_adapter._push_launch_setpoint` drives
+  the launch trajectory with below-mask horizon-hold.
+- **HANDOFF**: `controller.rs step_handoff` (program-track + parallel detect +
+  auto hand-off) is implemented and forced-PROGRAM launch override is wired.
+- **Safety hardening (2026-07 P0)**: consecutive-fault safe-stop, panic
+  containment (`loop_dead`), NaN-tolerant hotspot median, explicit stop on a
+  cleared PROGRAM setpoint, mount-frame target limit gate, HOTSPOT
+  stale-frame gate, and an adapter liveness watchdog.
+
+Still gaps (use flag-off where they matter):
+- **Satellite below-horizon mask-exit**: Python's `program_track` drives to a
+  mask-exit point; the adapter clears the setpoint, which now commands a stop
+  (safe hold) but does not pre-position at the mask-exit azimuth.
+- **MTI**: stub, as in the Python loop.
+- **Closed-loop A/B parity harness** (same sim scenario through both loops,
+  comparing rate-command traces) — promised in STEP4_DESIGN, not yet built;
+  a promotion gate.
 
 ## Performance
 
@@ -83,6 +95,5 @@ Set the flag off (or unset the env var). No other change needed.
 
 ## Unrelated pre-existing issue
 
-`test_transform.py` fails to import `AzEl2AzAlt` from `transformations.py` — that
-bare name does not exist there (only `AzEl2AzAlt_AltAz` / `_Passthrough`). This
-predates the Rust work and is independent of it.
+(Resolved: the `test_transform.py` import issue noted here previously was fixed
+in commit f1cc0e4.)

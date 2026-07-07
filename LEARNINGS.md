@@ -6,6 +6,37 @@ Newest entries first.
 
 ---
 
+## 2026-07-07 — Per-axis shortest-arc wrap is not shortest spherical path
+
+Field report from the sim: mount pointed west, target in the east — PROGRAM
+tracking drove the azimuth axis ~180° the long way around instead of ~90° of
+ALT motion straight over the zenith.
+
+The per-axis modular wrap (the earlier "360 lap" / ALT-seam fixes) reduces
+each axis error to ±180°, but it only ever sees the **canonical** mount
+solution. An alt-az style mount reaches every sky pointing in **two** axis
+configurations — canonical, and over-the-zenith via the mirrored sky
+representation `(az+180°, 180−el)` (in the AltAz convention that is
+`(AZM+180°, −ALT)`). When the target is on the far side of the sky, the
+flipped solution is often far shorter, and no amount of per-axis wrapping
+can discover it.
+
+Fix: `control.choose_mount_target` evaluates both solutions each cycle
+(minimax wrapped axis error, 0.5° hysteresis so near-ties don't flap
+mid-slew, safety-limit aware — an out-of-limits solution is never chosen),
+mirrored in the Rust `step_program`. Two knock-on sign rules matter: the
+ALT **feed-forward sign inverts** in the flipped configuration (the axis
+runs opposite), and the limit gate must gate the solution actually being
+driven to. Fixing the FF sign here also resolved a long-standing divergence
+where the launch path had no AltAz negation at all.
+
+General principle: on a two-axis mount, "shortest path" is a choice between
+*configurations* first and per-axis arcs second. Any future mode (Eq
+meridian flips, HANDOFF) that computes axis errors from a sky target needs
+to ask "which of the mount's solutions am I wrapping toward?"
+
+---
+
 ## 2026-07-03 — Stacking performance + the "sharpness rewards noise" trap
 
 Profiling the stacking pipeline ([`stacking.py`](stacking.py)) on realistic

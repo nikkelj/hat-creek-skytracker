@@ -31,7 +31,8 @@ from camera_manager import apply_gamma_correction, roi_sizes, roi_label_texts
 from utils import draw_button
 
 # Import PID controller and helper functions
-from control import create_pid_controllers, compute_mount_position_error, sky_target_to_mount
+from control import (create_pid_controllers, compute_mount_position_error,
+                     sky_target_to_mount, choose_mount_target, mount_target_for)
 from trajectory import interpolate_position_data_and_rates
 from hotspot import detect_hotspot, pixel_offset_to_angles
 
@@ -964,8 +965,16 @@ class JoystickModeState:
                     # target through the command transform before comparing --
                     # in AltAz mode mount ALT = 90 - el, so gating raw sky el
                     # against a mount limit is checking the wrong quantity.
-                    target_azm_mount, target_alt_mount = sky_target_to_mount(
-                        self.config_state, target_az_deg, target_el_deg)
+                    # choose_mount_target additionally picks the SHORTEST-slew
+                    # axis solution (canonical, or over-the-zenith when the
+                    # target is on the far side of the sky) among solutions
+                    # inside the limits -- pointed west with the target in the
+                    # east, the loop must go up through the zenith, not drive
+                    # the azimuth axis 180 deg the long way around.
+                    target_azm_mount, target_alt_mount, target_flipped = choose_mount_target(
+                        self.config_state, current_azm, current_alt,
+                        target_az_deg, target_el_deg,
+                        limits=(azm_limit_min, azm_limit_max, alt_limit_min, alt_limit_max))
                     if (target_azm_mount > azm_limit_max or target_azm_mount < azm_limit_min or
                         target_alt_mount > alt_limit_max or target_alt_mount < alt_limit_min):
                         self.tracking_mode = TrackingMode.STANDBY
@@ -996,21 +1005,29 @@ class JoystickModeState:
                     target_az_deg, target_el_deg = self._apply_bias_to_target(
                         target_az_deg, target_el_deg, az_rate, el_rate)
 
-                    # Compute position errors using config state instance
-                    az_error, el_error = compute_mount_position_error(
-                        self.config_state, current_azm, current_alt, target_az_deg, target_el_deg
-                    )
+                    # Position errors in mount coordinates, in the SAME axis
+                    # configuration the gate chose above (recomputing the choice
+                    # after lead/bias could disagree at the decision boundary).
+                    target_azm_mount, target_alt_mount = mount_target_for(
+                        self.config_state, target_az_deg, target_el_deg, target_flipped)
+                    az_error = (target_azm_mount - current_azm + 180.0) % 360.0 - 180.0
+                    el_error = (target_alt_mount - current_alt + 180.0) % 360.0 - 180.0
 
                     # Set feed-forward rates from trajectory. The trajectory gives
                     # sky rates; the PID drives the mount. AZM tracks azimuth
-                    # directly, but in AltAz the ALT axis runs opposite sky
-                    # elevation (ALT = 90 - el), so the ALT feed-forward is -el_rate.
-                    # Without this the elevation feed-forward pushes the wrong way.
+                    # directly, but the ALT axis direction depends on the mount
+                    # convention AND the chosen configuration: in AltAz the ALT
+                    # axis runs opposite sky elevation (ALT = 90 - el), and the
+                    # over-the-zenith (flipped) solution runs opposite the
+                    # canonical one. Without the right sign the elevation
+                    # feed-forward pushes the wrong way.
                     if self.feed_forward_azm_enabled:
                         self.azm_pid.set_feed_forward_rate(az_rate)
                     if self.feed_forward_alt_enabled:
-                        alt_ff_rate = -el_rate if getattr(self.config_state, 'mount_mode', 'Eq') == 'AltAz' else el_rate
-                        self.alt_pid.set_feed_forward_rate(alt_ff_rate)
+                        alt_sign = -1.0 if getattr(self.config_state, 'mount_mode', 'Eq') == 'AltAz' else 1.0
+                        if target_flipped:
+                            alt_sign = -alt_sign
+                        self.alt_pid.set_feed_forward_rate(alt_sign * el_rate)
 
                     # Update PID controllers
                     current_time = time.time()
@@ -1161,9 +1178,11 @@ class JoystickModeState:
 
             # Launch is above horizon - use PID control for tracking
             # Check hardware safety limits against target position first, in the
-            # MOUNT frame (see program_track: the limits gate encoder positions).
-            target_azm_mount, target_alt_mount = sky_target_to_mount(
-                self.config_state, az_deg, target_el_deg)
+            # MOUNT frame; choose_mount_target also picks the shortest-slew axis
+            # solution (see program_track: canonical vs over-the-zenith).
+            target_azm_mount, target_alt_mount, target_flipped = choose_mount_target(
+                self.config_state, current_azm, current_alt, az_deg, target_el_deg,
+                limits=(azm_limit_min, azm_limit_max, alt_limit_min, alt_limit_max))
             if (target_azm_mount > azm_limit_max or target_azm_mount < azm_limit_min or
                 target_alt_mount > alt_limit_max or target_alt_mount < alt_limit_min):
                 self.tracking_mode = TrackingMode.STANDBY
@@ -1189,16 +1208,24 @@ class JoystickModeState:
             az_deg, target_el_deg = self._apply_bias_to_target(
                 az_deg, target_el_deg, az_rate_dps, el_rate_dps)
 
-            # Compute position errors using config state instance
-            az_error, el_error = compute_mount_position_error(
-                self.config_state, current_azm, current_alt, az_deg, target_el_deg
-            )
+            # Position errors in mount coordinates, in the SAME configuration
+            # the gate chose (see program_track).
+            target_azm_mount, target_alt_mount = mount_target_for(
+                self.config_state, az_deg, target_el_deg, target_flipped)
+            az_error = (target_azm_mount - current_azm + 180.0) % 360.0 - 180.0
+            el_error = (target_alt_mount - current_alt + 180.0) % 360.0 - 180.0
 
-            # Set feed-forward rates from launch trajectory
+            # Set feed-forward rates from launch trajectory. ALT sign follows
+            # the mount convention and the chosen configuration -- the same
+            # rule as program_track (this path used to omit the AltAz
+            # negation, a long-standing divergence between the two).
             if self.feed_forward_azm_enabled:
                 self.azm_pid.set_feed_forward_rate(az_rate_dps)
             if self.feed_forward_alt_enabled:
-                self.alt_pid.set_feed_forward_rate(el_rate_dps)
+                alt_sign = -1.0 if getattr(self.config_state, 'mount_mode', 'Eq') == 'AltAz' else 1.0
+                if target_flipped:
+                    alt_sign = -alt_sign
+                self.alt_pid.set_feed_forward_rate(alt_sign * el_rate_dps)
 
             # Update PID controllers
             current_time = time.time()

@@ -343,20 +343,62 @@ impl LoopState {
         let led_az = sp.az_deg + sp.ff_az_dps * lead;
         let led_el = sp.el_deg + sp.ff_el_dps * lead;
 
-        // Sky -> mount (the per-cycle transform we ported in step 5).
-        let (target_azm, target_alt) = transforms::sky_to_mount(
+        // Sky -> mount (the per-cycle transform we ported in step 5), choosing
+        // the SHORTEST-slew axis solution. An alt-az style mount reaches every
+        // sky pointing in two configurations: the canonical one and the
+        // over-the-zenith one from the mirrored sky representation
+        // (az+180, 180-el). Per-axis wrap alone cannot discover the second
+        // solution -- pointed west with the target in the east it drives the
+        // azimuth axis ~180 deg the long way instead of ~90 deg of ALT motion
+        // straight over the top. Mirrors control.choose_mount_target
+        // (same minimax metric, same hysteresis, limits-aware; Eq mode has no
+        // usable second solution here).
+        let canon = transforms::sky_to_mount(
             inputs.mount_mode,
             led_az,
             led_el,
             inputs.alignment_az,
             inputs.alignment_el,
         );
+        let (azm_min, azm_max) = inputs.azm_limit;
+        let (alt_min, alt_max) = inputs.alt_limit;
+        let in_limits = |t: (f64, f64)| {
+            t.0 >= azm_min && t.0 <= azm_max && t.1 >= alt_min && t.1 <= alt_max
+        };
+        let metric = |t: (f64, f64)| {
+            wrap180(t.0 - current_azm)
+                .abs()
+                .max(wrap180(t.1 - current_alt).abs())
+        };
+        const FLIP_HYSTERESIS_DEG: f64 = 0.5;
+        let mut target_azm = canon.0;
+        let mut target_alt = canon.1;
+        let mut flipped = false;
+        if inputs.mount_mode != MountMode::Eq {
+            let flip = transforms::sky_to_mount(
+                inputs.mount_mode,
+                (led_az + 180.0).rem_euclid(360.0),
+                180.0 - led_el,
+                inputs.alignment_az,
+                inputs.alignment_el,
+            );
+            let canon_ok = in_limits(canon);
+            let flip_ok = in_limits(flip);
+            let use_flip = match (canon_ok, flip_ok) {
+                (_, false) => false,
+                (false, true) => true,
+                (true, true) => metric(flip) < metric(canon) - FLIP_HYSTERESIS_DEG,
+            };
+            if use_flip {
+                target_azm = flip.0;
+                target_alt = flip.1;
+                flipped = true;
+            }
+        }
 
         // Safety: abort to STANDBY if the MOUNT-frame target exceeds the
         // configured axis limits (they gate encoder positions, so the check
         // must happen after sky_to_mount). Mirrors program_track.
-        let (azm_min, azm_max) = inputs.azm_limit;
-        let (alt_min, alt_max) = inputs.alt_limit;
         if target_azm > azm_max
             || target_azm < azm_min
             || target_alt > alt_max
@@ -386,14 +428,20 @@ impl LoopState {
             .update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
         self.azm_pid.set_feed_forward_enabled(inputs.ff_azm_enabled);
         self.alt_pid.set_feed_forward_enabled(inputs.ff_alt_enabled);
-        // Sky rates -> mount feed-forward. AZM tracks azimuth directly; in AltAz
-        // the ALT axis runs opposite sky elevation (ALT = 90 - el), so the ALT
-        // feed-forward is -ff_el_dps. Mirrors joystick_controller.program_track.
-        let alt_ff = if inputs.mount_mode == MountMode::AltAz {
-            -sp.ff_el_dps
+        // Sky rates -> mount feed-forward. AZM tracks azimuth directly; the
+        // ALT direction follows the mount convention (in AltAz the axis runs
+        // opposite sky elevation, ALT = 90 - el) AND the chosen configuration
+        // (the over-the-zenith solution runs opposite the canonical one).
+        // Mirrors joystick_controller.program_track.
+        let mut alt_sign = if inputs.mount_mode == MountMode::AltAz {
+            -1.0
         } else {
-            sp.ff_el_dps
+            1.0
         };
+        if flipped {
+            alt_sign = -alt_sign;
+        }
+        let alt_ff = alt_sign * sp.ff_el_dps;
         self.azm_pid.set_feed_forward_rate(sp.ff_az_dps);
         self.alt_pid.set_feed_forward_rate(alt_ff);
 

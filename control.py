@@ -379,6 +379,91 @@ def sky_target_to_mount(config_state, target_az_deg, target_el_deg):
     return target_azm_deg, target_alt_deg
 
 
+# Prefer the flipped mount solution only when it is decisively shorter, so a
+# near-tie (target ~90 deg away in both configurations) can't flap between
+# solutions from cycle to cycle mid-slew.
+FLIP_HYSTERESIS_DEG = 0.5
+
+
+def mount_target_for(config_state, target_az_deg, target_el_deg, flipped):
+    """Mount-axis coordinates of a sky target in a CHOSEN configuration.
+
+    ``flipped=False`` is the canonical solution (sky_target_to_mount).
+    ``flipped=True`` pushes the mirrored sky representation
+    ``(az+180, 180-el)`` -- the same physical pointing -- through the same
+    transform, yielding the 'over the zenith' axis solution (for the AltAz
+    convention that is (AZM+180, -ALT)).
+    """
+    if not flipped:
+        return sky_target_to_mount(config_state, target_az_deg, target_el_deg)
+    return sky_target_to_mount(config_state,
+                               (target_az_deg + 180.0) % 360.0,
+                               180.0 - target_el_deg)
+
+
+def choose_mount_target(config_state, current_azm_deg, current_alt_deg,
+                        target_az_deg, target_el_deg, limits=None):
+    """Pick the mount-axis solution with the shortest slew to a sky target.
+
+    An alt-az style mount reaches every sky pointing in TWO axis
+    configurations: the canonical one, and the over-the-zenith one from the
+    mirrored sky representation (az+180, 180-el). The per-axis shortest-arc
+    wrap (the earlier '360 lap' fix) cannot discover the second solution:
+    pointed west with the target in the east, the canonical solution demands
+    a ~180-deg azimuth slew the long way around, while the flipped solution
+    is a ~90-deg ALT move straight over the zenith. Choose per cycle by
+    minimax wrapped axis error, with FLIP_HYSTERESIS_DEG of preference for
+    the canonical solution so near-ties don't oscillate.
+
+    Only AltAz and Passthrough modes have a usable second solution here; in
+    Eq mode the mirrored representation maps to the same axis coordinates
+    (a true meridian flip changes pier side and pointing-model terms, so it
+    is deliberately not attempted by the tracking loop).
+
+    ``limits``: optional (azm_min, azm_max, alt_min, alt_max) mount-frame
+    safety limits; a solution outside them is never chosen. If no solution
+    is inside, the canonical one is returned so the caller's safety gate
+    aborts exactly as it would have before.
+
+    Note: with the pointing model enabled, its correction in the flipped
+    configuration is an extrapolation of a fit made in the canonical one --
+    fine for choosing the path, but expect to re-center after a flip.
+
+    Returns (target_azm_deg, target_alt_deg, flipped).
+    """
+    mount_mode = getattr(config_state, 'mount_mode', 'AltAz')
+    canon = mount_target_for(config_state, target_az_deg, target_el_deg, False)
+    candidates = [(canon, False)]
+    if mount_mode in ('AltAz', 'Passthrough'):
+        candidates.append(
+            (mount_target_for(config_state, target_az_deg, target_el_deg, True), True))
+
+    def _wrap(d):
+        return (d + 180.0) % 360.0 - 180.0
+
+    def metric(t):
+        # Axes slew simultaneously, so slew time ~ the larger axis error.
+        return max(abs(_wrap(t[0] - current_azm_deg)),
+                   abs(_wrap(t[1] - current_alt_deg)))
+
+    def in_limits(t):
+        if limits is None:
+            return True
+        azm_min, azm_max, alt_min, alt_max = limits
+        return (azm_min <= t[0] <= azm_max) and (alt_min <= t[1] <= alt_max)
+
+    legal = [(t, f) for t, f in candidates if in_limits(t)]
+    if not legal:
+        return canon[0], canon[1], False
+    (best_t, best_f) = legal[0]
+    best_m = metric(best_t)
+    for t, f in legal[1:]:
+        m = metric(t)
+        if m < best_m - FLIP_HYSTERESIS_DEG:
+            best_t, best_f, best_m = t, f, m
+    return best_t[0], best_t[1], best_f
+
+
 def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg, target_az_deg, target_el_deg):
     """
     Compute position error between current mount position and target position.
@@ -397,8 +482,11 @@ def compute_mount_position_error(config_state, current_azm_deg, current_alt_deg,
     Returns:
         tuple: (az_error_deg, el_error_deg) - errors in degrees
     """
-    target_azm_deg, target_alt_deg = sky_target_to_mount(
-        config_state, target_az_deg, target_el_deg)
+    # Shortest-slew solution: canonical, or over-the-zenith when that is
+    # decisively shorter (see choose_mount_target).
+    target_azm_deg, target_alt_deg, _flipped = choose_mount_target(
+        config_state, current_azm_deg, current_alt_deg,
+        target_az_deg, target_el_deg)
 
     # Compute error in mount coordinates
     azm_error_deg = target_azm_deg - current_azm_deg

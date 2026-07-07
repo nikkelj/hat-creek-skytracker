@@ -68,7 +68,10 @@ class TestAzmShortestPath(unittest.TestCase):
         # Raw diff > 540 deg: the old one-shot if/elif wrap returned +190 (then
         # clamped to +180 -> long way). Shortest arc is -170.
         # current -200 (== 160), target 350 -> +190 raw -> -170 short.
-        az_err, _ = compute_mount_position_error(self.cfg, -200.0, 45.0, 350.0, 45.0)
+        # Geometry chosen (sky el 2, ALT near 88) so the over-the-zenith flip
+        # is LONGER than canonical and this stays a pure per-axis wrap test;
+        # the flip choice itself is covered by test_shortest_path_flip.py.
+        az_err, _ = compute_mount_position_error(self.cfg, -200.0, 88.0, 350.0, 2.0)
         self.assertAlmostEqual(az_err, -170.0, places=6)
 
 
@@ -104,8 +107,10 @@ class TestZeroErrorAtTarget(unittest.TestCase):
 
 
 class TestBothAxesAlwaysShortestArc(unittest.TestCase):
-    """Sweep: for any current position, the error must equal the true shortest
-    arc and never exceed 180 deg in magnitude -- on BOTH axes."""
+    """Sweep: for any current position, the error pair must be the per-axis
+    shortest arc to ONE of the two valid mount solutions (canonical or
+    over-the-zenith), it must never exceed 180 deg on either axis, and the
+    chosen solution must never be WORSE than canonical (minimax metric)."""
 
     def test_sweep_matches_modular_reference(self):
         for mode in ("AltAz", "Passthrough"):
@@ -117,18 +122,37 @@ class TestBothAxesAlwaysShortestArc(unittest.TestCase):
                             cfg, float(current), float(current),
                             float(target_sky_az), float(target_sky_el),
                         )
+                        # The two valid mount solutions for this pointing
+                        # (alignment 0/0): canonical, and the mirrored sky
+                        # representation (az+180, 180-el) through the same
+                        # transform.
                         if mode == "AltAz":
-                            target_azm = target_sky_az % 360.0
-                            target_alt = 90.0 - target_sky_el
+                            canon = (target_sky_az % 360.0, 90.0 - target_sky_el)
+                            flip = ((target_sky_az + 180.0) % 360.0,
+                                    90.0 - (180.0 - target_sky_el))
                         else:  # Passthrough: sky == mount
-                            target_azm = float(target_sky_az)
-                            target_alt = float(target_sky_el)
-                        self.assertAlmostEqual(
-                            az_err, shortest_arc(target_azm - current), places=6,
-                            msg=f"AZM {mode} current={current} target_az={target_sky_az}")
-                        self.assertAlmostEqual(
-                            alt_err, shortest_arc(target_alt - current), places=6,
-                            msg=f"ALT {mode} current={current} target_el={target_sky_el}")
+                            canon = (float(target_sky_az), float(target_sky_el))
+                            flip = ((target_sky_az + 180.0) % 360.0,
+                                    180.0 - target_sky_el)
+
+                        def errs(t):
+                            return (shortest_arc(t[0] - current),
+                                    shortest_arc(t[1] - current))
+
+                        e_canon, e_flip = errs(canon), errs(flip)
+                        got = (az_err, alt_err)
+                        matches = any(
+                            abs(got[0] - e[0]) < 1e-6 and abs(got[1] - e[1]) < 1e-6
+                            for e in (e_canon, e_flip))
+                        self.assertTrue(
+                            matches,
+                            msg=f"{mode} current={current} sky=({target_sky_az},"
+                                f"{target_sky_el}): {got} matches neither "
+                                f"{e_canon} nor {e_flip}")
+                        # Never worse than canonical, and both axes wrapped.
+                        metric = max(abs(got[0]), abs(got[1]))
+                        canon_metric = max(abs(e_canon[0]), abs(e_canon[1]))
+                        self.assertLessEqual(metric, canon_metric + 1e-9)
                         self.assertLessEqual(abs(az_err), 180.0 + 1e-9)
                         self.assertLessEqual(abs(alt_err), 180.0 + 1e-9)
 

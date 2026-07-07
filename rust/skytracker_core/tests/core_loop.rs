@@ -195,3 +195,32 @@ fn consecutive_poll_faults_stop_motion() {
     );
     assert!(!fresh, "snapshot must be marked stale under comm faults");
 }
+
+#[test]
+fn west_to_east_converges_over_the_zenith_not_the_long_way() {
+    // Mount west (270, 45), target east (az=90, el=45), Passthrough: the
+    // closed loop must converge to the FLIPPED solution (270, 135) with the
+    // azimuth axis essentially parked -- not drag the azimuth 180 deg around.
+    let shared = Shared::new(program_inputs(90.0, 45.0));
+    let mut mount = Mount::new(LoopbackTransport::new(SimResponder::new_manual(270.0, 45.0)));
+    let mut state = LoopState::new();
+
+    let mut now = 0.0;
+    let mut az_excursion: f64 = 0.0;
+    for _ in 0..500 {
+        now += 0.1;
+        mount.io.responder.advance_time(0.1);
+        run_cycle(&mut mount, &mut state, &shared, now);
+        let az = mount.io.responder.az_true_deg;
+        let d = ((az - 270.0 + 180.0).rem_euclid(360.0) - 180.0).abs();
+        az_excursion = az_excursion.max(d);
+    }
+
+    let o = shared.outputs.lock().unwrap();
+    assert!((o.azm - 270.0).abs() < 2.0, "azm should stay ~270, got {}", o.azm);
+    assert!((o.alt - 135.0).abs() < 2.0, "alt should arrive at 135, got {}", o.alt);
+    assert!(
+        az_excursion < 10.0,
+        "azimuth slewed {az_excursion} deg -- it took the long way around"
+    );
+}

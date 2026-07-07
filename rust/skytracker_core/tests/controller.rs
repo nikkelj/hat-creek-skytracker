@@ -329,3 +329,67 @@ fn program_target_beyond_mount_limits_aborts_to_standby() {
     assert_eq!(o.requested_mode, None);
     assert!(o.azm_rate_cmd.is_some());
 }
+
+#[test]
+fn program_west_to_east_goes_over_the_zenith() {
+    // Mount west (270, 45), target east (az=90, el=45), Passthrough. The
+    // canonical solution is a 180-deg azimuth slew; the flipped one
+    // (az+180, 180-el) = (270, 135) is pure alt motion over the top. The
+    // loop must choose the flip: azm error ~0, alt error ~+90.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.mount_mode = MountMode::Passthrough;
+    i.setpoint = Some(Setpoint {
+        az_deg: 90.0,
+        el_deg: 45.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let o = s.step(&i, None, 270.0, 45.0, 100.0);
+    assert!(o.azm_error.abs() < 1e-6, "azm must not slew the long way: {}", o.azm_error);
+    assert!((o.alt_error - 90.0).abs() < 1e-6, "alt error {}", o.alt_error);
+    assert!(o.alt_rate_cmd.unwrap_or(0) > 0, "ALT must drive up over the zenith");
+}
+
+#[test]
+fn program_flip_vetoed_by_alt_limits() {
+    // Same scenario but ALT limits exclude the flipped solution (alt 135):
+    // fall back to the legal canonical 180-deg azimuth path, not STANDBY.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.mount_mode = MountMode::Passthrough;
+    i.alt_limit = (0.0, 90.0);
+    i.setpoint = Some(Setpoint {
+        az_deg: 90.0,
+        el_deg: 45.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let o = s.step(&i, None, 270.0, 45.0, 100.0);
+    assert_eq!(o.requested_mode, None, "canonical is legal - no abort");
+    assert!((o.azm_error.abs() - 180.0).abs() < 1e-6, "azm error {}", o.azm_error);
+    assert!(o.alt_error.abs() < 1e-6, "alt error {}", o.alt_error);
+}
+
+#[test]
+fn program_flip_altaz_error_convention() {
+    // AltAz convention (ALT = 90 - el): the flipped solution for the
+    // west-east scenario is (AZM=270, ALT=-45) -> alt error -90.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Program;
+    i.mount_mode = MountMode::AltAz;
+    i.setpoint = Some(Setpoint {
+        az_deg: 90.0,
+        el_deg: 45.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    // current mount: AZM=270, ALT=45 (el=45, pointing west)
+    let o = s.step(&i, None, 270.0, 45.0, 100.0);
+    assert!(o.azm_error.abs() < 1e-6, "azm error {}", o.azm_error);
+    assert!((o.alt_error + 90.0).abs() < 1e-6, "alt error {}", o.alt_error);
+    assert!(o.alt_rate_cmd.unwrap_or(0) < 0);
+}

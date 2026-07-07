@@ -48,7 +48,13 @@ from events import *
 
 # Update Intervals (seconds)
 POSITION_UPDATE_INTERVAL = 0.1  # 10 Hz
-TRAJECTORY_UPDATE_INTERVAL = 900  # 15 minutes
+# Trajectory auto-refresh policy: recompute when live time has consumed this
+# fraction of the FORWARD half of the trajectory window (the window is
+# centered on "now" at compute time, so only the forward half is future
+# coverage). A 2 h window therefore refreshes after ~45 min instead of on a
+# fixed short timer; the floor keeps a tiny window from thrashing the worker.
+TRAJECTORY_REFRESH_FRACTION = 0.75
+TRAJECTORY_REFRESH_MIN_SEC = 300.0
 
 # TLE API Configuration
 TLE_API_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle'
@@ -238,7 +244,6 @@ last_trajectory_update = -1
 last_update_time = 0
 update_interval = 1.0 / 30.0  # Target 30 Hz (vectorized update is ~0.6 ms, so cheap)
 last_trajectory_update = -1  # Force immediate trigger on first loop
-trajectory_interval = 900  # 15 minutes
 
 # ==============================================================================
 # MAIN PROGRAM LOOP
@@ -333,10 +338,22 @@ while running:
             update_status_callback(f"Error recomputing: {str(e)}")
             tracking_vis_state.recompute_triggered = False
 
-    # Precompute trajectories and arc segments every 15 minutes (background).
-    if (current_time - last_trajectory_update >= trajectory_interval
+    # Precompute trajectories and arc segments in the background, refreshing
+    # when the live time has consumed most of the forward half of the window
+    # (see TRAJECTORY_REFRESH_FRACTION) -- NOT on a fixed short timer, which
+    # recomputed a 2-hour window every 15 minutes for no reason.
+    try:
+        duration_minutes_auto = float(tracking_vis_state.duration_str) if tracking_vis_state.duration_str else 120.0
+    except (TypeError, ValueError):
+        duration_minutes_auto = 120.0  # mid-edit UI text must not crash the loop
+    trajectory_refresh_sec = max(
+        TRAJECTORY_REFRESH_MIN_SEC,
+        TRAJECTORY_REFRESH_FRACTION * (duration_minutes_auto / 2.0) * 60.0)
+    if (current_time - last_trajectory_update >= trajectory_refresh_sec
             and not tracking_vis_state.precompute_in_progress):
-        update_status_callback("Starting trajectory precomputation...")
+        update_status_callback(
+            f"Starting trajectory precomputation ({duration_minutes_auto:.0f} min window, "
+            f"next auto-refresh in ~{trajectory_refresh_sec / 60:.0f} min)...")
         lat = float(config_state.lat_str or 0)
         lon = float(config_state.lon_str or 0)
         alt_m = float(config_state.alt_str or 0)
@@ -344,7 +361,6 @@ while running:
         # Use current time as center and user-specified duration. Snap the center
         # to the quantization grid so the window matches across relaunches (disk
         # cache reuse); the live "now" marker still tracks true time via the slider.
-        duration_minutes_auto = float(tracking_vis_state.duration_str) if tracking_vis_state.duration_str else 120.0
         current_utc = quantized_now()
         tracking_vis_state.t0 = ts.utc(current_utc - timedelta(minutes=duration_minutes_auto/2))
         tracking_vis_state.t1 = ts.utc(current_utc + timedelta(minutes=duration_minutes_auto/2))

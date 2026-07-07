@@ -198,5 +198,84 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(adapter.loop)
 
 
+@unittest.skipUnless(_HAVE_CORE, "skytracker_core not built (run `maturin develop`)")
+class WatchdogTests(unittest.TestCase):
+    """Liveness-watchdog behavior, including the old-wheel regression: a
+    skytracker_core build without cycle_count in snapshots must DISABLE the
+    stall watchdog, not trip it 2 s after every connect (which presented as
+    'the sim mount tracks briefly after reconnect, then stops')."""
+
+    def _adapter(self, mode=None):
+        from joystick_controller import TrackingMode
+        from rust_loop_adapter import RustCoreLoopAdapter
+        ctrl = FakeMount()
+        st = fake_state(ctrl, mode or TrackingMode.STANDBY)
+        msgs = []
+        st.update_status_callback = msgs.append
+        adapter = RustCoreLoopAdapter(st, fake_config(), target_hz=50)
+        return adapter, st, ctrl, msgs
+
+    def test_missing_cycle_count_does_not_trip_watchdog(self):
+        adapter, st, ctrl, msgs = self._adapter()
+        self.assertTrue(adapter._ensure_loop())
+        loop = adapter.loop
+        # Simulate an old-wheel snapshot: no cycle_count / loop_dead keys, and
+        # let far more than WATCHDOG_STALL_SEC of apparent silence accumulate.
+        adapter._last_cycle_advance -= 10 * adapter.WATCHDOG_STALL_SEC
+        old_snap = {"fresh": True, "azm": 0.0, "alt": 0.0}
+        for _ in range(5):
+            self.assertFalse(adapter._watchdog(old_snap),
+                             "missing liveness API must not read as a stall")
+        self.assertIs(adapter.loop, loop, "loop must not be torn down")
+        self.assertTrue(any("wheel" in m for m in msgs),
+                        f"operator should be told to rebuild: {msgs}")
+        adapter.loop.stop()
+        adapter.loop = None
+
+    def test_real_stall_trips_then_retries_after_cooldown(self):
+        adapter, st, ctrl, msgs = self._adapter()
+        self.assertTrue(adapter._ensure_loop())
+        # A snapshot whose cycle_count stops advancing IS a stall.
+        adapter._last_cycle_count = 42
+        adapter._last_cycle_advance = time.monotonic() - (adapter.WATCHDOG_STALL_SEC + 1)
+        tripped = adapter._watchdog({"cycle_count": 42, "loop_dead": False})
+        self.assertTrue(tripped)
+        self.assertIsNone(adapter.loop)
+        self.assertTrue(any("retrying" in m for m in msgs), msgs)
+        # Within the cooldown: no rebuild.
+        self.assertFalse(adapter._ensure_loop())
+        # After the cooldown: rebuilds on its own (no reconnect needed).
+        adapter._loop_retry_at = time.monotonic() - 0.01
+        self.assertTrue(adapter._ensure_loop())
+        adapter.loop.stop()
+        adapter.loop = None
+
+    def test_reconnect_clears_retry_cooldown_immediately(self):
+        adapter, st, ctrl, msgs = self._adapter()
+        adapter._loop_retry_at = time.monotonic() + 1000.0
+        st.telescope_connected = False
+        self.assertFalse(adapter._ensure_loop())   # disconnect resets cooldown
+        st.telescope_connected = True
+        self.assertTrue(adapter._ensure_loop(), "reconnect must retry immediately")
+        adapter.loop.stop()
+        adapter.loop = None
+
+    def test_live_loop_with_new_wheel_never_trips(self):
+        # End-to-end: real bridged loop running for > WATCHDOG_STALL_SEC with
+        # real snapshots must never trip the watchdog (cycle_count advances).
+        adapter, st, ctrl, msgs = self._adapter()
+        self.assertTrue(adapter._ensure_loop())
+        deadline = time.time() + 2.5 * adapter.WATCHDOG_STALL_SEC
+        while time.time() < deadline:
+            snap = adapter.loop.snapshot()
+            self.assertIn("cycle_count", snap,
+                          "wheel in this env must expose the liveness API")
+            self.assertFalse(adapter._watchdog(snap),
+                             "healthy loop must not trip the watchdog")
+            time.sleep(0.1)
+        adapter.loop.stop()
+        adapter.loop = None
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

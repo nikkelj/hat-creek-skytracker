@@ -52,8 +52,10 @@ class RustCoreLoopAdapter:
 
     # Loop-liveness watchdog: if the Rust loop's cycle_count stops advancing
     # for this long (or the loop reports itself dead), stop the mount from
-    # Python and latch the fault until the telescope is reconnected.
+    # Python, tear the loop down, and retry after WATCHDOG_RETRY_SEC (or
+    # immediately on a telescope reconnect).
     WATCHDOG_STALL_SEC = 2.0
+    WATCHDOG_RETRY_SEC = 5.0
 
     def __init__(self, joystick_mode_state, config_state, target_hz=15):
         self.state = joystick_mode_state
@@ -64,7 +66,8 @@ class RustCoreLoopAdapter:
         self._thread = None
         self._last_cycle_count = -1
         self._last_cycle_advance = time.monotonic()
-        self._loop_fault_latched = False
+        self._loop_retry_at = 0.0        # monotonic time before which we don't rebuild
+        self._warned_no_liveness = False
         self._last_pushed_frame_seq = None
         self._park_state = None
 
@@ -107,10 +110,11 @@ class RustCoreLoopAdapter:
         st = self.state
         connected = bool(st.telescope_connected) and st.telescope_controller is not None
         if not connected:
-            # Reconnecting is the operator's explicit reset of a latched
-            # loop fault (see _watchdog).
-            self._loop_fault_latched = False
-        if self.loop is None and connected and not self._loop_fault_latched:
+            # Reconnecting is the operator's explicit "retry now" for a
+            # watchdog-tripped loop (see _watchdog).
+            self._loop_retry_at = 0.0
+        if (self.loop is None and connected
+                and time.monotonic() >= self._loop_retry_at):
             self.loop = rc.CoreLoop.wrap_mount(st.telescope_controller, self.target_hz)
             self._last_cycle_count = -1
             self._last_cycle_advance = time.monotonic()
@@ -127,13 +131,38 @@ class RustCoreLoopAdapter:
         'loop_dead' when its thread exits (including a contained panic). A
         snapshot whose count stops advancing is stale no matter what 'fresh'
         says, so: stop the mount from Python (the controller lock serializes
-        this with any remaining loop traffic), tear the loop down, and latch
-        the fault until the operator reconnects the telescope.
+        this with any remaining loop traffic), tear the loop down, and retry
+        after WATCHDOG_RETRY_SEC (a reconnect retries immediately). Snapshots
+        without a cycle_count (an old wheel) disable stall detection instead
+        of tripping it.
 
         Returns True when the loop was torn down (pump must not keep using it).
         """
         now = time.monotonic()
-        count = snap.get("cycle_count", -1)
+        if "cycle_count" not in snap:
+            # An installed skytracker_core wheel that predates the liveness
+            # API never reports cycle_count. That is NOT a stall: without
+            # this guard the "never advancing" count tripped the watchdog
+            # exactly WATCHDOG_STALL_SEC after every connect (the loop
+            # tracked for ~2 s, was torn down, and stayed dead until a
+            # reconnect). Disable stall detection and tell the operator to
+            # rebuild once.
+            if not self._warned_no_liveness:
+                self._warned_no_liveness = True
+                msg = ("RustCoreLoopAdapter: installed skytracker_core wheel "
+                       "predates the liveness API - loop-stall watchdog "
+                       "disabled. Rebuild it: maturin build --release -m "
+                       "rust/skytracker_core/Cargo.toml && pip install "
+                       "--force-reinstall rust/skytracker_core/target/wheels/"
+                       "skytracker_core-*.whl")
+                print(msg)
+                if self.state.update_status_callback:
+                    self.state.update_status_callback(
+                        "Rust loop: OLD skytracker_core wheel - rebuild it "
+                        "(see console); stall watchdog disabled")
+            return False
+
+        count = snap["cycle_count"]
         if count != self._last_cycle_count:
             self._last_cycle_count = count
             self._last_cycle_advance = now
@@ -144,7 +173,8 @@ class RustCoreLoopAdapter:
 
         reason = "loop thread died" if dead else (
             f"loop stalled >{self.WATCHDOG_STALL_SEC:.0f}s")
-        msg = f"RustCoreLoopAdapter: {reason} - stopping mount, reverting to fault-latched state"
+        msg = (f"RustCoreLoopAdapter: {reason} - stopping mount; retrying in "
+               f"{self.WATCHDOG_RETRY_SEC:.0f}s (reconnect telescope to retry now)")
         print(msg)
         st = self.state
         if st.update_status_callback:
@@ -163,7 +193,7 @@ class RustCoreLoopAdapter:
             pass
         self.loop = None
         st.position_fresh = False
-        self._loop_fault_latched = True
+        self._loop_retry_at = now + self.WATCHDOG_RETRY_SEC
         return True
 
     def _pump(self):

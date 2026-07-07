@@ -489,6 +489,7 @@ impl SimCoreLoop {
         self.shared.inputs.lock().unwrap().handoff_min_frames = n;
     }
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -499,6 +500,7 @@ impl SimCoreLoop {
         pixel_size_um: f64,
         focal_length_mm: f64,
         rotation_deg: f64,
+        max_rate_dps: f64,
     ) {
         self.shared.inputs.lock().unwrap().hotspot = crate::controller::HotspotParams {
             snr_threshold,
@@ -509,6 +511,7 @@ impl SimCoreLoop {
             pixel_size_um,
             focal_length_mm,
             rotation_deg,
+            max_rate_dps,
         };
     }
 
@@ -673,11 +676,13 @@ fn h_set_hotspot_params(
     px: f64,
     fl: f64,
     rot: f64,
+    max_rate_dps: f64,
 ) {
     sh.inputs.lock().unwrap().hotspot = HotspotParams {
         snr_threshold: snr,
         gate_radius: gate,
         coast_time_s: coast,
+        max_rate_dps,
         x_sign: xs,
         y_sign: ys,
         pixel_size_um: px,
@@ -906,6 +911,7 @@ impl CoreLoop {
         h_set_handoff_min_frames(self.inner.shared(), n);
     }
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -916,6 +922,7 @@ impl CoreLoop {
         pixel_size_um: f64,
         focal_length_mm: f64,
         rotation_deg: f64,
+        max_rate_dps: f64,
     ) {
         h_set_hotspot_params(
             self.inner.shared(),
@@ -927,6 +934,7 @@ impl CoreLoop {
             pixel_size_um,
             focal_length_mm,
             rotation_deg,
+            max_rate_dps,
         );
     }
     fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {

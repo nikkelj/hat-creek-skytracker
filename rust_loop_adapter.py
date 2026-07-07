@@ -516,6 +516,7 @@ class RustCoreLoopAdapter:
             float(cfg.get_camera_pixel_size(cam_name)),
             float(cfg.get_camera_focal_length(cam_name)),
             float(cfg.get_camera_alignment_rotation(cam_name)),
+            float(getattr(cfg, "hotspot_max_rate_dps", 2.0) or 2.0),
         )
         camera = camera_manager.get_camera(cam_index)
         if camera is not None and getattr(camera, "thread", None) is not None:

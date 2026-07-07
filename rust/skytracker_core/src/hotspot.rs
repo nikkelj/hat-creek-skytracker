@@ -243,3 +243,39 @@ pub fn pixel_offset_to_angles(
 
     (az_err, el_err)
 }
+
+/// Inverse of `pixel_offset_to_angles` (mirrors `simulator.angles_to_pixel`):
+/// angular offset from boresight -> pixel offset from image center. Used by
+/// the tracking-gate prediction to move the search window by the boresight
+/// motion the loop itself commanded between frames.
+#[allow(clippy::too_many_arguments)]
+pub fn angles_to_pixel_offset(
+    d_az_deg: f64,
+    d_el_deg: f64,
+    pixel_size_um: f64,
+    focal_length_mm: f64,
+    rotation_deg: f64,
+    el_deg: f64,
+    x_sign: f64,
+    y_sign: f64,
+    apply_cos_el: bool,
+) -> (f64, f64) {
+    if focal_length_mm == 0.0 {
+        return (0.0, 0.0);
+    }
+    let ifov_deg = ((pixel_size_um * 1e-3) / focal_length_mm).to_degrees();
+
+    let cross_el = if apply_cos_el {
+        d_az_deg * el_deg.to_radians().cos()
+    } else {
+        d_az_deg
+    };
+    let el_err = d_el_deg;
+
+    let th = rotation_deg.to_radians();
+    let (cos_t, sin_t) = (th.cos(), th.sin());
+    let ax = cross_el * cos_t + el_err * sin_t;
+    let ay = -cross_el * sin_t + el_err * cos_t;
+
+    (ax / (ifov_deg * x_sign), ay / (ifov_deg * y_sign))
+}

@@ -306,6 +306,10 @@ class JoystickModeState:
         self.hotspot_centroid = None
         self.hotspot_status = ""
         self.hotspot_last_frame_seq = None   # last camera frame processed (stale gate)
+        self._hotspot_last_fresh_time = 0.0  # for the measured frame interval
+        self._hotspot_frame_interval = 0.2   # conservative until measured
+        self._hotspot_cmd_dps = (0.0, 0.0)   # last commanded rates (mount frame)
+        self._hotspot_gate_time = 0.0        # frame time the gate was anchored on
 
         # PID controllers for PROGRAM track mode
         self.azm_pid = None
@@ -1376,6 +1380,10 @@ class JoystickModeState:
         self.hotspot_centroid = None
         self.hotspot_snr = 0.0
         self.hotspot_last_frame_seq = None
+        self._hotspot_last_fresh_time = 0.0
+        self._hotspot_frame_interval = 0.2
+        self._hotspot_cmd_dps = (0.0, 0.0)
+        self._hotspot_gate_time = 0.0
         if self.azm_pid:
             self.azm_pid.reset()
         if self.alt_pid:
@@ -1445,10 +1453,59 @@ class JoystickModeState:
         except (ValueError, AttributeError):
             pass
 
+        now = time.time()
+
+        # Measured fresh-frame interval (hit OR miss): gate prediction and the
+        # correction-rate cap are sized to it, so the loop never outruns its
+        # own measurements.
+        elapsed_since_fresh = 0.0
+        if raw is not None:
+            if self._hotspot_last_fresh_time > 0.0:
+                elapsed_since_fresh = max(0.0, now - self._hotspot_last_fresh_time)
+                self._hotspot_frame_interval = max(0.05, min(2.0, elapsed_since_fresh))
+            self._hotspot_last_fresh_time = now
+
         detection = None
         if raw is not None:
             gate_center = self.hotspot_gate_center
-            gate_radius = int(getattr(cfg, 'hotspot_gate_radius', 120)) if gate_center else None
+            gate_radius = None
+            if gate_center:
+                # Predict where the target moved in the frame due to OUR OWN
+                # commanded slew since the last fresh frame (the boresight
+                # moved, so the target streams the other way in pixels). With
+                # a narrow FOV a legitimate correction sweeps a large pixel
+                # distance between frames; a static gate loses the target the
+                # loop is successfully converging on.
+                cam_name = f"camera{cam_index + 1}"
+                az_dps, alt_dps = getattr(self, '_hotspot_cmd_dps', (0.0, 0.0))
+                # Predict from the frame the gate was anchored on (the last
+                # detection) -- missed frames in between extend the span, and
+                # the commanded rate has been held constant since then.
+                gate_dt = max(0.0, now - getattr(self, '_hotspot_gate_time', now))
+                if gate_dt > 0.0 and (az_dps or alt_dps):
+                    el_sky_dps = (-alt_dps
+                                  if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                                  else alt_dps)
+                    from simulator import angles_to_pixel
+                    el_sky_geom = (90.0 - current_alt
+                                   if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                                   else current_alt)
+                    pdx, pdy = angles_to_pixel(
+                        -az_dps * gate_dt,
+                        -el_sky_dps * gate_dt,
+                        float(cfg.get_camera_pixel_size(cam_name)),
+                        float(cfg.get_camera_focal_length(cam_name)),
+                        float(cfg.get_camera_alignment_rotation(cam_name)),
+                        el_sky_geom,
+                        float(getattr(cfg, 'hotspot_x_sign', 1.0)),
+                        float(getattr(cfg, 'hotspot_y_sign', -1.0)))
+                    gate_center = (gate_center[0] + pdx, gate_center[1] + pdy)
+                # Grow the gate on consecutive misses (classic track-gate
+                # growth) so residual prediction error or target motion can't
+                # strand the gate while the target is still in frame.
+                base = int(getattr(cfg, 'hotspot_gate_radius', 120))
+                growth = min(4.0, 1.5 ** min(self.hotspot_miss_count, 8))
+                gate_radius = int(base * growth)
             try:
                 detection = detect_hotspot(
                     raw,
@@ -1460,8 +1517,6 @@ class JoystickModeState:
                 print(f"HOTSPOT: detection error: {e}")
                 detection = None
 
-        now = time.time()
-
         if detection is not None:
             # Pixel error of the object from boresight (image center).
             h, w = raw.shape[:2]
@@ -1469,12 +1524,20 @@ class JoystickModeState:
             dy = detection.cy - (h / 2.0)
 
             cam_name = f"camera{cam_index + 1}"
+            # The pixel->angle geometry needs the SKY elevation (azimuth
+            # compresses by cos(el) on the sky). In AltAz the mount ALT axis
+            # is 90-el: passing it raw overstates the azimuth error by
+            # cos(el)/cos(ALT) -- >1.5x at el=30 -- making every correction
+            # overshoot and the loop oscillate divergently.
+            el_sky = (90.0 - current_alt
+                      if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                      else current_alt)
             az_error, el_error = pixel_offset_to_angles(
                 dx, dy,
                 pixel_size_um=float(cfg.get_camera_pixel_size(cam_name)),
                 focal_length_mm=float(cfg.get_camera_focal_length(cam_name)),
                 rotation_deg=float(cfg.get_camera_alignment_rotation(cam_name)),
-                el_deg=current_alt,
+                el_deg=el_sky,
                 x_sign=float(getattr(cfg, 'hotspot_x_sign', 1.0)),
                 y_sign=float(getattr(cfg, 'hotspot_y_sign', -1.0)),
             )
@@ -1498,6 +1561,7 @@ class JoystickModeState:
 
             # Update lock state and diagnostics.
             self.hotspot_gate_center = (detection.cx, detection.cy)
+            self._hotspot_gate_time = now
             self.hotspot_centroid = (detection.cx, detection.cy)
             self.hotspot_snr = detection.snr
             self.hotspot_acquired = True
@@ -1511,8 +1575,21 @@ class JoystickModeState:
 
             if self.telescope_connected and not self.stopped:
                 try:
-                    self._issue_axis_rate(Targets.AZM, az_pid_output, az_rate_cmd)
-                    self._issue_axis_rate(Targets.ALT, el_pid_output, el_rate_cmd)
+                    # Cap each axis so the correction covers at most ~90% of
+                    # the remaining error before the NEXT measurement arrives
+                    # (measured fresh-frame interval). Without this, a single
+                    # strong correction at a slow frame rate overshoots, exits
+                    # its own tracking gate, and then COASTS at full rate
+                    # through the loss window -- the FOV-sized stair-step.
+                    cap = float(getattr(cfg, 'hotspot_max_rate_dps', 2.0) or 2.0)
+                    interval = getattr(self, '_hotspot_frame_interval', 0.2)
+                    az_cap = min(cap, 0.9 * abs(az_error) / interval)
+                    el_cap = min(cap, 0.9 * abs(el_error) / interval)
+                    az_eff = self._issue_axis_rate(Targets.AZM, az_pid_output, az_rate_cmd, max_dps=az_cap)
+                    el_eff = self._issue_axis_rate(Targets.ALT, el_pid_output, el_rate_cmd, max_dps=el_cap)
+                    # Remember what we commanded (mount frame): gate prediction
+                    # uses it to move the search window with our own slew.
+                    self._hotspot_cmd_dps = (az_eff or 0.0, el_eff or 0.0)
                 except Exception as e:
                     print(f"HOTSPOT: error sending slew commands: {e}")
             return
@@ -1521,6 +1598,24 @@ class JoystickModeState:
         # miss -- only count misses against frames we actually examined.
         if not frame_is_stale:
             self.hotspot_miss_count += 1
+            # Bleed off the held correction: rates persist on the mount, and a
+            # correction that hasn't been confirmed by a detection must not
+            # keep integrating (that runaway is what turned a single overshoot
+            # into an FOV-sized stair-step). Halve per missed frame.
+            az_d, el_d = getattr(self, '_hotspot_cmd_dps', (0.0, 0.0))
+            if (abs(az_d) > 1e-3 or abs(el_d) > 1e-3) and self.telescope_connected and not self.stopped:
+                az_d *= 0.5
+                el_d *= 0.5
+                if abs(az_d) < 1e-3:
+                    az_d = 0.0
+                if abs(el_d) < 1e-3:
+                    el_d = 0.0
+                try:
+                    self._issue_axis_rate(Targets.AZM, az_d / 360.0, 0)
+                    self._issue_axis_rate(Targets.ALT, el_d / 360.0, 0)
+                    self._hotspot_cmd_dps = (az_d, el_d)
+                except Exception as e:
+                    print(f"HOTSPOT: error decaying rates: {e}")
         coast_time = float(getattr(cfg, 'hotspot_coast_time_sec', 1.0))
 
         if self.hotspot_acquired:
@@ -1546,7 +1641,7 @@ class JoystickModeState:
         if self.update_status_callback:
             self.update_status_callback("HOTSPOT: lost lock - falling back to PROGRAM track")
 
-    def _issue_axis_rate(self, target, pid_output_rev_s, discrete_cmd):
+    def _issue_axis_rate(self, target, pid_output_rev_s, discrete_cmd, max_dps=None):
         """Send one axis's rate to the mount.
 
         In continuous-rate mode use the fine 24-bit variable-rate (guide-rate)
@@ -1555,14 +1650,31 @@ class JoystickModeState:
         MC_MOVE step when the requested rate exceeds guide_rate_max_dps (the
         regime where the guide-rate command may not be honored, e.g. the
         near-zenith keyhole) or when continuous mode is off.
+
+        ``max_dps`` caps the commanded rate in BOTH paths. HOTSPOT passes its
+        hotspot_max_rate_dps: a centering loop that lunges at slew rates yanks
+        the target out of its own tracking gate before the next frame arrives
+        (the acquire -> yank -> lose -> fallback stair-step failure).
         """
         cfg = self.config_state
+        dps = pid_output_rev_s * 360.0
+        if max_dps is not None:
+            dps = max(-float(max_dps), min(float(max_dps), dps))
         if getattr(cfg, 'continuous_rate_tracking', False) and hasattr(self.telescope_controller, 'hc_set_rate_dps'):
-            dps = pid_output_rev_s * 360.0
             if abs(dps) <= float(getattr(cfg, 'guide_rate_max_dps', 5.0)):
                 self.telescope_controller.hc_set_rate_dps(target, dps)
-                return
+                return dps
+        if max_dps is not None and discrete_cmd != 0:
+            sign = 1 if discrete_cmd > 0 else -1
+            mag = abs(int(discrete_cmd))
+            # Largest discrete step whose rate fits under the cap (keep at
+            # least 1 so a capped axis still creeps toward center).
+            while mag > 1 and RATES.get(mag, 0.0) * 360.0 > float(max_dps):
+                mag -= 1
+            discrete_cmd = sign * mag
         self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+        sign = 1.0 if discrete_cmd >= 0 else -1.0
+        return sign * RATES.get(abs(int(discrete_cmd)), 0.0) * 360.0
 
     PARK_TIMEOUT_SEC = 90.0
     PARK_TOLERANCE_DEG = 1.0
@@ -1622,6 +1734,7 @@ class JoystickModeState:
 
     def _hotspot_stop_motion(self):
         """Best-effort stop of both axes."""
+        self._hotspot_cmd_dps = (0.0, 0.0)
         if self.telescope_connected and self.telescope_controller is not None:
             try:
                 self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)

@@ -231,11 +231,16 @@ fn hotspot_coasts_on_brief_dropout() {
     let f = blob_frame(256, 200, 138.0, 110.0);
     let o1 = s.step(&i, Some(&f), 50.0, 45.0, 100.0);
     assert!(o1.hotspot_acquired);
-    // Dropout within coast window -> coast, no new command, stays in HOTSPOT.
+    assert!(o1.azm_pid_output != 0.0, "off-center blob must command a correction");
+    // Dropout within coast window -> coast, stays in HOTSPOT, but the held
+    // correction decays (halves) rather than integrating unconfirmed motion.
     let o2 = s.step(&i, None, 50.0, 45.0, 100.5);
     assert_eq!(o2.hotspot_status, "coasting");
-    assert_eq!(o2.azm_rate_cmd, None);
     assert_eq!(o2.requested_mode, None);
+    assert!(
+        (o2.azm_pid_output - 0.5 * o1.azm_pid_output).abs() < 1e-12,
+        "held rate must halve per missed frame"
+    );
     // Past the coast window -> lost, hand back to PROGRAM.
     let o3 = s.step(&i, None, 50.0, 45.0, 102.0);
     assert_eq!(o3.hotspot_status, "lost");

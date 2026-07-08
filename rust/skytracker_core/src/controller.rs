@@ -39,6 +39,9 @@ pub struct HotspotParams {
     pub snr_threshold: f64,
     pub gate_radius: f64,
     pub coast_time_s: f64,
+    /// Cap on the centering-correction rate (deg/s). A centering loop that
+    /// lunges at slew rates yanks the target out of its own tracking gate.
+    pub max_rate_dps: f64,
     pub x_sign: f64,
     pub y_sign: f64,
     pub pixel_size_um: f64,
@@ -116,6 +119,7 @@ impl Default for Inputs {
                 snr_threshold: 5.0,
                 gate_radius: 120.0,
                 coast_time_s: 1.0,
+                max_rate_dps: 2.0,
                 x_sign: 1.0,
                 y_sign: -1.0,
                 pixel_size_um: 4.0,
@@ -160,6 +164,21 @@ fn wrap180(deg: f64) -> f64 {
     (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
+/// Reduce a signed discrete rate step until its physical rate fits under
+/// `cap_rev_s` (rev/sec), keeping at least step 1 so a capped axis still
+/// creeps toward center. Mirrors joystick_controller._issue_axis_rate.
+fn clamp_discrete(rate: i32, cap_rev_s: f64) -> i32 {
+    if rate == 0 {
+        return 0;
+    }
+    let sign = if rate > 0 { 1 } else { -1 };
+    let mut mag: u8 = rate.unsigned_abs().min(9) as u8;
+    while mag > 1 && crate::protocol::rate(mag) > cap_rev_s {
+        mag -= 1;
+    }
+    sign * mag as i32
+}
+
 /// Run hot-spot detection on a frame (gated or full-frame). Returns None when
 /// there is no frame or nothing qualifies. Pure; issues no commands.
 fn detect_in_frame(
@@ -189,6 +208,14 @@ pub struct LoopState {
     hotspot_last_detection_time: f64,
     hotspot_entry_time: f64,
     hotspot_last_frame_seq: Option<u64>,
+    // Fresh-frame arrival time + measured camera cadence (sec) — corrections
+    // are capped so one frame's command can't outrun the next measurement.
+    hotspot_last_fresh_time: f64,
+    hotspot_frame_interval: f64,
+    // Last commanded slew (az_dps, el_dps) + when the gate was anchored, so
+    // the search gate can be shifted by the loop's own commanded motion.
+    hotspot_cmd_dps: (f64, f64),
+    hotspot_gate_time: f64,
 
     // HANDOFF: consecutive-detection counter toward the auto hand-off.
     handoff_detection_count: u32,
@@ -213,6 +240,10 @@ impl LoopState {
             hotspot_last_detection_time: 0.0,
             hotspot_entry_time: 0.0,
             hotspot_last_frame_seq: None,
+            hotspot_last_fresh_time: 0.0,
+            hotspot_frame_interval: 0.2,
+            hotspot_cmd_dps: (0.0, 0.0),
+            hotspot_gate_time: 0.0,
             handoff_detection_count: 0,
             program_had_setpoint: false,
         }
@@ -268,6 +299,10 @@ impl LoopState {
                     self.hotspot_last_detection_time = 0.0;
                     self.hotspot_entry_time = now;
                     self.hotspot_last_frame_seq = None;
+                    self.hotspot_last_fresh_time = 0.0;
+                    self.hotspot_frame_interval = 0.2;
+                    self.hotspot_cmd_dps = (0.0, 0.0);
+                    self.hotspot_gate_time = 0.0;
                 }
                 Mode::Handoff => {
                     self.handoff_detection_count = 0;
@@ -545,10 +580,60 @@ impl LoopState {
         }
         let frame = if frame_is_stale { None } else { frame };
 
-        // Detect on this cycle's frame (gated to the last lock once acquired).
-        let gate = self
-            .hotspot_gate_center
-            .map(|(cx, cy)| (cx, cy, hp.gate_radius));
+        // Measured fresh-frame interval (hit OR miss): gate prediction and the
+        // correction-rate cap are sized to it, so the loop never outruns its
+        // own measurements. Mirrors hotspot_track.
+        if frame.is_some() {
+            if self.hotspot_last_fresh_time > 0.0 {
+                self.hotspot_frame_interval =
+                    (now - self.hotspot_last_fresh_time).clamp(0.05, 2.0);
+            }
+            self.hotspot_last_fresh_time = now;
+        }
+
+        // The optical geometry needs the SKY elevation (azimuth compresses by
+        // cos(el) on the sky); in AltAz the mount ALT axis is 90 - el, and
+        // passing it raw overstates the azimuth error by cos(el)/cos(ALT) --
+        // a divergent overshoot at moderate elevations.
+        let el_sky = if inputs.mount_mode == MountMode::AltAz {
+            90.0 - current_alt
+        } else {
+            current_alt
+        };
+
+        // Detect on this cycle's frame, gated to the last lock once acquired.
+        // The gate is PREDICTED forward by the boresight motion we ourselves
+        // commanded since the frame it was anchored on (with a narrow FOV a
+        // legitimate correction sweeps a large pixel distance between frames),
+        // and GROWS on consecutive misses so residual prediction error or
+        // target motion can't strand it while the target is still in frame.
+        let gate = self.hotspot_gate_center.map(|(cx, cy)| {
+            let (az_dps, alt_dps) = self.hotspot_cmd_dps;
+            let gate_dt = (now - self.hotspot_gate_time).max(0.0);
+            let (mut gx, mut gy) = (cx, cy);
+            if gate_dt > 0.0 && (az_dps != 0.0 || alt_dps != 0.0) {
+                let el_sky_dps = if inputs.mount_mode == MountMode::AltAz {
+                    -alt_dps
+                } else {
+                    alt_dps
+                };
+                let (pdx, pdy) = hotspot::angles_to_pixel_offset(
+                    -az_dps * gate_dt,
+                    -el_sky_dps * gate_dt,
+                    hp.pixel_size_um,
+                    hp.focal_length_mm,
+                    hp.rotation_deg,
+                    el_sky,
+                    hp.x_sign,
+                    hp.y_sign,
+                    true,
+                );
+                gx += pdx;
+                gy += pdy;
+            }
+            let growth = 1.5f64.powi(self.hotspot_miss_count.min(8) as i32).min(4.0);
+            (gx, gy, hp.gate_radius * growth)
+        });
         let detection = detect_in_frame(frame, &hp, gate);
 
         if let Some(det) = detection {
@@ -561,7 +646,7 @@ impl LoopState {
                 hp.pixel_size_um,
                 hp.focal_length_mm,
                 hp.rotation_deg,
-                current_alt,
+                el_sky,
                 hp.x_sign,
                 hp.y_sign,
                 true,
@@ -591,7 +676,24 @@ impl LoopState {
                 self.alt_pid
                     .compute_pid_output(el_error, dt, Some(current_alt));
 
+            // Cap each axis so the correction covers at most ~90% of the
+            // remaining error before the NEXT measurement (measured frame
+            // interval): a correction that outruns its measurements
+            // overshoots, exits its own gate, and coasts into a stair-step.
+            let interval = self.hotspot_frame_interval.max(0.05);
+            let cap_az = (hp.max_rate_dps / 360.0).min(0.9 * az_error.abs() / interval / 360.0);
+            let cap_al = (hp.max_rate_dps / 360.0).min(0.9 * el_error.abs() / interval / 360.0);
+            let az_out = az_out.clamp(-cap_az, cap_az);
+            let al_out = al_out.clamp(-cap_al, cap_al);
+            let az_rate = clamp_discrete(az_rate, cap_az);
+            let al_rate = clamp_discrete(al_rate, cap_al);
+            // Remember what we commanded (mount frame, deg/s) for the gate
+            // prediction. The threaded loop actuates az_out/al_out (continuous)
+            // or the discrete steps; either way this is the commanded motion.
+            self.hotspot_cmd_dps = (az_out * 360.0, al_out * 360.0);
+
             self.hotspot_gate_center = Some((det.cx, det.cy));
+            self.hotspot_gate_time = now;
             self.hotspot_acquired = true;
             self.hotspot_miss_count = 0;
             self.hotspot_last_detection_time = now;
@@ -613,6 +715,26 @@ impl LoopState {
         // not a miss -- only count misses against frames actually examined.
         if !frame_is_stale {
             self.hotspot_miss_count += 1;
+            // Bleed off the held correction: rates persist on the mount, and
+            // a correction that hasn't been re-confirmed by a detection must
+            // not keep integrating (a single overshoot would otherwise coast
+            // into an FOV-sized stair-step). Halve per missed frame.
+            let (mut az_d, mut el_d) = self.hotspot_cmd_dps;
+            if az_d.abs() > 1e-3 || el_d.abs() > 1e-3 {
+                az_d *= 0.5;
+                el_d *= 0.5;
+                if az_d.abs() < 1e-3 {
+                    az_d = 0.0;
+                }
+                if el_d.abs() < 1e-3 {
+                    el_d = 0.0;
+                }
+                self.hotspot_cmd_dps = (az_d, el_d);
+                out.azm_pid_output = az_d / 360.0;
+                out.alt_pid_output = el_d / 360.0;
+                out.azm_rate_cmd = Some(0);
+                out.alt_rate_cmd = Some(0);
+            }
         }
 
         if self.hotspot_acquired {

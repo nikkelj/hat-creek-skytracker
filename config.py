@@ -115,6 +115,10 @@ class ConfigState:
         self.hotspot_snr_threshold = 5.0    # min (peak-bg)/noise to accept a detection
         self.hotspot_gate_radius = 120      # tracking-gate half-size in pixels once locked
         self.hotspot_coast_time_sec = 1.0   # coast this long on loss before falling back
+        # HOTSPOT is a CENTERING loop, not a slew: cap its commanded rate so a
+        # large pixel error can't lunge the mount and yank the target out of
+        # its own tracking gate (the acquire->yank->lose->fallback stair-step).
+        self.hotspot_max_rate_dps = 2.0
         self.hotspot_x_sign = 1.0           # per-axis sign calibration (set on hardware)
         self.hotspot_y_sign = -1.0
 
@@ -300,6 +304,7 @@ class ConfigState:
             "hotspot_camera_index": self.hotspot_camera_index,
             "hotspot_snr_threshold": self.hotspot_snr_threshold,
             "hotspot_gate_radius": self.hotspot_gate_radius,
+            "hotspot_max_rate_dps": self.hotspot_max_rate_dps,
             "hotspot_coast_time_sec": self.hotspot_coast_time_sec,
             "handoff_min_frames": self.handoff_min_frames,
             "hotspot_x_sign": self.hotspot_x_sign,
@@ -388,6 +393,7 @@ class ConfigState:
         self.hotspot_camera_index = config_dict.get("hotspot_camera_index", self.hotspot_camera_index)
         self.hotspot_snr_threshold = config_dict.get("hotspot_snr_threshold", self.hotspot_snr_threshold)
         self.hotspot_gate_radius = config_dict.get("hotspot_gate_radius", self.hotspot_gate_radius)
+        self.hotspot_max_rate_dps = config_dict.get("hotspot_max_rate_dps", self.hotspot_max_rate_dps)
         self.hotspot_coast_time_sec = config_dict.get("hotspot_coast_time_sec", self.hotspot_coast_time_sec)
         self.handoff_min_frames = config_dict.get("handoff_min_frames", self.handoff_min_frames)
         self.hotspot_x_sign = config_dict.get("hotspot_x_sign", self.hotspot_x_sign)

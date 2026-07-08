@@ -6,6 +6,53 @@ Newest entries first.
 
 ---
 
+## 2026-07-07 — HOTSPOT/HANDOFF stair-steps: four coupled failure modes
+
+Field report: HANDOFF centered briefly then walked off in near-FOV-sized
+stair-steps; manual HOTSPOT reverted to PROGRAM immediately. A live-fidelity
+harness ([`test_mode_machine.py`](test_mode_machine.py)) — real
+`tracking_control()` state machine against the simulated mount, a paced
+camera thread, and the *tuned* `config.example.json` gains — reproduced the
+walk-off on the first run. Four distinct bugs compounded; any one of them
+alone would have been survivable:
+
+1. **Wrong elevation convention in the optical geometry.** The pixel↔angle
+   transforms need the SKY elevation for the cos(el) azimuth compression, but
+   `hotspot_track` passed the mount ALT axis (which is `90 − el` in AltAz).
+   At el=30° that overstates the azimuth error by cos(30)/cos(60) ≈ 1.73× —
+   a *divergent* per-step overshoot. This is the same convention trap as the
+   sky-vs-mount entry below: any code touching angles must say which frame
+   it's in.
+2. **Uncapped correction rates.** The PID output was clamped only by
+   `guide_rate_max_dps` (5°/s — a slew rate). One high-SNR detection at the
+   FOV edge commanded a lunge that swept the whole FOV before the next frame.
+   New `hotspot_max_rate_dps` (default 2.0) plus a measurement-cadence cap:
+   never cover more than ~90% of the remaining error per measured frame
+   interval — a centering loop must not outrun its own measurements.
+3. **Static tracking gate.** The search gate stayed where the target *was*;
+   the loop's own commanded slew streams the target across the frame, so a
+   legitimate correction pushed the target out of its own gate → instant
+   "lost". The gate is now predicted forward by the loop's own commanded
+   rates (anchored at the last detection, not the last frame) and grows
+   1.5×/miss (cap 4×) so residual error can't strand it.
+4. **Held rates never decayed on miss.** On a missed frame the mount kept
+   the last commanded rate indefinitely ("coast"), so one overshoot coasted
+   into the next stair-step. Held rates now halve per missed fresh frame —
+   coast through a one-frame dropout survives, sustained loss bleeds to zero.
+
+All four are mirrored in the Rust loop (`step_hotspot`), with
+`hotspot::angles_to_pixel_offset` added as the exact inverse of the forward
+transform for the gate prediction.
+
+General principle: closed-loop optical tracking bugs are invisible to
+open-loop unit tests — every piece (detector, PID, geometry) tested fine in
+isolation. The failures only appear when the loop's own actuation feeds back
+into its next measurement. Keep an end-to-end harness (real state machine +
+simulated physics + real config) as the regression net for any control-loop
+change.
+
+---
+
 ## 2026-07-07 — Per-axis shortest-arc wrap is not shortest spherical path
 
 Field report from the sim: mount pointed west, target in the east — PROGRAM

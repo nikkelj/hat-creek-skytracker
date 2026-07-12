@@ -1742,6 +1742,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
             return True
 
+        # Handle the star-filter toggle (PID Diagnostics pane)
+        if handle_star_filter_mouse_events(joystick_state, mouse_pos):
+            return True
+
         # Handle plate-solve pane clicks (toggle / apply alignment)
         if handle_plate_solve_mouse_events(joystick_state, mouse_pos, config_state):
             return True
@@ -2037,6 +2041,22 @@ def render_pid_diagnostics(display, joystick_state):
     pygame.draw.rect(display.menu_screen, border, (x_start, y_start, width, height), 1)
     display.menu_screen.blit(
         display.small_font.render("PID Diagnostics", True, val_c), (x_start + 10, y_start + 5))
+
+    # Star-filter toggle (top-right): the HANDOFF/HOTSPOT detector rejects
+    # detections whose angular rate doesn't match the target (i.e. stars).
+    # Toggle OFF to deliberately track a star. Persisted to config.
+    cfg_sf = getattr(joystick_state, 'config_state', None)
+    sf_on = bool(getattr(cfg_sf, 'hotspot_star_filter_enabled', True))
+    sf_rect = pygame.Rect(x_start + width - 78, y_start + 4, 70, 16)
+    sf_color = ((0, 130, 0) if sf_on else (110, 90, 40)) if active else (60, 60, 70)
+    if active and sf_rect.collidepoint(pygame.mouse.get_pos()):
+        sf_color = tuple(min(255, c + 40) for c in sf_color)
+    pygame.draw.rect(display.menu_screen, sf_color, sf_rect)
+    pygame.draw.rect(display.menu_screen, (170, 170, 190), sf_rect, 1)
+    sf_text = display.tiny_font.render(
+        "no stars" if sf_on else "stars OK", True, (255, 255, 255))
+    display.menu_screen.blit(sf_text, sf_text.get_rect(center=sf_rect.center))
+    joystick_state.star_filter_button_rect = sf_rect
 
     az_err = getattr(joystick_state, 'azm_position_error', 0.0)
     el_err = getattr(joystick_state, 'alt_position_error', 0.0)
@@ -2637,9 +2657,12 @@ def render_feed_forward_toggle_buttons(display, joystick_state):
     """
     Render feed-forward toggle buttons (FF AZ / FF EL / FF OFF) as a row inside
     the bottom of the PID Gain Control pane. Always drawn so the controls are
-    visible; greyed out and non-interactable unless in PROGRAM mode.
+    visible; greyed out and non-interactable unless in a tracking mode that
+    applies feed-forward (PROGRAM/HANDOFF program track; HOTSPOT rides its
+    optical correction on the same trajectory rates).
     """
-    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
+    enabled = joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT)
 
     # Lay the buttons out along the bottom strip of the PID pane
     pane = joystick_panel_layout(display)['pid']
@@ -2736,14 +2759,16 @@ def render_pid_gain_sliders(display, joystick_state):
     Anchored to the bottom-right of the upper-left quadrant (below the Bias
     pane). The feed-forward toggle buttons are drawn inside the bottom of this
     pane by render_feed_forward_toggle_buttons(). Always drawn so its location
-    is visible; greyed out and non-interactable unless in PROGRAM mode.
+    is visible; greyed out and non-interactable unless in a tracking mode that
+    runs the shared PID loop (PROGRAM/HANDOFF/HOTSPOT).
     """
     # Only render when there's an active config_state
     if not hasattr(joystick_state, 'config_state') or joystick_state.config_state is None:
         return
 
     config_state = joystick_state.config_state
-    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
+    enabled = joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT)
 
     # Pane hugging the bottom-right of the quadrant
     pane = joystick_panel_layout(display)['pid']
@@ -3000,6 +3025,30 @@ def handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
 
     return False
 
+def handle_star_filter_mouse_events(joystick_state, mouse_pos):
+    """
+    Handle clicks on the star-filter toggle in the PID Diagnostics pane.
+    Toggles config.hotspot_star_filter_enabled (both control loops read it)
+    and auto-saves so the choice persists across restarts.
+    """
+    rect = getattr(joystick_state, 'star_filter_button_rect', None)
+    cfg = getattr(joystick_state, 'config_state', None)
+    if rect is None or cfg is None or not rect.collidepoint(mouse_pos):
+        return False
+    if joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT):
+        return False
+    cfg.hotspot_star_filter_enabled = not bool(
+        getattr(cfg, 'hotspot_star_filter_enabled', True))
+    state = "ON (stars rejected)" if cfg.hotspot_star_filter_enabled else "OFF (stars trackable)"
+    print(f"Star filter: {state}")
+    try:
+        cfg.save_to_file()
+    except Exception as e:
+        print(f"Star filter: could not save config: {e}")
+    return True
+
+
 def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
     """
     Handle mouse clicks on feed-forward toggle buttons.
@@ -3008,8 +3057,10 @@ def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
     if not hasattr(joystick_state, 'ff_button_rects'):
         return False
 
-    # Feed-forward toggles are only interactable in PROGRAM mode (greyed otherwise)
-    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
+    # Interactable while program-tracking (PROGRAM, or HANDOFF/HOTSPOT which
+    # run the same feed-forward underneath; greyed otherwise).
+    if joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT):
         return False
 
     for label, rect in joystick_state.ff_button_rects:

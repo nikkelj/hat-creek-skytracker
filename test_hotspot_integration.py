@@ -59,11 +59,27 @@ class _FakeController:
         return True
 
 
+class _FakeGuideController(_FakeController):
+    """Adds the continuous guide-rate primitive (the field configuration)."""
+
+    def __init__(self):
+        super().__init__()
+        self.rate_cmds = []
+
+    def hc_set_rate_dps(self, target, dps):
+        self.rate_cmds.append((target, dps))
+        return True
+
+
 class HotspotIntegrationTests(unittest.TestCase):
 
     def _make_state(self, raw):
         from config import ConfigState
         cfg = ConfigState()
+        # These tests exercise lock/coast/fallback mechanics with a STATIC
+        # blob and a static mount -- exactly what the star filter is built to
+        # reject. Disable it here; StarFilterTests covers it explicitly.
+        cfg.hotspot_star_filter_enabled = False
         self.cfg = cfg
         self.messages = []
         state = JoystickModeState(None, cfg, self.messages.append)
@@ -152,6 +168,140 @@ class HotspotIntegrationTests(unittest.TestCase):
         state.hotspot_track()
         self.assertGreater(len(state.telescope_controller.cmds), n_cmds)
         self.assertEqual(state.hotspot_status, "locked")
+
+
+class StarFilterTests(unittest.TestCase):
+    """Star-rejection rate gate: a detection whose implied sky rate doesn't
+    match the program trajectory (or is star-like near-zero when tracking
+    bare) must be rejected -- and the toggle must disable that. The filter
+    verifies against a baseline candidate >= RATE_FILTER_BASELINE_S old
+    (timing-skew robustness); tests shrink the baseline so two quick frames
+    are enough."""
+
+    def setUp(self):
+        self._orig_baseline = jc.RATE_FILTER_BASELINE_S
+        jc.RATE_FILTER_BASELINE_S = 0.02
+
+    def tearDown(self):
+        jc.RATE_FILTER_BASELINE_S = self._orig_baseline
+
+    def _make_state(self, cam, sky_rates):
+        from config import ConfigState
+        cfg = ConfigState()
+        self.cfg = cfg
+        state = JoystickModeState(None, cfg, lambda m: None)
+        state.telescope_connected = True
+        state.telescope_controller = _FakeController()
+        state.current_azm = 10.0
+        state.current_alt = 30.0
+        state._program_target_sky_rates = lambda: sky_rates
+        jc.camera_manager.get_camera = lambda idx: cam
+        return state
+
+    def _fresh_detect_twice(self, state, cam):
+        """Two _handoff_detect calls on FRESH frames far enough apart for a
+        rate estimate. The static blob + static mount = implied rate ~0."""
+        cam.thread.latest_raw_seq = 1
+        first = state._handoff_detect(self.cfg)
+        time.sleep(0.05)
+        cam.thread.latest_raw_seq = 2
+        return first, state._handoff_detect(self.cfg)
+
+    def test_static_blob_rejected_when_target_moves(self):
+        cam = _FakeCamera(blob_frame())
+        state = self._make_state(cam, (0.5, 0.0))  # trajectory says 0.5 deg/s
+        first, second = self._fresh_detect_twice(state, cam)
+        self.assertIsNone(first, "first detection is warm-up: no verdict")
+        self.assertFalse(second, "static (star-like) blob must be rejected")
+        self.assertIn("rejected", state.handoff_reject_reason)
+
+    def test_static_blob_rejected_bare_mode(self):
+        cam = _FakeCamera(blob_frame())
+        state = self._make_state(cam, None)  # no program target
+        _first, second = self._fresh_detect_twice(state, cam)
+        self.assertFalse(second, "near-zero rate must read as a star")
+        self.assertIn("star-like", state.handoff_reject_reason)
+
+    def test_matching_rate_accepted(self):
+        # Static blob + static mount = implied rate 0; a trajectory rate of 0
+        # matches it, which is the same geometry as a perfectly-tracked target.
+        cam = _FakeCamera(blob_frame())
+        state = self._make_state(cam, (0.0, 0.0))
+        _first, second = self._fresh_detect_twice(state, cam)
+        self.assertTrue(second, "rate matching the trajectory must be accepted")
+
+    def test_relative_gate_tolerates_fast_target_noise(self):
+        # At 2 deg/s the acceptance threshold grows to 0.35 * |rate|, so the
+        # timing-skew noise floor (which scales the same way) doesn't reject
+        # the real target. Static blob + trajectory (0,0)... instead emulate:
+        # implied error of 0.4 deg/s against a 2 deg/s trajectory must pass
+        # (0.4 < 0.7), while the same absolute error against a slow 0.2 deg/s
+        # trajectory must fail (0.4 > max(0.15, 0.07)).
+        for rate, expect in ((2.0, True), (0.2, False)):
+            cam = _FakeCamera(blob_frame())
+            state = self._make_state(cam, (rate, 0.0))
+            # Fake the boresight moving at (rate - 0.4): implied rate ends up
+            # 0.4 deg/s short of the trajectory.
+            cam.thread.latest_raw_seq = 1
+            self.assertIsNone(state._handoff_detect(self.cfg))
+            dt = 0.05
+            time.sleep(dt)
+            state.current_azm += (rate - 0.4) * dt
+            cam.thread.latest_raw_seq = 2
+            got = state._handoff_detect(self.cfg)
+            self.assertEqual(bool(got), expect,
+                             f"rate={rate}: expected accept={expect}")
+
+    def test_toggle_off_accepts_stars(self):
+        cam = _FakeCamera(blob_frame())
+        state = self._make_state(cam, None)
+        self.cfg.hotspot_star_filter_enabled = False
+        first, second = self._fresh_detect_twice(state, cam)
+        self.assertTrue(first and second, "filter disabled: stars are trackable")
+
+    def test_stale_frame_returns_none(self):
+        cam = _FakeCamera(blob_frame())
+        state = self._make_state(cam, (0.0, 0.0))
+        self.cfg.hotspot_star_filter_enabled = False  # isolate the stale gate
+        cam.thread.latest_raw_seq = 1
+        self.assertTrue(state._handoff_detect(self.cfg))
+        # Same seq again: no new information -- neither count nor reset.
+        self.assertIsNone(state._handoff_detect(self.cfg))
+
+
+class HotspotFeedForwardTests(unittest.TestCase):
+    """HOTSPOT rides its optical correction on the trajectory rates."""
+
+    def test_centered_target_still_commands_trajectory_rate(self):
+        from config import ConfigState
+        cfg = ConfigState()
+        cfg.hotspot_star_filter_enabled = False
+        cfg.continuous_rate_tracking = True   # the field configuration
+        state = JoystickModeState(None, cfg, lambda m: None)
+        state.telescope_connected = True
+        state.telescope_controller = _FakeGuideController()
+        state.current_azm = 10.0
+        state.current_alt = 30.0
+        state.feed_forward_azm_enabled = True
+        state.feed_forward_alt_enabled = True
+        state._program_target_sky_rates = lambda: (1.2, 0.0)
+        # Blob dead-center: zero optical error, so any commanded azimuth rate
+        # comes from the trajectory feed-forward alone.
+        cam = _FakeCamera(blob_frame(cx=128, cy=128))
+        jc.camera_manager.get_camera = lambda idx: cam
+
+        state.tracking_mode = TrackingMode.HOTSPOT
+        state._enter_hotspot_mode()
+        state.hotspot_track()
+
+        self.assertTrue(state.hotspot_acquired)
+        az_rates = [d for (t, d) in state.telescope_controller.rate_cmds
+                    if t == Targets.AZM]
+        self.assertTrue(az_rates, "expected a continuous guide-rate command")
+        self.assertAlmostEqual(az_rates[-1], 1.2, delta=0.3,
+                               msg="commanded azimuth rate should carry the "
+                                   "1.2 deg/s trajectory feed-forward")
+        self.assertGreater(state._hotspot_cmd_dps[0], 0.9)
 
 
 if __name__ == '__main__':

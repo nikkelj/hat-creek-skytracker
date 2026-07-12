@@ -489,7 +489,7 @@ impl SimCoreLoop {
         self.shared.inputs.lock().unwrap().handoff_min_frames = n;
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0, star_filter = false, rate_gate_dps = 0.15))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -501,6 +501,8 @@ impl SimCoreLoop {
         focal_length_mm: f64,
         rotation_deg: f64,
         max_rate_dps: f64,
+        star_filter: bool,
+        rate_gate_dps: f64,
     ) {
         self.shared.inputs.lock().unwrap().hotspot = crate::controller::HotspotParams {
             snr_threshold,
@@ -512,7 +514,14 @@ impl SimCoreLoop {
             focal_length_mm,
             rotation_deg,
             max_rate_dps,
+            star_filter,
+            rate_gate_dps,
         };
+    }
+
+    /// Feedback low-pass time constant for both PIDs (seconds; 0 disables).
+    fn set_output_filter(&self, tau_seconds: f64) {
+        self.shared.inputs.lock().unwrap().output_filter_tau = tau_seconds.max(0.0);
     }
 
     /// Publish a frame (2D float32 intensity map) for HOTSPOT mode.
@@ -588,6 +597,7 @@ impl SimCoreLoop {
         let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
         let _ = d.set_item("hotspot_snr", o.hotspot_snr);
         let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+        let _ = d.set_item("handoff_detection_count", o.handoff_detection_count);
         let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
         let _ = d.set_item("status_msgs", o.status_msgs.clone());
         let _ = d.set_item("cycle_count", o.cycle_count);
@@ -677,6 +687,8 @@ fn h_set_hotspot_params(
     fl: f64,
     rot: f64,
     max_rate_dps: f64,
+    star_filter: bool,
+    rate_gate_dps: f64,
 ) {
     sh.inputs.lock().unwrap().hotspot = HotspotParams {
         snr_threshold: snr,
@@ -688,7 +700,12 @@ fn h_set_hotspot_params(
         pixel_size_um: px,
         focal_length_mm: fl,
         rotation_deg: rot,
+        star_filter,
+        rate_gate_dps,
     };
+}
+fn h_set_output_filter(sh: &Shared, tau_seconds: f64) {
+    sh.inputs.lock().unwrap().output_filter_tau = tau_seconds.max(0.0);
 }
 fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>) {
     let view = image.as_array();
@@ -730,6 +747,7 @@ fn h_snapshot<'py>(py: Python<'py>, sh: &Shared) -> Bound<'py, PyDict> {
     let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
     let _ = d.set_item("hotspot_snr", o.hotspot_snr);
     let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+    let _ = d.set_item("handoff_detection_count", o.handoff_detection_count);
     let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
     let _ = d.set_item("status_msgs", o.status_msgs.clone());
     let _ = d.set_item("actual_hz", o.actual_hz);
@@ -911,7 +929,7 @@ impl CoreLoop {
         h_set_handoff_min_frames(self.inner.shared(), n);
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0, star_filter = false, rate_gate_dps = 0.15))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -923,6 +941,8 @@ impl CoreLoop {
         focal_length_mm: f64,
         rotation_deg: f64,
         max_rate_dps: f64,
+        star_filter: bool,
+        rate_gate_dps: f64,
     ) {
         h_set_hotspot_params(
             self.inner.shared(),
@@ -935,7 +955,14 @@ impl CoreLoop {
             focal_length_mm,
             rotation_deg,
             max_rate_dps,
+            star_filter,
+            rate_gate_dps,
         );
+    }
+
+    /// Feedback low-pass time constant for both PIDs (seconds; 0 disables).
+    fn set_output_filter(&self, tau_seconds: f64) {
+        h_set_output_filter(self.inner.shared(), tau_seconds);
     }
     fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
         self.frame_seq += 1;

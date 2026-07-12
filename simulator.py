@@ -167,7 +167,20 @@ def injected_boresight(config_state, nominal_az_deg, nominal_el_deg):
     recover all seven terms end-to-end (not just the encoder-bias IA/IE)."""
     s = getattr(config_state, 'sim_config', {}) or {}
     az, el = float(nominal_az_deg), float(nominal_el_deg)
-    terms = s.get('mount_pointing_model') or None
+    if 'mount_pointing_model' in s:
+        terms = s.get('mount_pointing_model') or None
+    else:
+        # No explicit injection configured: default to the APP's fitted
+        # pointing-model terms, i.e. simulate the mount those terms were
+        # fitted on. Without this, a config carrying real-hardware terms
+        # made the control loop pre-correct setpoints for an error the sim
+        # never had -- every tracking mode sat a constant ~0.1 deg off the
+        # true target ("biased off-center"), and only optical feedback
+        # could pull it out. An explicit sim_config['mount_pointing_model']
+        # (including {}) still overrides, so alignment-recovery tests that
+        # inject their own model are unaffected.
+        terms = (getattr(config_state, 'pointing_model_terms', None)
+                 if getattr(config_state, 'pointing_model_enabled', False) else None)
     if terms and any(abs(float(v)) > 0.0 for v in terms.values()):
         from pointing_model import PointingModel
         az, el = PointingModel(terms).predict_observed(az, el)

@@ -122,6 +122,21 @@ class ConfigState:
         self.hotspot_x_sign = 1.0           # per-axis sign calibration (set on hardware)
         self.hotspot_y_sign = -1.0
 
+        # Star-rejection rate filter: a detection is only accepted when its
+        # implied sky angular rate (boresight motion + pixel drift between
+        # fresh frames) matches the program-track trajectory rate within
+        # hotspot_rate_gate_dps. Without a trajectory (bare HOTSPOT), reject
+        # near-sidereal (star-like) rates below the gate instead. Toggle off
+        # to deliberately track a star.
+        self.hotspot_star_filter_enabled = True
+        self.hotspot_rate_gate_dps = 0.15
+
+        # Low-pass (EMA) time constant for the PID FEEDBACK term, seconds.
+        # Smooths encoder-noise/backlash jitter out of the rate commands while
+        # feed-forward passes through unfiltered (trajectory response stays
+        # crisp). 0 disables.
+        self.pid_output_filter_tau_sec = 0.0
+
         # HANDOFF mode: PROGRAM track runs the hotspot detector in parallel and
         # hands the loop to HOTSPOT after this many consecutive solid detections.
         self.handoff_min_frames = 5
@@ -309,6 +324,9 @@ class ConfigState:
             "handoff_min_frames": self.handoff_min_frames,
             "hotspot_x_sign": self.hotspot_x_sign,
             "hotspot_y_sign": self.hotspot_y_sign,
+            "hotspot_star_filter_enabled": self.hotspot_star_filter_enabled,
+            "hotspot_rate_gate_dps": self.hotspot_rate_gate_dps,
+            "pid_output_filter_tau_sec": self.pid_output_filter_tau_sec,
             "sim_config": self.sim_config,
             "mount_mode": self.mount_mode,
             "use_rust_core_loop": self.use_rust_core_loop,
@@ -398,6 +416,12 @@ class ConfigState:
         self.handoff_min_frames = config_dict.get("handoff_min_frames", self.handoff_min_frames)
         self.hotspot_x_sign = config_dict.get("hotspot_x_sign", self.hotspot_x_sign)
         self.hotspot_y_sign = config_dict.get("hotspot_y_sign", self.hotspot_y_sign)
+        self.hotspot_star_filter_enabled = config_dict.get(
+            "hotspot_star_filter_enabled", self.hotspot_star_filter_enabled)
+        self.hotspot_rate_gate_dps = config_dict.get(
+            "hotspot_rate_gate_dps", self.hotspot_rate_gate_dps)
+        self.pid_output_filter_tau_sec = config_dict.get(
+            "pid_output_filter_tau_sec", self.pid_output_filter_tau_sec)
 
         # Merge hardware simulator settings (keep defaults for missing keys)
         if "sim_config" in config_dict and isinstance(config_dict["sim_config"], dict):

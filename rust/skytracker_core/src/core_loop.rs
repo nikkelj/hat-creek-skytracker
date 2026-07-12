@@ -48,6 +48,9 @@ pub struct Outputs {
     pub hotspot_status: String,
     pub hotspot_snr: f64,
     pub hotspot_centroid: Option<(f64, f64)>,
+    /// HANDOFF's consecutive-detection progress (0 outside HANDOFF), so the
+    /// UI can show "detecting n/m" instead of a static "armed".
+    pub handoff_detection_count: u32,
 
     pub requested_mode: Option<Mode>,
     pub status_msgs: Vec<String>,
@@ -172,12 +175,17 @@ pub fn run_cycle<T: Transport>(
     let out = state.step(&inputs, frame.as_deref(), current_azm, current_alt, now);
 
     // 5) Actuate (only when the step commands a rate). In continuous-rate mode
-    //    PROGRAM/HOTSPOT issue the fine variable-rate (guide-rate) command using
-    //    the PID's continuous output, falling back to the discrete MC_MOVE step
-    //    above guide_rate_max_dps (e.g. the near-zenith keyhole). Manual
-    //    RATE_CONTROL always uses the discrete joystick step.
+    //    the tracking modes issue the fine variable-rate (guide-rate) command
+    //    using the PID's continuous output, falling back to the discrete
+    //    MC_MOVE step above guide_rate_max_dps (e.g. the near-zenith keyhole).
+    //    HANDOFF is program tracking (step_handoff drives step_program), so it
+    //    must actuate identically — on the discrete steps its error limit-
+    //    cycles FOV-wide and the parallel hotspot detector never sees the
+    //    target long enough to hand off (the Python loop's _send_tracking_rate
+    //    is mode-agnostic). Manual RATE_CONTROL always uses the discrete
+    //    joystick step.
     let continuous = inputs.continuous_rate
-        && matches!(inputs.mode, Mode::Program | Mode::Hotspot);
+        && matches!(inputs.mode, Mode::Program | Mode::Handoff | Mode::Hotspot);
     let max_dps = inputs.guide_rate_max_dps;
     if let Some(r) = out.azm_rate_cmd {
         let dps = out.azm_pid_output * 360.0;
@@ -215,7 +223,22 @@ pub fn run_cycle<T: Transport>(
     }
     o.hotspot_snr = out.hotspot_snr;
     o.hotspot_centroid = out.hotspot_centroid;
-    o.requested_mode = out.requested_mode;
+    o.handoff_detection_count = out.handoff_detection_count;
+    // Latch loop-originated mode requests instead of overwriting each cycle:
+    // a request is produced on exactly ONE cycle (e.g. HANDOFF's 5th
+    // consecutive detection), and the polling adapter can miss a one-cycle
+    // snapshot value indefinitely when the two 15 Hz timers phase-lock. Hold
+    // the request until the host has actually pushed that mode back into
+    // `inputs.mode`, then clear it so a stale request can never override a
+    // later operator mode change.
+    match out.requested_mode {
+        Some(m) => o.requested_mode = Some(m),
+        None => {
+            if o.requested_mode == Some(inputs.mode) {
+                o.requested_mode = None;
+            }
+        }
+    }
     if let Some(msg) = out.status_msg {
         o.status_msgs.push(msg);
     }

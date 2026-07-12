@@ -183,15 +183,23 @@ fn handoff_program_tracks_and_hands_off_after_n_detections() {
         ff_az_dps: 0.0,
         ff_el_dps: 0.0,
     });
-    let f = blob_frame(256, 200, 138.0, 110.0);
     // Each cycle: program-tracks (commands a rate toward the setpoint) AND counts
-    // a detection. Hand-off to HOTSPOT fires on the 3rd consecutive detection.
+    // a detection on each FRESH frame (stale frames neither count nor reset).
+    // Hand-off to HOTSPOT fires on the 3rd consecutive fresh detection.
+    let mut f = blob_frame(256, 200, 138.0, 110.0);
+    f.seq = 1;
     let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0);
     assert!(o1.azm_rate_cmd.unwrap() > 0, "handoff must keep program-tracking");
     assert_eq!(o1.hotspot_status, "detecting");
     assert_eq!(o1.requested_mode, None);
+    // A STALE repeat of the same frame is not new information: no count change.
+    let stale = s.step(&i, Some(&f), 10.0, 20.0, 1.05);
+    assert_eq!(stale.requested_mode, None);
+    assert_eq!(stale.handoff_detection_count, 1);
+    f.seq = 2;
     let o2 = s.step(&i, Some(&f), 10.0, 20.0, 1.1);
     assert_eq!(o2.requested_mode, None);
+    f.seq = 3;
     let o3 = s.step(&i, Some(&f), 10.0, 20.0, 1.2);
     assert_eq!(o3.requested_mode, Some(Mode::Hotspot));
 }
@@ -209,14 +217,17 @@ fn handoff_resets_count_on_missed_detection() {
         ff_az_dps: 0.0,
         ff_el_dps: 0.0,
     });
-    let f = blob_frame(256, 200, 138.0, 110.0);
+    let mut f = blob_frame(256, 200, 138.0, 110.0);
+    f.seq = 1;
     let _ = s.step(&i, Some(&f), 10.0, 20.0, 1.0); // count 1
     let miss = s.step(&i, None, 10.0, 20.0, 1.1); // no frame -> reset
     assert_eq!(miss.hotspot_status, "program");
     assert_eq!(miss.requested_mode, None);
     // Needs two fresh consecutive detections again before handing off.
+    f.seq = 2;
     let a = s.step(&i, Some(&f), 10.0, 20.0, 1.2);
     assert_eq!(a.requested_mode, None);
+    f.seq = 3;
     let b = s.step(&i, Some(&f), 10.0, 20.0, 1.3);
     assert_eq!(b.requested_mode, Some(Mode::Hotspot));
 }
@@ -397,4 +408,107 @@ fn program_flip_altaz_error_convention() {
     assert!(o.azm_error.abs() < 1e-6, "azm error {}", o.azm_error);
     assert!((o.alt_error + 90.0).abs() < 1e-6, "alt error {}", o.alt_error);
     assert!(o.alt_rate_cmd.unwrap_or(0) < 0);
+}
+
+#[test]
+fn handoff_star_filter_rejects_static_blob() {
+    // Boresight static + blob static in frame => the detection's implied sky
+    // rate is ~0 (a star). The trajectory says the target moves at 0.5 deg/s,
+    // so every post-baseline detection must be rejected and the hand-off must
+    // never fire.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Handoff;
+    i.mount_mode = MountMode::Passthrough;
+    i.handoff_min_frames = 2;
+    i.hotspot.star_filter = true;
+    i.hotspot.rate_gate_dps = 0.15;
+    i.setpoint = Some(Setpoint {
+        az_deg: 15.0,
+        el_deg: 25.0,
+        ff_az_dps: 0.5,
+        ff_el_dps: 0.0,
+    });
+    let mut f = blob_frame(256, 200, 138.0, 110.0);
+    f.seq = 1;
+    // First fresh detection: rate baseline warming up -- neither counted nor
+    // rejected (a star must not build count during the warm-up window).
+    let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0);
+    assert_eq!(o1.hotspot_status, "detecting");
+    assert_eq!(o1.handoff_detection_count, 0);
+    // Subsequent frames >= the 0.35s baseline are verified and rejected.
+    for seq in 2..=6u64 {
+        f.seq = seq;
+        let o = s.step(&i, Some(&f), 10.0, 20.0, 1.0 + 0.4 * (seq - 1) as f64);
+        assert_eq!(o.hotspot_status, "star-reject");
+        assert_eq!(o.requested_mode, None, "a star must never trigger the hand-off");
+        assert_eq!(o.handoff_detection_count, 0);
+    }
+}
+
+#[test]
+fn handoff_star_filter_accepts_matching_rate() {
+    // Same geometry, but the trajectory rate is ~0 -- equivalent to a target
+    // being tracked perfectly (zero relative pixel motion, boresight moving
+    // with the target). The filter must accept and the hand-off fire.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Handoff;
+    i.mount_mode = MountMode::Passthrough;
+    i.handoff_min_frames = 2;
+    i.hotspot.star_filter = true;
+    i.hotspot.rate_gate_dps = 0.15;
+    i.setpoint = Some(Setpoint {
+        az_deg: 15.0,
+        el_deg: 25.0,
+        ff_az_dps: 0.0,
+        ff_el_dps: 0.0,
+    });
+    let mut f = blob_frame(256, 200, 138.0, 110.0);
+    f.seq = 1;
+    let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0); // warm-up: not counted
+    assert_eq!(o1.hotspot_status, "detecting");
+    assert_eq!(o1.handoff_detection_count, 0);
+    f.seq = 2;
+    let o2 = s.step(&i, Some(&f), 10.0, 20.0, 1.4); // verified: count 1
+    assert_eq!(o2.requested_mode, None);
+    assert_eq!(o2.handoff_detection_count, 1);
+    f.seq = 3;
+    let o3 = s.step(&i, Some(&f), 10.0, 20.0, 1.8); // verified: count 2 -> engage
+    assert_eq!(o3.requested_mode, Some(Mode::Hotspot));
+}
+
+#[test]
+fn hotspot_rides_trajectory_feed_forward() {
+    // A dead-centered target has zero optical error; the commanded rate must
+    // still carry the trajectory feed-forward (3 deg/s), and a subsequent
+    // miss must keep the feed-forward running while the correction decays.
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Hotspot;
+    i.mount_mode = MountMode::Passthrough;
+    i.ff_azm_enabled = true;
+    i.ff_alt_enabled = true;
+    i.setpoint = Some(Setpoint {
+        az_deg: 50.0,
+        el_deg: 45.0,
+        ff_az_dps: 3.0,
+        ff_el_dps: 0.0,
+    });
+    let f = blob_frame(256, 200, 128.0, 100.0); // exact frame center
+    let o1 = s.step(&i, Some(&f), 50.0, 45.0, 100.0);
+    assert_eq!(o1.hotspot_status, "locked");
+    assert!(
+        (o1.azm_pid_output * 360.0 - 3.0).abs() < 0.3,
+        "centered target should command ~3 deg/s of feed-forward, got {}",
+        o1.azm_pid_output * 360.0
+    );
+    // Miss (no frame): coast at the trajectory rate, not a frozen total.
+    let o2 = s.step(&i, None, 50.0, 45.0, 100.1);
+    assert_eq!(o2.hotspot_status, "coasting");
+    assert!(
+        (o2.azm_pid_output * 360.0 - 3.0).abs() < 0.3,
+        "coast must keep the feed-forward running, got {}",
+        o2.azm_pid_output * 360.0
+    );
 }

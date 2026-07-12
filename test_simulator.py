@@ -204,6 +204,11 @@ class SimInTheLoopTests(unittest.TestCase):
         cfg.pid_azm_i_gain = cfg.pid_alt_i_gain = 0.0
         cfg.pid_azm_d_gain = cfg.pid_alt_d_gain = 0.0
         cfg.azm_offset_str = "0"; cfg.alt_offset_str = "0"
+        # This target is STATIC in the sky -- exactly what the star filter
+        # rejects in bare mode (a static object IS star-like by definition).
+        # The test exercises the centering loop, so opt out of the filter
+        # (the operator's "stars OK" toggle).
+        cfg.hotspot_star_filter_enabled = False
 
         target_az, target_el = 100.0, 30.0
         sim = HardwareSimulator(cfg, None, None)

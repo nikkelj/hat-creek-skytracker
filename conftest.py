@@ -62,6 +62,11 @@ if not _HAVE_RUST:
         "test_rust_loop_adapter.py",
         "test_rust_perf.py",
         "test_loop_ab_parity.py",
+        # Live-fidelity tracking-quality metrics harness: drives the Rust
+        # loop through the real adapter (imports skytracker_core at module
+        # scope via rust_loop_adapter). Wall-clock based (~85 s); run it
+        # locally / in the rust-core job environment.
+        "test_tracking_quality.py",
     ]
 
 if not _HAVE_HIPPARCOS:

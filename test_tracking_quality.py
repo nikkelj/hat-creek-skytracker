@@ -38,13 +38,18 @@ from simulator import HardwareSimulator
 import simulator
 
 import joystick_controller as jc
-import rust_loop_adapter as rla
 from joystick_controller import JoystickModeState, TrackingMode
 
 try:
+    # rust_loop_adapter imports skytracker_core at module scope, so both go
+    # under the guard: without the wheel this file must still IMPORT cleanly
+    # (pytest collection) and skip its tests. conftest.py also collect_ignores
+    # it when the wheel is absent.
     import skytracker_core  # noqa: F401
+    import rust_loop_adapter as rla
     _HAVE_CORE = True
 except ImportError:
+    rla = None
     _HAVE_CORE = False
 
 

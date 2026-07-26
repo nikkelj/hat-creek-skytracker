@@ -71,7 +71,16 @@ class _FakeGuideController(_FakeController):
         return True
 
 
+def _restore_camera_manager():
+    """Drop the per-instance get_camera override so the shared singleton's
+    real class method is back for whatever test module runs next."""
+    jc.camera_manager.__dict__.pop("get_camera", None)
+
+
 class HotspotIntegrationTests(unittest.TestCase):
+
+    def tearDown(self):
+        _restore_camera_manager()
 
     def _make_state(self, raw):
         from config import ConfigState
@@ -184,6 +193,7 @@ class StarFilterTests(unittest.TestCase):
 
     def tearDown(self):
         jc.RATE_FILTER_BASELINE_S = self._orig_baseline
+        _restore_camera_manager()
 
     def _make_state(self, cam, sky_rates):
         from config import ConfigState
@@ -271,6 +281,9 @@ class StarFilterTests(unittest.TestCase):
 
 class HotspotFeedForwardTests(unittest.TestCase):
     """HOTSPOT rides its optical correction on the trajectory rates."""
+
+    def tearDown(self):
+        _restore_camera_manager()
 
     def test_centered_target_still_commands_trajectory_rate(self):
         from config import ConfigState

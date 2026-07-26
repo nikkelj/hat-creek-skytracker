@@ -234,6 +234,9 @@ class SimInTheLoopTests(unittest.TestCase):
             thread = _Thread()
 
         jc.camera_manager.get_camera = lambda idx: _Cam()
+        # Instance-level override on the shared singleton; drop it after the
+        # test so later test modules see the real class method again.
+        self.addCleanup(jc.camera_manager.__dict__.pop, "get_camera", None)
 
         initial_err = math.hypot(2.0, 1.0)
         last_centroid = None

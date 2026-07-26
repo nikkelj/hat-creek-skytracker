@@ -188,8 +188,10 @@ class ConfigState:
         # alignment_azimuth -- equatorial geometry with the pole on the
         # horizon), "Eq" (polar-aligned wedge), or "Passthrough".
         # AltAz-Side field setup: put both axes on the AVX index marks
-        # (scope points along the polar axis, at the horizon), Tare, and
-        # enter the azimuth the scope points at as Alignment Azimuth.
+        # (scope points along the polar axis, at the horizon), press
+        # Sync Home in the joystick connection panel (captures the raw
+        # encoder readings into azm/alt_offset below), and enter the azimuth
+        # the scope points at as Alignment Azimuth.
         self.mount_mode = "AltAz"
         # AltAz-Side tip side: False = first +ALT jog from the index marks
         # sweeps toward alignment_azimuth - 90; True = mirrored rig (laid

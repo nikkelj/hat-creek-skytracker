@@ -23,8 +23,11 @@ Fix: H = AZM + 90°, dec = 90° − ALT (`ALTAZ_SIDE_H0_DEG`), which also makes
 the axes behave as originally described from home (+ALT walks the horizon —
 identically 0 elevation, a strong test — and AZM sweeps the vertical circle
 once off the pole). `altaz_side_flip` mirrors the H origin for a rig laid
-down on its other side. Field procedure: index marks → Tare → enter the
-azimuth the scope points at as Alignment Azimuth.
+down on its other side. Field procedure: index marks → Sync Home (the
+connection-panel button that captures raw encoder readings into the
+azm/alt offsets — the joystick "Tare axes" button is for the game
+controller sticks, not the mount) → enter the azimuth the scope points at
+as Alignment Azimuth.
 
 Meta-lessons: (1) an apparent *polarity* error on both axes was actually an
 *index* error — near H = 90° the sign of ∂el/∂ALT flips, so a 90° home

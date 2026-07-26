@@ -145,6 +145,23 @@ def render_connection_controls(display, joystick_state):
     disconnect_text = display.small_font.render("Disconnect", True, (255, 255, 255))
     display.menu_screen.blit(disconnect_text, (disconnect_rect.x + 5, disconnect_rect.y + 5))
 
+    # Sync Home: capture the RAW encoder readings into the azm/alt offsets so
+    # the CURRENT physical attitude becomes working (0, 0) -- the mount home.
+    # Put the mount on its index marks first (AltAz-Side: scope along the
+    # polar axis at the pole azimuth). Offsets persist to config and both
+    # control loops read them live; Park also returns here. Grey until
+    # connected. (The joystick "Tare axes" button is unrelated -- it zeroes
+    # the game-controller stick centers, not the mount.)
+    sync_home_rect = pygame.Rect(display.sub_x + 190, button_y, button_width, button_height)
+    sync_hover = sync_home_rect.collidepoint(pygame.mouse.get_pos())
+    if joystick_state.telescope_connected:
+        sync_color = (110, 140, 180) if sync_hover else (100, 120, 150)
+    else:
+        sync_color = (100, 100, 100)
+    pygame.draw.rect(display.menu_screen, sync_color, sync_home_rect)
+    sync_text = display.small_font.render("Sync Home", True, (255, 255, 255))
+    display.menu_screen.blit(sync_text, (sync_home_rect.x + 4, sync_home_rect.y + 5))
+
     # Port selector
     port_y = button_y + 40
     port_label = display.small_font.render("Port:", True, (255, 255, 255))
@@ -1592,6 +1609,31 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         if disconnect_rect.collidepoint(pos) and joystick_state.telescope_connected:
             joystick_state.disconnect_telescope()
             print("Telescope disconnected")
+
+        # Sync Home: capture the raw encoder readings into the azm/alt
+        # offsets so the current attitude (put the mount on its index marks
+        # first) becomes working (0, 0). Persisted to config; both control
+        # loops read offsets live, so it takes effect immediately.
+        sync_home_rect = pygame.Rect(display.sub_x + 190, display.sub_y + 10, 80, 30)
+        if sync_home_rect.collidepoint(pos) and joystick_state.telescope_connected:
+            cfg = joystick_state.config_state
+            raw_azm = getattr(joystick_state, 'current_azm_raw', None)
+            raw_alt = getattr(joystick_state, 'current_alt_raw', None)
+            if cfg is not None and raw_azm is not None and raw_alt is not None:
+                cfg.azm_offset_str = f"{raw_azm % 360.0:.4f}"
+                cfg.alt_offset_str = f"{raw_alt % 360.0:.4f}"
+                try:
+                    cfg.save_to_file()
+                    saved = "saved"
+                except Exception as e:
+                    saved = f"NOT saved: {e}"
+                msg = (f"Home synced: offsets AZM {cfg.azm_offset_str} "
+                       f"ALT {cfg.alt_offset_str} ({saved})")
+                print(msg)
+                if joystick_state.update_status_callback:
+                    joystick_state.update_status_callback(msg)
+            else:
+                print("Sync Home: no position read yet -- wait for the poll")
 
         # ADS-B connect/disconnect buttons (rects stored by the renderer).
         adsb_rects = getattr(joystick_state, 'adsb_button_rects', {}) or {}

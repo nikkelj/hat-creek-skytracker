@@ -448,6 +448,13 @@ class JoystickModeState:
         self.target_el_rate = 0.0
         self.target_el_deg = 0.0
 
+        # PID auto-tuner (autotune.py). Lives outside both control loops: it
+        # watches the per-cycle position errors published on this state and
+        # writes candidate gains into config_state, which both loops re-read
+        # every cycle. Serviced via service_autotune() from whichever loop is
+        # active; started/stopped from the PID pane's AUTOTUNE button.
+        self.autotuner = None
+
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
         self.joystick_tare = {}
@@ -657,6 +664,50 @@ class JoystickModeState:
         elif self.tracking_mode == TrackingMode.MTI:
             # MTI: Stub implementation
             self.mti_track()
+
+    def toggle_autotune(self):
+        """Start/stop the PID auto-tuner (PID pane's AUTOTUNE button).
+        Armable while tracking in PROGRAM or HOTSPOT; stopping keeps the
+        best gains found so far (they are already live in config_state --
+        save the config to persist them)."""
+        from autotune import PIDAutoTuner
+        tuner = self.autotuner
+        if tuner is not None and tuner.active:
+            tuner.stop()
+            self._drain_autotune_messages(tuner)
+            return
+        if self.tracking_mode not in (TrackingMode.PROGRAM, TrackingMode.HOTSPOT):
+            if self.update_status_callback:
+                self.update_status_callback(
+                    "Auto-tune: start PROGRAM or HOTSPOT tracking first")
+            return
+        self.autotuner = PIDAutoTuner(self.config_state, mode=self.tracking_mode)
+        self.autotuner.start()
+        self._drain_autotune_messages(self.autotuner)
+
+    def service_autotune(self):
+        """Feed the auto-tuner one control-cycle sample. Called from BOTH
+        control paths (the mount-control cycle and the Rust adapter pump)
+        right after the cycle's position errors are published on this state.
+        The tuner only scores samples taken while the mode it was armed in is
+        genuinely closed-loop on the target -- PROGRAM and HOTSPOT are
+        different plants (encoder loop vs. optical loop), so a tune must not
+        mix their measurements."""
+        tuner = self.autotuner
+        if tuner is None or not tuner.active:
+            return
+        tracking = (self.telescope_connected and not self.stopped
+                    and self.tracking_mode == tuner.armed_mode)
+        if tracking and tuner.armed_mode == TrackingMode.HOTSPOT:
+            tracking = self.hotspot_status == "locked"
+        tuner.update(time.time(), tracking,
+                     self.azm_position_error, self.alt_position_error)
+        self._drain_autotune_messages(tuner)
+
+    def _drain_autotune_messages(self, tuner):
+        for msg in tuner.take_messages():
+            if self.update_status_callback:
+                self.update_status_callback(msg)
 
     def chart_axis_scale(self, key, values, floor):
         """Auto-range a strip chart's vertical axis (±return value). Tracks the

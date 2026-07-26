@@ -6,6 +6,44 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — Online PID auto-tune: twiddle on the live error stream works
+
+Added [`autotune.py`](autotune.py): one button tunes all six PID gains *while
+tracking*, no injected test signals — a coordinate-descent ("twiddle")
+optimizer in **log-gain space** (the gains span 5 decades, matching the UI's
+log sliders) that probes each gain up/down, scores a settle-then-measure RMS
+window of the live mount-axis error, keeps >3% improvements, and expands/
+shrinks its per-gain step. Both control loops re-read gains from config every
+cycle, so the tuner is loop-agnostic: it just writes candidates into
+`config_state` and watches `azm/alt_position_error` on the shared state
+(serviced from the mount-control cycle *and* the Rust adapter pump). On the
+live-fidelity sim rig (noise, backlash, periodic error, ~10 fps camera,
+15 Hz loop) a ~2.5-minute tune took the field-tuned example gains from
+**81″ → 38″ sky RMS** (encoder-error RMS 30″/13.5″ → 5.7″/4.4″ az/el).
+
+Non-obvious bits:
+
+- **Re-baseline every sweep.** Windowed RMS drifts with the pass geometry;
+  scoring candidates against a best-cost measured minutes ago either blocks
+  all acceptance or accepts regressions. Each sweep starts with a fresh
+  baseline window at the current best gains.
+- **The acceptance margin is what makes it a descent.** With ~40 samples per
+  window the RMS estimate is noisy; a plain `<` comparison random-walks the
+  gains. Requiring >3% improvement (and reverting otherwise) makes progress
+  monotone in expectation.
+- **Pause ≠ stop.** Mode change, STOP, or a lost optical lock mid-probe must
+  revert to the best-known gains and *restart the interrupted probe* on
+  resume — a half-measured window scored across the gap is garbage.
+- **Measure the plant you armed on.** PROGRAM (encoder loop) and HOTSPOT
+  (optical loop) are different plants; the tuner refuses to mix their samples.
+- **Sim-rig gotcha that looked like a tuner disaster:** the tracking-quality
+  `Rig`'s analytic target climbs at 0.5°/s elevation, so past ~120 s it
+  crosses the zenith and the rig's sky-error metric (built for el ≤ 90°)
+  reports hundreds of thousands of arcsec while the loop is actually fine.
+  A first "tune made it worse" verdict (38″ → 143″, then 430 000″) was
+  entirely this artifact; with a 0.08°/s target the same tune measured
+  cleanly. Any long-window use of `Rig` needs rates that keep el < 90°.
+
 ## 2026-07-26 — The 9600-baud wire caps the control loop at ~8 Hz; dedup rate commands
 
 `bench_guiderate.py --throughput` on the real AVX: every AUX transaction costs

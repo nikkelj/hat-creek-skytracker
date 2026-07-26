@@ -1815,6 +1815,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                     print(f"Launch visualization started for {tracking_vis_state.selected_launch}")
                 return True
 
+        # Handle AUTOTUNE button clicks (PID pane title row)
+        if handle_autotune_button_mouse_events(joystick_state, display, mouse_pos):
+            return True
+
         # Handle PID slider clicks
         if handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
             return True
@@ -2852,6 +2856,29 @@ def render_pid_gain_sliders(display, joystick_state):
     title_text = display.small_font.render("PID Gain Control", True, (255, 255, 255))
     display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
 
+    # AUTOTUNE button (title row, right edge -- above the disabled scrim so it
+    # reads even when the sliders are greyed). Toggles the online auto-tuner
+    # (autotune.py) via joystick_state.toggle_autotune().
+    tuner = getattr(joystick_state, 'autotuner', None)
+    tuning = tuner is not None and tuner.active
+    at_rect = pygame.Rect(x_start + width - 72, y_start + 3, 64, 15)
+    display.joystick_autotune_button_rect = at_rect
+    at_armable = tuning or joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HOTSPOT)
+    if tuning:
+        at_color = (0, 150, 0)
+    elif tuner is not None and tuner.phase == 'done':
+        at_color = (0, 90, 160)
+    else:
+        at_color = (100, 100, 100) if at_armable else (70, 70, 85)
+    if at_armable and at_rect.collidepoint(pygame.mouse.get_pos()):
+        at_color = tuple(min(255, c + 40) for c in at_color)
+    pygame.draw.rect(display.menu_screen, at_color, at_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), at_rect, 1)
+    at_label = display.tiny_font.render("TUNING" if tuning else "AUTOTUNE",
+                                        True, (255, 255, 255))
+    display.menu_screen.blit(at_label, at_label.get_rect(center=at_rect.center))
+
     # Define PID gain ranges (similar to camera settings)
     PID_GAIN_RANGE = (0.0, 2.0)  # From 0 to 2.0
     SLIDER_WIDTH = 80  # Width for each PID slider
@@ -3040,6 +3067,12 @@ def render_pid_gain_sliders(display, joystick_state):
     pygame.draw.rect(display.menu_screen, (255, 0, 0) if lead_hover else (200, 0, 0),
                      (lead_handle_x - 3, lead_track.y - 4, 6, 12))
 
+    # Auto-tuner progress line (sweep/probe/last RMS), between the lead slider
+    # and the feed-forward strip. Only drawn once a tuner exists.
+    if tuner is not None:
+        at_status = display.tiny_font.render(tuner.status_text(), True, (170, 220, 255))
+        display.menu_screen.blit(at_status, (x_start + 10, y_start + 158))
+
     # Grey out the slider area when not in PROGRAM mode (the feed-forward strip
     # below is greyed separately by render_feed_forward_toggle_buttons()).
     if not enabled:
@@ -3065,6 +3098,26 @@ def handle_lead_slider_mouse_events(joystick_state, display, mouse_pos):
         return False
     cfg.pid_lead_time_sec = _lead_from_track_x(track, mouse_pos[0])
     print(f"Lead time: {cfg.pid_lead_time_sec:.3f}s")
+    return True
+
+
+def handle_autotune_button_mouse_events(joystick_state, display, mouse_pos):
+    """Click on the PID pane's AUTOTUNE button: start/stop the auto-tuner.
+    Startable only in PROGRAM or HOTSPOT (the tuner needs a live closed loop
+    to measure); a RUNNING tune is stoppable from any mode so the operator is
+    never locked out of the button."""
+    rect = getattr(display, 'joystick_autotune_button_rect', None)
+    if rect is None or not rect.collidepoint(mouse_pos):
+        return False
+    tuner = getattr(joystick_state, 'autotuner', None)
+    tuning = tuner is not None and tuner.active
+    if not tuning and joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HOTSPOT):
+        if joystick_state.update_status_callback:
+            joystick_state.update_status_callback(
+                "Auto-tune: start PROGRAM or HOTSPOT tracking first")
+        return True
+    joystick_state.toggle_autotune()
     return True
 
 

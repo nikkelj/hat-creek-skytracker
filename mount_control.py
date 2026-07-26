@@ -89,6 +89,12 @@ class MountControlThread(threading.Thread):
         #    the cached position set above rather than hitting the wire again.
         state.tracking_control()
 
+        # 3) Feed the PID auto-tuner (if armed) this cycle's position errors.
+        #    getattr: test rigs drive this thread with minimal fake states.
+        service_autotune = getattr(state, "service_autotune", None)
+        if service_autotune is not None:
+            service_autotune()
+
     # -------------------------------------------------------------- polling
     def _poll_position(self, controller):
         poll_start = time.perf_counter()

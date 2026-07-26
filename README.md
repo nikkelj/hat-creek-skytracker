@@ -34,6 +34,13 @@ capture.
   instead of freezing the loop (which previously let an axis run open-loop).
 - **PID controller** with trajectory **feed-forward**, **derivative-on-measurement**
   (no derivative kick), and **conditional-integration anti-windup**.
+- **One-click PID auto-tune** (`autotune.py`): while tracking in PROGRAM or
+  HOTSPOT, the PID pane's **AUTOTUNE** button runs an online coordinate-descent
+  optimizer over all six gains — no injected test signals, just the live
+  tracking error. It probes each gain up/down in log space, keeps measured
+  improvements, converges in a few minutes (the sliders visibly follow along),
+  and pauses safely on STOP / mode change / lost lock. Stopping keeps the best
+  gains found; works identically under the Python and Rust control loops.
 
 **Imaging & visualization**
 - Threaded camera capture (ZWO ASI) with a large circular buffer and
@@ -64,7 +71,9 @@ orbital elements, camera FOV footprints, and a scrollable pass table.
 **Joystick Loop** — the operational screen: live camera feeds (with boresight
 crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
 strip charts, mount connection/position status, tracking mode, and PID
-diagnostics. Shown here in simulation with the mount and both cameras connected.
+diagnostics. The PID pane's log sliders tune the gains live, and its
+**AUTOTUNE** button hands them to the online auto-tuner while tracking.
+Shown here in simulation with the mount and both cameras connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 

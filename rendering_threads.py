@@ -37,6 +37,111 @@ STAR_LABEL_CACHE = {}
 # Polar plot constants (must match tracking_visuals.py)
 POLAR_RADIUS_OFFSET = 50
 
+# ---- Mount keepout overlay ---------------------------------------------------
+# The azm/alt safety limits are MOUNT-frame quantities, so the sky region they
+# forbid depends on the mount mode + alignment (in AltAz-Side/Eq it is not an
+# az/el-aligned band at all). Painted as a very light red wash on the polar
+# plot so target picking can account for the keepouts. Built once at low
+# resolution and smoothscaled (the boundary is soft anyway), cached per
+# (limits, mode, alignment, radius) until the config that shapes it changes.
+# Pointing-model corrections (sub-degree) are invisible at plot scale but ride
+# along anyway since the scan uses the loop's own command transform.
+_KEEPOUT_ALPHA = 40
+# Scan resolution: high enough that a keepout wedge converging at the zenith
+# (constant azimuth width -> geometrically thin near the plot center) still
+# paints there instead of being diluted away by the smoothscale.
+_KEEPOUT_LATTICE = 160         # scan edge, pixels (~20k transform calls, one-time)
+_keepout_cache = {}            # cache key -> overlay surface (or None on error)
+
+
+def _keepout_cache_key(config_state, radius):
+    return (
+        radius,
+        getattr(config_state, 'mount_mode', 'AltAz'),
+        bool(getattr(config_state, 'altaz_side_flip', False)),
+        str(getattr(config_state, 'azm_limit_min_str', '')),
+        str(getattr(config_state, 'azm_limit_max_str', '')),
+        str(getattr(config_state, 'alt_limit_min_str', '')),
+        str(getattr(config_state, 'alt_limit_max_str', '')),
+        str(getattr(config_state, 'alignment_azimuth_str', '')),
+        str(getattr(config_state, 'alignment_elevation_str', '')),
+        str(getattr(config_state, 'lat_str', '')),  # Eq default pole altitude
+    )
+
+
+def _build_keepout_surface(config_state, radius):
+    """Reachability scan over the sky dome -> smoothscaled keepout wash.
+
+    A sky direction is kept out when NO mount-axis solution the tracking loop
+    would consider lands inside the configured limits: the canonical solution
+    always, plus the over-the-zenith flip in the modes where
+    control.choose_mount_target actually offers it (AltAz/Passthrough). Using
+    the same mount_target_for transform + limit comparison as the loop keeps
+    the painted region consistent with where PROGRAM track would refuse to go.
+    """
+    from control import mount_target_for
+    try:
+        azm_min = float(config_state.azm_limit_min_str)
+        azm_max = float(config_state.azm_limit_max_str)
+        alt_min = float(config_state.alt_limit_min_str)
+        alt_max = float(config_state.alt_limit_max_str)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    mount_mode = getattr(config_state, 'mount_mode', 'AltAz')
+    flips = (False, True) if mount_mode in ('AltAz', 'Passthrough') else (False,)
+
+    n = _KEEPOUT_LATTICE
+    small = pygame.Surface((n, n), pygame.SRCALPHA)
+    small.fill((0, 0, 0, 0))
+    half = (n - 1) / 2.0
+    keepout_rgba = (255, 70, 70, _KEEPOUT_ALPHA)
+    for iy in range(n):
+        for ix in range(n):
+            dx = (ix - half) / half      # -1..1, +x = east
+            dy = (iy - half) / half      # -1..1, +y = screen down = south
+            r = math.hypot(dx, dy)
+            if r > 1.0:
+                continue
+            el = 90.0 * (1.0 - r)        # plot projection: r=(90-el)/90
+            az = math.degrees(math.atan2(dx, -dy)) % 360.0
+            reachable = False
+            for flip in flips:
+                try:
+                    azm, alt = mount_target_for(config_state, az, el, flip)
+                except Exception:
+                    continue
+                if azm_min <= azm <= azm_max and alt_min <= alt <= alt_max:
+                    reachable = True
+                    break
+            if not reachable:
+                small.set_at((ix, iy), keepout_rgba)
+    scaled = pygame.transform.smoothscale(small, (2 * radius, 2 * radius))
+    # Clip to the horizon disc so smoothscale bleed can't tint the ring of
+    # azimuth labels outside the white horizon circle.
+    clip = pygame.Surface((2 * radius, 2 * radius), pygame.SRCALPHA)
+    pygame.draw.circle(clip, (255, 255, 255, 255), (radius, radius), radius)
+    scaled.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    return scaled
+
+
+def draw_keepout_overlay_on_surface(surface, config_state, cx, cy, radius):
+    """Blit the (cached) mount-keepout wash centered on the polar plot.
+    Cache is keyed on everything that shapes the region; a rebuild costs a
+    few hundred ms ONCE on the rendering thread when limits/mode change."""
+    key = _keepout_cache_key(config_state, radius)
+    if key not in _keepout_cache:
+        if len(_keepout_cache) > 6:   # two plot sizes x a few config edits
+            _keepout_cache.clear()
+        try:
+            _keepout_cache[key] = _build_keepout_surface(config_state, radius)
+        except Exception as e:
+            print(f"Keepout overlay error: {e}")
+            _keepout_cache[key] = None
+    overlay = _keepout_cache[key]
+    if overlay is not None:
+        surface.blit(overlay, (cx - radius, cy - radius))
+
+
 # ==============================================================================
 # SURFACE-BASED DRAWING FUNCTIONS FOR THREADED RENDERING
 # ==============================================================================
@@ -187,6 +292,11 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
         cy = surface_height // 2
 
     radius = min(surface_width, surface_height) // 2 - 50
+
+    # Mount keepout wash (very light red): sky directions whose mount-axis
+    # solutions all fall outside the configured safety limits. Drawn first so
+    # the grid, mask circle, stars, and satellites stay readable on top.
+    draw_keepout_overlay_on_surface(surface, config_state, cx, cy, radius)
 
     # Draw elevation mask circle first (thick red)
     mask_radius = (90 - elevation_mask) / 90 * radius

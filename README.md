@@ -74,6 +74,16 @@ orbital elements, camera FOV footprints, and a scrollable pass table.
 
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
+Both polar plots shade the **mount keepout** in light red: every sky direction
+whose mount-axis solutions all fall outside the configured safety limits,
+computed through the active mount mode's command transform (including the
+over-the-zenith flip the tracking loop may use in AltAz) — so you can see at a
+glance which targets and passes are flyable before picking one. Shown here
+with an azimuth keepout wedge around north and a mount-ALT ceiling that
+forbids the lowest elevations:
+
+![Keepout overlay](doc/screenshots/keepout_overlay.png)
+
 **Joystick Loop** — the operational screen: live camera feeds (with boresight
 crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
 strip charts, mount connection/position status, tracking mode, and PID

@@ -811,6 +811,14 @@ class HardwareSimulator:
             # Residual mount errors (cone/index/flexure) on top of the polar misalignment:
             # distort the mount HA/Dec by the injected equatorial model before the pole geometry.
             h_m, d_m = self.mount.az_true_deg, self.mount.el_true_deg
+            if mount_mode == 'AltAz-Side':
+                # Index-mark home: encoder (0,0) points the scope ALONG the
+                # pole (H = AZM + h0, dec = 90 - ALT). Mirrors
+                # transformations.AzAlt2AzEl_AltAzSide.
+                from transformations import ALTAZ_SIDE_H0_DEG
+                h0 = (-ALTAZ_SIDE_H0_DEG if getattr(cfg, 'altaz_side_flip', False)
+                      else ALTAZ_SIDE_H0_DEG)
+                h_m, d_m = h_m + h0, 90.0 - d_m
             eqterms = s.get('mount_eq_pointing_model') or None
             if eqterms and any(abs(float(v)) > 0.0 for v in eqterms.values()):
                 from eq_pointing_model import EquatorialPointingModel

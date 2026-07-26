@@ -366,13 +366,15 @@ fn AzEl2AzAlt_AltAz(az: f64, el: f64, alignment_azimuth: f64, alignment_elevatio
 }
 
 #[pyfunction]
-fn AzAlt2AzEl_AltAzSide(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
-    core_tf::az_alt_to_az_el_altaz_side(azm, alt, alignment_azimuth)
+#[pyo3(signature = (azm, alt, alignment_azimuth, flip=false))]
+fn AzAlt2AzEl_AltAzSide(azm: f64, alt: f64, alignment_azimuth: f64, flip: bool) -> (f64, f64) {
+    core_tf::az_alt_to_az_el_altaz_side(azm, alt, alignment_azimuth, flip)
 }
 
 #[pyfunction]
-fn AzEl2AzAlt_AltAzSide(az: f64, el: f64, alignment_azimuth: f64) -> (f64, f64) {
-    core_tf::az_el_to_az_alt_altaz_side(az, el, alignment_azimuth)
+#[pyo3(signature = (az, el, alignment_azimuth, flip=false))]
+fn AzEl2AzAlt_AltAzSide(az: f64, el: f64, alignment_azimuth: f64, flip: bool) -> (f64, f64) {
+    core_tf::az_el_to_az_alt_altaz_side(az, el, alignment_azimuth, flip)
 }
 
 #[pyfunction]
@@ -464,6 +466,11 @@ impl SimCoreLoop {
     }
     fn set_mount_mode(&self, mode: &str) -> PyResult<()> {
         self.shared.inputs.lock().unwrap().mount_mode = parse_mount_mode(mode)?;
+        Ok(())
+    }
+
+    fn set_altaz_side_flip(&self, flip: bool) -> PyResult<()> {
+        self.shared.inputs.lock().unwrap().altaz_side_flip = flip;
         Ok(())
     }
     fn set_alignment(&self, az: f64, el: f64) {
@@ -652,6 +659,11 @@ fn h_set_rate_cmd(sh: &Shared, azm: i32, alt: i32) {
 }
 fn h_set_mount_mode(sh: &Shared, s: &str) -> PyResult<()> {
     sh.inputs.lock().unwrap().mount_mode = parse_mount_mode(s)?;
+    Ok(())
+}
+
+fn h_set_altaz_side_flip(sh: &Shared, flip: bool) -> PyResult<()> {
+    sh.inputs.lock().unwrap().altaz_side_flip = flip;
     Ok(())
 }
 fn h_set_alignment(sh: &Shared, az: f64, el: f64) {
@@ -918,6 +930,10 @@ impl CoreLoop {
     }
     fn set_mount_mode(&self, mode: &str) -> PyResult<()> {
         h_set_mount_mode(self.inner.shared(), mode)
+    }
+
+    fn set_altaz_side_flip(&self, flip: bool) -> PyResult<()> {
+        h_set_altaz_side_flip(self.inner.shared(), flip)
     }
     fn set_alignment(&self, az: f64, el: f64) {
         h_set_alignment(self.inner.shared(), az, el);

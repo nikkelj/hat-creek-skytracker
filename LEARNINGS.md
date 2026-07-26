@@ -6,6 +6,34 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — AltAz-Side home is the AVX index marks, not the zenith
+
+First PROGRAM track in the new side-mount mode drove the scope into the
+ground while the UI self-consistently displayed el +49°, and jog polarity
+*appeared* wrong on both axes. Root cause: the mode's transforms assumed
+encoder (0, 0) = zenith, but the natural (and mechanically meaningful) home
+on the AVX is the **index marks — where the scope points ALONG the polar
+axis**. In the side rig that's at the *horizon*, at the pole azimuth, with
+the dec axis vertical. The decisive field datum: at the index marks the
+scope sat on the horizon at az 259° while the model read el +17.7° — exactly
+asin(cos ALT · cos AZM) of the encoder values, confirming a coherent model
+with the wrong home.
+
+Fix: H = AZM + 90°, dec = 90° − ALT (`ALTAZ_SIDE_H0_DEG`), which also makes
+the axes behave as originally described from home (+ALT walks the horizon —
+identically 0 elevation, a strong test — and AZM sweeps the vertical circle
+once off the pole). `altaz_side_flip` mirrors the H origin for a rig laid
+down on its other side. Field procedure: index marks → Tare → enter the
+azimuth the scope points at as Alignment Azimuth.
+
+Meta-lessons: (1) an apparent *polarity* error on both axes was actually an
+*index* error — near H = 90° the sign of ∂el/∂ALT flips, so a 90° home
+offset masquerades as reversed axes; (2) "the UI agrees with itself" proves
+nothing — the navball, skyplot and FOV boxes all read from the same wrong
+transform; only an independent physical reference (the horizon) broke the
+tie; (3) define a mode's home as something the operator can *find* with the
+hardware's own markings, not an attitude they must eyeball.
+
 ## 2026-07-25 — AVX guide-rate wire unit is arcsec/s × 1024, not rev/s × 2²⁴
 
 First hardware run of `bench_guiderate.py` (checklist step 2): every commanded

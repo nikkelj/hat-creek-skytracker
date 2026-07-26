@@ -268,16 +268,39 @@ pub fn compute_fov_for_camera(
     }
 }
 
+/// Side-mount index-home offset (deg). Field-calibrated 2026-07-26: at the
+/// AVX index marks the scope points ALONG the horizontal polar axis (at the
+/// horizon, azimuth `alignment_azimuth`) with the dec axis vertical, so
+/// H = AZM + 90 and dec = 90 - ALT. Mirrors
+/// transformations.ALTAZ_SIDE_H0_DEG; `flip` mirrors the H origin for a rig
+/// laid down on its other side.
+pub const ALTAZ_SIDE_H0_DEG: f64 = 90.0;
+
+#[inline]
+fn altaz_side_h0(flip: bool) -> f64 {
+    if flip {
+        -ALTAZ_SIDE_H0_DEG
+    } else {
+        ALTAZ_SIDE_H0_DEG
+    }
+}
+
 /// Side-mounted AltAz (mount lying on its side for center-of-gravity):
 /// mount (AZM, ALT) -> true sky (az, el). The AZM axis is HORIZONTAL,
 /// pointing at azimuth `alignment_azimuth`; geometrically an equatorial
-/// mount whose pole sits ON the horizon (AZM = hour angle, ALT =
-/// declination). Mirrors transformations.AzAlt2AzEl_AltAzSide, which is
-/// eq_mount_to_azel with pole_alt exactly 0: basis p = pole (horizontal),
-/// x = zenith (up - (up.p)p with up.p = 0), y = p x up.
-pub fn az_alt_to_az_el_altaz_side(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
-    let h = azm.to_radians();
-    let d = alt.to_radians();
+/// mount whose pole sits ON the horizon, with the AVX index marks as the
+/// encoder home (H = AZM + h0, dec = 90 - ALT). Mirrors
+/// transformations.AzAlt2AzEl_AltAzSide, which is eq_mount_to_azel with
+/// pole_alt exactly 0: basis p = pole (horizontal), x = zenith
+/// (up - (up.p)p with up.p = 0), y = p x up.
+pub fn az_alt_to_az_el_altaz_side(
+    azm: f64,
+    alt: f64,
+    alignment_azimuth: f64,
+    flip: bool,
+) -> (f64, f64) {
+    let h = (azm + altaz_side_h0(flip)).to_radians();
+    let d = (90.0 - alt).to_radians();
     let a0 = alignment_azimuth.to_radians();
     // v = cos(d)cos(h)*x + cos(d)sin(h)*y + sin(d)*p in (north, east, up)
     // with x = (0,0,1), y = (sin a0, -cos a0, 0), p = (cos a0, sin a0, 0).
@@ -290,10 +313,15 @@ pub fn az_alt_to_az_el_altaz_side(azm: f64, alt: f64, alignment_azimuth: f64) ->
 }
 
 /// Inverse of `az_alt_to_az_el_altaz_side`: true sky (az, el) -> mount
-/// (AZM, ALT). Mirrors transformations.AzEl2AzAlt_AltAzSide (azel_to_eq_mount
-/// with pole_alt = 0): dec = asin(v.p), ha = atan2(v.y, v.x), both in
-/// (-180, 180] like Python's atan2/asin (no rem_euclid on AZM).
-pub fn az_el_to_az_alt_altaz_side(az: f64, el: f64, alignment_azimuth: f64) -> (f64, f64) {
+/// (AZM, ALT). Mirrors transformations.AzEl2AzAlt_AltAzSide: the eq-frame
+/// (ha, dec) = (asin(v.p), atan2(v.y, v.x)) solution mapped back through the
+/// index home, AZM = (ha - h0) mod 360, ALT = 90 - dec.
+pub fn az_el_to_az_alt_altaz_side(
+    az: f64,
+    el: f64,
+    alignment_azimuth: f64,
+    flip: bool,
+) -> (f64, f64) {
     let a = az.to_radians();
     let e = el.to_radians();
     let a0 = alignment_azimuth.to_radians();
@@ -302,7 +330,7 @@ pub fn az_el_to_az_alt_altaz_side(az: f64, el: f64, alignment_azimuth: f64) -> (
     let up = e.sin();
     let dec = (north * a0.cos() + east * a0.sin()).clamp(-1.0, 1.0).asin().to_degrees();
     let ha = (north * a0.sin() - east * a0.cos()).atan2(up).to_degrees();
-    (ha, dec)
+    ((ha - altaz_side_h0(flip)).rem_euclid(360.0), 90.0 - dec)
 }
 
 /// Mount mode selector for the control loop's sky->mount transform.
@@ -317,16 +345,20 @@ pub enum MountMode {
 /// Sky (az, el) -> mount (azm, alt) for the given mount mode. This is the
 /// transform the PROGRAM control path uses each cycle. For Eq mode, `lat_deg`
 /// is the configured alignment elevation (matching control.py's call site).
+/// `altaz_side_flip` selects the side-mount tip side (ignored elsewhere).
 pub fn sky_to_mount(
     mode: MountMode,
     az: f64,
     el: f64,
     alignment_azimuth: f64,
     alignment_elevation: f64,
+    altaz_side_flip: bool,
 ) -> (f64, f64) {
     match mode {
         MountMode::AltAz => az_el_to_az_alt_altaz(az, el, alignment_azimuth, alignment_elevation),
-        MountMode::AltAzSide => az_el_to_az_alt_altaz_side(az, el, alignment_azimuth),
+        MountMode::AltAzSide => {
+            az_el_to_az_alt_altaz_side(az, el, alignment_azimuth, altaz_side_flip)
+        }
         MountMode::Passthrough => az_el_to_az_alt_passthrough(az, el),
         // Eq: lat is the alignment elevation; returns (alt, azm) -> reorder.
         MountMode::Eq => {

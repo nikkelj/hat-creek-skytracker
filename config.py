@@ -187,7 +187,14 @@ class ConfigState:
         # (mount lying on its side: the az axis is HORIZONTAL at
         # alignment_azimuth -- equatorial geometry with the pole on the
         # horizon), "Eq" (polar-aligned wedge), or "Passthrough".
+        # AltAz-Side field setup: put both axes on the AVX index marks
+        # (scope points along the polar axis, at the horizon), Tare, and
+        # enter the azimuth the scope points at as Alignment Azimuth.
         self.mount_mode = "AltAz"
+        # AltAz-Side tip side: False = first +ALT jog from the index marks
+        # sweeps toward alignment_azimuth - 90; True = mirrored rig (laid
+        # down on its other side), sweeps toward alignment_azimuth + 90.
+        self.altaz_side_flip = False
 
         # Continuous-rate tracking: issue the fine 24-bit variable-rate
         # (MC_SET_POS/NEG_GUIDERATE) command for smooth tracking instead of the
@@ -335,6 +342,7 @@ class ConfigState:
             "pid_output_filter_tau_sec": self.pid_output_filter_tau_sec,
             "sim_config": self.sim_config,
             "mount_mode": self.mount_mode,
+            "altaz_side_flip": self.altaz_side_flip,
             "use_rust_core_loop": self.use_rust_core_loop,
             "rust_core_loop_hz": self.rust_core_loop_hz,
             "continuous_rate_tracking": self.continuous_rate_tracking,
@@ -436,6 +444,7 @@ class ConfigState:
 
         # Load mount mode
         self.mount_mode = config_dict.get("mount_mode", self.mount_mode)
+        self.altaz_side_flip = bool(config_dict.get("altaz_side_flip", self.altaz_side_flip))
 
         # Load experimental Rust core loop toggle
         self.use_rust_core_loop = config_dict.get("use_rust_core_loop", self.use_rust_core_loop)

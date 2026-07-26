@@ -361,6 +361,9 @@ class RustCoreLoopAdapter:
             float(getattr(cfg, "alt_offset_str", 0.0) or 0.0),
         )
         loop.set_mount_mode(_mount_mode_str(cfg))
+        # Side-mount tip side (older wheels predate the setter).
+        if hasattr(loop, "set_altaz_side_flip"):
+            loop.set_altaz_side_flip(bool(getattr(cfg, "altaz_side_flip", False)))
         loop.set_continuous_rate(
             bool(getattr(cfg, "continuous_rate_tracking", False)),
             float(getattr(cfg, "guide_rate_max_dps", 5.0)),

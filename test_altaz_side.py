@@ -5,6 +5,12 @@ mount's AZM axis is HORIZONTAL (pointing at azimuth alignment_azimuth) and
 sweeps a vertical great circle, while the ALT axis initially sweeps the
 horizon. Geometrically an equatorial mount whose pole sits ON the horizon.
 
+HOME CONVENTION (field-calibrated 2026-07-26): encoder (0, 0) = the AVX
+index marks, where the scope points ALONG the horizontal polar axis -- at the
+horizon, at azimuth alignment_azimuth -- and the dec axis stands vertical.
+So H = AZM + 90 and dec = 90 - ALT (flip mirrors the H origin for a rig laid
+on its other side).
+
 Covers the transform pair's round trip, the physical semantics the rig was
 built around, the control-path dispatch (sky_target_to_mount), and that the
 axis-flip search stays disabled (the mirrored-sky trick has no second solution
@@ -24,6 +30,7 @@ class _Cfg:
     alignment_azimuth_str = "30.0"
     alignment_elevation_str = "0.0"
     lat_str = "40.0"  # must be IGNORED in this mode (no latitude fallback)
+    altaz_side_flip = False
     pointing_model_enabled = False
     eq_pointing_model_enabled = False
 
@@ -35,10 +42,10 @@ class TransformRoundTrip(unittest.TestCase):
             for az in range(0, 360, 30):
                 for el in range(-75, 90, 15):
                     azm, alt = AzEl2AzAlt_AltAzSide(az, el, a0)
-                    # |ALT| -> 90 means the boresight lies along the horizontal
-                    # pole itself, where mount azimuth is undefined (gimbal
-                    # pole of the mount frame); skip the singular ring.
-                    if abs(abs(alt) - 90.0) < 0.5:
+                    # ALT -> 0 or 180 means the boresight lies along the
+                    # horizontal pole itself (dec +/-90), where mount azimuth
+                    # is undefined (gimbal pole); skip the singular ring.
+                    if min(alt % 360.0, 360.0 - (alt % 360.0)) < 0.5 or abs(alt - 180.0) < 0.5:
                         continue
                     raz, rel = AzAlt2AzEl_AltAzSide(azm, alt, a0)
                     self.assertAlmostEqual((raz - az + 180.0) % 360.0 - 180.0, 0.0,
@@ -48,27 +55,42 @@ class TransformRoundTrip(unittest.TestCase):
 
 class RigSemantics(unittest.TestCase):
     """The behaviors the side-mounted rig is defined by (pole az = 0: the
-    mount's horizontal AZM axis points due north)."""
+    mount's horizontal AZM axis points due north). Home = AVX index marks."""
 
-    def test_mount_zero_points_at_zenith(self):
+    def test_index_home_points_along_the_pole(self):
+        # At the index marks the scope points along the horizontal polar
+        # axis: at the horizon, at the pole azimuth. (First field session:
+        # scope at index read horizon az 259 with Alignment Azimuth 259.)
         az, el = AzAlt2AzEl_AltAzSide(0.0, 0.0, 0.0)
-        self.assertAlmostEqual(el, 90.0, places=9)
+        self.assertAlmostEqual(el, 0.0, places=9)
+        self.assertAlmostEqual(az % 360.0, 0.0, places=9)
+
+    def test_alt_axis_sweeps_the_horizon_from_home(self):
+        # "What is normally Alt sweeps the horizon": from the index marks,
+        # +ALT stays at elevation 0 and walks azimuth toward pole_az - 90.
+        for a in (5.0, 30.0, 60.0, 120.0):
+            az, el = AzAlt2AzEl_AltAzSide(0.0, a, 0.0)
+            self.assertAlmostEqual(el, 0.0, places=9)
+            self.assertAlmostEqual(az, (-a) % 360.0, places=9)
 
     def test_azm_axis_sweeps_a_vertical_circle(self):
-        # "What is normally Az sweeps like Alt": AZM motion at ALT=0 changes
-        # elevation along the vertical great circle through the zenith.
+        # "What is normally Az sweeps like Alt": with the boresight off the
+        # pole (ALT=90 -> dec 0), AZM motion sweeps the vertical great circle
+        # through the zenith; AZM=270 is the zenith itself.
+        az, el = AzAlt2AzEl_AltAzSide(270.0, 90.0, 0.0)
+        self.assertAlmostEqual(el, 90.0, places=9)
         for h in (10.0, 45.0, 80.0):
-            az, el = AzAlt2AzEl_AltAzSide(h, 0.0, 0.0)
+            az, el = AzAlt2AzEl_AltAzSide(270.0 + h, 90.0, 0.0)
             self.assertAlmostEqual(el, 90.0 - h, places=9)
-            self.assertAlmostEqual(az, 270.0, places=9)  # west side of the circle
+            self.assertAlmostEqual(az, 270.0, places=9)  # pole_az - 90 side
 
-    def test_alt_axis_sweeps_the_horizon(self):
-        # "What is normally Alt sweeps the horizon": with the boresight on the
-        # horizon (AZM=90), ALT motion stays at elevation 0 and walks azimuth.
-        for d in (-60.0, -20.0, 0.0, 20.0, 60.0):
-            az, el = AzAlt2AzEl_AltAzSide(90.0, d, 0.0)
+    def test_flip_mirrors_the_alt_sweep(self):
+        # A rig laid down on its other side: +ALT walks the horizon the
+        # other way (toward pole_az + 90).
+        for a in (5.0, 30.0, 60.0):
+            az, el = AzAlt2AzEl_AltAzSide(0.0, a, 0.0, flip=True)
             self.assertAlmostEqual(el, 0.0, places=9)
-            self.assertAlmostEqual(az, (270.0 + d) % 360.0, places=9)
+            self.assertAlmostEqual(az, a % 360.0, places=9)
 
     def test_pole_azimuth_rotates_the_frame(self):
         # Rotating the rig (alignment_azimuth) rotates the whole sky mapping.
@@ -96,6 +118,15 @@ class ControlPathDispatch(unittest.TestCase):
         cfg.lat_str = "77.0"  # would shift the answer if it leaked in
         got = sky_target_to_mount(cfg, 200.0, 10.0)
         want = AzEl2AzAlt_AltAzSide(200.0, 10.0, 30.0)
+        self.assertAlmostEqual(got[0], want[0], places=9)
+        self.assertAlmostEqual(got[1], want[1], places=9)
+
+    def test_flip_config_reaches_the_transform(self):
+        from control import sky_target_to_mount
+        cfg = _Cfg()
+        cfg.altaz_side_flip = True
+        got = sky_target_to_mount(cfg, 123.0, 40.0)
+        want = AzEl2AzAlt_AltAzSide(123.0, 40.0, 30.0, flip=True)
         self.assertAlmostEqual(got[0], want[0], places=9)
         self.assertAlmostEqual(got[1], want[1], places=9)
 

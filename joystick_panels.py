@@ -2322,10 +2322,11 @@ def render_navball(display, joystick_state):
                                      joystick_state.current_alt, align_az)
         elif mount_mode == 'AltAz-Side':
             # Side-mounted rig: equatorial forward transform, pole on the
-            # horizon at alignment_azimuth
+            # horizon at alignment_azimuth (index-mark home)
             from transformations import AzAlt2AzEl_AltAzSide
             az, el = AzAlt2AzEl_AltAzSide(joystick_state.current_azm,
-                                          joystick_state.current_alt, align_az)
+                                          joystick_state.current_alt, align_az,
+                                          flip=bool(getattr(cfg, 'altaz_side_flip', False)))
         else:
             from transformations import AzAlt2AzEl
             az, el = AzAlt2AzEl(joystick_state.current_azm,

@@ -393,7 +393,8 @@ def sky_target_to_mount(config_state, target_az_deg, target_el_deg):
         from transformations import AzEl2AzAlt_AltAzSide
         target_azm_deg, target_alt_deg = AzEl2AzAlt_AltAzSide(
             target_az_deg, target_el_deg,
-            float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0))
+            float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0),
+            flip=bool(getattr(config_state, 'altaz_side_flip', False)))
     else:
         # Equatorial mode: convert the target sky position to mount (hour-angle, dec) axes
         # for a polar axis pointing at (pole_az, pole_alt). pole_az defaults to due north

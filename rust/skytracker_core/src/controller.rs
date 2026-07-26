@@ -78,6 +78,8 @@ pub struct Inputs {
     pub mount_mode: MountMode,
     pub alignment_az: f64,
     pub alignment_el: f64,
+    /// Side-mount tip side for MountMode::AltAzSide (see transforms).
+    pub altaz_side_flip: bool,
     pub setpoint: Option<Setpoint>,
     pub ff_azm_enabled: bool,
     pub ff_alt_enabled: bool,
@@ -119,6 +121,7 @@ impl Default for Inputs {
             mount_mode: MountMode::AltAz,
             alignment_az: 0.0,
             alignment_el: 0.0,
+            altaz_side_flip: false,
             setpoint: None,
             ff_azm_enabled: false,
             ff_alt_enabled: false,
@@ -430,6 +433,7 @@ impl LoopState {
             led_el,
             inputs.alignment_az,
             inputs.alignment_el,
+            inputs.altaz_side_flip,
         );
         let (azm_min, azm_max) = inputs.azm_limit;
         let (alt_min, alt_max) = inputs.alt_limit;
@@ -454,6 +458,7 @@ impl LoopState {
                 180.0 - led_el,
                 inputs.alignment_az,
                 inputs.alignment_el,
+                inputs.altaz_side_flip,
             );
             let canon_ok = in_limits(canon);
             let flip_ok = in_limits(flip);

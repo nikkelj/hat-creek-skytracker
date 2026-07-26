@@ -1283,11 +1283,12 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                         )
                     elif mount_mode == 'AltAz-Side':
                         # Side-mounted rig: equatorial forward transform with the
-                        # pole on the horizon at alignment_azimuth
+                        # pole on the horizon at alignment_azimuth (index home)
                         from transformations import AzAlt2AzEl_AltAzSide
                         true_az, true_el = AzAlt2AzEl_AltAzSide(
                             current_azm, current_alt,
-                            alignment_azimuth
+                            alignment_azimuth,
+                            flip=bool(getattr(self.config_state, 'altaz_side_flip', False))
                         )
                     else:
                         # Use full equatorial transformation for Eq mode
@@ -1531,11 +1532,12 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         )
                     elif mount_mode == 'AltAz-Side':
                         # Side-mounted rig: equatorial forward transform with the
-                        # pole on the horizon at alignment_azimuth
+                        # pole on the horizon at alignment_azimuth (index home)
                         from transformations import AzAlt2AzEl_AltAzSide
                         true_az, true_el = AzAlt2AzEl_AltAzSide(
                             current_azm, current_alt,
-                            alignment_azimuth
+                            alignment_azimuth,
+                            flip=bool(getattr(self.config_state, 'altaz_side_flip', False))
                         )
                     else:
                         # Use full equatorial transformation for Eq mode

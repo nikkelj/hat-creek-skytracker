@@ -1,0 +1,54 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Rust: rebuild skytracker_core (maturin develop --release)",
+            "type": "shell",
+            "command": "C:\\Users\\nikke\\anaconda3\\envs\\track\\Scripts\\maturin.exe",
+            "args": ["develop", "--release"],
+            "options": {
+                "cwd": "${workspaceFolder}/rust/skytracker_core",
+                "env": {
+                    // maturin needs the conda env "active" to find the target
+                    // interpreter; CARGO_TARGET_DIR must stay outside OneDrive
+                    // or the final link step fails (LNK1114, sync file locks).
+                    "CONDA_PREFIX": "C:\\Users\\nikke\\anaconda3\\envs\\track",
+                    "CARGO_TARGET_DIR": "C:\\Users\\nikke\\rust-build"
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Rust: cargo test (skytracker_core)",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["test"],
+            "options": {
+                "cwd": "${workspaceFolder}/rust/skytracker_core",
+                "env": {
+                    "CARGO_TARGET_DIR": "C:\\Users\\nikke\\rust-build"
+                }
+            },
+            "group": "test",
+            "problemMatcher": ["$rustc"]
+        },
+        {
+            "label": "Tests: full pytest suite",
+            "type": "shell",
+            "command": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python.exe",
+            "args": ["-m", "pytest", "-q"],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}

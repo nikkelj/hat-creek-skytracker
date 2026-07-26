@@ -1,0 +1,10 @@
+{
+    "python.defaultInterpreterPath": "C:\\Users\\nikke\\anaconda3\\envs\\track\\python.exe",
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestArgs": ["."],
+    "rust-analyzer.linkedProjects": ["rust/skytracker_core/Cargo.toml"],
+    "rust-analyzer.cargo.extraEnv": {
+        "CARGO_TARGET_DIR": "C:\\Users\\nikke\\rust-build"
+    }
+}

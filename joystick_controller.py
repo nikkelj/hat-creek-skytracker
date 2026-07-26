@@ -23,7 +23,7 @@ class TrackingMode(Enum):
     MTI = 6          # MTI mode (stub)
 
 # Import existing components
-from lib.auxstar import NexstarHandController, RATES, Targets
+from lib.auxstar import NexstarHandController, RATES, Targets, GUIDE_COUNTS_PER_DPS
 from tracking_visuals import PolarPlotMode
 from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
@@ -263,6 +263,10 @@ class JoystickModeState:
         self.joysticks = {}  # Dict of active joysticks
         self.connected_joystick = None  # Currently active joystick
         self.joystick_tare = {}  # Tare values for deadzone calibration
+        # Last rate command actually sent per axis: {target: (wire_key, time)}.
+        # See _send_rate_command -- unchanged commands are not re-sent (the
+        # firmware holds the rate; the 9600-baud wire is the loop bottleneck).
+        self._rate_cmd_cache = {}
         self.stopped = False  # Stop button state
 
         # Tracking mode state
@@ -1910,7 +1914,16 @@ class JoystickModeState:
             dps = max(-float(max_dps), min(float(max_dps), dps))
         if getattr(cfg, 'continuous_rate_tracking', False) and hasattr(self.telescope_controller, 'hc_set_rate_dps'):
             if abs(dps) <= float(getattr(cfg, 'guide_rate_max_dps', 5.0)):
-                self.telescope_controller.hc_set_rate_dps(target, dps)
+                # Dedup: the firmware HOLDS the last commanded rate, and each
+                # AUX transaction costs ~30 ms of 9600-baud wire time (measured
+                # 2026-07-26: full read+command cycle = 7.7 Hz vs 15 Hz target;
+                # reads alone support ~16 Hz). Resend only when the wire-
+                # quantized value changes, with a keepalive so an out-of-band
+                # stop can't leave the cache lying for more than a second.
+                wire = ('g', int(round(dps * GUIDE_COUNTS_PER_DPS)))
+                if not self._rate_cmd_repeats(target, wire):
+                    self.telescope_controller.hc_set_rate_dps(target, dps)
+                    self._rate_cmd_cache[target] = (wire, time.monotonic())
                 return dps
         if max_dps is not None and discrete_cmd != 0:
             sign = 1 if discrete_cmd > 0 else -1
@@ -1920,9 +1933,24 @@ class JoystickModeState:
             while mag > 1 and RATES.get(mag, 0.0) * 360.0 > float(max_dps):
                 mag -= 1
             discrete_cmd = sign * mag
-        self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+        # Same dedup for the discrete path: MC_MOVE also persists until changed.
+        wire = ('m', int(discrete_cmd))
+        if not self._rate_cmd_repeats(target, wire):
+            self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+            self._rate_cmd_cache[target] = (wire, time.monotonic())
         sign = 1.0 if discrete_cmd >= 0 else -1.0
         return sign * RATES.get(abs(int(discrete_cmd)), 0.0) * 360.0
+
+    # Resend an unchanged rate at least this often: bounds how long a stale
+    # cache entry can mask an out-of-band stop/change sent past the cache.
+    RATE_CMD_KEEPALIVE_SEC = 1.0
+
+    def _rate_cmd_repeats(self, target, wire):
+        """True when `wire` matches the last command sent to `target` recently
+        enough that the firmware is already holding it (skip the transaction)."""
+        last = self._rate_cmd_cache.get(target)
+        return (last is not None and last[0] == wire
+                and time.monotonic() - last[1] < self.RATE_CMD_KEEPALIVE_SEC)
 
     PARK_TIMEOUT_SEC = 90.0
     PARK_TOLERANCE_DEG = 1.0

@@ -172,7 +172,11 @@ class HotspotIntegrationTests(unittest.TestCase):
         self.assertEqual(state.hotspot_miss_count, 0)
         self.assertTrue(state.hotspot_acquired)
 
-        # A new frame (seq bump) is processed and commands again.
+        # A new frame (seq bump) is processed and commands again. The blob
+        # moves so the correction differs: the rate-command dedup layer
+        # (deliberately) suppresses re-sends of an IDENTICAL rate, so a
+        # same-position blob would be processed without a visible send.
+        cam.thread.raw = blob_frame(cx=180, cy=110)
         cam.thread.latest_raw_seq += 1
         state.hotspot_track()
         self.assertGreater(len(state.telescope_controller.cmds), n_cmds)

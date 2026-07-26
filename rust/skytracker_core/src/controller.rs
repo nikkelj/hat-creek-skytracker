@@ -257,7 +257,18 @@ pub struct LoopState {
     // cleared setpoint (target set / deselected) commands an explicit stop
     // once instead of silently leaving the mount at its last commanded rate.
     program_had_setpoint: bool,
+
+    // Rate-command dedup: last wire command actually sent per axis
+    // (kind: 0 = guide-rate counts, 1 = discrete MC_MOVE step; value; time).
+    // The firmware holds the last rate and each AUX transaction costs ~30 ms
+    // of 9600-baud wire time (measured 2026-07-26: full read+command cycle
+    // ran 7.7 Hz vs the 15 Hz target), so unchanged commands are skipped,
+    // with a keepalive bounding staleness against out-of-band stops.
+    pub last_wire_cmd: [Option<(u8, i64, f64)>; 2],
 }
+
+/// Resend an unchanged rate at least this often (see `last_wire_cmd`).
+pub const RATE_CMD_KEEPALIVE_SEC: f64 = 1.0;
 
 impl LoopState {
     pub fn new() -> Self {
@@ -281,7 +292,21 @@ impl LoopState {
             track_candidates: Vec::new(),
             handoff_detection_count: 0,
             program_had_setpoint: false,
+            last_wire_cmd: [None, None],
         }
+    }
+
+    /// True when `wire` (kind, value) matches the last command sent to axis
+    /// slot `idx` recently enough that the firmware is already holding it.
+    /// Records the send otherwise. Call exactly once per actuation decision.
+    pub fn wire_cmd_repeats(&mut self, idx: usize, kind: u8, value: i64, now: f64) -> bool {
+        if let Some((k, v, t)) = self.last_wire_cmd[idx] {
+            if k == kind && v == value && now - t < RATE_CMD_KEEPALIVE_SEC {
+                return true;
+            }
+        }
+        self.last_wire_cmd[idx] = Some((kind, value, now));
+        false
     }
 
     fn dt(&mut self, now: f64) -> f64 {

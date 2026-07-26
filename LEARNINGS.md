@@ -6,6 +6,29 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — The 9600-baud wire caps the control loop at ~8 Hz; dedup rate commands
+
+`bench_guiderate.py --throughput` on the real AVX: every AUX transaction costs
+~30 ms round-trip (mean 30.5, p95 41.6 — that is 9600-baud wire time, not
+software overhead), so the control cycle's 4 transactions (read AZM+ALT,
+command AZM+ALT) support only **7.7 Hz against the 15 Hz target**. Reads alone
+support ~16 Hz. The fix shipped in both loops: **rate-command deduplication** —
+the firmware *holds* the last guide rate (and MC_MOVE step), so an unchanged
+command is pure wire waste; commands are re-sent only when the wire-quantized
+value changes, with a 1 s keepalive and cache invalidation on every
+out-of-band stop path. Steady tracking now costs 2 transactions/cycle.
+
+Rehearse this reality in sim: set `sim_serial_latency_s` to `0.03` in the HW
+Sim screen — gains tuned against an instant-serial sim meet ~130 ms of
+transport lag on hardware and lose phase margin (a contributor to the first
+side-mode session's PID oscillation).
+
+Also: the mount has no software encoder tare — the "Tare axes" button tares
+the *game controller sticks*. Mount homing = power on at the index marks
+(firmware boots encoders to 0) or the joystick screen's **Sync Home** button
+(captures current raw encoder readings into azm/alt offsets; Park drives back
+to them).
+
 ## 2026-07-26 — AltAz-Side home is the AVX index marks, not the zenith
 
 First PROGRAM track in the new side-mount mode drove the scope into the

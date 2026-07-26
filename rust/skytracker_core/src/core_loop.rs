@@ -89,7 +89,11 @@ impl Shared {
     }
 }
 
-fn apply_command<T: Transport>(mount: &mut Mount<T>, cmd: &Command) {
+fn apply_command<T: Transport>(mount: &mut Mount<T>, state: &mut LoopState, cmd: &Command) {
+    // Manual commands write the wire outside the tracking dedup cache --
+    // drop it so the next tracking cycle re-sends rather than assuming the
+    // firmware still holds its last rate.
+    state.last_wire_cmd = [None, None];
     let _ = match cmd {
         Command::Stop => {
             let _ = mount.hc_slew_fixed(targets::AZM, 0);
@@ -165,7 +169,7 @@ pub fn run_cycle<T: Transport>(
         q.drain(..).collect()
     };
     for cmd in &drained {
-        apply_command(mount, cmd);
+        apply_command(mount, state, cmd);
     }
 
     // 3) Frame (Arc clone so the camera shim isn't blocked during detection).
@@ -184,23 +188,42 @@ pub fn run_cycle<T: Transport>(
     //    target long enough to hand off (the Python loop's _send_tracking_rate
     //    is mode-agnostic). Manual RATE_CONTROL always uses the discrete
     //    joystick step.
+    //    Unchanged commands are deduplicated (controller::wire_cmd_repeats):
+    //    the firmware holds the last rate and each AUX transaction is ~30 ms
+    //    of 9600-baud wire time, so re-sending every cycle halves the loop
+    //    rate for nothing. A failed send clears the cache slot so the next
+    //    cycle retries instead of trusting a command the mount never got.
     let continuous = inputs.continuous_rate
         && matches!(inputs.mode, Mode::Program | Mode::Handoff | Mode::Hotspot);
     let max_dps = inputs.guide_rate_max_dps;
     if let Some(r) = out.azm_rate_cmd {
         let dps = out.azm_pid_output * 360.0;
         if continuous && dps.abs() <= max_dps {
-            let _ = mount.hc_set_rate_dps(targets::AZM, dps);
-        } else {
-            let _ = mount.hc_slew_fixed(targets::AZM, r);
+            let counts = (dps * crate::protocol::GUIDE_COUNTS_PER_DPS).round() as i64;
+            if !state.wire_cmd_repeats(0, 0, counts, now)
+                && mount.hc_set_rate_dps(targets::AZM, dps).is_err()
+            {
+                state.last_wire_cmd[0] = None;
+            }
+        } else if !state.wire_cmd_repeats(0, 1, r as i64, now)
+            && mount.hc_slew_fixed(targets::AZM, r).is_err()
+        {
+            state.last_wire_cmd[0] = None;
         }
     }
     if let Some(r) = out.alt_rate_cmd {
         let dps = out.alt_pid_output * 360.0;
         if continuous && dps.abs() <= max_dps {
-            let _ = mount.hc_set_rate_dps(targets::ALT, dps);
-        } else {
-            let _ = mount.hc_slew_fixed(targets::ALT, r);
+            let counts = (dps * crate::protocol::GUIDE_COUNTS_PER_DPS).round() as i64;
+            if !state.wire_cmd_repeats(1, 0, counts, now)
+                && mount.hc_set_rate_dps(targets::ALT, dps).is_err()
+            {
+                state.last_wire_cmd[1] = None;
+            }
+        } else if !state.wire_cmd_repeats(1, 1, r as i64, now)
+            && mount.hc_slew_fixed(targets::ALT, r).is_err()
+        {
+            state.last_wire_cmd[1] = None;
         }
     }
 
@@ -298,7 +321,7 @@ impl CoreLoop {
                             // (best effort on a possibly-dead link).
                             consecutive_faults += 1;
                             if consecutive_faults >= MAX_CONSECUTIVE_FAULTS {
-                                apply_command(&mut mount, &Command::Stop);
+                                apply_command(&mut mount, &mut state, &Command::Stop);
                                 if consecutive_faults == MAX_CONSECUTIVE_FAULTS {
                                     if let Ok(mut o) = thread_shared.outputs.lock() {
                                         o.status_msgs.push(format!(
@@ -312,7 +335,7 @@ impl CoreLoop {
                             // A cycle panicked. Stop the mount, mark the loop
                             // dead so the adapter's watchdog surfaces it, and
                             // halt — the loop's state can no longer be trusted.
-                            apply_command(&mut mount, &Command::Stop);
+                            apply_command(&mut mount, &mut state, &Command::Stop);
                             if let Ok(mut o) = thread_shared.outputs.lock() {
                                 o.fresh = false;
                                 o.loop_dead = true;
@@ -341,7 +364,7 @@ impl CoreLoop {
                     }
                 }
                 // On shutdown, never leave the mount slewing.
-                apply_command(&mut mount, &Command::Stop);
+                apply_command(&mut mount, &mut state, &Command::Stop);
                 if let Ok(mut o) = thread_shared.outputs.lock() {
                     o.loop_dead = true;
                 }

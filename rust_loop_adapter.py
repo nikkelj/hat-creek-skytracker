@@ -44,6 +44,8 @@ def _mount_mode_str(cfg):
         return "passthrough"
     if mm == "eq":
         return "eq"
+    if mm in ("altaz-side", "altaz_side", "altazside"):
+        return "altaz_side"
     return "altaz"
 
 

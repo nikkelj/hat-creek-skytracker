@@ -268,10 +268,48 @@ pub fn compute_fov_for_camera(
     }
 }
 
+/// Side-mounted AltAz (mount lying on its side for center-of-gravity):
+/// mount (AZM, ALT) -> true sky (az, el). The AZM axis is HORIZONTAL,
+/// pointing at azimuth `alignment_azimuth`; geometrically an equatorial
+/// mount whose pole sits ON the horizon (AZM = hour angle, ALT =
+/// declination). Mirrors transformations.AzAlt2AzEl_AltAzSide, which is
+/// eq_mount_to_azel with pole_alt exactly 0: basis p = pole (horizontal),
+/// x = zenith (up - (up.p)p with up.p = 0), y = p x up.
+pub fn az_alt_to_az_el_altaz_side(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
+    let h = azm.to_radians();
+    let d = alt.to_radians();
+    let a0 = alignment_azimuth.to_radians();
+    // v = cos(d)cos(h)*x + cos(d)sin(h)*y + sin(d)*p in (north, east, up)
+    // with x = (0,0,1), y = (sin a0, -cos a0, 0), p = (cos a0, sin a0, 0).
+    let north = d.cos() * h.sin() * a0.sin() + d.sin() * a0.cos();
+    let east = -(d.cos() * h.sin() * a0.cos()) + d.sin() * a0.sin();
+    let up = d.cos() * h.cos();
+    let el = up.clamp(-1.0, 1.0).asin().to_degrees();
+    let az = east.atan2(north).to_degrees().rem_euclid(360.0);
+    (az, el)
+}
+
+/// Inverse of `az_alt_to_az_el_altaz_side`: true sky (az, el) -> mount
+/// (AZM, ALT). Mirrors transformations.AzEl2AzAlt_AltAzSide (azel_to_eq_mount
+/// with pole_alt = 0): dec = asin(v.p), ha = atan2(v.y, v.x), both in
+/// (-180, 180] like Python's atan2/asin (no rem_euclid on AZM).
+pub fn az_el_to_az_alt_altaz_side(az: f64, el: f64, alignment_azimuth: f64) -> (f64, f64) {
+    let a = az.to_radians();
+    let e = el.to_radians();
+    let a0 = alignment_azimuth.to_radians();
+    let north = e.cos() * a.cos();
+    let east = e.cos() * a.sin();
+    let up = e.sin();
+    let dec = (north * a0.cos() + east * a0.sin()).clamp(-1.0, 1.0).asin().to_degrees();
+    let ha = (north * a0.sin() - east * a0.cos()).atan2(up).to_degrees();
+    (ha, dec)
+}
+
 /// Mount mode selector for the control loop's sky->mount transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MountMode {
     AltAz,
+    AltAzSide,
     Passthrough,
     Eq,
 }
@@ -288,6 +326,7 @@ pub fn sky_to_mount(
 ) -> (f64, f64) {
     match mode {
         MountMode::AltAz => az_el_to_az_alt_altaz(az, el, alignment_azimuth, alignment_elevation),
+        MountMode::AltAzSide => az_el_to_az_alt_altaz_side(az, el, alignment_azimuth),
         MountMode::Passthrough => az_el_to_az_alt_passthrough(az, el),
         // Eq: lat is the alignment elevation; returns (alt, azm) -> reorder.
         MountMode::Eq => {

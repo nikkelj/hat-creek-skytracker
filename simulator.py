@@ -791,11 +791,16 @@ class HardwareSimulator:
             # Equatorial: mount AZM=hour angle, ALT=declination, rotating about the TRUE
             # polar axis. The sim's true pole can be mis-set (sim_pole_az/alt_err) so a
             # polar-alignment run has a real error to measure; it defaults to the assumed
-            # pole (north, latitude) -> perfect alignment.
+            # pole (north, latitude) -> perfect alignment. AltAz-Side is the same
+            # geometry with the pole ON the horizon (exactly 0, no latitude
+            # fallback -- the rig's az axis is horizontal by construction).
             from transformations import eq_mount_to_azel
             lat = float(getattr(cfg, 'lat_str', 0.0) or 0.0)
             true_pole_az = align_az + float(s.get('sim_pole_az_err_deg', 0.0))
-            base_alt = align_el if align_el != 0.0 else lat
+            if mount_mode == 'AltAz-Side':
+                base_alt = 0.0
+            else:
+                base_alt = align_el if align_el != 0.0 else lat
             true_pole_alt = base_alt + float(s.get('sim_pole_alt_err_deg', 0.0))
             # Residual mount errors (cone/index/flexure) on top of the polar misalignment:
             # distort the mount HA/Dec by the injected equatorial model before the pole geometry.
@@ -818,6 +823,10 @@ class HardwareSimulator:
         # the pointing error and an alignment run can recover the seven terms end-to-end.
         if mount_mode == 'AltAz':
             cam_az, cam_el = injected_boresight(cfg, cam_az, cam_el)
+
+        # Final rendered boresight, observable by tests (mode-machine and
+        # transform tests verify mount->sky geometry against this).
+        self.last_boresight_azel = (cam_az, cam_el)
 
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 

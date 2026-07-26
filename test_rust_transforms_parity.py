@@ -87,6 +87,27 @@ class RustTransformsParity(unittest.TestCase):
         self.assertEqual(tf.AzEl2AzAlt_Passthrough(40, 50), rc.AzEl2AzAlt_Passthrough(40, 50))
         self.assertEqual(tf.AzAlt2AzEl_Passthrough(40, 50), rc.AzAlt2AzEl_Passthrough(40, 50))
 
+    def test_altaz_side_pair(self):
+        # Side-mounted AltAz (pole on the horizon at alignment_azimuth). The
+        # Python side goes through the generic numpy eq-basis; the Rust side is
+        # the closed form -- they must agree everywhere except the exact frame
+        # poles, where the swept angle is undefined (atan2 of signed zeros) and
+        # only the well-defined axis is compared.
+        for az in AZ:
+            for el in EL:
+                for a0 in (0.0, 10.0, 77.3, 200.0, 350.0):
+                    p = tf.AzEl2AzAlt_AltAzSide(az, el, a0)
+                    r = rc.AzEl2AzAlt_AltAzSide(az, el, a0)
+                    self.assertTrue(num_close(p[1], r[1], places=9), f"alt {p[1]} vs {r[1]}")
+                    if abs(p[1]) < 90.0 - 1e-9:  # AZM undefined along the pole
+                        self.assertTrue(ang_close(p[0], r[0]), f"azm {p[0]} vs {r[0]}")
+
+                    p2 = tf.AzAlt2AzEl_AltAzSide(az, el, a0)
+                    r2 = rc.AzAlt2AzEl_AltAzSide(az, el, a0)
+                    self.assertTrue(num_close(p2[1], r2[1], places=9), f"el {p2[1]} vs {r2[1]}")
+                    if abs(p2[1]) < 90.0 - 1e-9:  # sky az undefined at zenith/nadir
+                        self.assertTrue(ang_close(p2[0], r2[0]), f"az {p2[0]} vs {r2[0]}")
+
     def test_wedge_pair(self):
         for az in AZ:
             for el in [e for e in EL if e > -90]:

@@ -183,8 +183,11 @@ class ConfigState:
             "seed": 1234,
         }
 
-        # Mount mode configuration
-        self.mount_mode = "AltAz"  # "AltAz" or "Eq" - mount coordinate system
+        # Mount mode configuration. "AltAz" (az axis vertical), "AltAz-Side"
+        # (mount lying on its side: the az axis is HORIZONTAL at
+        # alignment_azimuth -- equatorial geometry with the pole on the
+        # horizon), "Eq" (polar-aligned wedge), or "Passthrough".
+        self.mount_mode = "AltAz"
 
         # Continuous-rate tracking: issue the fine 24-bit variable-rate
         # (MC_SET_POS/NEG_GUIDERATE) command for smooth tracking instead of the

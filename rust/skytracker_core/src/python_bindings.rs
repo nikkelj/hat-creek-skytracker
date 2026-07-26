@@ -52,6 +52,7 @@ fn mode_str(m: Mode) -> &'static str {
 fn parse_mount_mode(s: &str) -> PyResult<MountMode> {
     match s.to_ascii_lowercase().as_str() {
         "altaz" => Ok(MountMode::AltAz),
+        "altaz_side" | "altaz-side" | "altazside" => Ok(MountMode::AltAzSide),
         "passthrough" => Ok(MountMode::Passthrough),
         "eq" => Ok(MountMode::Eq),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -362,6 +363,16 @@ fn AzAlt2AzEl_AltAz(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
 #[pyfunction]
 fn AzEl2AzAlt_AltAz(az: f64, el: f64, alignment_azimuth: f64, alignment_elevation: f64) -> (f64, f64) {
     core_tf::az_el_to_az_alt_altaz(az, el, alignment_azimuth, alignment_elevation)
+}
+
+#[pyfunction]
+fn AzAlt2AzEl_AltAzSide(azm: f64, alt: f64, alignment_azimuth: f64) -> (f64, f64) {
+    core_tf::az_alt_to_az_el_altaz_side(azm, alt, alignment_azimuth)
+}
+
+#[pyfunction]
+fn AzEl2AzAlt_AltAzSide(az: f64, el: f64, alignment_azimuth: f64) -> (f64, f64) {
+    core_tf::az_el_to_az_alt_altaz_side(az, el, alignment_azimuth)
 }
 
 #[pyfunction]
@@ -1006,6 +1017,8 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_rotation_to_az_el, m)?)?;
     m.add_function(wrap_pyfunction!(AzAlt2AzEl_AltAz, m)?)?;
     m.add_function(wrap_pyfunction!(AzEl2AzAlt_AltAz, m)?)?;
+    m.add_function(wrap_pyfunction!(AzAlt2AzEl_AltAzSide, m)?)?;
+    m.add_function(wrap_pyfunction!(AzEl2AzAlt_AltAzSide, m)?)?;
     m.add_function(wrap_pyfunction!(AzAlt2AzEl_Passthrough, m)?)?;
     m.add_function(wrap_pyfunction!(AzEl2AzAlt_Passthrough, m)?)?;
     m.add_function(wrap_pyfunction!(telescope_to_local_elev_az, m)?)?;

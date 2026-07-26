@@ -443,7 +443,9 @@ impl LoopState {
         let mut target_azm = canon.0;
         let mut target_alt = canon.1;
         let mut flipped = false;
-        if inputs.mount_mode != MountMode::Eq {
+        // Only true alt-az geometries have the mirrored-sky second solution;
+        // Eq and AltAzSide map (az+180, 180-el) to the same principal axes.
+        if matches!(inputs.mount_mode, MountMode::AltAz | MountMode::Passthrough) {
             let flip = transforms::sky_to_mount(
                 inputs.mount_mode,
                 (led_az + 180.0).rem_euclid(360.0),

@@ -383,6 +383,17 @@ def sky_target_to_mount(config_state, target_az_deg, target_el_deg):
             target_az_deg,
             target_el_deg
         )
+    elif mount_mode == 'AltAz-Side':
+        # Side-mounted AltAz (mount lying on its side for center-of-gravity):
+        # equatorial geometry with the pole ON the horizon at alignment_azimuth.
+        # The pole elevation is exactly 0 by construction of the rig -- no
+        # latitude fallback like Eq mode. Neither pointing model applies (the
+        # 7-term model is alt-az specific, the eq model assumes a polar-aligned
+        # axis), so the transform is used directly.
+        from transformations import AzEl2AzAlt_AltAzSide
+        target_azm_deg, target_alt_deg = AzEl2AzAlt_AltAzSide(
+            target_az_deg, target_el_deg,
+            float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0))
     else:
         # Equatorial mode: convert the target sky position to mount (hour-angle, dec) axes
         # for a polar axis pointing at (pole_az, pole_alt). pole_az defaults to due north

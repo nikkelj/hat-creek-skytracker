@@ -316,6 +316,27 @@ def azel_to_eq_mount(az_deg, el_deg, pole_az_deg, pole_alt_deg):
     return ha, dec
 
 
+def AzAlt2AzEl_AltAzSide(AZM, ALT, alignment_azimuth):
+    """Side-mounted AltAz (e.g. an AVX lying on its side for center-of-gravity):
+    mount coordinates (AZM, ALT) -> true sky (az, el).
+
+    In this rig the mount's AZM axis is HORIZONTAL, pointing at azimuth
+    `alignment_azimuth`, so AZM motion sweeps a vertical great circle
+    (elevation-like), and the ALT axis initially sweeps the horizon.
+    Geometrically this is an equatorial mount whose pole sits ON the horizon:
+    AZM = hour angle about that horizontal pole, ALT = declination from its
+    equator. pole_alt is exactly 0 by construction of the rig -- deliberately
+    NOT the Eq mode's "0 means use site latitude" convention.
+    """
+    return eq_mount_to_azel(AZM, ALT, alignment_azimuth, 0.0)
+
+
+def AzEl2AzAlt_AltAzSide(az, el, alignment_azimuth):
+    """Inverse of :func:`AzAlt2AzEl_AltAzSide`: true sky (az, el) -> mount
+    (AZM, ALT) for the side-mounted AltAz rig."""
+    return azel_to_eq_mount(az, el, alignment_azimuth, 0.0)
+
+
 def compute_fov_for_camera(pixel_size_um, focal_length_mm, roi_width_pct, roi_height_pct,
                           camera_width_pixels, camera_height_pixels):
     """

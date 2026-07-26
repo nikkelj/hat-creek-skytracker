@@ -2852,8 +2852,13 @@ def render_pid_gain_sliders(display, joystick_state):
     pygame.draw.rect(display.menu_screen, (140, 140, 170),
                      (x_start, y_start, width, height), 1)
 
-    # Title
-    title_text = display.small_font.render("PID Gain Control", True, (255, 255, 255))
+    # Title, naming the active per-mode gain profile when one applies (the
+    # sliders and auto-tuner edit THAT profile's gains; see
+    # JoystickModeState.service_gain_profiles).
+    _gk = getattr(joystick_state, '_gain_profile_key', None)
+    profile_key = _gk(joystick_state.tracking_mode) if _gk else None
+    title_str = f"PID Gains - {profile_key}" if profile_key else "PID Gain Control"
+    title_text = display.small_font.render(title_str, True, (255, 255, 255))
     display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
 
     # AUTOTUNE button (title row, right edge -- above the disabled scrim so it
@@ -3067,10 +3072,21 @@ def render_pid_gain_sliders(display, joystick_state):
     pygame.draw.rect(display.menu_screen, (255, 0, 0) if lead_hover else (200, 0, 0),
                      (lead_handle_x - 3, lead_track.y - 4, 6, 12))
 
-    # Auto-tuner progress line (sweep/probe/last RMS), between the lead slider
-    # and the feed-forward strip. Only drawn once a tuner exists.
-    if tuner is not None:
-        at_status = display.tiny_font.render(tuner.status_text(), True, (170, 220, 255))
+    # Status line between the lead slider and the feed-forward strip: the
+    # auto-tuner's progress while it runs (sweep/probe/last RMS); otherwise
+    # the active profile's provenance stamp -- which target these gains were
+    # auto-tuned on, and when.
+    status_line = None
+    if tuner is not None and (tuner.active or tuner.phase == 'paused'):
+        status_line = tuner.status_text()
+    elif profile_key:
+        prof = (getattr(config_state, 'pid_mode_profiles', None) or {}).get(profile_key)
+        if isinstance(prof, dict) and prof.get('tuned_on'):
+            status_line = f"tuned on {prof['tuned_on']} {prof.get('tuned_at', '')}".strip()
+    if status_line is None and tuner is not None:
+        status_line = tuner.status_text()
+    if status_line:
+        at_status = display.tiny_font.render(status_line, True, (170, 220, 255))
         display.menu_screen.blit(at_status, (x_start + 10, y_start + 158))
 
     # Grey out the slider area when not in PROGRAM mode (the feed-forward strip

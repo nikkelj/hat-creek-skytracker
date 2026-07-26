@@ -223,13 +223,16 @@ class RustCoreLoopAdapter:
             return
         if snap.get("fresh"):
             self._read_back(st, snap)
-            # Feed the PID auto-tuner (if armed) the errors this snapshot
-            # published; it writes candidate gains into config_state, which
-            # _push_static hands to the Rust loop below in this same pump.
+            # Post-snapshot services: per-mode PID gain profile swap first
+            # (so a mode change lands the right gains before the tuner sees
+            # them), then feed the auto-tuner this snapshot's errors. Both
+            # write into config_state, which _push_static hands to the Rust
+            # loop below in this same pump.
             # getattr: adapter tests drive the pump with minimal fake states.
-            service_autotune = getattr(st, "service_autotune", None)
-            if service_autotune is not None:
-                service_autotune()
+            for name in ("service_gain_profiles", "service_autotune"):
+                service = getattr(st, name, None)
+                if service is not None:
+                    service()
         req = snap.get("requested_mode")
         if req:
             st.tracking_mode = _STR_TO_MODE.get(req, st.tracking_mode)

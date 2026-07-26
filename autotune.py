@@ -24,8 +24,11 @@ rather than injected test signals, so it is safe to run on a live pass:
 Cost is the RMS mount-axis position error over the window. Guards: gains are
 clamped to the UI slider range, a diverging candidate is reverted mid-window,
 and the tuner pauses (holding the best-known gains) whenever tracking stops
-being live -- mode change, STOP, or a lost optical lock -- resuming the
-interrupted probe when tracking returns.
+being live -- STOP, target below the mask, etc. -- resuming the interrupted
+probe when tracking returns. A mode change that switches the PID gain
+PROFILE (PROGRAM <-> HOTSPOT; see JoystickModeState.service_gain_profiles)
+instead STOPS the tune, keeping the best gains: the two modes are different
+plants with separately stored tunings, so a tune never outlives its plant.
 """
 
 import math
@@ -123,6 +126,10 @@ class PIDAutoTuner:
         # it: PROGRAM and HOTSPOT are different plants (encoder loop vs.
         # optical loop), so a tune only ever measures the mode it started in.
         self.armed_mode = mode
+        # Set by the caller at arm time: what we're tuning against (target
+        # name). Stamped into the mode's gain profile when the tune finishes.
+        self.target_label = None
+        self._label_stamped = False
         self.axes = {'azm': _AxisTuner(config_state, 'azm'),
                      'alt': _AxisTuner(config_state, 'alt')}
         self.active = False

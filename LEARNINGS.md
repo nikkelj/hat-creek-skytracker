@@ -36,6 +36,14 @@ Non-obvious bits:
   resume — a half-measured window scored across the gap is garbage.
 - **Measure the plant you armed on.** PROGRAM (encoder loop) and HOTSPOT
   (optical loop) are different plants; the tuner refuses to mix their samples.
+  Follow-through: each plant keeps its own **gain profile**
+  (`config.pid_mode_profiles`, stamped with the target it was tuned on),
+  swapped into the live gain fields automatically on mode transitions by
+  `service_gain_profiles()`. Keeping the six live fields as "the active set"
+  meant the sliders, both loops, and the tuner needed zero changes — but the
+  swap must run BEFORE the tuner's servicing each cycle, and a plant-changing
+  transition must STOP a running tune (keeping its best) so the departing
+  profile saves tuned gains, not a half-tested probe candidate.
 - **Sim-rig gotcha that looked like a tuner disaster:** the tracking-quality
   `Rig`'s analytic target climbs at 0.5°/s elevation, so past ~120 s it
   crosses the zenith and the rig's sky-error metric (built for el ≤ 90°)

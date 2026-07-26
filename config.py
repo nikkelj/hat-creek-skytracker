@@ -97,6 +97,14 @@ class ConfigState:
         self.pid_alt_i_gain = 0.0
         self.pid_alt_d_gain = 0.0
 
+        # Per-tracking-mode PID gain profiles, keyed "PROGRAM" / "HOTSPOT".
+        # The six pid_*_gain fields above are the LIVE set both control loops
+        # (and the UI sliders and auto-tuner) read; JoystickModeState.
+        # service_gain_profiles() swaps the live set from these profiles
+        # automatically on mode transitions -- the encoder loop and the
+        # optical loop are different plants and want different gains.
+        self.pid_mode_profiles = {}
+
         # Seconds to lead the trajectory target by, compensating read/command
         # transport latency. 0 disables leading. Tune on hardware.
         self.pid_lead_time_sec = 0.0
@@ -325,6 +333,7 @@ class ConfigState:
             "pid_alt_p_gain": self.pid_alt_p_gain,
             "pid_alt_i_gain": self.pid_alt_i_gain,
             "pid_alt_d_gain": self.pid_alt_d_gain,
+            "pid_mode_profiles": self.pid_mode_profiles,
             "pid_lead_time_sec": self.pid_lead_time_sec,
             "feed_forward_azm_enabled": self.feed_forward_azm_enabled,
             "feed_forward_alt_enabled": self.feed_forward_alt_enabled,
@@ -415,6 +424,8 @@ class ConfigState:
         self.pid_alt_p_gain = config_dict.get("pid_alt_p_gain", self.pid_alt_p_gain)
         self.pid_alt_i_gain = config_dict.get("pid_alt_i_gain", self.pid_alt_i_gain)
         self.pid_alt_d_gain = config_dict.get("pid_alt_d_gain", self.pid_alt_d_gain)
+        if isinstance(config_dict.get("pid_mode_profiles"), dict):
+            self.pid_mode_profiles = config_dict["pid_mode_profiles"]
         self.pid_lead_time_sec = config_dict.get("pid_lead_time_sec", self.pid_lead_time_sec)
 
         # Load feed-forward and bias control settings

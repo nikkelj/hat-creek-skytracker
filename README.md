@@ -39,8 +39,14 @@ capture.
   optimizer over all six gains — no injected test signals, just the live
   tracking error. It probes each gain up/down in log space, keeps measured
   improvements, converges in a few minutes (the sliders visibly follow along),
-  and pauses safely on STOP / mode change / lost lock. Stopping keeps the best
-  gains found; works identically under the Python and Rust control loops.
+  and pauses safely on STOP or a lost target. Stopping keeps the best gains
+  found; works identically under the Python and Rust control loops.
+- **Per-mode gain profiles**: PROGRAM (encoder loop) and HOTSPOT (optical loop)
+  are different plants, so each keeps its own gain set in
+  `config.pid_mode_profiles` — swapped into the live gains **automatically** on
+  mode transitions (HANDOFF shares PROGRAM's). Each profile is stamped with the
+  **target it was tuned on** and the date, shown in the PID pane, so you know
+  whose tune you're flying.
 
 **Imaging & visualization**
 - Threaded camera capture (ZWO ASI) with a large circular buffer and

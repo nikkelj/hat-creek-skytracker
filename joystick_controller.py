@@ -454,6 +454,9 @@ class JoystickModeState:
         # every cycle. Serviced via service_autotune() from whichever loop is
         # active; started/stopped from the PID pane's AUTOTUNE button.
         self.autotuner = None
+        # Which per-mode gain profile currently occupies the live pid_* fields
+        # (see service_gain_profiles). None until the first PID mode is entered.
+        self._active_gain_profile = None
 
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
@@ -674,6 +677,7 @@ class JoystickModeState:
         tuner = self.autotuner
         if tuner is not None and tuner.active:
             tuner.stop()
+            self._stamp_autotune_label(tuner)
             self._drain_autotune_messages(tuner)
             return
         if self.tracking_mode not in (TrackingMode.PROGRAM, TrackingMode.HOTSPOT):
@@ -682,6 +686,9 @@ class JoystickModeState:
                     "Auto-tune: start PROGRAM or HOTSPOT tracking first")
             return
         self.autotuner = PIDAutoTuner(self.config_state, mode=self.tracking_mode)
+        # Remember what we're tuning ON (captured at arm time; the profile of
+        # this mode gets stamped with it when the tune finishes).
+        self.autotuner.target_label = self._current_target_label()
         self.autotuner.start()
         self._drain_autotune_messages(self.autotuner)
 
@@ -694,7 +701,14 @@ class JoystickModeState:
         different plants (encoder loop vs. optical loop), so a tune must not
         mix their measurements."""
         tuner = self.autotuner
-        if tuner is None or not tuner.active:
+        if tuner is None:
+            return
+        if not tuner.active:
+            # A tune that finished (converged) but hasn't had its provenance
+            # stamped yet gets it here; _stamp_autotune_label is a no-op once
+            # stamped, so this costs nothing on later cycles.
+            if tuner.phase == 'done':
+                self._stamp_autotune_label(tuner)
             return
         tracking = (self.telescope_connected and not self.stopped
                     and self.tracking_mode == tuner.armed_mode)
@@ -702,12 +716,122 @@ class JoystickModeState:
             tracking = self.hotspot_status == "locked"
         tuner.update(time.time(), tracking,
                      self.azm_position_error, self.alt_position_error)
+        if not tuner.active and tuner.phase == 'done':
+            self._stamp_autotune_label(tuner)
         self._drain_autotune_messages(tuner)
 
     def _drain_autotune_messages(self, tuner):
         for msg in tuner.take_messages():
             if self.update_status_callback:
                 self.update_status_callback(msg)
+
+    # ---------------------------------------------------- per-mode gain profiles
+    # The six live gain fields form "the active set" that both control loops,
+    # the UI sliders, and the auto-tuner all read/write.
+    _GAIN_PROFILE_FIELDS = ('pid_azm_p_gain', 'pid_azm_i_gain', 'pid_azm_d_gain',
+                            'pid_alt_p_gain', 'pid_alt_i_gain', 'pid_alt_d_gain')
+
+    def _gain_profile_key(self, mode):
+        """Gain-profile key for a tracking mode. HANDOFF runs program-track,
+        so it shares PROGRAM's plant (and gains); modes with no PID loop
+        (STANDBY, RATE, MTI) have no profile."""
+        if mode in (TrackingMode.PROGRAM, TrackingMode.HANDOFF):
+            return "PROGRAM"
+        if mode == TrackingMode.HOTSPOT:
+            return "HOTSPOT"
+        return None
+
+    def _current_target_label(self):
+        """Short 'what are we tracking' label for the gain-profile stamp,
+        e.g. 'satellite ISS (ZARYA)', 'aircraft A1B2C3', 'launch Starship'."""
+        vis = self.tracking_vis_state
+        if (vis is not None and getattr(vis, 'selected_launch', None)
+                and getattr(vis, 'launch_launched', False)):
+            return f"launch {vis.selected_launch}"
+        _traj, kind, key = active_program_trajectory(vis)
+        return f"{kind} {key}" if key is not None else None
+
+    def service_gain_profiles(self):
+        """Automatic per-mode PID gain lookup. PROGRAM (encoder loop) and
+        HOTSPOT (optical loop) are different plants and want different gains,
+        so each keeps its own profile in config.pid_mode_profiles: on a mode
+        transition the departing mode's live gains are saved into its profile
+        and the arriving mode's profile is loaded into the live fields (first
+        entry seeds the profile from the live gains). Runs every control
+        cycle, BEFORE service_autotune, from both control paths."""
+        cfg = self.config_state
+        if cfg is None:
+            return
+        key = self._gain_profile_key(self.tracking_mode)
+        if key is None or key == self._active_gain_profile:
+            return
+
+        # A plant change ends any running tune: its measurements belong to
+        # the departing mode, and stop() writes its best gains into the live
+        # fields so the profile save below captures them rather than a
+        # half-tested probe candidate.
+        tuner = self.autotuner
+        if (tuner is not None and tuner.active
+                and self._gain_profile_key(tuner.armed_mode) != key):
+            tuner.stop()
+            self._stamp_autotune_label(tuner)
+            self._drain_autotune_messages(tuner)
+
+        profiles = getattr(cfg, 'pid_mode_profiles', None)
+        if not isinstance(profiles, dict):
+            profiles = cfg.pid_mode_profiles = {}
+        live = {f: float(getattr(cfg, f)) for f in self._GAIN_PROFILE_FIELDS}
+
+        if self._active_gain_profile is not None:
+            entry = profiles.get(self._active_gain_profile)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry['gains'] = live
+            profiles[self._active_gain_profile] = entry
+
+        stored = profiles.get(key)
+        gains = stored.get('gains') if isinstance(stored, dict) else None
+        if isinstance(gains, dict):
+            for f in self._GAIN_PROFILE_FIELDS:
+                try:
+                    setattr(cfg, f, float(gains.get(f, getattr(cfg, f))))
+                except (TypeError, ValueError):
+                    pass
+            tuned_on = stored.get('tuned_on')
+            msg = f"PID gains: {key} profile loaded" + (
+                f" (tuned on {tuned_on})" if tuned_on else "")
+            if self.update_status_callback:
+                self.update_status_callback(msg)
+        else:
+            profiles[key] = {'gains': dict(live)}
+            print(f"PID gains: seeded new {key} profile from current gains")
+        self._active_gain_profile = key
+
+    def _stamp_autotune_label(self, tuner):
+        """Stamp the tuned mode's profile with what the tune ran against
+        (target, date, achieved RMS) and the resulting gains. Once per tune,
+        and only if it completed at least one measurement."""
+        if getattr(tuner, '_label_stamped', False):
+            return
+        if not any(ax.best_cost is not None for ax in tuner.axes.values()):
+            return
+        cfg = self.config_state
+        key = self._gain_profile_key(tuner.armed_mode)
+        if cfg is None or key is None:
+            return
+        profiles = getattr(cfg, 'pid_mode_profiles', None)
+        if not isinstance(profiles, dict):
+            profiles = cfg.pid_mode_profiles = {}
+        entry = profiles.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        # The tuner has already applied its best gains to the live fields
+        # (stop()/convergence do so), so the live snapshot IS the tuned set.
+        entry['gains'] = {f: float(getattr(cfg, f))
+                          for f in self._GAIN_PROFILE_FIELDS}
+        entry['tuned_on'] = tuner.target_label or "unknown target"
+        entry['tuned_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        entry['tuned_rms'] = tuner.summary()
+        profiles[key] = entry
+        tuner._label_stamped = True
 
     def chart_axis_scale(self, key, values, floor):
         """Auto-range a strip chart's vertical axis (±return value). Tracks the

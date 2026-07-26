@@ -51,7 +51,7 @@ def render_position_display(display, joystick_state):
 
     # Box sized to envelope its text (the old 100x65 box clipped the values).
     width, height = 140, 86
-    x_start = display.sub_x + display.sub_width // 2 - width - 12
+    x_start = display.joystick_layout_params()['divider_x'] - width - 12
     y_start = display.sub_y + 12
 
     # Background color based on stop state
@@ -295,9 +295,9 @@ def render_joystick_target_panel(display, joystick_state, tracking_vis_state, co
     screen = display.menu_screen
     font = display.small_font
     mouse_pos = pygame.mouse.get_pos()
-    qx = display.sub_x + display.sub_width // 2
+    qx = display.joystick_layout_params()['divider_x']
     qy = display.sub_y
-    qw = display.sub_width // 2
+    qw = display.sub_x + display.sub_width - qx
     qh = display.sub_height // 2
 
     strip_x, strip_y, bh = qx + 8, qy + 6, 22
@@ -1630,9 +1630,9 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             return True
 
         # Handle satellite selection/hover in polar plot area
-        quadrant_x = display.sub_x + display.sub_width // 2
+        quadrant_x = display.joystick_layout_params()['divider_x']
         quadrant_y = display.sub_y
-        quadrant_width = display.sub_width // 2
+        quadrant_width = display.sub_x + display.sub_width - quadrant_x
         quadrant_height = display.sub_height // 2
 
         quadrant_rect = pygame.Rect(quadrant_x, quadrant_y, quadrant_width, quadrant_height)
@@ -1644,11 +1644,15 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 print(f"Click at ({pos[0]}, {pos[1]}) in polar plot quadrant")
 
-            # Pre-calculate centers and scale factor to match draw_satellites exactly
+            # Pre-calculate centers and scale factor to match
+            # draw_satellites_on_surface exactly: positions are stored in
+            # full-subarea coordinates, scaled by 0.45 about the full-subarea
+            # center, then placed about the quadrant surface's center (which
+            # sits at the blit position + half the quadrant size on screen).
             full_screen_center_x = display.sub_x + display.sub_width // 2
             full_screen_center_y = display.sub_y + display.sub_height // 2
-            quadrant_center_x = display.sub_x + display.sub_width // 2
-            quadrant_center_y = display.sub_y + display.sub_height // 2
+            quadrant_center_x = quadrant_x + quadrant_width // 2
+            quadrant_center_y = quadrant_y + quadrant_height // 2
             scale_factor = 0.45
 
             for sat, (px, py, alt, _) in tracking_vis_state.satellite_positions.items():
@@ -2237,6 +2241,19 @@ def _navball_active_target(tvs):
     if tvs is None:
         return None
     cur_tt = getattr(tvs, 'current_tt', None)
+    if cur_tt is None:
+        # No shared timestamp yet (startup / mode switch): the ball still
+        # renders, just without a target overlay.
+        return None
+
+    def _interp(*args):
+        # A malformed trajectory (None rows around cur_tt) raises out of
+        # numpy's searchsorted; that must cost the target marker for a frame,
+        # not the whole navball.
+        try:
+            return interpolate_position_data_and_rates(*args)
+        except Exception:
+            return None
 
     sat = getattr(tvs, 'selected_satellite', None)
     sat_trajs = getattr(tvs, 'satellite_trajectories', None) or {}
@@ -2246,7 +2263,7 @@ def _navball_active_target(tvs):
             sunlit = getattr(tvs, 'sunlit_status_cache', {}).get(sat.name)
         except Exception:
             sunlit = None
-        res = interpolate_position_data_and_rates(traj, cur_tt)
+        res = _interp(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, sunlit, tgt[0], tgt[1]
 
@@ -2254,7 +2271,7 @@ def _navball_active_target(tvs):
     ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
     if icao is not None and ac_trajs.get(icao):
         traj = ac_trajs[icao]
-        res = interpolate_position_data_and_rates(traj, cur_tt)
+        res = _interp(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, None, tgt[0], tgt[1]
 
@@ -2262,7 +2279,7 @@ def _navball_active_target(tvs):
     launch_trajs = getattr(tvs, 'launch_trajectories', None) or {}
     if lname and launch_trajs.get(lname):
         traj = launch_trajs[lname]
-        res = interpolate_position_data_and_rates(
+        res = _interp(
             traj, cur_tt,
             getattr(tvs, 'launch_start_time', 0) or 0,
             getattr(tvs, 'launch_launched', False))
@@ -2298,10 +2315,17 @@ def render_navball(display, joystick_state):
             align_el = float(getattr(cfg, 'alignment_elevation_str', 0.0) or 0.0)
         except (TypeError, ValueError):
             align_az = align_el = 0.0
-        if getattr(cfg, 'mount_mode', 'AltAz') == 'AltAz':
+        mount_mode = getattr(cfg, 'mount_mode', 'AltAz')
+        if mount_mode == 'AltAz':
             from transformations import AzAlt2AzEl_AltAz
             az, el = AzAlt2AzEl_AltAz(joystick_state.current_azm,
                                      joystick_state.current_alt, align_az)
+        elif mount_mode == 'AltAz-Side':
+            # Side-mounted rig: equatorial forward transform, pole on the
+            # horizon at alignment_azimuth
+            from transformations import AzAlt2AzEl_AltAzSide
+            az, el = AzAlt2AzEl_AltAzSide(joystick_state.current_azm,
+                                          joystick_state.current_alt, align_az)
         else:
             from transformations import AzAlt2AzEl
             az, el = AzAlt2AzEl(joystick_state.current_azm,

@@ -407,6 +407,22 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
                 pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
 
+def _quadrant_info_panel_geometry(surface_width, surface_height, desired_w=170):
+    """Geometry for the right-edge info panels in quadrant mode.
+
+    The panels must sit in the free margin right of the skyplot circle, not on
+    it. Mirrors draw_polar_plot_on_surface's radius math (min(w,h)//2 - 50,
+    centered); on cramped surfaces the panel narrows into the margin (down to
+    100 px, with compact labels) before any overlap is allowed.
+    Returns (panel_x, panel_width).
+    """
+    radius = min(surface_width, surface_height) // 2 - 50
+    circle_right = surface_width // 2 + radius
+    avail = surface_width - circle_right - 14  # 6 px gap to circle + 8 px edge
+    width = max(100, min(desired_w, avail))
+    return surface_width - width - 8, width
+
+
 def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """
     Draw camera FOV details panels on a specified surface with given bounds.
@@ -423,10 +439,9 @@ def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset,
     for i, fov_data in enumerate(state.camera_fov_data):
         # Use the same panel positioning as tracking visuals mode for consistency
         if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
-            # Adjust for quadrant surface bounds
-            panel_x = surface_width - 190
+            # Keep clear of the skyplot circle (narrows on small quadrants)
+            panel_x, panel_width = _quadrant_info_panel_geometry(surface_width, surface_height)
             panel_y = current_y
-            panel_width = 170
             panel_height = 120
         else:
             # Full screen mode - same positioning as tracking visuals
@@ -452,17 +467,31 @@ def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset,
         title_surface = dynamic_font.render(title, True, (255, 255, 255))
         surface.blit(title_surface, (panel_x + 5, panel_y + 5))
 
-        # FOV details
-        details = [
-            f"Az: {fov_data.get('az', 0.0):.2f}°",
-            f"El: {fov_data.get('el', 0.0):.2f}°",
-            f"FOV Width: {fov_data.get('fov_width_deg', 1.0):.3f}°",
-            f"FOV Height: {fov_data.get('fov_height_deg', 1.0):.3f}°",
-            f"Rotation: {fov_data.get('rotation', 0.0):.1f}°",
-            f"Spot Size: {fov_data.get('spot_size_arcsec_per_pixel', 0.5):.2f}\"/pix",
-        ]
+        # FOV details (compact labels when the panel had to narrow to stay
+        # off the skyplot circle)
+        if panel_width < 150:
+            details = [
+                f"Az: {fov_data.get('az', 0.0):.2f}°",
+                f"El: {fov_data.get('el', 0.0):.2f}°",
+                f"FOV W: {fov_data.get('fov_width_deg', 1.0):.3f}°",
+                f"FOV H: {fov_data.get('fov_height_deg', 1.0):.3f}°",
+                f"Rot: {fov_data.get('rotation', 0.0):.1f}°",
+                f"Spot: {fov_data.get('spot_size_arcsec_per_pixel', 0.5):.2f}\"/pix",
+            ]
+        else:
+            details = [
+                f"Az: {fov_data.get('az', 0.0):.2f}°",
+                f"El: {fov_data.get('el', 0.0):.2f}°",
+                f"FOV Width: {fov_data.get('fov_width_deg', 1.0):.3f}°",
+                f"FOV Height: {fov_data.get('fov_height_deg', 1.0):.3f}°",
+                f"Rotation: {fov_data.get('rotation', 0.0):.1f}°",
+                f"Spot Size: {fov_data.get('spot_size_arcsec_per_pixel', 0.5):.2f}\"/pix",
+            ]
 
-        # Draw detail lines
+        # Draw detail lines, clipped to the panel so nothing spills onto the
+        # skyplot beside it
+        prev_clip = surface.get_clip()
+        surface.set_clip(pygame.Rect(panel_x, panel_y, panel_width, panel_height))
         y_offset_line = panel_y + 25
         for line_no, line in enumerate(details):
             # Color-coded display
@@ -478,6 +507,7 @@ def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset,
             line_surface = dynamic_font.render(line, True, color)
             surface.blit(line_surface, (panel_x + 5, y_offset_line))
             y_offset_line += 15
+        surface.set_clip(prev_clip)
 
         # Update vertical position for next camera panel
         current_y += panel_height + 0  # Panel height + spacing
@@ -496,18 +526,36 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
     # Get the satellite to display details for
     sat = state.selected_satellite if state.selected_satellite else state.hovered_satellite
 
+    # Position the details panel based on mode and surface bounds
+    surface_width, surface_height = surface.get_size()
+
+    # Use the same panel size and font size as tracking visuals mode for consistency
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        # Keep clear of the skyplot circle (narrows on small quadrants)
+        panel_x, panel_width = _quadrant_info_panel_geometry(surface_width, surface_height)
+        panel_y = 20  # Top margin
+        panel_height = min(250, surface_height - 30)  # Same height as tracking visuals mode
+    else:
+        # Full screen mode - original positioning relative to surface
+        panel_x = surface_width - 190
+        panel_y = 20
+        panel_width = 170
+        panel_height = min(250, surface_height - 30)
+
     # Get satellite data the same way as the main draw_details function
+    # (compact labels when the panel had to narrow to stay off the circle)
+    compact = panel_width < 150
     epoch_dt = sat.epoch.utc_datetime().strftime("%Y-%m-%d %H:%M:%S")
     details = [
         f"NORAD ID: {sat.model.satnum_str}",
         f"Name: {sat.name.strip()}",
-        f"Int. Designator: {sat.model.intldesg}",
+        f"Int. Desig: {sat.model.intldesg}" if compact else f"Int. Designator: {sat.model.intldesg}",
         f"Epoch: {epoch_dt}",
-        f"Inclination (deg): {math.degrees(sat.model.inclo):.2f}",
+        f"Incl (deg): {math.degrees(sat.model.inclo):.2f}" if compact else f"Inclination (deg): {math.degrees(sat.model.inclo):.2f}",
         f"RAAN (deg): {math.degrees(sat.model.nodeo):.2f}",
-        f"Arg. of Perigee (deg): {math.degrees(sat.model.argpo):.2f}",
-        f"Mean Anomaly (deg): {math.degrees(sat.model.mo):.2f}",
-        f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
+        f"Arg.Per (deg): {math.degrees(sat.model.argpo):.2f}" if compact else f"Arg. of Perigee (deg): {math.degrees(sat.model.argpo):.2f}",
+        f"M.Anom (deg): {math.degrees(sat.model.mo):.2f}" if compact else f"Mean Anomaly (deg): {math.degrees(sat.model.mo):.2f}",
+        f"M.Motion (rev/d): {sat.model.no_kozai:.4f}" if compact else f"Mean Motion (rev/day): {sat.model.no_kozai:.4f}",
         f"Rev Number: {sat.model.revnum}",
     ]
 
@@ -523,29 +571,12 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
         sat_apogee = state.satellite_apogee[sat] if sat in state.satellite_apogee else None
         if sat_perigee is not None and sat_apogee is not None:
             details.extend([
-                f"Apogee Altitude (km): {sat_apogee:.1f}",
-                f"Perigee Altitude (km): {sat_perigee:.1f}"
+                f"Apogee (km): {sat_apogee:.1f}" if compact else f"Apogee Altitude (km): {sat_apogee:.1f}",
+                f"Perigee (km): {sat_perigee:.1f}" if compact else f"Perigee Altitude (km): {sat_perigee:.1f}"
             ])
 
     if dist is not None:
-        details.append(f"Slant Range (km): {dist:.1f}")
-
-    # Position the details panel based on mode and surface bounds
-    surface_width, surface_height = surface.get_size()
-
-    # Use the same panel size and font size as tracking visuals mode for consistency
-    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
-        # In quadrant mode, position relative to the quadrant surface bounds
-        panel_x = surface_width - 190  # Right side of quadrant surface (same as full-screen)
-        panel_y = 20  # Top margin
-        panel_width = 170  # Same width as tracking visuals mode
-        panel_height = min(250, surface_height - 30)  # Same height as tracking visuals mode
-    else:
-        # Full screen mode - original positioning relative to surface
-        panel_x = surface_width - 190
-        panel_y = 20
-        panel_width = 170
-        panel_height = min(250, surface_height - 30)
+        details.append(f"Slant Rng (km): {dist:.1f}" if compact else f"Slant Range (km): {dist:.1f}")
 
     # Create font if needed (always use same font size as tracking visuals)
     if SATELLITE_LABEL_FONT is None:
@@ -562,7 +593,10 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
     line_height = 15  # Same as tracking visuals
     padding = 5  # Same as tracking visuals
 
-    # Draw detail lines
+    # Draw detail lines, clipped to the panel so a long value (e.g. a wide
+    # satellite name) can't spill onto the skyplot beside it
+    prev_clip = surface.get_clip()
+    surface.set_clip(pygame.Rect(panel_x, panel_y, panel_width, panel_height))
     y_offset = panel_y + padding
     for i, line in enumerate(details):
         text_surface = dynamic_font.render(line, True, (255, 255, 255))
@@ -572,6 +606,7 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
         # Prevent drawing below panel
         if y_offset > panel_y + panel_height - padding:
             break
+    surface.set_clip(prev_clip)
 
 FOV_MAGNIFICATION = 10  # dotted boxes are drawn at this magnification for clarity
 
@@ -1011,7 +1046,9 @@ class VisualizationRenderingThread(threading.Thread):
         if mode == RenderMode.FULL_SCREEN:
             self.surface = pygame.Surface((display.sub_width, display.sub_height))
         elif mode == RenderMode.UPPER_RIGHT_QUADRANT:
-            self.surface = pygame.Surface((display.sub_width // 2, display.sub_height // 2))
+            divider_x = display.joystick_layout_params()['divider_x']
+            self.surface = pygame.Surface((display.sub_x + display.sub_width - divider_x,
+                                           display.sub_height // 2))
 
         self.latest_surface = None
         self.surface_lock = threading.Condition()  # guards the latest_surface handoff
@@ -1244,6 +1281,14 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                             current_azm, current_alt,
                             alignment_azimuth
                         )
+                    elif mount_mode == 'AltAz-Side':
+                        # Side-mounted rig: equatorial forward transform with the
+                        # pole on the horizon at alignment_azimuth
+                        from transformations import AzAlt2AzEl_AltAzSide
+                        true_az, true_el = AzAlt2AzEl_AltAzSide(
+                            current_azm, current_alt,
+                            alignment_azimuth
+                        )
                     else:
                         # Use full equatorial transformation for Eq mode
                         true_az, true_el = AzAlt2AzEl(
@@ -1355,12 +1400,15 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         self.surface.fill((0, 0, 0))
 
                     # Set up display bounds for quadrant mode
-                    # The surface will be blitted at (display.sub_x + display.sub_width // 2, display.sub_y)
-                    # So we need to set the bounds to represent the final screen position
+                    # The surface is blitted at (divider_x, display.sub_y) --
+                    # the divider can sit right of the midline on short
+                    # screens (display.joystick_layout_params) -- so the
+                    # bounds must represent the final screen position.
+                    divider_x = self.display.joystick_layout_params()['divider_x']
                     display_bounds = {
-                        'sub_x': self.display.sub_x + self.display.sub_width // 2,  # Upper right quadrant start
+                        'sub_x': divider_x,  # Upper right quadrant start
                         'sub_y': self.display.sub_y,
-                        'sub_width': self.display.sub_width // 2,
+                        'sub_width': self.display.sub_x + self.display.sub_width - divider_x,
                         'sub_height': self.display.sub_height // 2
                     }
 
@@ -1478,6 +1526,14 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     if mount_mode == 'AltAz':
                         from transformations import AzAlt2AzEl_AltAz
                         true_az, true_el = AzAlt2AzEl_AltAz(
+                            current_azm, current_alt,
+                            alignment_azimuth
+                        )
+                    elif mount_mode == 'AltAz-Side':
+                        # Side-mounted rig: equatorial forward transform with the
+                        # pole on the horizon at alignment_azimuth
+                        from transformations import AzAlt2AzEl_AltAzSide
+                        true_az, true_el = AzAlt2AzEl_AltAzSide(
                             current_azm, current_alt,
                             alignment_azimuth
                         )

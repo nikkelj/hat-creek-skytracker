@@ -921,7 +921,7 @@ while running:
         # Blit pre-rendered polar plot from joystick visual thread
         joystick_surface = joystick_viz_thread.get_latest_surface()
         if joystick_surface:
-            display.menu_screen.blit(joystick_surface, (display.sub_x + display.sub_width // 2, display.sub_y))
+            display.menu_screen.blit(joystick_surface, (display.joystick_layout_params()['divider_x'], display.sub_y))
             # Update tracking surface for capture functionality in joystick mode
             current_tracking_surface = joystick_surface
         else:
@@ -934,7 +934,7 @@ while running:
         if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
             # Create joystick launch button rectangle (lower left of upper right quadrant)
             joystick_launch_button = pygame.Rect(
-                display.sub_x + display.sub_width // 2 + 10,  # Left edge of quadrant + margin
+                display.joystick_layout_params()['divider_x'] + 10,  # Left edge of quadrant + margin
                 display.sub_y + display.sub_height // 2 - 45,  # Bottom of quadrant - button height - margin
                 70, 30  # Same size as main launch button
             )

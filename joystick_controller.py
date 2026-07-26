@@ -125,36 +125,52 @@ def _draw_disabled_scrim(display, rect):
 
 def joystick_panel_layout(display):
     """Geometry for the control panes that hug the RIGHT edge of the joystick
-    mode's upper-left quadrant, stacked bottom-up: PID Gain (bottom), Bias above
-    it, and PID Diagnostics above that. All right-aligned to the quadrant
-    divider, which keeps the center of the quadrant clear (reserved for the
-    forthcoming navball)."""
+    mode's upper-left quadrant. On tall screens they stack bottom-up in one
+    column: PID Gain (bottom), Bias, PID Diagnostics, Plate Solve. On short
+    screens (the stack doesn't fit -- e.g. 1080p) they reflow into two
+    bottom-aligned columns: pid+bias rightmost, diag+plate to their left, and
+    the quadrant divider slides right (display.joystick_layout_params) so the
+    navball column keeps its width. All right-aligned to the divider."""
+    params = display.joystick_layout_params()
     qx, qy = display.sub_x, display.sub_y
-    qw, qh = display.sub_width // 2, display.sub_height // 2
+    qh = display.sub_height // 2
+    gap = params['gap']
+    right = params['divider_x'] - 12  # right edge of the pane block
+    bottom = qy + qh - 12
+    top_min = qy + display.JOYSTICK_PANE_TOP
 
     pid_w, pid_h = 250, 215
-    pid_x = qx + qw - pid_w - 12
-    pid_y = qy + qh - pid_h - 12
-
     bias_w, bias_h = 250, 150
-    bias_x = qx + qw - bias_w - 12
-    bias_y = pid_y - bias_h - 12
-
     diag_w, diag_h = 250, 112
-    diag_x = qx + qw - diag_w - 12
-    diag_y = bias_y - diag_h - 12
-
-    # Plate-solve pane above the diagnostics pane, clamped so it never rides up over
-    # the connect/port/status rows at the top of the quadrant.
     plate_w, plate_h = 250, 92
-    plate_x = qx + qw - plate_w - 12
-    plate_y = max(qy + 104, diag_y - plate_h - 12)
+
+    pid_x = right - pid_w
+    pid_y = bottom - pid_h
+    bias_x = pid_x
+    bias_y = pid_y - gap - bias_h
+
+    if params['two_col']:
+        # Second column left of pid/bias, bottom-aligned: plate at the bottom,
+        # diagnostics above it.
+        diag_x = pid_x - gap - diag_w
+        plate_x = diag_x
+        plate_y = bottom - plate_h
+        diag_y = plate_y - gap - diag_h
+        pane_left = diag_x
+    else:
+        diag_x = pid_x
+        diag_y = bias_y - gap - diag_h
+        plate_x = pid_x
+        # Clamped so it never rides up over the connect/port/status rows at
+        # the top of the quadrant.
+        plate_y = max(top_min, diag_y - gap - plate_h)
+        pane_left = pid_x
 
     # ADS-B pane: top-center band, above the navball and between the left
-    # status block and the right-hand panes / position-display box (which already
+    # status block and the pane block / position-display box (which already
     # own the top-left and top-right corners).
-    center_left = qx + 280
-    center_right = qx + qw - 250 - 14
+    center_left = qx + display.JOYSTICK_STATUS_W
+    center_right = pane_left - 14
     center_w = max(150, center_right - center_left)
     adsb_w = min(260, center_w)
     adsb_x = center_left + (center_w - adsb_w) // 2
@@ -167,21 +183,23 @@ def joystick_panel_layout(display):
         'diag': pygame.Rect(diag_x, diag_y, diag_w, diag_h),
         'plate': pygame.Rect(plate_x, plate_y, plate_w, plate_h),
         'adsb': pygame.Rect(adsb_x, adsb_y, adsb_w, adsb_h),
+        'pane_left': pane_left,
     }
 
 
 def joystick_center_layout(display):
-    """Geometry for the previously-unused center column of the joystick mode's
-    upper-left quadrant: the navball up top and the two PID-tuning strip charts
-    (tracking rate, position error) stacked below it. The column sits between the
-    left button/axes status block and the right-hand PID/bias/diag panes.
-    `valid` is False when the quadrant is too small to host them."""
+    """Geometry for the center column of the joystick mode's upper-left
+    quadrant: the navball up top and the two PID-tuning strip charts
+    (tracking rate, position error) stacked below it. The column sits between
+    the left button/axes status block and the right-hand pane block (one or
+    two columns wide -- see joystick_panel_layout). `valid` is False when the
+    quadrant is too small to host them."""
     qx, qy = display.sub_x, display.sub_y
-    qw, qh = display.sub_width // 2, display.sub_height // 2
+    qh = display.sub_height // 2
 
-    left = qx + 280              # clear of the button/axes status block
-    right = qx + qw - 250 - 14   # clear of the right-hand panes (250 wide + margin)
-    top = qy + 104               # below the connect/port/baud/status rows
+    left = qx + display.JOYSTICK_STATUS_W  # clear of the button/axes status block
+    right = joystick_panel_layout(display)['pane_left'] - 14  # clear of the pane block
+    top = qy + display.JOYSTICK_PANE_TOP   # below the connect/port/baud/status rows
     bottom = qy + qh - 12
     cw = right - left
     ch = bottom - top
@@ -2049,8 +2067,10 @@ class JoystickModeState:
                 return
 
             elif event.button == 6:  # Op (Options) button - mount mode toggle
-                # Cycle through AltAz, Eq, and Passthrough modes
+                # Cycle through AltAz, AltAz-Side, Eq, and Passthrough modes
                 if self.mount_mode == "AltAz":
+                    self.mount_mode = "AltAz-Side"
+                elif self.mount_mode == "AltAz-Side":
                     self.mount_mode = "Eq"
                 elif self.mount_mode == "Eq":
                     self.mount_mode = "Passthrough"

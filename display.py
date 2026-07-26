@@ -44,6 +44,44 @@ class DisplaySetup:
     FPS_TARGET = 30
     WINDOW_POSITION = "0,0"
 
+    # Joystick-screen layout policy (shared by joystick_controller layout
+    # helpers, rendering_threads and main so every consumer agrees on where
+    # the upper-left control quadrant ends and the skyplot quadrant begins).
+    JOYSTICK_PANE_W = 250                       # control pane width
+    JOYSTICK_PANE_HEIGHTS = (215, 150, 112, 92)  # pid, bias, diag, plate
+    JOYSTICK_PANE_TOP = 104     # below connect/port/status + position box
+    JOYSTICK_PANE_MARGIN = 12
+    JOYSTICK_STATUS_W = 280     # left button/axes status block
+    JOYSTICK_CENTER_MIN = 200   # navball/strip-chart column minimum width
+
+    def joystick_layout_params(self):
+        """Divider policy for the joystick screen.
+
+        The right-edge control-pane stack needs ~720 px of quadrant height to
+        fit in one column; on shorter screens (e.g. 1080p laptop) it reflows
+        into two columns, and the control quadrant widens (divider slides
+        right) so the navball column keeps its designed width. The skyplot
+        circle is height-bound well past that shift, so it loses nothing.
+        """
+        qh = self.sub_height // 2
+        stack = sum(self.JOYSTICK_PANE_HEIGHTS)
+        avail = qh - self.JOYSTICK_PANE_TOP - self.JOYSTICK_PANE_MARGIN
+        two_col = avail < stack + 3 * 6  # can't fit even with 6 px gaps
+        if two_col:
+            gap = self.JOYSTICK_PANE_MARGIN
+            pane_block_w = 2 * self.JOYSTICK_PANE_W + gap
+        else:
+            gap = min(self.JOYSTICK_PANE_MARGIN, max(6, (avail - stack) // 3))
+            pane_block_w = self.JOYSTICK_PANE_W
+        needed = (self.JOYSTICK_STATUS_W + self.JOYSTICK_CENTER_MIN
+                  + pane_block_w + 3 * self.JOYSTICK_PANE_MARGIN + 2)
+        split = min(max(self.sub_width // 2, needed), int(self.sub_width * 0.62))
+        return {
+            'divider_x': self.sub_x + split,
+            'two_col': two_col,
+            'gap': gap,
+        }
+
     def __init__(self):
         pygame.init()
         display_info = pygame.display.Info()

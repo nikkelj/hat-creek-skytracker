@@ -6,6 +6,34 @@ Newest entries first.
 
 ---
 
+## 2026-07-25 — AVX guide-rate wire unit is arcsec/s × 1024, not rev/s × 2²⁴
+
+First hardware run of `bench_guiderate.py` (checklist step 2): every commanded
+continuous rate produced "NOT MOVING" with a dead-constant ratio of **0.01265 =
+1/79.1** — commanded 1.0 °/s actually moved at 45.5″/s. 79.1 is exactly the
+ratio between our assumed encoding (revolutions/sec × 2²⁴) and the firmware's
+real unit: **the 24-bit MC_SET_POS/NEG_GUIDERATE value is arcseconds/second in
+Q10 fixed point (value = arcsec/s × 1024)**. Corroboration: 24-bit full scale
+works out to 4.551 °/s — precisely the AVX max slew — and the encoder readback
+was independently validated in the same run (see below). Fixed in
+`hc_set_rate_dps` + `protocol.rs encode_set_guiderate` + both sim decoders
+(count-space rounding so full scale encodes exactly 0xFFFFFF), and
+`guide_rate_max_dps` default lowered 5.0 → 4.5 to sit under full scale.
+
+Second finding from the same run: the discrete **`RATES` table is wrong on
+this mount** — MC_MOVE rate 4 measured 0.0335 °/s = 8.0× sidereal (the classic
+Celestron HC progression), not the 0.25 °/s the table lists. That table feeds
+the discrete-rate PID path AND the simulated mount, so desk rehearsals were
+self-consistent but ~7.5× optimistic about discrete slew authority. Left
+as-is pending a full measurement: `bench_guiderate.py --survey` now measures
+all nine steps and prints a paste-ready table.
+
+Meta-lesson: the bench ordering in `doc/BENCH_CHECKLIST.md` was right — this
+was caught at guide rates with a hand on the power switch, before any
+tracking mode trusted the encoding. And a single reference measurement of a
+*known* discrete rate in the same run was what separated "encoder scale
+wrong" from "command scale wrong."
+
 ## 2026-07-07 — HOTSPOT/HANDOFF stair-steps: four coupled failure modes
 
 Field report: HANDOFF centered briefly then walked off in near-FOV-sized

@@ -828,7 +828,9 @@ impl Transport for PyMountTransport {
                 || msg_id == protocol::MC_SET_NEG_GUIDERATE.0
             {
                 let sign = if msg_id == protocol::MC_SET_POS_GUIDERATE.0 { 1.0 } else { -1.0 };
-                let dps = sign * protocol::unpack_int3(&d) * 360.0;
+                // Calibrated firmware unit: 24-bit value = arcsec/s * 1024.
+                let dps =
+                    sign * protocol::unpack_int3(&d) * 16777216.0 / protocol::GUIDE_COUNTS_PER_DPS;
                 let _ = mount.call_method1("hc_set_rate_dps", (target, dps));
                 vec![b'#']
             } else if msg_id == protocol::MC_GOTO_FAST.0 {

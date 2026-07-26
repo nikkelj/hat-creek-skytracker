@@ -195,7 +195,10 @@ class ConfigState:
         # (e.g. the near-zenith keyhole). Off by default until verified on hardware
         # with bench_guiderate.py.
         self.continuous_rate_tracking = False
-        self.guide_rate_max_dps = 5.0  # max rate sent via the guide-rate command
+        # Max rate sent via the guide-rate command. The 24-bit wire value is
+        # arcsec/s * 1024 (calibrated on the AVX 2026-07-25), so full scale is
+        # 4.551 dps -- stay below it; MC_MOVE handles faster slews.
+        self.guide_rate_max_dps = 4.5
 
         # Experimental: run the control loop in Rust (skytracker_core) instead of
         # the Python MountControlThread. Read at startup in main.py; toggled from

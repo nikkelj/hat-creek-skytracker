@@ -104,16 +104,27 @@ pub fn encode_slew_fixed(target: u8, rate_step: i32) -> Vec<u8> {
     passthrough(clen, target, id, [mag, 0, 0], rlen)
 }
 
+/// Firmware guide-rate unit, CALIBRATED on the real AVX (bench_guiderate.py,
+/// 2026-07-25): the 24-bit MC_SET_POS/NEG_GUIDERATE value is arcseconds per
+/// second in Q10 fixed point (value = arcsec_per_sec * 1024). Full scale
+/// (2^24 - 1) is 4.551 deg/s, matching the AVX max slew. Mirrors
+/// `auxstar.GUIDE_COUNTS_PER_DPS`.
+pub const GUIDE_COUNTS_PER_DPS: f64 = 3600.0 * 1024.0;
+pub const GUIDE_RATE_MAX_DPS: f64 = ((1u32 << 24) - 1) as f64 / GUIDE_COUNTS_PER_DPS;
+
 /// Continuous variable rate in deg/s via MC_SET_POS/NEG_GUIDERATE. Sign selects
-/// the opcode; magnitude is packed in rev/sec (dps/360 * 2^24) -- the same
-/// convention as the RATES table and `auxstar.hc_set_rate_dps`.
+/// the opcode; magnitude is packed as arcsec/s * 1024 (GUIDE_COUNTS_PER_DPS,
+/// clamped to 24-bit full scale) -- mirrors `auxstar.hc_set_rate_dps`.
 pub fn encode_set_guiderate(target: u8, dps: f64) -> Vec<u8> {
     let (id, clen, rlen) = if dps >= 0.0 {
         MC_SET_POS_GUIDERATE
     } else {
         MC_SET_NEG_GUIDERATE
     };
-    let mag = pack_int3((dps.abs()) / 360.0);
+    // Round+clamp in COUNT space so full scale encodes exactly 0xFFFFFF
+    // (clamping in deg/s and converting back can land one LSB short).
+    let counts = (dps.abs() * GUIDE_COUNTS_PER_DPS).round().min(16777215.0);
+    let mag = pack_int3(counts / 16777216.0);
     passthrough(clen, target, id, mag, rlen)
 }
 

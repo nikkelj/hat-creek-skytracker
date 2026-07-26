@@ -5,9 +5,11 @@ Bench test: verify and calibrate the Celestron AVX fine variable-rate primitive
 
 Background: the 10-step MC_MOVE table is geometric, so steady tracking has a
 quantization sawtooth ~ rate-gap x control-dt. The 24-bit guide-rate command
-should give effectively continuous rates and remove that sawtooth -- IF the AVX
-firmware honors it for sustained tracking and IF our on-wire encoding scale is
-right (hc_set_rate_dps assumes the rev/sec convention; UNVERIFIED). This script
+should give effectively continuous rates and remove that sawtooth. The on-wire
+scale was CALIBRATED with this script on the real AVX (2026-07-25): the 24-bit
+value is arcsec/s * 1024 (the original rev/sec assumption measured a dead-flat
+ratio of 0.01265 = exactly 1/79.1, and full scale works out to 4.551 dps = the
+AVX max slew). Re-run after firmware changes or on a new mount. This script
 answers three questions on real hardware:
 
   1) Does MC_SET_POS_GUIDERATE produce smooth, sustained axis motion (not just a
@@ -22,6 +24,12 @@ angular travel limit per step, and a stop after every step.
 Usage:
     python bench_guiderate.py --port COM5 --target azm
     python bench_guiderate.py --port COM5 --target alt --max-dps 3.0
+    python bench_guiderate.py --port COM5 --survey       # measure MC_MOVE 1..9
+
+--survey measures every discrete MC_MOVE step instead: the shipped RATES table
+is suspect (measured rate 4 = 8x sidereal on the AVX, not the 0.25 dps listed),
+and the discrete-rate PID path and the simulator both consume that table.
+Paste the survey output into RATES once measured.
 
 Start with the axis roughly mid-range and clear to move +/- a few degrees.
 """
@@ -111,9 +119,11 @@ def run(port, target_name, max_dps, travel_limit_deg):
             if abs(travel) > travel_limit_deg:
                 break
 
-    # MC_MOVE reference for comparison (discrete rate 4 ~ 0.25 dps).
-    print("\n  Reference, discrete MC_MOVE rate 4 (table says "
-          f"{RATES[4] * 360:.3f} dps):")
+    # MC_MOVE reference for comparison. NOTE: the shipped RATES table is
+    # suspect (2026-07-25: rate 4 measured 0.0335 dps = 8.0x sidereal, not the
+    # 0.25 dps the table lists) -- run --survey to measure the real table.
+    print("\n  Reference, discrete MC_MOVE rate 4 (RATES table claims "
+          f"{RATES[4] * 360:.3f} dps; AVX measured 8x sidereal = 0.0334):")
     hc.hc_slew_fixed(target, 4)
     actual, travel = measure_rate(hc, target)
     stop(hc, target)
@@ -127,6 +137,53 @@ def run(port, target_name, max_dps, travel_limit_deg):
     print("  * smooth actual at low rates -> the sawtooth fix is real on this mount.")
 
 
+SIDEREAL_DPS = 360.0 / 86164.0905  # 0.0041781 deg/s
+
+
+def run_survey(port, target_name, travel_limit_deg):
+    """Measure every discrete MC_MOVE step (1..9), out-and-back per step so the
+    axis roughly returns to start. Prints a ready-to-paste RATES table."""
+    target = Targets.ALT if target_name == "alt" else Targets.AZM
+    hc = NexstarHandController(port)
+    print(f"Connected on {port}. Target axis: {target_name.upper()}")
+    print(f"Start position: {read_deg(hc, target):.4f} deg")
+    print("\n  step   actual_dps   x sidereal   table_dps   travel")
+    print("  ----   ----------   ----------   ---------   ------")
+
+    measured = {}
+    # Short dwells at high steps: 9 can run multiple deg/s.
+    dwell = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 3.0, 6: 2.5, 7: 2.0, 8: 1.5, 9: 1.2}
+    for step in range(1, 10):
+        fwd = rev = 0.0
+        for sign in (+1, -1):
+            hc.hc_slew_fixed(target, sign * step)
+            actual, travel = measure_rate(hc, target, sample_s=dwell[step])
+            stop(hc, target)
+            time.sleep(0.3)
+            if sign > 0:
+                fwd = actual
+            else:
+                rev = actual
+            if abs(travel) > travel_limit_deg:
+                print(f"  step {step}: travel limit hit ({travel:+.2f} deg), "
+                      "skipping remaining steps")
+                break
+        actual = (abs(fwd) + abs(rev)) / 2.0
+        measured[step] = actual
+        print(f"   {step}     {actual:+9.4f}   {actual / SIDEREAL_DPS:9.2f}   "
+              f"{RATES[step] * 360.0:9.4f}   ok")
+
+    print("\nMeasured RATES table (rev/sec, paste into lib/auxstar.py):")
+    print("RATES = {")
+    print("    0 : 0.0,")
+    for step in range(1, 10):
+        if step in measured:
+            print(f"    {step} : {measured[step] / 360.0:.9f},"
+                  f"  # {measured[step]:.4f} dps = "
+                  f"{measured[step] / SIDEREAL_DPS:.1f}x sidereal (measured)")
+    print("}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -136,9 +193,15 @@ if __name__ == "__main__":
                     help="don't command rates above this (default 3.0; raise carefully)")
     ap.add_argument("--travel-limit", type=float, default=8.0,
                     help="abort a step if the axis travels more than this many degrees")
+    ap.add_argument("--survey", action="store_true",
+                    help="measure the discrete MC_MOVE steps 1..9 instead "
+                         "(the shipped RATES table is suspect)")
     args = ap.parse_args()
     try:
-        run(args.port, args.target, args.max_dps, args.travel_limit)
+        if args.survey:
+            run_survey(args.port, args.target, args.travel_limit)
+        else:
+            run(args.port, args.target, args.max_dps, args.travel_limit)
     except KeyboardInterrupt:
         print("\nInterrupted -- sending stop.")
         try:

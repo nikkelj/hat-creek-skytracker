@@ -124,7 +124,9 @@ impl Default for Inputs {
             ff_alt_enabled: false,
             lead_time_sec: 0.0,
             continuous_rate: false,
-            guide_rate_max_dps: 5.0,
+            // 24-bit guide-rate full scale is 4.551 dps (arcsec/s Q10); the
+            // encoder clamps there, so default the MC_MOVE fallback gate below it.
+            guide_rate_max_dps: 4.5,
             output_filter_tau: 0.0,
             handoff_min_frames: 5,
             hotspot: HotspotParams {

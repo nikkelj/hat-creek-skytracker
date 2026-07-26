@@ -445,14 +445,17 @@ class SimMount:
         return True
 
     # Fine continuous-rate primitive (MC_SET_POS/NEG_GUIDERATE). Sets the axis
-    # rate directly in deg/s, quantized to the real 24-bit guide-rate LSB so the
-    # sim faithfully shows "effectively continuous" tracking (vs the 10-step
-    # MC_MOVE used by hc_slew_fixed).
-    _GUIDE_LSB_DPS = 360.0 / 2 ** 24  # ~0.077 arcsec/s
+    # rate directly in deg/s, quantized (and clamped) to the real 24-bit
+    # guide-rate scale -- arcsec/s * 1024, calibrated on the AVX 2026-07-25 --
+    # so the sim faithfully shows "effectively continuous" tracking (vs the
+    # 10-step MC_MOVE used by hc_slew_fixed).
+    _GUIDE_LSB_DPS = 1.0 / 3686400.0  # 1/(3600*1024) deg/s, ~0.001 arcsec/s
 
     def hc_set_rate_dps(self, target, dps):
+        from lib.auxstar import GUIDE_RATE_MAX_DPS
         with self._lock:
             self._advance()
+            dps = max(-GUIDE_RATE_MAX_DPS, min(GUIDE_RATE_MAX_DPS, dps))
             q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
             if target == Targets.ALT:
                 self._el_rate_dps = q
@@ -546,7 +549,10 @@ class SimSerialDevice:
                 # sidereal / solar / lunar specials -- accept as an ack.
                 self.mount.hc_set_guide_rate(target, sign)
             else:
-                dps = unpack_int3(data) * 360.0  # rev/s convention -> deg/s
+                # Calibrated firmware unit: 24-bit value = arcsec/s * 1024
+                # (unpack_int3 returns value/2^24 -> scale back to counts).
+                from lib.auxstar import GUIDE_COUNTS_PER_DPS
+                dps = unpack_int3(data) * (2 ** 24) / GUIDE_COUNTS_PER_DPS
                 self.mount.hc_set_rate_dps(target, sign * dps)
             return b""
         if msg_id in (0x24, 0x25):               # MC_MOVE_POS / MC_MOVE_NEG

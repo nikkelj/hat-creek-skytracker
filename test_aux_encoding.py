@@ -76,12 +76,23 @@ class GuideRateEncodingTests(unittest.TestCase):
         self.assertEqual(msg, bytes([0x50, 0x04, 0x10, 0x06, 0xff, 0xff, 0x00, 0x00]))
 
     def test_set_rate_dps_scale_convention(self):
-        # hc_set_rate_dps packs dps/360 (rev/sec) -- the convention shared with
-        # the RATES table. The on-wire *scale* still needs bench_guiderate.py
-        # on real hardware; this pins the code's intended convention.
+        # hc_set_rate_dps packs arcsec/s * 1024 (Q10) -- the firmware unit
+        # CALIBRATED on the real AVX with bench_guiderate.py (2026-07-25): a
+        # commanded 1 dps under the old rev/sec assumption measured 0.01265 dps
+        # = exactly the 79.1x between the two conventions.
         self.ctrl.hc_set_rate_dps(Targets.AZM, 0.36)
         (msg,) = self.dev.writes
-        self.assertEqual(msg[4:7], pack_int3(0.36 / 360.0))
+        # 0.36 dps * 3600 * 1024 = 1327104 counts exactly.
+        self.assertEqual(msg[4:7], (1327104).to_bytes(3, 'big'))
+
+    def test_set_rate_dps_clamps_to_24_bit_full_scale(self):
+        # Full scale is 4.551 dps; anything above must clamp, not wrap the
+        # 24-bit field (a wrap would command a slow rate instead of max).
+        from lib.auxstar import GUIDE_RATE_MAX_DPS
+        self.ctrl.hc_set_rate_dps(Targets.AZM, 12.0)
+        (msg,) = self.dev.writes
+        self.assertEqual(msg[4:7], (2 ** 24 - 1).to_bytes(3, 'big'))
+        self.assertAlmostEqual(GUIDE_RATE_MAX_DPS, 4.551, places=3)
 
     def test_every_rate_magnitude_encodes_without_error(self):
         # The old '{:06x}'.format(bytes) crashed on every call; sweep a range

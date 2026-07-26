@@ -234,14 +234,16 @@ impl SimResponder {
         } else if msg_id == protocol::MC_SET_POS_GUIDERATE.0
             || msg_id == protocol::MC_SET_NEG_GUIDERATE.0
         {
-            // Continuous variable rate: value packed in rev/sec, sign by opcode.
+            // Continuous variable rate: value = arcsec/s * 1024 (calibrated
+            // firmware unit), sign by opcode. unpack_int3 returns value/2^24.
             self.advance();
             let sign = if msg_id == protocol::MC_SET_POS_GUIDERATE.0 {
                 1.0
             } else {
                 -1.0
             };
-            let dps = sign * protocol::unpack_int3(&data) * 360.0;
+            let dps =
+                sign * protocol::unpack_int3(&data) * 16777216.0 / protocol::GUIDE_COUNTS_PER_DPS;
             if dest == protocol::targets::ALT {
                 self.el_rate_dps = dps;
             } else if dest == protocol::targets::FOCUS {

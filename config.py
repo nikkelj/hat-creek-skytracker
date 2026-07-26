@@ -596,108 +596,26 @@ class ConfigState:
         self.camera_configs[camera_name].update(config_dict)
 
 
-def draw_angle_groups(display, config_state):
-    """
-    Draw PID and alignment configuration UI groups.
-    This extends draw_config_options with PID parameter controls.
-    """
+def _draw_config_field(display, config_state, field, label_text, value_str):
+    """Draw one config input: label above the box, white box, current value,
+    and (when focused) the blue focus ring + text cursor. One code path for
+    every field on the config screen -- the per-field copies this replaced had
+    drifted apart in fonts, offsets, and cursor handling."""
     import pygame
-    from utils import draw_button_with_objects
-
-    # Draw PID configuration group (right side)
-    pid_group_rect = pygame.Rect(display.sub_x + 480, display.sub_y + 0, 320, 280)
-    pygame.draw.rect(display.menu_screen, (0, 0, 0), pid_group_rect, 2, border_radius=5)
-    pid_label = display.font.render("PID Control", True, (0, 0, 0))
-    display.menu_screen.blit(pid_label, (display.sub_x + 490, display.sub_y + 10))
-
-    current_y = display.sub_y + 40
-
-    # AZM PID gains
-    azm_p_label = display.small_font.render("AZM P:", True, (0, 0, 0))
-    display.menu_screen.blit(azm_p_label, (display.sub_x + 490, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_p_gain'])
-    azm_p_text = display.small_font.render(f"{config_state.pid_azm_p_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(azm_p_text, (display.input_rects['pid_azm_p_gain'].x + 5, display.input_rects['pid_azm_p_gain'].y + 5))
-
-    azm_i_label = display.small_font.render("I:", True, (0, 0, 0))
-    display.menu_screen.blit(azm_i_label, (display.sub_x + 600, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_i_gain'])
-    azm_i_text = display.small_font.render(f"{config_state.pid_azm_i_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(azm_i_text, (display.input_rects['pid_azm_i_gain'].x + 5, display.input_rects['pid_azm_i_gain'].y + 5))
-
-    azm_d_label = display.small_font.render("D:", True, (0, 0, 0))
-    display.menu_screen.blit(azm_d_label, (display.sub_x + 710, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_azm_d_gain'])
-    azm_d_text = display.small_font.render(f"{config_state.pid_azm_d_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(azm_d_text, (display.input_rects['pid_azm_d_gain'].x + 5, display.input_rects['pid_azm_d_gain'].y + 5))
-
-    current_y += 70
-
-    # ALT PID gains
-    alt_p_label = display.small_font.render("ALT P:", True, (0, 0, 0))
-    display.menu_screen.blit(alt_p_label, (display.sub_x + 490, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_p_gain'])
-    alt_p_text = display.small_font.render(f"{config_state.pid_alt_p_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(alt_p_text, (display.input_rects['pid_alt_p_gain'].x + 5, display.input_rects['pid_alt_p_gain'].y + 5))
-
-    alt_i_label = display.small_font.render("I:", True, (0, 0, 0))
-    display.menu_screen.blit(alt_i_label, (display.sub_x + 600, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_i_gain'])
-    alt_i_text = display.small_font.render(f"{config_state.pid_alt_i_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(alt_i_text, (display.input_rects['pid_alt_i_gain'].x + 5, display.input_rects['pid_alt_i_gain'].y + 5))
-
-    alt_d_label = display.small_font.render("D:", True, (0, 0, 0))
-    display.menu_screen.blit(alt_d_label, (display.sub_x + 710, current_y))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['pid_alt_d_gain'])
-    alt_d_text = display.small_font.render(f"{config_state.pid_alt_d_gain:.3f}", True, (0, 0, 0))
-    display.menu_screen.blit(alt_d_text, (display.input_rects['pid_alt_d_gain'].x + 5, display.input_rects['pid_alt_d_gain'].y + 5))
-
-    current_y += 70
-
-    # Feed-forward status display
-    ff_azm_label = display.small_font.render("AZM FF:", True, (0, 0, 0))
-    display.menu_screen.blit(ff_azm_label, (display.sub_x + 480, current_y))
-    ff_azm_status = "ON" if config_state.feed_forward_azm_enabled else "OFF"
-    ff_azm_color = (0, 150, 0) if config_state.feed_forward_azm_enabled else (150, 0, 0)
-    ff_azm_status_text = display.small_font.render(ff_azm_status, True, ff_azm_color)
-    display.menu_screen.blit(ff_azm_status_text, (display.sub_x + 550, current_y))
-
-    ff_alt_label = display.small_font.render("ALT FF:", True, (0, 0, 0))
-    display.menu_screen.blit(ff_alt_label, (display.sub_x + 620, current_y))
-    ff_alt_status = "ON" if config_state.feed_forward_alt_enabled else "OFF"
-    ff_alt_color = (0, 150, 0) if config_state.feed_forward_alt_enabled else (150, 0, 0)
-    ff_alt_status_text = display.small_font.render(ff_alt_status, True, ff_alt_color)
-    display.menu_screen.blit(ff_alt_status_text, (display.sub_x + 690, current_y))
-
-    current_y += 30
-
-    # Focus highlights for PID fields
-    pid_focus_fields = ['pid_azm_p_gain', 'pid_azm_i_gain', 'pid_azm_d_gain',
-                       'pid_alt_p_gain', 'pid_alt_i_gain', 'pid_alt_d_gain']
-
-    for field in pid_focus_fields:
-        if config_state.focused_field == field and field in display.input_rects:
-            pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects[field], 2)
-            field_str = ""
-            if field == 'pid_azm_p_gain':
-                field_str = f"{config_state.pid_azm_p_gain:.3f}"
-            elif field == 'pid_azm_i_gain':
-                field_str = f"{config_state.pid_azm_i_gain:.3f}"
-            elif field == 'pid_azm_d_gain':
-                field_str = f"{config_state.pid_azm_d_gain:.3f}"
-            elif field == 'pid_alt_p_gain':
-                field_str = f"{config_state.pid_alt_p_gain:.3f}"
-            elif field == 'pid_alt_i_gain':
-                field_str = f"{config_state.pid_alt_i_gain:.3f}"
-            elif field == 'pid_alt_d_gain':
-                field_str = f"{config_state.pid_alt_d_gain:.3f}"
-
-            if field_str and config_state.focused_field in config_state.cursor_pos:
-                text_width, _ = display.small_font.size(field_str[:config_state.cursor_pos[config_state.focused_field]])
-                rect = display.input_rects[config_state.focused_field]
-                pygame.draw.line(display.menu_screen, (0, 0, 255),
-                               (rect.x + 5 + text_width, rect.y + 5),
-                               (rect.x + 5 + text_width, rect.y + 25), 2)
+    rect = display.input_rects[field]
+    if label_text:
+        label = display.font.render(label_text, True, (0, 0, 0))
+        display.menu_screen.blit(label, (rect.x, rect.y - 22))
+    pygame.draw.rect(display.menu_screen, (255, 255, 255), rect)
+    value = display.font.render(value_str, True, (0, 0, 0))
+    display.menu_screen.blit(value, (rect.x + 5, rect.y + 5))
+    if config_state.focused_field == field:
+        pygame.draw.rect(display.menu_screen, (0, 0, 255), rect, 2)
+        cursor = config_state.cursor_pos.get(field, 0)
+        text_width, _ = display.font.size(value_str[:cursor])
+        pygame.draw.line(display.menu_screen, (0, 0, 255),
+                         (rect.x + 5 + text_width, rect.y + 5),
+                         (rect.x + 5 + text_width, rect.y + rect.height - 5), 2)
 
 
 def handle_input(event, config_state):
@@ -748,18 +666,20 @@ def handle_input(event, config_state):
         field_str = config_state.azm_offset_str
     elif focused_field == "alt_offset":
         field_str = config_state.alt_offset_str
+    # 5 decimals: tuned gains (auto-tune, log sliders) live at 1e-4..1e-3
+    # scale; the old %.3f displayed e.g. an I gain of 0.00025 as "0.000".
     elif focused_field == "pid_azm_p_gain":
-        field_str = f"{config_state.pid_azm_p_gain:.3f}"
+        field_str = f"{config_state.pid_azm_p_gain:.5f}"
     elif focused_field == "pid_azm_i_gain":
-        field_str = f"{config_state.pid_azm_i_gain:.3f}"
+        field_str = f"{config_state.pid_azm_i_gain:.5f}"
     elif focused_field == "pid_azm_d_gain":
-        field_str = f"{config_state.pid_azm_d_gain:.3f}"
+        field_str = f"{config_state.pid_azm_d_gain:.5f}"
     elif focused_field == "pid_alt_p_gain":
-        field_str = f"{config_state.pid_alt_p_gain:.3f}"
+        field_str = f"{config_state.pid_alt_p_gain:.5f}"
     elif focused_field == "pid_alt_i_gain":
-        field_str = f"{config_state.pid_alt_i_gain:.3f}"
+        field_str = f"{config_state.pid_alt_i_gain:.5f}"
     elif focused_field == "pid_alt_d_gain":
-        field_str = f"{config_state.pid_alt_d_gain:.3f}"
+        field_str = f"{config_state.pid_alt_d_gain:.5f}"
     elif focused_field == "azm_limit_min":
         field_str = config_state.azm_limit_min_str
     elif focused_field == "azm_limit_max":
@@ -950,338 +870,91 @@ def handle_input(event, config_state):
 
 
 def draw_config_options(display, config_state):
-    """
-    Draw the configuration options UI when in config mode.
-    This includes location fields and both camera configuration groups.
-    """
+    """Draw the configuration screen: five aligned group columns (Site &
+    Alignment, Mount & Limits, Camera 1, Camera 2, PID Gains), rendered
+    data-driven from display.input_rects / display.config_group_rects so
+    labels, boxes, and group frames stay in register. _draw_config_field
+    draws label/box/value/focus identically for every field."""
     import pygame
     from utils import draw_button_with_objects
 
-    # Draw gradient background for config options
+    # Gradient background
     for y in range(display.sub_height):
-        color = (160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5), 160 - (y / display.sub_height * 5))
-        pygame.draw.line(display.menu_screen, color, (display.sub_x, display.sub_y + y), (display.sub_x + display.sub_width, display.sub_y + y))
+        shade = int(160 - (y / display.sub_height * 5))
+        pygame.draw.line(display.menu_screen, (shade, shade, shade),
+                         (display.sub_x, display.sub_y + y),
+                         (display.sub_x + display.sub_width, display.sub_y + y))
 
-    # Draw grouping box and label
-    group_rect = pygame.Rect(display.sub_x + 10, display.sub_y + 0, 220, 990)
-    pygame.draw.rect(display.menu_screen, (0, 0, 0), group_rect, 2, border_radius=5)
-    group_label = display.font.render("Site / Mount / Limits", True, (0, 0, 0))
-    display.menu_screen.blit(group_label, (display.sub_x + 20, display.sub_y + 10))
+    def camera_fields(prefix, cam):
+        return [
+            (f'{prefix}_pixel_size', "Pixel Size (μm):", f"{cam['pixel_size']:.2f}"),
+            (f'{prefix}_array_size_diagonal', "Array Diagonal (mm):", f"{cam['array_size_diagonal']:.1f}"),
+            (f'{prefix}_focal_length', "Focal Length (mm):", f"{cam['focal_length']:.1f}"),
+            (f'{prefix}_alignment_rotation', "Align Rotation (deg):", f"{cam['alignment_rotation']:.1f}"),
+            (f'{prefix}_gain', "Gain:", f"{cam['gain']:.2f}"),
+            (f'{prefix}_exposure', "Exposure (μs):", f"{cam['exposure']:.0f}"),
+        ]
 
-    # Left column fields. Each label is drawn a consistent gap ABOVE its input
-    # box, with the y derived from display.input_rects so the column stays
-    # aligned regardless of box spacing. (Previously the label offsets were
-    # hand-tuned and drifted out of register -- the azimuth-alignment label even
-    # overlapped its own box, and a duplicate header was drawn above it.)
-    left_fields = [
-        ('lat', "Latitude:", config_state.lat_str),
-        ('lon', "Longitude:", config_state.lon_str),
-        ('alt', "Altitude (m):", config_state.alt_str),
-        ('elevation_mask', "Elevation Mask (deg):", config_state.elevation_mask_str),
-        ('alignment_azimuth', "Azimuth Alignment (deg):", config_state.alignment_azimuth_str),
-        ('alignment_elevation', "Elevation Align (deg, Eq):", config_state.alignment_elevation_str),
-        ('azm_offset', "Azm Offset (deg):", config_state.azm_offset_str),
-        ('alt_offset', "Alt Offset (deg):", config_state.alt_offset_str),
-        ('azm_limit_min', "AZM Limit Min (deg):", config_state.azm_limit_min_str),
-        ('azm_limit_max', "AZM Limit Max (deg):", config_state.azm_limit_max_str),
-        ('alt_limit_min', "ALT Limit Min (deg):", config_state.alt_limit_min_str),
-        ('alt_limit_max', "ALT Limit Max (deg):", config_state.alt_limit_max_str),
+    groups = [
+        ('site', "Site & Alignment", [
+            ('lat', "Latitude:", config_state.lat_str),
+            ('lon', "Longitude:", config_state.lon_str),
+            ('alt', "Altitude (m):", config_state.alt_str),
+            ('elevation_mask', "Elevation Mask (deg):", config_state.elevation_mask_str),
+            ('alignment_azimuth', "Azimuth Alignment (deg):", config_state.alignment_azimuth_str),
+            ('alignment_elevation', "Elevation Align (deg, Eq):", config_state.alignment_elevation_str),
+        ]),
+        ('mount', "Mount & Limits", [
+            ('azm_offset', "Azm Offset (deg):", config_state.azm_offset_str),
+            ('alt_offset', "Alt Offset (deg):", config_state.alt_offset_str),
+            ('azm_limit_min', "AZM Limit Min (deg):", config_state.azm_limit_min_str),
+            ('azm_limit_max', "AZM Limit Max (deg):", config_state.azm_limit_max_str),
+            ('alt_limit_min', "ALT Limit Min (deg):", config_state.alt_limit_min_str),
+            ('alt_limit_max', "ALT Limit Max (deg):", config_state.alt_limit_max_str),
+        ]),
+        ('camera1', "Camera 1", camera_fields('camera1', config_state.camera_configs['camera1'])),
+        ('camera2', "Camera 2", camera_fields('camera2', config_state.camera_configs['camera2'])),
+        # 5 decimals: tuned gains live at 1e-4..1e-3 scale; %.3f showed an
+        # I gain of 0.00025 as "0.000". These are the LIVE gains -- the
+        # per-mode profiles behind them swap on tracking-mode changes.
+        ('pid', "PID Gains (live set)", [
+            ('pid_azm_p_gain', "AZM P:", f"{config_state.pid_azm_p_gain:.5f}"),
+            ('pid_azm_i_gain', "I:", f"{config_state.pid_azm_i_gain:.5f}"),
+            ('pid_azm_d_gain', "D:", f"{config_state.pid_azm_d_gain:.5f}"),
+            ('pid_alt_p_gain', "ALT P:", f"{config_state.pid_alt_p_gain:.5f}"),
+            ('pid_alt_i_gain', "I:", f"{config_state.pid_alt_i_gain:.5f}"),
+            ('pid_alt_d_gain', "D:", f"{config_state.pid_alt_d_gain:.5f}"),
+        ]),
     ]
-    for field, label_text, value_str in left_fields:
-        rect = display.input_rects[field]
-        label = display.font.render(label_text, True, (0, 0, 0))
-        display.menu_screen.blit(label, (rect.x, rect.y - 22))
-        pygame.draw.rect(display.menu_screen, (255, 255, 255), rect)
-        value = display.font.render(value_str, True, (0, 0, 0))
-        display.menu_screen.blit(value, (rect.x + 5, rect.y + 5))
 
-    # Focus highlights for location fields
-    if config_state.focused_field == "lat":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['lat'], 2)
-        if config_state.focused_field == "lat":
-            text_width, _ = display.font.size(config_state.lat_str[:config_state.cursor_pos["lat"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['lat'].x + 5 + text_width, display.input_rects['lat'].y + 5),
-                            (display.input_rects['lat'].x + 5 + text_width, display.input_rects['lat'].y + 25), 2)
+    for key, title, fields in groups:
+        box = display.config_group_rects[key]
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), box, 2, border_radius=5)
+        display.menu_screen.blit(display.font.render(title, True, (0, 0, 0)),
+                                 (box.x + 10, box.y + 8))
+        for field, label, value in fields:
+            _draw_config_field(display, config_state, field, label, value)
 
-    if config_state.focused_field == "lon":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['lon'], 2)
-        if config_state.focused_field == "lon":
-            text_width, _ = display.font.size(config_state.lon_str[:config_state.cursor_pos["lon"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['lon'].x + 5 + text_width, display.input_rects['lon'].y + 5),
-                            (display.input_rects['lon'].x + 5 + text_width, display.input_rects['lon'].y + 25), 2)
+    # Feed-forward status row at the bottom of the PID group (editable from
+    # the joystick screen's FF buttons; shown here read-only for reference).
+    pid_box = display.config_group_rects['pid']
+    ff_y = pid_box.bottom - 30
+    for i, (ff_label, enabled) in enumerate((
+            ("AZM FF:", config_state.feed_forward_azm_enabled),
+            ("ALT FF:", config_state.feed_forward_alt_enabled))):
+        x = pid_box.x + 12 + i * 130
+        display.menu_screen.blit(
+            display.small_font.render(ff_label, True, (0, 0, 0)), (x, ff_y))
+        display.menu_screen.blit(
+            display.small_font.render("ON" if enabled else "OFF", True,
+                                      (0, 150, 0) if enabled else (150, 0, 0)),
+            (x + 62, ff_y))
 
-    if config_state.focused_field == "alt":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt'], 2)
-        if config_state.focused_field == "alt":
-            text_width, _ = display.font.size(config_state.alt_str[:config_state.cursor_pos["alt"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alt'].x + 5 + text_width, display.input_rects['alt'].y + 5),
-                            (display.input_rects['alt'].x + 5 + text_width, display.input_rects['alt'].y + 25), 2)
-
-    if config_state.focused_field == "elevation_mask":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['elevation_mask'], 2)
-        if config_state.focused_field == "elevation_mask":
-            text_width, _ = display.font.size(config_state.elevation_mask_str[:config_state.cursor_pos["elevation_mask"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['elevation_mask'].x + 5 + text_width, display.input_rects['elevation_mask'].y + 5),
-                            (display.input_rects['elevation_mask'].x + 5 + text_width, display.input_rects['elevation_mask'].y + 25), 2)
-
-    if config_state.focused_field == "alignment_azimuth":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alignment_azimuth'], 2)
-        if config_state.focused_field == "alignment_azimuth":
-            text_width, _ = display.font.size(config_state.alignment_azimuth_str[:config_state.cursor_pos["alignment_azimuth"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alignment_azimuth'].x + 5 + text_width, display.input_rects['alignment_azimuth'].y + 5),
-                            (display.input_rects['alignment_azimuth'].x + 5 + text_width, display.input_rects['alignment_azimuth'].y + 25), 2)
-
-    if config_state.focused_field == "alignment_elevation":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alignment_elevation'], 2)
-        if config_state.focused_field == "alignment_elevation":
-            text_width, _ = display.font.size(config_state.alignment_elevation_str[:config_state.cursor_pos["alignment_elevation"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 5),
-                            (display.input_rects['alignment_elevation'].x + 5 + text_width, display.input_rects['alignment_elevation'].y + 25), 2)
-
-    if config_state.focused_field == "azm_offset":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_offset'], 2)
-        if config_state.focused_field == "azm_offset":
-            text_width, _ = display.font.size(config_state.azm_offset_str[:config_state.cursor_pos["azm_offset"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['azm_offset'].x + 5 + text_width, display.input_rects['azm_offset'].y + 5),
-                            (display.input_rects['azm_offset'].x + 5 + text_width, display.input_rects['azm_offset'].y + 25), 2)
-
-    if config_state.focused_field == "alt_offset":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_offset'], 2)
-        if config_state.focused_field == "alt_offset":
-            text_width, _ = display.font.size(config_state.alt_offset_str[:config_state.cursor_pos["alt_offset"]])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 5),
-                            (display.input_rects['alt_offset'].x + 5 + text_width, display.input_rects['alt_offset'].y + 25), 2)
-
-    # Hardware safety limits focus highlights
-    if config_state.focused_field == "azm_limit_min":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_limit_min'], 2)
-        if config_state.focused_field == "azm_limit_min":
-            text_width, _ = display.font.size(config_state.azm_limit_min_str[:config_state.cursor_pos.get("azm_limit_min", 0)])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['azm_limit_min'].x + 5 + text_width, display.input_rects['azm_limit_min'].y + 5),
-                            (display.input_rects['azm_limit_min'].x + 5 + text_width, display.input_rects['azm_limit_min'].y + 25), 2)
-
-    if config_state.focused_field == "azm_limit_max":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['azm_limit_max'], 2)
-        if config_state.focused_field == "azm_limit_max":
-            text_width, _ = display.font.size(config_state.azm_limit_max_str[:config_state.cursor_pos.get("azm_limit_max", 0)])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['azm_limit_max'].x + 5 + text_width, display.input_rects['azm_limit_max'].y + 5),
-                            (display.input_rects['azm_limit_max'].x + 5 + text_width, display.input_rects['azm_limit_max'].y + 25), 2)
-
-    if config_state.focused_field == "alt_limit_min":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_limit_min'], 2)
-        if config_state.focused_field == "alt_limit_min":
-            text_width, _ = display.font.size(config_state.alt_limit_min_str[:config_state.cursor_pos.get("alt_limit_min", 0)])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alt_limit_min'].x + 5 + text_width, display.input_rects['alt_limit_min'].y + 5),
-                            (display.input_rects['alt_limit_min'].x + 5 + text_width, display.input_rects['alt_limit_min'].y + 25), 2)
-
-    if config_state.focused_field == "alt_limit_max":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['alt_limit_max'], 2)
-        if config_state.focused_field == "alt_limit_max":
-            text_width, _ = display.font.size(config_state.alt_limit_max_str[:config_state.cursor_pos.get("alt_limit_max", 0)])
-            pygame.draw.line(display.menu_screen, (0, 0, 255),
-                            (display.input_rects['alt_limit_max'].x + 5 + text_width, display.input_rects['alt_limit_max'].y + 5),
-                            (display.input_rects['alt_limit_max'].x + 5 + text_width, display.input_rects['alt_limit_max'].y + 25), 2)
-
-    # Camera 1 configuration
-    camera1_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 0, 240, 380)
-    pygame.draw.rect(display.menu_screen, (0, 0, 0), camera1_group_rect, 2, border_radius=5)
-    camera1_label = display.font.render("Camera 1", True, (0, 0, 0))
-    display.menu_screen.blit(camera1_label, (display.sub_x + 245, display.sub_y + 10))
-
-    pixel_size1_label = display.font.render("Pixel Size (μm):", True, (0, 0, 0))
-    display.menu_screen.blit(pixel_size1_label, (display.sub_x + 245, display.sub_y + 35))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_pixel_size'])
-    pixel_size1_text = display.font.render(f"{config_state.camera_configs['camera1']['pixel_size']:.2f}", True, (0, 0, 0))
-    display.menu_screen.blit(pixel_size1_text, (display.input_rects['camera1_pixel_size'].x + 5, display.input_rects['camera1_pixel_size'].y + 5))
-
-    array_diag1_label = display.font.render("Array Diagonal (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag1_label, (display.sub_x + 245, display.sub_y + 90))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_array_size_diagonal'])
-    array_diag1_text = display.font.render(f"{config_state.camera_configs['camera1']['array_size_diagonal']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag1_text, (display.input_rects['camera1_array_size_diagonal'].x + 5, display.input_rects['camera1_array_size_diagonal'].y + 5))
-
-    focal_length1_label = display.font.render("Focal Length (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(focal_length1_label, (display.sub_x + 245, display.sub_y + 145))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_focal_length'])
-    focal_length1_text = display.font.render(f"{config_state.camera_configs['camera1']['focal_length']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(focal_length1_text, (display.input_rects['camera1_focal_length'].x + 5, display.input_rects['camera1_focal_length'].y + 5))
-
-    alignment_rotation1_label = display.font.render("Alignment Rotation (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(alignment_rotation1_label, (display.sub_x + 245, display.sub_y + 205))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_alignment_rotation'])
-    alignment_rotation1_text = display.font.render(f"{config_state.camera_configs['camera1']['alignment_rotation']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(alignment_rotation1_text, (display.input_rects['camera1_alignment_rotation'].x + 5, display.input_rects['camera1_alignment_rotation'].y + 5))
-
-    gain1_label = display.font.render("Gain:", True, (0, 0, 0))
-    display.menu_screen.blit(gain1_label, (display.sub_x + 245, display.sub_y + 265))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_gain'])
-    gain1_text = display.font.render(f"{config_state.camera_configs['camera1']['gain']:.2f}", True, (0, 0, 0))
-    display.menu_screen.blit(gain1_text, (display.input_rects['camera1_gain'].x + 5, display.input_rects['camera1_gain'].y + 5))
-
-    exposure1_label = display.font.render("Exposure (µs):", True, (0, 0, 0))
-    display.menu_screen.blit(exposure1_label, (display.sub_x + 245, display.sub_y + 325))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera1_exposure'])
-    exposure1_text = display.font.render(f"{config_state.camera_configs['camera1']['exposure']:.0f}", True, (0, 0, 0))
-    display.menu_screen.blit(exposure1_text, (display.input_rects['camera1_exposure'].x + 5, display.input_rects['camera1_exposure'].y + 5))
-
-    # Camera 2 configuration
-    camera2_group_rect = pygame.Rect(display.sub_x + 235, display.sub_y + 390, 240, 360)
-    pygame.draw.rect(display.menu_screen, (0, 0, 0), camera2_group_rect, 2, border_radius=5)
-    camera2_label = display.font.render("Camera 2", True, (0, 0, 0))
-    display.menu_screen.blit(camera2_label, (display.sub_x + 245, display.sub_y + 400))
-
-    pixel_size2_label = display.font.render("Pixel Size (μm):", True, (0, 0, 0))
-    display.menu_screen.blit(pixel_size2_label, (display.sub_x + 245, display.sub_y + 415))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_pixel_size'])
-    pixel_size2_text = display.font.render(f"{config_state.camera_configs['camera2']['pixel_size']:.2f}", True, (0, 0, 0))
-    display.menu_screen.blit(pixel_size2_text, (display.input_rects['camera2_pixel_size'].x + 5, display.input_rects['camera2_pixel_size'].y + 5))
-
-    array_diag2_label = display.font.render("Array Diagonal (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag2_label, (display.sub_x + 245, display.sub_y + 470))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_array_size_diagonal'])
-    array_diag2_text = display.font.render(f"{config_state.camera_configs['camera2']['array_size_diagonal']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(array_diag2_text, (display.input_rects['camera2_array_size_diagonal'].x + 5, display.input_rects['camera2_array_size_diagonal'].y + 5))
-
-    focal_length2_label = display.font.render("Focal Length (mm):", True, (0, 0, 0))
-    display.menu_screen.blit(focal_length2_label, (display.sub_x + 245, display.sub_y + 525))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_focal_length'])
-    focal_length2_text = display.font.render(f"{config_state.camera_configs['camera2']['focal_length']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(focal_length2_text, (display.input_rects['camera2_focal_length'].x + 5, display.input_rects['camera2_focal_length'].y + 5))
-
-    alignment_rotation2_label = display.font.render("Alignment Rotation (deg):", True, (0, 0, 0))
-    display.menu_screen.blit(alignment_rotation2_label, (display.sub_x + 245, display.sub_y + 585))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_alignment_rotation'])
-    alignment_rotation2_text = display.font.render(f"{config_state.camera_configs['camera2']['alignment_rotation']:.1f}", True, (0, 0, 0))
-    display.menu_screen.blit(alignment_rotation2_text, (display.input_rects['camera2_alignment_rotation'].x + 5, display.input_rects['camera2_alignment_rotation'].y + 5))
-
-    gain2_label = display.font.render("Gain:", True, (0, 0, 0))
-    display.menu_screen.blit(gain2_label, (display.sub_x + 245, display.sub_y + 645))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_gain'])
-    gain2_text = display.font.render(f"{config_state.camera_configs['camera2']['gain']:.2f}", True, (0, 0, 0))
-    display.menu_screen.blit(gain2_text, (display.input_rects['camera2_gain'].x + 5, display.input_rects['camera2_gain'].y + 5))
-
-    exposure2_label = display.font.render("Exposure (µs):", True, (0, 0, 0))
-    display.menu_screen.blit(exposure2_label, (display.sub_x + 245, display.sub_y + 695))
-    pygame.draw.rect(display.menu_screen, (255, 255, 255), display.input_rects['camera2_exposure'])
-    exposure2_text = display.font.render(f"{config_state.camera_configs['camera2']['exposure']:.0f}", True, (0, 0, 0))
-    display.menu_screen.blit(exposure2_text, (display.input_rects['camera2_exposure'].x + 5, display.input_rects['camera2_exposure'].y + 5))
-
-    # Camera field focus highlights
-    # Camera 1 fields
-    if config_state.focused_field == "camera1_pixel_size":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_pixel_size'], 2)
-        pixel_size1_str = f"{config_state.camera_configs['camera1']['pixel_size']:.2f}"
-        text_width, _ = display.font.size(pixel_size1_str[:config_state.cursor_pos["camera1_pixel_size"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_pixel_size'].x + 5 + text_width, display.input_rects['camera1_pixel_size'].y + 5),
-                        (display.input_rects['camera1_pixel_size'].x + 5 + text_width, display.input_rects['camera1_pixel_size'].y + 25), 2)
-
-    if config_state.focused_field == "camera1_array_size_diagonal":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_array_size_diagonal'], 2)
-        array_diag1_str = f"{config_state.camera_configs['camera1']['array_size_diagonal']:.1f}"
-        text_width, _ = display.font.size(array_diag1_str[:config_state.cursor_pos["camera1_array_size_diagonal"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_array_size_diagonal'].x + 5 + text_width, display.input_rects['camera1_array_size_diagonal'].y + 5),
-                        (display.input_rects['camera1_array_size_diagonal'].x + 5 + text_width, display.input_rects['camera1_array_size_diagonal'].y + 25), 2)
-
-    if config_state.focused_field == "camera1_focal_length":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_focal_length'], 2)
-        focal_length1_str = f"{config_state.camera_configs['camera1']['focal_length']:.1f}"
-        text_width, _ = display.font.size(focal_length1_str[:config_state.cursor_pos["camera1_focal_length"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_focal_length'].x + 5 + text_width, display.input_rects['camera1_focal_length'].y + 5),
-                        (display.input_rects['camera1_focal_length'].x + 5 + text_width, display.input_rects['camera1_focal_length'].y + 25), 2)
-
-    if config_state.focused_field == "camera1_alignment_rotation":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_alignment_rotation'], 2)
-        alignment_rotation1_str = f"{config_state.camera_configs['camera1']['alignment_rotation']:.1f}"
-        text_width, _ = display.font.size(alignment_rotation1_str[:config_state.cursor_pos["camera1_alignment_rotation"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_alignment_rotation'].x + 5 + text_width, display.input_rects['camera1_alignment_rotation'].y + 5),
-                        (display.input_rects['camera1_alignment_rotation'].x + 5 + text_width, display.input_rects['camera1_alignment_rotation'].y + 25), 2)
-
-    if config_state.focused_field == "camera1_gain":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_gain'], 2)
-        gain1_str = f"{config_state.camera_configs['camera1']['gain']:.2f}"
-        text_width, _ = display.font.size(gain1_str[:config_state.cursor_pos["camera1_gain"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_gain'].x + 5 + text_width, display.input_rects['camera1_gain'].y + 5),
-                        (display.input_rects['camera1_gain'].x + 5 + text_width, display.input_rects['camera1_gain'].y + 25), 2)
-
-    if config_state.focused_field == "camera1_exposure":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera1_exposure'], 2)
-        exposure1_str = f"{config_state.camera_configs['camera1']['exposure']:.0f}"
-        text_width, _ = display.font.size(exposure1_str[:config_state.cursor_pos["camera1_exposure"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera1_exposure'].x + 5 + text_width, display.input_rects['camera1_exposure'].y + 5),
-                        (display.input_rects['camera1_exposure'].x + 5 + text_width, display.input_rects['camera1_exposure'].y + 25), 2)
-
-    # Camera 2 fields
-    if config_state.focused_field == "camera2_pixel_size":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_pixel_size'], 2)
-        pixel_size2_str = f"{config_state.camera_configs['camera2']['pixel_size']:.2f}"
-        text_width, _ = display.font.size(pixel_size2_str[:config_state.cursor_pos["camera2_pixel_size"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_pixel_size'].x + 5 + text_width, display.input_rects['camera2_pixel_size'].y + 5),
-                        (display.input_rects['camera2_pixel_size'].x + 5 + text_width, display.input_rects['camera2_pixel_size'].y + 25), 2)
-
-    if config_state.focused_field == "camera2_array_size_diagonal":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_array_size_diagonal'], 2)
-        array_diag2_str = f"{config_state.camera_configs['camera2']['array_size_diagonal']:.1f}"
-        text_width, _ = display.font.size(array_diag2_str[:config_state.cursor_pos["camera2_array_size_diagonal"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_array_size_diagonal'].x + 5 + text_width, display.input_rects['camera2_array_size_diagonal'].y + 5),
-                        (display.input_rects['camera2_array_size_diagonal'].x + 5 + text_width, display.input_rects['camera2_array_size_diagonal'].y + 25), 2)
-
-    if config_state.focused_field == "camera2_focal_length":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_focal_length'], 2)
-        focal_length2_str = f"{config_state.camera_configs['camera2']['focal_length']:.1f}"
-        text_width, _ = display.font.size(focal_length2_str[:config_state.cursor_pos["camera2_focal_length"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_focal_length'].x + 5 + text_width, display.input_rects['camera2_focal_length'].y + 5),
-                        (display.input_rects['camera2_focal_length'].x + 5 + text_width, display.input_rects['camera2_focal_length'].y + 25), 2)
-
-    if config_state.focused_field == "camera2_alignment_rotation":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_alignment_rotation'], 2)
-        alignment_rotation2_str = f"{config_state.camera_configs['camera2']['alignment_rotation']:.1f}"
-        text_width, _ = display.font.size(alignment_rotation2_str[:config_state.cursor_pos["camera2_alignment_rotation"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_alignment_rotation'].x + 5 + text_width, display.input_rects['camera2_alignment_rotation'].y + 5),
-                        (display.input_rects['camera2_alignment_rotation'].x + 5 + text_width, display.input_rects['camera2_alignment_rotation'].y + 25), 2)
-
-    if config_state.focused_field == "camera2_gain":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_gain'], 2)
-        gain2_str = f"{config_state.camera_configs['camera2']['gain']:.2f}"
-        text_width, _ = display.font.size(gain2_str[:config_state.cursor_pos["camera2_gain"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_gain'].x + 5 + text_width, display.input_rects['camera2_gain'].y + 5),
-                        (display.input_rects['camera2_gain'].x + 5 + text_width, display.input_rects['camera2_gain'].y + 25), 2)
-
-    if config_state.focused_field == "camera2_exposure":
-        pygame.draw.rect(display.menu_screen, (0, 0, 255), display.input_rects['camera2_exposure'], 2)
-        exposure2_str = f"{config_state.camera_configs['camera2']['exposure']:.0f}"
-        text_width, _ = display.font.size(exposure2_str[:config_state.cursor_pos["camera2_exposure"]])
-        pygame.draw.line(display.menu_screen, (0, 0, 255),
-                        (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 5),
-                        (display.input_rects['camera2_exposure'].x + 5 + text_width, display.input_rects['camera2_exposure'].y + 25), 2)
-
-    # Draw PID configuration group (extends config options with PID controls)
-    draw_angle_groups(display, config_state)
-
-    # Draw buttons and divider
-    pygame.draw.line(display.menu_screen, (0, 0, 0), (display.sub_x, display.sub_y + display.sub_height - 60), (display.sub_x + display.sub_width, display.sub_y + display.sub_height - 60), 1)
-    # Config mode buttons use display object properties
+    # Footer: divider + Save/Load buttons.
+    pygame.draw.line(display.menu_screen, (0, 0, 0),
+                     (display.sub_x, display.sub_y + display.sub_height - 60),
+                     (display.sub_x + display.sub_width,
+                      display.sub_y + display.sub_height - 60), 1)
     draw_button_with_objects(display, "save")
     draw_button_with_objects(display, "load")
 

@@ -37,6 +37,18 @@ timers + tracemalloc diff) found two independent causes:
   pre-generated zero-mean unit-sigma noise planes applied at random crop
   offsets (normalize them exactly, or sum-based tests get flaky).
 
+Follow-up, same session: **gamma correction cost ~44 ms per camera frame**
+(user-confirmed lag when stretching to see dim targets — which is exactly
+when you need the UI responsive for hand-steering). Three stacked fixes,
+verified pixel-identical: gamma AFTER scale-to-display instead of before
+(`pygame.transform.scale` point-samples, so a monotone per-pixel LUT
+commutes — ~6x fewer pixels), the LUT cached per gamma value instead of
+rebuilt per call, and `cv2.LUT` (SIMD, ~2.5x numpy's take; numpy fallback
+kept) on one contiguous copy instead of three full-frame copies. Pipeline
+measured 43.8 -> 4.4 ms. Gotcha discovered en route: writing through
+`surfarray.pixels3d` views is SLOWER than copy-transform-copy — the views
+are strided, and numpy fancy-indexing into them crawls; stay contiguous.
+
 Meta-lesson repeated from the render-cache entry below: on this app the GIL
 is the shared budget — a cost on ANY thread is a cost on EVERY thread, and
 "only 20 ms" on a 10 FPS render thread is 20% of the whole interpreter.

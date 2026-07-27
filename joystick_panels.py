@@ -920,10 +920,12 @@ def _process_feed_surface(camera, frame, width, height):
     if seq is not None and cache is not None and cache[0] == key:
         return cache[1]
 
-    processed = frame
+    # Scale FIRST, then gamma: pygame.transform.scale point-samples, so the
+    # monotone per-pixel LUT commutes -- pixel-identical display at ~6x fewer
+    # gamma'd pixels (full-res gamma was the dominant per-frame cost here).
+    surface = pygame.transform.scale(frame, (width, height))
     if camera.gamma_enabled:
-        processed = apply_gamma_correction(frame, camera.gamma)
-    surface = pygame.transform.scale(processed, (width, height))
+        surface = apply_gamma_correction(surface, camera.gamma)
     if camera.alignment_rotation != 0.0:
         rotated = pygame.transform.rotate(surface, camera.alignment_rotation)
         surface = pygame.Surface((width, height))

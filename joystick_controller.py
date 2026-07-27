@@ -558,6 +558,10 @@ class JoystickModeState:
         # Persistent per-chart vertical-axis scale for prompt auto-ranging.
         self._chart_scale = {}
 
+        # Throttle for the per-cycle PROGRAM/LAUNCH tracking debug prints
+        # (monotonic time of the last print; shared -- only one handler runs).
+        self._last_debug_print = 0.0
+
         # PID diagnostic state
         self.azm_position_error = 0.0
         self.alt_position_error = 0.0
@@ -1147,6 +1151,17 @@ class JoystickModeState:
                         except Exception as reconnect_e:
                             print(f"Failed to reconnect: {reconnect_e}")
 
+    def _debug_print_throttled(self, msg, period_s=5.0):
+        """Print a per-cycle tracking debug line at most once per period.
+        Replaces the old `int(current_time) % 5 == 0` gate, which referenced
+        a variable that no longer existed (NameError caught by the handlers'
+        catch-all every cycle = console flood) and, even when it worked,
+        printed every cycle for a full second out of each five."""
+        now = time.monotonic()
+        if now - self._last_debug_print >= period_s:
+            self._last_debug_print = now
+            print(msg)
+
     def cycle_bias_mode(self):
         """Op button: cycle the bias adjust mode through the four combinations of
         resolution (coarse/fine) and frame (Az/El vs along/cross-track). The
@@ -1453,11 +1468,11 @@ class JoystickModeState:
                             print(f"Error sending satellite tracking commands: {e}")
 
                     # Debug output (throttled)
-                    if int(current_time) % 5 == 0:  # Every 5 seconds
-                        print(f"PROGRAM TRACK: {target_kind}:{target_key} | "
-                              f"AZ:{current_azm:.2f}->{target_az_deg:.2f}({az_error:+.2f}) | "
-                              f"EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | "
-                              f"CMD AZ:{az_command} EL:{el_command}")
+                    self._debug_print_throttled(
+                        f"PROGRAM TRACK: {target_kind}:{target_key} | "
+                        f"AZ:{current_azm:.2f}->{target_az_deg:.2f}({az_error:+.2f}) | "
+                        f"EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | "
+                        f"CMD AZ:{az_command} EL:{el_command}")
 
         except Exception as e:
             print(f"PROGRAM TRACK: Error in tracking loop: {e}")
@@ -1652,8 +1667,8 @@ class JoystickModeState:
                     print(f"Error sending launch tracking commands: {e}")
 
             # Debug output (throttled)
-            if int(current_time) % 5 == 0:  # Every 5 seconds
-                print(f"LAUNCH TRACK: {launch_name} | AZ:{current_azm:.2f}->{az_deg:.2f}({az_error:+.2f}) | EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | CMD AZ:{az_command} EL:{el_command}")
+            self._debug_print_throttled(
+                f"LAUNCH TRACK: {launch_name} | AZ:{current_azm:.2f}->{az_deg:.2f}({az_error:+.2f}) | EL:{current_alt:.2f}->{target_el_deg:.2f}({el_error:+.2f}) | CMD AZ:{az_command} EL:{el_command}")
 
         except Exception as e:
             print(f"LAUNCH TRACK: Error in tracking loop: {e}")

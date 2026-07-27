@@ -30,6 +30,7 @@ class ConfigState:
         # surfaced as toggle buttons in the joystick-mode skyplot overlay).
         self.satellites_enabled = True          # draw satellite markers on the skyplot
         self.satellite_labels_enabled = True    # draw satellite name labels
+        self.aircraft_enabled = True            # draw ADS-B aircraft markers
 
         # Star catalogue / starfield configuration
         self.starfield_enabled = True          # draw catalogue stars on the skyplot
@@ -318,6 +319,7 @@ class ConfigState:
             "satellites_enabled": self.satellites_enabled,
             "satellite_labels_enabled": self.satellite_labels_enabled,
             "starfield_enabled": self.starfield_enabled,
+            "aircraft_enabled": self.aircraft_enabled,
             "messier_enabled": self.messier_enabled,
             "ngc_enabled": self.ngc_enabled,
             "ngc_limiting_magnitude": self.ngc_limiting_magnitude,
@@ -414,6 +416,7 @@ class ConfigState:
         self.satellites_enabled = config_dict.get("satellites_enabled", self.satellites_enabled)
         self.satellite_labels_enabled = config_dict.get("satellite_labels_enabled", self.satellite_labels_enabled)
         self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
+        self.aircraft_enabled = config_dict.get("aircraft_enabled", self.aircraft_enabled)
         self.messier_enabled = config_dict.get("messier_enabled", self.messier_enabled)
         self.ngc_enabled = config_dict.get("ngc_enabled", self.ngc_enabled)
         self.ngc_limiting_magnitude = config_dict.get(

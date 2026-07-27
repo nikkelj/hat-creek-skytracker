@@ -1142,7 +1142,7 @@ def draw_celestial_on_surface(surface, config_state, ts, state, display_bounds,
     state.celestial_positions = positions
 
 
-def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN):
+def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """Draw ADS-B aircraft on the skyplot: an orange diamond + label per aircraft,
     a yellow ring on the selected/hovered one, and the selected aircraft's
     predicted track (grey past, orange future). Mirrors draw_satellites_on_surface
@@ -1152,6 +1152,8 @@ def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=Po
     as passed at the call site (same convention as the satellite draw)."""
     global AIRCRAFT_LABEL_FONT
 
+    if config_state is not None and not getattr(config_state, 'aircraft_enabled', True):
+        return
     positions = getattr(state, 'aircraft_positions', None) or {}
     if not positions:
         return
@@ -1478,7 +1480,7 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
                     # Draw ADS-B aircraft + selected aircraft track
-                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, display_bounds, current_tt, PolarPlotMode.FULL_SCREEN)
+                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, display_bounds, current_tt, PolarPlotMode.FULL_SCREEN, self.config_state)
                     # Draw launch trajectory if one is selected
                     draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, display_bounds, PolarPlotMode.FULL_SCREEN)
                     # Draw launch position marker
@@ -1726,7 +1728,7 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                     # Draw ADS-B aircraft + selected aircraft track
-                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, full_screen_bounds, current_tt, PolarPlotMode.UPPER_RIGHT_QUADRANT)
+                    draw_aircraft_on_surface(self.surface, self.tracking_vis_state, full_screen_bounds, current_tt, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                     # Draw launch trajectory if one is selected
                     draw_launch_trajectory_on_surface(self.surface, self.tracking_vis_state, current_tt, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT)
                     # Draw launch position marker

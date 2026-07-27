@@ -329,6 +329,45 @@ class TestProgramTrackEndToEnd(unittest.TestCase):
                         f"{[f'{e:.2f}' for e in settled[-8:]]}")
 
 
+class TestObjectToggleButtons(unittest.TestCase):
+    """The shared object-type toggle spec + the tracking-vis click handler.
+    (The Mount 3D HUD drives the same config attrs through its own buttons.)"""
+
+    def test_spec_covers_types_but_not_always_on_objects(self):
+        from tracking_visuals import OBJECT_TOGGLES
+        attrs = [a for a, _n, _d in OBJECT_TOGGLES]
+        for want in ("satellites_enabled", "aircraft_enabled", "starfield_enabled",
+                     "messier_enabled", "ngc_enabled"):
+            self.assertIn(want, attrs)
+        # Kid-friendly invariant: no toggle may hide the sun/moon/planets or
+        # the named bright stars -- they have no config attr at all.
+        self.assertFalse(any("planet" in a or "moon" in a or "sun" in a
+                             for a in attrs))
+
+    def test_click_flips_config_flag(self):
+        import pygame
+        from tracking_visuals import handle_object_toggle_click
+        from config import ConfigState
+        cfg = ConfigState()
+        state = SimpleNamespace(object_toggle_rects={
+            "ngc_enabled": pygame.Rect(10, 10, 110, 22)})
+        self.assertFalse(cfg.ngc_enabled)
+        self.assertTrue(handle_object_toggle_click(state, cfg, (15, 15)))
+        self.assertTrue(cfg.ngc_enabled)
+        self.assertTrue(handle_object_toggle_click(state, cfg, (15, 15)))
+        self.assertFalse(cfg.ngc_enabled)
+        self.assertFalse(handle_object_toggle_click(state, cfg, (500, 500)))
+
+    def test_aircraft_flag_round_trips(self):
+        from config import ConfigState
+        cfg = ConfigState()
+        self.assertTrue(cfg.aircraft_enabled)
+        cfg.aircraft_enabled = False
+        cfg2 = ConfigState()
+        cfg2.load_from_dict(cfg.get_config_dict())
+        self.assertFalse(cfg2.aircraft_enabled)
+
+
 class TestConfigToggles(unittest.TestCase):
     def test_round_trip(self):
         from config import ConfigState

@@ -694,12 +694,70 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
 
     tvs = tracking_vis_state
     if tvs is not None:
-        draw_traj_markers(getattr(tvs, 'satellite_positions', None),
-                          getattr(tvs, 'satellite_trajectories', None),
-                          getattr(tvs, 'selected_satellite', None), (170, 190, 140))
-        draw_traj_markers(getattr(tvs, 'aircraft_positions', None),
-                          getattr(tvs, 'aircraft_trajectories', None),
-                          getattr(tvs, 'selected_aircraft', None), (90, 200, 220))
+        if getattr(config_state, 'satellites_enabled', True):
+            draw_traj_markers(getattr(tvs, 'satellite_positions', None),
+                              getattr(tvs, 'satellite_trajectories', None),
+                              getattr(tvs, 'selected_satellite', None), (170, 190, 140))
+        if getattr(config_state, 'aircraft_enabled', True):
+            draw_traj_markers(getattr(tvs, 'aircraft_positions', None),
+                              getattr(tvs, 'aircraft_trajectories', None),
+                              getattr(tvs, 'selected_aircraft', None), (90, 200, 220))
+
+    # Celestial layer on the sky dome: sun/moon/planets always (pinned dimmed
+    # on the horizon when below it, like the skyplot), Messier/NGC per the
+    # toggles. Stars come from the starfield above; 'star' anchor entries are
+    # selection-only on the skyplot and are skipped here.
+    if current_tt is not None:
+        try:
+            from celestial import get_celestial
+            cat = get_celestial(getattr(tvs, 'ephemeris', None)
+                                if tvs is not None else None)
+            objs = cat.compute_plot_objects(config_state, ts, current_tt,
+                                            elevation_mask=0.0)
+            sel = getattr(tvs, 'selected_celestial', None) if tvs is not None else None
+            for obj in objs:
+                kind = obj['kind']
+                if kind == 'star':
+                    continue
+                el = obj['el']
+                body_like = kind in ('sun', 'moon', 'planet')
+                below = el < 0.0
+                if below and not body_like:
+                    continue
+                d = unit_from_azel(obj['az'], max(el, 0.0))
+                sx, sy, z = project_dirs(d[None, :], R, cx, cy, focal)
+                if z[0] <= 0.08:
+                    continue
+                X, Y = int(sx[0]), int(sy[0])
+                if not (-10 <= X < w + 10 and -10 <= Y < h + 10):
+                    continue
+                color = obj['color'] or ((205, 130, 255) if kind == 'messier'
+                                         else (90, 200, 180))
+                if below:
+                    color = tuple(c // 2 for c in color)
+                if body_like:
+                    pygame.draw.circle(surface, color, (X, Y), obj['radius'] + 1)
+                    if obj['key'] == 'sun':
+                        pygame.draw.circle(surface, (255, 245, 160), (X, Y),
+                                           obj['radius'] + 4, 1)
+                    name = obj['name'] + (" (below hrz)" if below else "")
+                    t = _font(16).render(name, True, (235, 235, 245))
+                    surface.blit(t, (X + obj['radius'] + 5, Y - 8))
+                elif kind == 'messier':
+                    pygame.draw.rect(surface, color,
+                                     pygame.Rect(X - 3, Y - 3, 7, 7), 1)
+                    t = _font(14).render(obj['name'].split()[0], True,
+                                         (205, 150, 245))
+                    surface.blit(t, (X + 6, Y - 7))
+                else:  # ngc
+                    pygame.draw.circle(surface, color, (X, Y), 3, 1)
+                if obj['key'] == sel:
+                    pygame.draw.circle(surface, (255, 255, 0), (X, Y),
+                                       obj['radius'] + 7, 1)
+        except Exception as e:
+            print(f"Mount3D celestial error: {e}")
+
+    if tvs is not None:
 
         # Selected-target trajectory polyline (navball color rules).
         try:
@@ -857,6 +915,17 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
                 bx, y + 4, m3d.follow_live)
     y += 30
 
+    # Object-type show/hide toggles: the same config flags as the skyplot
+    # (tracking_visuals.OBJECT_TOGGLES), so the two views always agree.
+    # Sun/moon/planets and the named stars stay always-on by design.
+    from tracking_visuals import OBJECT_TOGGLES
+    bx = 10
+    for attr, label, default in OBJECT_TOGGLES:
+        on = bool(getattr(config_state, attr, default))
+        bx = button('toggle_' + attr, f"{label} {'On' if on else 'Off'}",
+                    bx, y + 4, on)
+    y += 26
+
     # Operator-seat controls (always visible; they also move the marker).
     seat_y = y + 4
     surface.blit(_font(16).render(
@@ -942,6 +1011,14 @@ def handle_mount3d_mouse_down(pos, button, display, m3d, config_state):
             return True
         if name == 'follow_toggle':
             m3d.follow_live = not m3d.follow_live
+            return True
+        if name.startswith('toggle_'):
+            # Object-type visibility flags shared with the skyplot views.
+            attr = name[len('toggle_'):]
+            from tracking_visuals import OBJECT_TOGGLES
+            default = next((d for a, _n, d in OBJECT_TOGGLES if a == attr), True)
+            setattr(config_state, attr,
+                    not bool(getattr(config_state, attr, default)))
             return True
         if name in _SEAT_STEPS:
             attr, step, default = _SEAT_STEPS[name]

@@ -609,6 +609,57 @@ def draw_satellite_count(display, state):
     count_surface = display.small_font.render(count_text, True, (255, 255, 255))
     display.menu_screen.blit(count_surface, (display.sub_x + 10, display.sub_y + 240))  # Moved below filter boxes
 
+# Object-type visibility toggles, shared by the full-screen tracking vis
+# (draw_object_toggles below) and the Mount 3D HUD: (config attr, label,
+# default). The sun/moon/planets and the top-100 named stars are deliberately
+# NOT toggleable -- they are always visible (kid-friendly invariant).
+OBJECT_TOGGLES = (
+    ('satellites_enabled', 'Satellites', True),
+    ('satellite_labels_enabled', 'Sat labels', True),
+    ('aircraft_enabled', 'Aircraft', True),
+    ('starfield_enabled', 'Stars', True),
+    ('messier_enabled', 'Messier', True),
+    ('ngc_enabled', 'NGC', False),
+)
+
+
+def draw_object_toggles(display, state, config_state):
+    """Column of object-type show/hide buttons on the tracking-vis left panel
+    (below the satellite count). Publishes state.object_toggle_rects for
+    handle_object_toggle_click."""
+    x = display.sub_x + 10
+    y = display.sub_y + 270
+    label = display.small_font.render("Show objects:", True, (255, 255, 255))
+    display.menu_screen.blit(label, (x, y))
+    y += 22
+    mouse_pos = pygame.mouse.get_pos()
+    rects = {}
+    for attr, name, default in OBJECT_TOGGLES:
+        on = bool(getattr(config_state, attr, default))
+        rect = pygame.Rect(x, y, 110, 22)
+        base = (70, 110, 70) if on else (90, 70, 70)
+        col = tuple(min(255, c + 25) for c in base) if rect.collidepoint(mouse_pos) else base
+        pygame.draw.rect(display.menu_screen, col, rect)
+        pygame.draw.rect(display.menu_screen, (150, 150, 160), rect, 1)
+        text = display.small_font.render(f"{name} {'On' if on else 'Off'}", True,
+                                         (255, 255, 255))
+        display.menu_screen.blit(text, (rect.x + 6, rect.y + 3))
+        rects[attr] = rect
+        y += 26
+    state.object_toggle_rects = rects
+
+
+def handle_object_toggle_click(state, config_state, pos):
+    """Flip the config flag for a clicked object-type toggle. Returns True if
+    the click was consumed."""
+    for attr, rect in (getattr(state, 'object_toggle_rects', {}) or {}).items():
+        if rect.collidepoint(pos):
+            default = next((d for a, _n, d in OBJECT_TOGGLES if a == attr), True)
+            setattr(config_state, attr, not bool(getattr(config_state, attr, default)))
+            return True
+    return False
+
+
 def draw_scroll_bar(display, state):
     """
     State-direct mutation function for drawing scroll bar.

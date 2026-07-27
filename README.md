@@ -89,11 +89,13 @@ The plot carries a full **celestial layer**: the sun, moon and planets are
 always drawn (dimmed on the horizon rim when below it, so you can see where
 they'll rise), the **100 brightest stars** get gold spike markers and their
 IAU proper names (Sirius, Vega, Betelgeuse...), and the **Messier** and
-**NGC** catalogues overlay as violet squares / teal circles with independent
-On/Off toggles (NGC additionally magnitude-limited) to keep the noise
-manageable. Every one of them — plus every satellite and aircraft — is
-click-selectable, and PROGRAM mode will slew to and track it. Shown here with
-the moon selected (yellow ring):
+**NGC** catalogues overlay as violet squares / teal circles (NGC additionally
+magnitude-limited) to keep the noise manageable. A **Show objects** toggle
+column on the left panel switches each object type on/off — satellites, their
+labels, aircraft, stars, Messier, NGC — with the sun/moon/planets and named
+stars deliberately always-on. Every object — plus every satellite and
+aircraft — is click-selectable, and PROGRAM mode will slew to and track it.
+Shown here with the moon selected (yellow ring):
 
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
@@ -131,8 +133,10 @@ intuition: the articulated model poses from the live axis angles through the
 **same forward transforms the tracker uses** (pinned by a parity test suite),
 per mount mode — shown here in AltAz-Side, where the cyan AZM-axis arrow lies
 on the horizon at the alignment azimuth. Both cameras' FOV cones sweep a real
-star field with satellites, aircraft, the selected trajectory, and the mount
-keepout tinted on the sky dome. Two view cameras: free **orbit** (drag/wheel)
+star field with satellites, aircraft, the sun/moon/planets and the
+Messier/NGC overlays, the selected trajectory, and the mount keepout tinted
+on the sky dome — with the same object-type toggle buttons as the skyplot in
+its HUD (the two views share one set of config flags). Two view cameras: free **orbit** (drag/wheel)
 and an **operator view** rendered from your configured seat position (bearing
 / distance / eye height) so the perspective matches what you actually see.
 Manual AZM/ALT sliders pose the model while disconnected. The orbit camera

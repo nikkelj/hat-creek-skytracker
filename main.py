@@ -31,7 +31,7 @@ from post_process_ui import (
 )
 from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
 from alignment import AlignmentState
-from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table
+from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table, draw_object_toggles, handle_object_toggle_click
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel, render_adsb_connection_controls, handle_adsb_fit_slider_mouse_events, render_joystick_target_panel
@@ -617,8 +617,12 @@ while running:
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
                 try:
-                    # Handle events using state-based handler
-                    handle_tracking_vis_mouse_events_state(tracking_vis_state, event, pos, display, display.button_states)
+                    # Object-type show/hide toggles get first crack at clicks;
+                    # a consumed click must not fall through to plot selection.
+                    if not (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                            and handle_object_toggle_click(tracking_vis_state, config_state, pos)):
+                        # Handle events using state-based handler
+                        handle_tracking_vis_mouse_events_state(tracking_vis_state, event, pos, display, display.button_states)
 
                 except Exception as e:
                     print(f"DEBUG: Error in tracking_vis mouse events: {e}")
@@ -857,6 +861,7 @@ while running:
         draw_camera_fov_details(display, tracking_vis_state, 290)  # Start below satellite details (20+250+20)
         draw_time_display(display)
         draw_satellite_count(display, tracking_vis_state)
+        draw_object_toggles(display, tracking_vis_state, config_state)
 
         # Apply live name/altitude filtering + multi-column sort each frame so the
         # table reacts immediately to filter edits and column-header clicks.

@@ -148,10 +148,44 @@ def render_v2mini(frame, px, py, amp, rotation_deg=0.0, scale=1.0):
     paint(bus_w // 2, bus_h // 2, amp)               # bus (bright)
 
 
+# Pre-generated unit-normal noise planes for add_noise. A fresh full-frame
+# rng.normal() cost ~10 ms per 720p frame -- the single largest slice of the
+# sim camera budget, GIL time stolen from the render/control threads (sim
+# cameras visibly starved everything at 2x30 FPS targets). Planes are padded
+# so a random crop offset de-correlates consecutive frames.
+_NOISE_PAD = 64
+_NOISE_PLANES = 4
+_NOISE_BANK = {}   # (h, w) -> [unit-normal float32 planes]
+
+
 def add_noise(frame, read_noise, rng):
-    """Add shot-ish + read noise, in place."""
+    """Add shot-ish + read noise, in place.
+
+    Applies a randomly chosen, randomly offset crop of a pre-generated
+    unit-normal plane scaled by read_noise: statistically equivalent for
+    display/detection purposes at ~1% of the per-frame cost of rng.normal."""
     if read_noise > 0:
-        frame += rng.normal(0.0, read_noise, frame.shape)
+        h, w = frame.shape[0], frame.shape[1]
+        bank = _NOISE_BANK.get((h, w))
+        if bank is None:
+            bank = []
+            for i in range(_NOISE_PLANES):
+                plane = np.random.default_rng(0xB0B + i).normal(
+                    0.0, 1.0, (h + _NOISE_PAD, w + _NOISE_PAD)).astype(np.float32)
+                # Exactly zero-mean / unit-sigma: a raw finite sample carries a
+                # small net offset, which showed up as frame-total drift
+                # between plane picks (flaky sum-based comparisons).
+                plane -= plane.mean()
+                plane /= plane.std()
+                bank.append(plane)
+            _NOISE_BANK[(h, w)] = bank
+        plane = bank[int(rng.integers(len(bank)))]
+        dy = int(rng.integers(_NOISE_PAD + 1))
+        dx = int(rng.integers(_NOISE_PAD + 1))
+        if frame.ndim == 2:
+            frame += read_noise * plane[dy:dy + h, dx:dx + w]
+        else:
+            frame += read_noise * plane[dy:dy + h, dx:dx + w, None]
     np.clip(frame, 0, None, out=frame)
 
 

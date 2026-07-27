@@ -201,39 +201,74 @@ def draw_dashed_polygon_on_surface(surface, color, points, dash=5, gap=4, width=
         draw_dashed_line_on_surface(surface, color, points[i], points[(i + 1) % n],
                                     dash=dash, gap=gap, width=width)
 
+# Starfield layer cache. The per-star Python draw loop (~2000 circles +
+# marker/label work) cost ~24 ms per frame PER RENDER THREAD. But the sky
+# only rotates ~0.02 px/s at plot scale, so a rendered layer is
+# pixel-identical for several seconds: rebuild on a 5 s time quantum (or
+# when the observer/geometry/toggles/hover change) and blit it per frame.
+_STARFIELD_CACHE = {}
+STARFIELD_QUANTUM_S = 5.0
+
+# Selected-satellite arc polyline layers (see draw_polar_plot_on_surface).
+_ARC_LAYER_CACHE = {}
+
+
 def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx, cy, radius,
                                elevation_mask, draw_labels=True, publish_positions=True):
-    """Draw catalogue stars on the polar plot and publish their screen positions.
+    """Blit the (cached) catalogue-star layer onto the polar plot and publish
+    star screen positions.
 
-    Stars are sized/brightened by visual magnitude. Only the brightest ~5% in view
-    (top_label_mask) and the hovered star are labelled (full-screen only). Publishes
-    state.star_screen_positions (for main-thread hover hit-testing) and
-    state.starfield_cutoff_mag (the faintest rendered magnitude, shown in the UI).
-    publish_positions=False (the small joystick quadrant) leaves the hover data alone.
-    Wrapped by the caller in try/except so a catalogue hiccup never kills rendering.
-    """
-    global STAR_LABEL_FONT, STAR_LABEL_CACHE
-
-    from star_catalog import get_catalog
-    catalog = get_catalog(ephemeris=getattr(state, 'ephemeris', None))
-
+    Stars are sized/brightened by visual magnitude; the top-100 named stars
+    get gold spike markers + labels in both modes, the brightest ~5%/hovered
+    get labels full-screen only. Publishes state.star_screen_positions (for
+    main-thread hover hit-testing) and state.starfield_cutoff_mag. Positions
+    are refreshed on layer rebuild; between rebuilds they drift < 1 px, far
+    inside the hover hit radius. Wrapped by the caller in try/except so a
+    catalogue hiccup never kills rendering."""
     lat = float(config_state.lat_str or 0.0)
     lon = float(config_state.lon_str or 0.0)
     elev = float(config_state.alt_str or 0.0)
     max_count = int(getattr(config_state, 'max_rendered_star_count', 2000))
     limiting_mag = float(getattr(config_state, 'star_limiting_magnitude', 6.5))
+    hovered = getattr(state, 'hovered_star', None)
+
+    key = (surface.get_size(), cx, cy, radius, round(elevation_mask, 2),
+           int(current_tt * 86400.0 / STARFIELD_QUANTUM_S),
+           round(lat, 5), round(lon, 5), max_count, round(limiting_mag, 2),
+           draw_labels, hovered)
+    ent = _STARFIELD_CACHE.get(key)
+    if ent is None:
+        if len(_STARFIELD_CACHE) > 4:   # two plot sizes, rebuilt every quantum
+            _STARFIELD_CACHE.clear()
+        layer = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        positions, cutoff = _render_starfield_layer(
+            layer, config_state, ts, current_tt, state, cx, cy, radius,
+            elevation_mask, draw_labels, lat, lon, elev, max_count, limiting_mag)
+        ent = _STARFIELD_CACHE[key] = (layer, positions, cutoff)
+    layer, positions, cutoff = ent
+    surface.blit(layer, (0, 0))
+    if publish_positions:
+        state.star_screen_positions = positions
+        state.starfield_cutoff_mag = cutoff
+
+
+def _render_starfield_layer(surface, config_state, ts, current_tt, state, cx, cy, radius,
+                            elevation_mask, draw_labels, lat, lon, elev,
+                            max_count, limiting_mag):
+    """Render the star layer onto a transparent surface; returns
+    (positions, cutoff_mag). Split out of _draw_starfield_on_surface so the
+    cache wrapper stays readable."""
+    global STAR_LABEL_FONT, STAR_LABEL_CACHE
+
+    from star_catalog import get_catalog
+    catalog = get_catalog(ephemeris=getattr(state, 'ephemeris', None))
 
     res = catalog.current_altaz(lat, lon, elev, ts, current_tt,
                                 elevation_mask=elevation_mask,
                                 max_count=max_count, limiting_mag=limiting_mag)
-    if publish_positions:
-        state.starfield_cutoff_mag = res['cutoff_mag']
-
     n = res['n_visible']
     if n == 0:
-        if publish_positions:
-            state.star_screen_positions = []
-        return
+        return [], res['cutoff_mag']
 
     az = res['az']
     el = res['el']
@@ -277,7 +312,7 @@ def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx,
             pygame.draw.circle(surface, col, (sx_i[i], sy_i[i]), ri)
 
         h = int(hip[i])
-        positions.append((sx_i[i], sy_i[i], h))
+        positions.append((int(sx_i[i]), int(sy_i[i]), h))
 
         is_named = h in named
         if is_named:
@@ -301,8 +336,81 @@ def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx,
             if label is not None:
                 surface.blit(label, (sx_i[i] + 4, sy_i[i] - 6))
 
-    if publish_positions:
-        state.star_screen_positions = positions
+    return positions, float(res['cutoff_mag'])
+
+
+# Static polar-plot background cache: keepout wash + mask circle + grid +
+# axis labels drawn once per (size, mask, keepout key) and blitted per frame.
+# These cost ~15-20 ms/frame rendered live -- on BOTH render threads that was
+# a large slice of the interpreter (GIL) stolen from the camera capture
+# threads (field symptom: single-digit camera FPS).
+_PLOT_BG_CACHE = {}
+
+
+def _plot_background(config_state, size, cx, cy, radius, elevation_mask):
+    key = (size, cx, cy, radius, round(elevation_mask, 3),
+           _keepout_cache_key(config_state, radius))
+    bg = _PLOT_BG_CACHE.get(key)
+    if bg is not None:
+        return bg
+    if len(_PLOT_BG_CACHE) > 4:   # two plot sizes x occasional config edits
+        _PLOT_BG_CACHE.clear()
+
+    bg = pygame.Surface(size)     # opaque black base, replaces the fill
+
+    # Mount keepout wash (very light red): sky directions whose mount-axis
+    # solutions all fall outside the configured safety limits. Drawn first so
+    # the grid, mask circle, stars, and satellites stay readable on top.
+    draw_keepout_overlay_on_surface(bg, config_state, cx, cy, radius)
+
+    # Elevation mask circle (thick red)
+    mask_radius = (90 - elevation_mask) / 90 * radius
+    pygame.draw.circle(bg, (255, 0, 0), (cx, cy), mask_radius, 2)
+
+    # Elevation circles (subtle gray)
+    for el in [30, 60]:
+        r = (90 - el) / 90 * radius
+        pygame.draw.circle(bg, (50, 50, 50), (cx, cy), int(r), 1)
+
+    # Azimuth lines (subtle gray)
+    for az_deg in range(0, 360, 30):
+        az_rad = math.radians(az_deg)
+        x1 = cx + radius * math.sin(az_rad)
+        y1 = cy - radius * math.cos(az_rad)
+        pygame.draw.line(bg, (50, 50, 50), (cx, cy), (x1, y1), 1)
+
+    # Horizon circle LAST so it appears on top (bright white, thicker)
+    pygame.draw.circle(bg, (255, 255, 255), (cx, cy), radius, 3)
+    pygame.draw.circle(bg, (255, 255, 255), (cx, cy), 3, 0)
+
+    # Cardinal directions + numeric axis labels (local fonts: off-main-thread).
+    pygame.font.init()
+    _dir_font = pygame.font.Font(None, 20)
+    _num_font = pygame.font.Font(None, 15)
+
+    def _blit_centered(text, color, px, py, font):
+        s = font.render(text, True, color)
+        bg.blit(s, (int(px - s.get_width() / 2), int(py - s.get_height() / 2)))
+
+    for az_deg in range(0, 360, 30):
+        if az_deg in (0, 90, 180, 270):
+            continue
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 13) * math.sin(az_rad)
+        ly = cy - (radius + 13) * math.cos(az_rad)
+        _blit_centered(f"{az_deg}", (140, 140, 150), lx, ly, _num_font)
+    for az_deg, lbl, col in ((0, "N", (255, 130, 130)), (90, "E", (225, 225, 235)),
+                             (180, "S", (225, 225, 235)), (270, "W", (225, 225, 235))):
+        az_rad = math.radians(az_deg)
+        lx = cx + (radius + 18) * math.sin(az_rad)
+        ly = cy - (radius + 18) * math.cos(az_rad)
+        _blit_centered(lbl, col, lx, ly, _dir_font)
+    for el in (30, 60):
+        r = (90 - el) / 90 * radius
+        _blit_centered(f"{el}°", (120, 170, 120), cx + 14, cy - r, _num_font)
+
+    _PLOT_BG_CACHE[key] = bg
+    return bg
 
 
 def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, full_screen_bounds=None):
@@ -327,66 +435,19 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
     radius = min(surface_width, surface_height) // 2 - 50
 
-    # Mount keepout wash (very light red): sky directions whose mount-axis
-    # solutions all fall outside the configured safety limits. Drawn first so
-    # the grid, mask circle, stars, and satellites stay readable on top.
-    draw_keepout_overlay_on_surface(surface, config_state, cx, cy, radius)
+    # Static background (keepout + grid + labels) from the cache: one opaque
+    # full-surface blit per frame instead of ~20 ms of live drawing.
+    surface.blit(_plot_background(config_state, (surface_width, surface_height),
+                                  cx, cy, radius, elevation_mask), (0, 0))
 
-    # Draw elevation mask circle first (thick red)
-    mask_radius = (90 - elevation_mask) / 90 * radius
-    pygame.draw.circle(surface, (255, 0, 0), (cx, cy), mask_radius, 2)
-
-    # Draw elevation circles (subtle gray)
-    for el in [30, 60]:
-        r = (90 - el) / 90 * radius
-        pygame.draw.circle(surface, (50, 50, 50), (cx, cy), int(r), 1)
-
-    # Draw azimuth lines (subtle gray)
-    for az_deg in range(0, 360, 30):
-        az_rad = math.radians(az_deg)
-        x1 = cx + radius * math.sin(az_rad)
-        y1 = cy - radius * math.cos(az_rad)
-        pygame.draw.line(surface, (50, 50, 50), (cx, cy), (x1, y1), 1)
-
-    # Draw horizon circle LAST so it appears on top (bright white, thicker)
-    pygame.draw.circle(surface, (255, 255, 255), (cx, cy), radius, 3)
-
-    # Draw center dot explicitly to ensure it's visible over grid lines
-    pygame.draw.circle(surface, (255, 255, 255), (cx, cy), 3, 0)
-
-    # ---- Cardinal directions + numeric axis labels --------------------------
-    # Restored after a prior iteration dropped them. Drawn off the main thread,
-    # so we create local fonts rather than relying on display fonts.
+    # Local text helper for the DYNAMIC annotations below (lim-mag readout,
+    # plate-solve tag) -- their text changes at runtime, so they stay live.
     pygame.font.init()
-    _dir_font = pygame.font.Font(None, 20)
     _num_font = pygame.font.Font(None, 15)
 
     def _blit_centered(text, color, px, py, font):
         s = font.render(text, True, color)
         surface.blit(s, (int(px - s.get_width() / 2), int(py - s.get_height() / 2)))
-
-    # Numeric azimuth ticks every 30 deg just outside the horizon ring (the four
-    # cardinals get letters instead). Azimuth: 0 = N = up, 90 = E = right.
-    for az_deg in range(0, 360, 30):
-        if az_deg in (0, 90, 180, 270):
-            continue
-        az_rad = math.radians(az_deg)
-        lx = cx + (radius + 13) * math.sin(az_rad)
-        ly = cy - (radius + 13) * math.cos(az_rad)
-        _blit_centered(f"{az_deg}", (140, 140, 150), lx, ly, _num_font)
-
-    # Cardinal direction letters, further out; N highlighted.
-    for az_deg, lbl, col in ((0, "N", (255, 130, 130)), (90, "E", (225, 225, 235)),
-                             (180, "S", (225, 225, 235)), (270, "W", (225, 225, 235))):
-        az_rad = math.radians(az_deg)
-        lx = cx + (radius + 18) * math.sin(az_rad)
-        ly = cy - (radius + 18) * math.cos(az_rad)
-        _blit_centered(lbl, col, lx, ly, _dir_font)
-
-    # Elevation ring labels (30 and 60 deg), placed just right of the N-S spoke.
-    for el in (30, 60):
-        r = (90 - el) / 90 * radius
-        _blit_centered(f"{el}°", (120, 170, 120), cx + 14, cy - r, _num_font)
 
     # Catalogue starfield, drawn under satellites/FOV. Rendered in both the full-screen
     # plot and the smaller joystick quadrant; labels + hover hit-testing only full-screen.
@@ -425,8 +486,27 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
             tag = f"solved {r.n_matches}m" if r is not None else "solved"
             _blit_centered(tag, cyan, px, py - 16, _num_font)
 
-    # Draw precomputed arc segments for selected satellite
+    # Selected-satellite trajectory arcs -> cached layer. Drawn live, the
+    # sunlit-colored polyline is ~600 pygame line calls with per-segment
+    # Python transforms (~15 ms per frame on EACH render thread). Only the
+    # past/future color split depends on the clock, so the layer is rebuilt
+    # on the same 5 s quantum as the starfield (or when the selection,
+    # trajectory grid, or plot geometry changes) and blitted per frame.
     if state.selected_satellite and state.tle_loaded and state.selected_satellite in state.satellite_arc_segments:
+        _traj_entry = state.satellite_trajectories.get(state.selected_satellite)
+        _times = _traj_entry[1] if _traj_entry else []
+        _arc_key = (getattr(state.selected_satellite, 'name', ''),
+                    len(_times), float(_times[0]) if len(_times) else 0.0,
+                    surface.get_size(), str(mode),
+                    int((current_tt or 0.0) * 86400.0 / STARFIELD_QUANTUM_S))
+        arc_layer = _ARC_LAYER_CACHE.get(_arc_key)
+        if arc_layer is not None:
+            surface.blit(arc_layer, (0, 0))
+            return
+        if len(_ARC_LAYER_CACHE) > 6:   # two modes x a few quanta in flight
+            _ARC_LAYER_CACHE.clear()
+        arc_layer = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+        _ARC_LAYER_CACHE[_arc_key] = arc_layer
     # Draw arcs with sunlit detection (preferred method)
         if state.selected_satellite in state.satellite_trajectories and state.satellite_trajectories[state.selected_satellite]:
             trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
@@ -511,7 +591,7 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
                         draw_x1 = quadrant_surface_width // 2 + rel_x1
                         draw_y1 = quadrant_surface_height // 2 + rel_y1
 
-                    pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
+                    pygame.draw.line(arc_layer, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
 
         else:
             # Fallback: draw basic arc segments without sunlit detection when no trajectory data available
@@ -561,7 +641,10 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
                     draw_x1 = quadrant_surface_width // 2 + rel_x1
                     draw_y1 = quadrant_surface_height // 2 + rel_y1
 
-                pygame.draw.line(surface, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
+                pygame.draw.line(arc_layer, color, (draw_x0, draw_y0), (draw_x1, draw_y1), 1)
+
+        surface.blit(arc_layer, (0, 0))
+
 
 def _quadrant_info_panel_geometry(surface_width, surface_height, desired_w=170):
     """Geometry for the right-edge info panels in quadrant mode.

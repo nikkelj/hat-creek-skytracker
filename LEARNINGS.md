@@ -6,6 +6,42 @@ Newest entries first.
 
 ---
 
+## 2026-07-27 — Perf scrub: the "memory leak" was the camera ring; the FPS was the GIL
+
+Field report: ~4 FPS on cam1, ~9 on cam2, and memory growing until the app
+had to be killed. A measured scrub (headless sim rig, per-function wall
+timers + tracemalloc diff) found two independent causes:
+
+* **The "leak": every camera frame was appended to a 1000-deep ring buffer
+  as a full pygame Surface, capture armed or not.** At real sensor sizes
+  that is multiple GB per camera, accumulating over minutes — indistinguishable
+  from an unbounded leak from the outside. The ring exists only for the
+  post-capture dump (which walks BACK from the end by captured-frame count;
+  `start_idx` is informational), so frames are now buffered only while a
+  capture is armed, the ring is cleared at capture start, and cleared again
+  after the stop-snapshot hands the dump its list. Idle memory is now flat.
+  (Remaining benign growth: the Tycho deep catalogue loads ~40 MB once, in
+  the background, minutes after startup.)
+* **The FPS: the two skyplot render threads each spent ~56 ms/frame in
+  draw_polar_plot_on_surface** — at 2×10 FPS targets that alone can consume
+  the entire interpreter, and the camera threads only got GIL scraps
+  (single-digit capture FPS on real hardware). None of that drawing needed
+  to be per-frame: the grid/labels/keepout background is static (now a
+  cached surface, keyed on geometry+mask+keepout config), the starfield
+  moves ~0.02 px/s at plot scale (now a cached layer on a 5 s time quantum
+  — same trick as the navball's quantized-pointing cache), and the selected
+  satellite's ~600-segment sunlit polyline only changes at the past/future
+  boundary (cached on the same quantum). draw_polar is now ~4 ms measured
+  isolated (14x). Sim-only: add_noise regenerated a full-frame rng.normal
+  every frame (~10 ms, the largest single sim-camera cost) — replaced with
+  pre-generated zero-mean unit-sigma noise planes applied at random crop
+  offsets (normalize them exactly, or sum-based tests get flaky).
+
+Meta-lesson repeated from the render-cache entry below: on this app the GIL
+is the shared budget — a cost on ANY thread is a cost on EVERY thread, and
+"only 20 ms" on a 10 FPS render thread is 20% of the whole interpreter.
+Layer-cache anything whose true rate of change is seconds, not frames.
+
 ## 2026-07-27 — Project-wide timing audit: three clocks, and who may read which
 
 A full audit ("something is off" — sky objects disagreeing in time) found the

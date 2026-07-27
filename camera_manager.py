@@ -248,7 +248,13 @@ class CameraManager:
             buffer_size = getattr(config_state, 'buffer_size', 1000)
 
         camera.threads_running = True
-        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size, target_fps=30)
+        # SIM cameras are paced down: each synthetic frame costs ~10 ms of
+        # numpy on the GIL, and two cams chasing 30 FPS starved the render
+        # and control threads. Real cameras keep the full 30 FPS target
+        # (their exposure/readout waits release the GIL inside the SDK).
+        is_sim = getattr(camera.cap, 'simulator', None) is not None
+        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size,
+                                     target_fps=15 if is_sim else 30)
         camera.thread.start()
 
         if config_state:

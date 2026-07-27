@@ -181,7 +181,14 @@ class CameraThread(threading.Thread):
         return info
 
     def start_capture(self):
-        """Start capture - mark beginning of capture in buffer"""
+        """Start capture - mark beginning of capture in buffer.
+
+        The ring is cleared first: frames are only buffered while a capture
+        is armed (see run()), so anything still in the ring belongs to a
+        previous session whose dump already snapshotted what it needed --
+        clearing releases that memory and makes the buffer contents exactly
+        this session's frames."""
+        self.circular_buffer.clear()
         self.capture_active = True
         self.capture_start_idx = len(self.circular_buffer) - 1  # Last frame in buffer
         self.capture_start_time = datetime.now(timezone.utc)
@@ -221,6 +228,10 @@ class CameraThread(threading.Thread):
                 print(f"Camera {self.camera_index}: No frames captured")
                 return None, None
             capture_end_idx = len(frames) - 1
+            # The dump owns the snapshot list from here; drop the live ring's
+            # references so the session's frames are freed as soon as the
+            # dump finishes instead of lingering until the next capture.
+            self.circular_buffer.clear()
 
             # Return buffer range and metadata for dump
             capture_info = {
@@ -439,8 +450,16 @@ class CameraThread(threading.Thread):
                             'buffer_sequence': self.frame_count
                         }
 
-                        # Always buffer the frame (circular buffer for capture)
-                        self.circular_buffer.append(frame_data)
+                        # Buffer frames ONLY while a capture session is armed.
+                        # The ring exists solely for the post-capture dump
+                        # (which walks back from the end by captured count),
+                        # but buffering unconditionally pinned up to
+                        # buffer_size full-resolution Surfaces per camera --
+                        # multiple GB at real sensor sizes, presenting in the
+                        # field as unbounded memory growth. Idle, only
+                        # latest_frame / latest_raw are retained.
+                        if self.capture_active:
+                            self.circular_buffer.append(frame_data)
 
                         # Keep reference to latest frame for UI/display
                         self.latest_frame = frame_data

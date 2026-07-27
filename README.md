@@ -71,11 +71,15 @@ capture.
 - **ADS-B aircraft tracking** (RTL-SDR / Nooelec): nearby aircraft appear on the
   skyplot and navball and can be selected, slewed to, and tracked like a satellite.
 
-**Rendering performance.** The render thread invariant-caches its expensive
-per-frame work so it doesn't starve the GIL the camera capture thread needs: the
-navball's hemisphere/grid is cached on quantized pointing (~33× cheaper when the
-mount is stationary) and each processed camera feed is cached on its capture
-sequence so an unchanged frame isn't re-scaled. See [`LEARNINGS.md`](LEARNINGS.md).
+**Rendering performance.** The render threads invariant-cache their expensive
+per-frame work so they don't starve the GIL the camera capture threads need:
+the navball's hemisphere/grid is cached on quantized pointing, each processed
+camera feed is cached on its capture sequence, and the skyplot's static
+background (grid/labels/keepout), starfield, and selected-satellite arc are
+cached layers rebuilt on a seconds-scale quantum instead of drawn per frame
+(~14× cheaper). Camera frames are buffered into the capture ring **only while
+a capture is armed** — idle memory stays flat instead of accumulating up to
+1000 full-resolution frames per camera. See [`LEARNINGS.md`](LEARNINGS.md).
 
 **Hardware simulator** (see below) — run the entire tracking loop without any
 physical hardware present.

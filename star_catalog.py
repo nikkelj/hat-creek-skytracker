@@ -20,9 +20,12 @@ pointing model fitted in Phase 4.
 """
 
 import math
+import re
 import threading
 
 import numpy as np
+
+_IAU_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 from skyfield.api import Star, load, wgs84
 from skyfield.data import hipparcos
@@ -36,8 +39,58 @@ ANCHOR_MAX_AGE_SEC = 600.0
 # independent of the UI's max_rendered_star_count. Keeps anchor cost bounded.
 ANCHOR_MAG_LIMIT = 7.5
 
+# IAU Catalog of Star Names (WGSN), parsed lazily from catalogs/iau-csn.txt into a
+# HIP -> proper-name dict (~450 named stars). Preferred over the abbreviated
+# fallback table below; absence of the file degrades gracefully to that table.
+IAU_CSN_PATH = "catalogs/iau-csn.txt"
+_IAU_NAMES = None
+_IAU_LOCK = threading.Lock()
+
+
+def iau_star_names(path=IAU_CSN_PATH):
+    """HIP -> IAU proper name dict, loaded once. Empty dict if the file is absent.
+
+    The file is fixed-width-ish; parsing is token-based from the right (the
+    name field can contain spaces): ... Vmag band HIP HD RA(deg) Dec(deg) date.
+    """
+    global _IAU_NAMES
+    if _IAU_NAMES is not None:
+        return _IAU_NAMES
+    with _IAU_LOCK:
+        if _IAU_NAMES is not None:
+            return _IAU_NAMES
+        names = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip() or line.startswith("#"):
+                        continue
+                    tokens = line.split()
+                    if len(tokens) < 7:
+                        continue
+                    # Anchor on the approval-date token (YYYY-MM-DD): some rows
+                    # carry a trailing '*' footnote marker after it. Layout
+                    # around the anchor: ... Vmag band HIP HD RA Dec DATE.
+                    date_idx = next((i for i in range(len(tokens) - 1, -1, -1)
+                                     if _IAU_DATE_RE.match(tokens[i])), None)
+                    if date_idx is None or date_idx < 4:
+                        continue
+                    try:
+                        hip = int(tokens[date_idx - 4])
+                    except ValueError:
+                        continue  # '_' = no HIP id
+                    name = line[:18].strip()
+                    if name and hip not in names:
+                        names[hip] = name
+        except OSError:
+            pass
+        _IAU_NAMES = names
+        return names
+
+
 # Common names for the brightest stars, keyed by Hipparcos (HIP) number. Used for the
 # always-on labels on the brightest stars in view; everything else falls back to HIP id.
+# Fallback only -- the IAU CSN table above wins when its data file is present.
 BRIGHT_STAR_NAMES = {
     32349: "Sirius", 30438: "Canopus", 71683: "Rigil Kent.", 69673: "Arcturus",
     91262: "Vega", 24608: "Capella", 24436: "Rigel", 37279: "Procyon",
@@ -155,8 +208,28 @@ class StarCatalog:
         return az[idx], el[idx], mag[idx]
 
     def name_for(self, hip):
-        """Human-friendly label for a star: common name if known, else 'HIP n'."""
-        return BRIGHT_STAR_NAMES.get(int(hip), f"HIP {int(hip)}")
+        """Human-friendly label for a star: IAU proper name if known, else the
+        legacy abbreviation table, else 'HIP n'."""
+        hip = int(hip)
+        name = iau_star_names().get(hip)
+        if name:
+            return name
+        return BRIGHT_STAR_NAMES.get(hip, f"HIP {hip}")
+
+    def top_named_hips(self, n=100):
+        """Frozenset of the HIP ids of the n brightest catalogue stars.
+
+        These are the always-labelled, marker-decorated stars on the skyplot
+        (the kid-friendly 'find Sirius' set). Cached per n."""
+        cache = getattr(self, '_top_named_cache', None)
+        if cache is None:
+            cache = self._top_named_cache = {}
+        got = cache.get(n)
+        if got is None:
+            k = min(n, self.bright_mag.size)
+            idx = np.argpartition(self.bright_mag, k - 1)[:k]
+            got = cache[n] = frozenset(int(h) for h in self.bright_hip[idx])
+        return got
 
     # ---- internals ----------------------------------------------------------
 

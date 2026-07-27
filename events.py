@@ -241,6 +241,17 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
     for sat, (px, py, _, _) in state.satellite_positions.items():
         if math.hypot(px - pos[0], py - pos[1]) < 10:
             state.selected_satellite = sat
+            state.selected_celestial = None  # mutual exclusivity
+            return True
+
+    # Celestial objects (sun/moon/planets, named stars, Messier/NGC): same
+    # full-screen coordinate convention. Checked after satellites so the
+    # sparser satellite layer keeps priority. No config_state here, so the
+    # tracking trajectory is built by the control loop's ensure call instead.
+    for ckey, cpos in list(getattr(state, 'celestial_positions', {}).items()):
+        if math.hypot(cpos[0] - pos[0], cpos[1] - pos[1]) < 10:
+            from celestial import select_celestial
+            select_celestial(state, None, ckey)
             return True
 
     return False

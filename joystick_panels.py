@@ -336,7 +336,17 @@ def render_joystick_target_panel(display, joystick_state, tracking_vis_state, co
     labels_on = getattr(config_state, 'satellite_labels_enabled', True)
     l_rect = _btn("Labels " + ("On" if labels_on else "Off"), strip_x + 172, 84, labels_on,
                   (70, 110, 70), (90, 70, 70))
-    joystick_state.jl_target_btn_rects = {'targets': t_rect, 'sats': s_rect, 'labels': l_rect}
+    # Deep-sky catalogue overlays (celestial.py). Sun/moon/planets and the
+    # named bright stars have no toggle -- they are always drawn.
+    m_on = getattr(config_state, 'messier_enabled', True)
+    m_rect = _btn("M " + ("On" if m_on else "Off"), strip_x + 260, 58, m_on,
+                  (95, 70, 120), (75, 60, 85))
+    ngc_on = getattr(config_state, 'ngc_enabled', False)
+    n_rect = _btn("NGC " + ("On" if ngc_on else "Off"), strip_x + 322, 74, ngc_on,
+                  (60, 105, 95), (60, 75, 72))
+    joystick_state.jl_target_btn_rects = {'targets': t_rect, 'sats': s_rect,
+                                          'labels': l_rect, 'messier': m_rect,
+                                          'ngc': n_rect}
 
     if not joystick_state.targets_panel_open:
         joystick_state.jl_filter_rects = {}
@@ -403,6 +413,14 @@ def handle_joystick_target_panel_click(joystick_state, tracking_vis_state, confi
         lbl = btns.get('labels')
         if lbl and lbl.collidepoint(pos):
             config_state.satellite_labels_enabled = not getattr(config_state, 'satellite_labels_enabled', True)
+            return True
+        m = btns.get('messier')
+        if m and m.collidepoint(pos):
+            config_state.messier_enabled = not getattr(config_state, 'messier_enabled', True)
+            return True
+        ngc = btns.get('ngc')
+        if ngc and ngc.collidepoint(pos):
+            config_state.ngc_enabled = not getattr(config_state, 'ngc_enabled', False)
             return True
 
     if not joystick_state.targets_panel_open or tracking_vis_state is None:
@@ -1772,6 +1790,21 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                     hovered_ac = icao
                     break
 
+            # Celestial objects (sun/moon/planets, named stars, Messier/NGC):
+            # same full-screen-coordinate hit-test. Lowest hover priority --
+            # their markers sit under the sparser satellite/aircraft layers.
+            hovered_cel = None
+            for ckey, cpos in list(getattr(tracking_vis_state,
+                                           'celestial_positions', {}).items()):
+                cpx, cpy = cpos[0], cpos[1]
+                rel_x = cpx - full_screen_center_x
+                rel_y = cpy - full_screen_center_y
+                trans_x = quadrant_center_x + rel_x * scale_factor
+                trans_y = quadrant_center_y + rel_y * scale_factor
+                if math.hypot(pos[0] - trans_x, pos[1] - trans_y) <= 12:
+                    hovered_cel = ckey
+                    break
+
             # Update hover state on motion
             if event.type == pygame.MOUSEMOTION:
                 tracking_vis_state.hovered_satellite = hovered_sat
@@ -1790,6 +1823,7 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                     else:
                         tracking_vis_state.selected_aircraft = hovered_ac
                         tracking_vis_state.selected_satellite = None  # mutual exclusivity
+                        tracking_vis_state.selected_celestial = None
                         print(f"Selected aircraft: {hovered_ac}")
                 elif hovered_sat is not None:
                     if tracking_vis_state.selected_satellite == hovered_sat:
@@ -1798,12 +1832,17 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                     else:
                         tracking_vis_state.selected_satellite = hovered_sat  # Select new satellite
                         tracking_vis_state.selected_aircraft = None  # mutual exclusivity
+                        tracking_vis_state.selected_celestial = None
                         print(f"Selected satellite: {hovered_sat.name}")
+                elif hovered_cel is not None:
+                    _select_celestial(tracking_vis_state, config_state,
+                                      joystick_state, hovered_cel)
                 else:
                     print("  -> Clicked empty area")
                     # Click in empty area - deselect current selection
                     tracking_vis_state.selected_satellite = None
                     tracking_vis_state.selected_aircraft = None
+                    tracking_vis_state.selected_celestial = None
                     print("Deselected target (empty area clicked)")
         else:
             # Mouse not over polar plot area - clear hover state
@@ -2294,6 +2333,14 @@ def _navball_grid(R):
     return g
 
 
+def _select_celestial(tracking_vis_state, config_state, joystick_state, key):
+    """Quadrant-click celestial selection: route through the shared helper with
+    the joystick status line for the solar-safety warning."""
+    from celestial import select_celestial
+    cb = getattr(joystick_state, 'update_status_callback', None)
+    select_celestial(tracking_vis_state, config_state, key, status_cb=cb)
+
+
 def active_program_trajectory(tvs):
     """Resolve the trajectory the PROGRAM loop should track: a selected satellite
     first, then a selected aircraft (ADS-B). Launch tracking is handled separately
@@ -2311,6 +2358,10 @@ def active_program_trajectory(tvs):
     ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
     if icao is not None and ac_trajs.get(icao):
         return ac_trajs[icao], 'aircraft', icao
+    ckey = getattr(tvs, 'selected_celestial', None)
+    cel_trajs = getattr(tvs, 'celestial_trajectories', None) or {}
+    if ckey is not None and cel_trajs.get(ckey):
+        return cel_trajs[ckey], 'celestial', ckey
     return None, None, None
 
 
@@ -2356,6 +2407,14 @@ def _navball_active_target(tvs):
     ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
     if icao is not None and ac_trajs.get(icao):
         traj = ac_trajs[icao]
+        res = _interp(traj, cur_tt)
+        tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
+        return traj, cur_tt, None, tgt[0], tgt[1]
+
+    ckey = getattr(tvs, 'selected_celestial', None)
+    cel_trajs = getattr(tvs, 'celestial_trajectories', None) or {}
+    if ckey is not None and cel_trajs.get(ckey):
+        traj = cel_trajs[ckey]
         res = _interp(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, None, tgt[0], tgt[1]

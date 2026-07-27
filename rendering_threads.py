@@ -259,6 +259,12 @@ def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx,
         STAR_LABEL_FONT = pygame.font.Font(None, 14)
 
     hovered = getattr(state, 'hovered_star', None)
+    # The top-100 brightest stars are the always-labelled, always-marked
+    # "find Sirius" set (both plot modes) -- gold diffraction-spike marker +
+    # proper name. Everything else keeps the old behavior: brightest-5%/hover
+    # labels, full-screen only.
+    named = catalog.top_named_hips(100)
+    NAMED_COLOR = (235, 210, 140)
     positions = []
     sx_i = sx.astype(int)
     sy_i = sy.astype(int)
@@ -273,13 +279,23 @@ def _draw_starfield_on_surface(surface, config_state, ts, current_tt, state, cx,
         h = int(hip[i])
         positions.append((sx_i[i], sy_i[i], h))
 
-        if draw_labels and (top_mask[i] or h == hovered):
+        is_named = h in named
+        if is_named:
+            s = ri + 3
+            pygame.draw.line(surface, NAMED_COLOR,
+                             (sx_i[i] - s, sy_i[i]), (sx_i[i] + s, sy_i[i]), 1)
+            pygame.draw.line(surface, NAMED_COLOR,
+                             (sx_i[i], sy_i[i] - s), (sx_i[i], sy_i[i] + s), 1)
+
+        if is_named or (draw_labels and (top_mask[i] or h == hovered)):
             name = catalog.name_for(h)
-            label = STAR_LABEL_CACHE.get(name)
+            color = NAMED_COLOR if is_named else (170, 190, 220)
+            cache_key = (name, color)
+            label = STAR_LABEL_CACHE.get(cache_key)
             if label is None:
                 try:
-                    label = STAR_LABEL_FONT.render(name, True, (170, 190, 220))
-                    STAR_LABEL_CACHE[name] = label
+                    label = STAR_LABEL_FONT.render(name, True, color)
+                    STAR_LABEL_CACHE[cache_key] = label
                 except pygame.error:
                     label = None
             if label is not None:
@@ -1005,6 +1021,127 @@ def _aircraft_to_surface_xy(px, py, surface, display_bounds, mode):
     return draw_px, draw_py
 
 
+CELESTIAL_LABEL_FONT = None
+CELESTIAL_DSO_FONT = None
+CELESTIAL_LABEL_CACHE = {}
+
+
+def draw_celestial_on_surface(surface, config_state, ts, state, display_bounds,
+                              current_tt, mode=PolarPlotMode.FULL_SCREEN):
+    """Sun/moon/planets (always shown, dimmed on the horizon rim when below it),
+    the top-100 named-star selection anchors (dots/labels come from the
+    starfield draw), and the Messier / NGC overlays (config toggles) on the
+    polar plot. Also draws the selected celestial object's sliding trajectory
+    and publishes state.celestial_positions {key: (px, py, el, az)} in
+    FULL-SCREEN pixel coords for the click hit-tests (same convention as
+    satellites/aircraft). display_bounds is the full-screen bounds in both
+    modes, matching draw_aircraft_on_surface."""
+    global CELESTIAL_LABEL_FONT, CELESTIAL_DSO_FONT
+    try:
+        from celestial import get_celestial
+        cat = get_celestial(getattr(state, 'ephemeris', None))
+        elevation_mask = float(getattr(config_state, 'elevation_mask_str', '0') or 0)
+        objs = cat.compute_plot_objects(config_state, ts, current_tt, elevation_mask)
+    except Exception as e:
+        print(f"Celestial render error: {e}")
+        return
+
+    fs_cx = display_bounds['sub_x'] + display_bounds['sub_width'] // 2
+    fs_cy = display_bounds['sub_y'] + display_bounds['sub_height'] // 2
+    fs_radius = min(display_bounds['sub_width'], display_bounds['sub_height']) // 2 - 50
+
+    if CELESTIAL_LABEL_FONT is None:
+        pygame.font.init()
+        CELESTIAL_LABEL_FONT = pygame.font.Font(None, 14)
+        CELESTIAL_DSO_FONT = pygame.font.Font(None, 12)
+
+    selected = getattr(state, 'selected_celestial', None)
+
+    # Selected object's sliding trajectory, projected from az/el at draw time
+    # (celestial rows carry no baked px/py -- built off-display in celestial.py).
+    trajs = getattr(state, 'celestial_trajectories', None) or {}
+    if selected and selected in trajs:
+        rows, times_arr = trajs[selected]
+        prev = None
+        for i in range(0, len(rows), 2):
+            el_r, az_r = rows[i][1], rows[i][2]
+            if el_r <= 0:
+                prev = None
+                continue
+            az_rad = math.radians(az_r % 360.0)
+            rr = (90.0 - el_r) / 90.0 * fs_radius
+            dx, dy = _aircraft_to_surface_xy(fs_cx + rr * math.sin(az_rad),
+                                             fs_cy - rr * math.cos(az_rad),
+                                             surface, display_bounds, mode)
+            pt = (int(dx), int(dy))
+            if prev is not None:
+                is_future = (current_tt is None) or (times_arr[i] > current_tt)
+                pygame.draw.line(surface, (170, 140, 255) if is_future
+                                 else (110, 110, 110), prev, pt, 1)
+            prev = pt
+
+    positions = {}
+    for obj in objs:
+        el, az, kind = obj['el'], obj['az'], obj['kind']
+        body_like = kind in ('sun', 'moon', 'planet')
+        below = el < elevation_mask
+        if below and not body_like:
+            continue  # DSOs/stars below the mask are simply not shown
+        az_rad = math.radians(az % 360.0)
+        rr = (90.0 - max(el, 0.0)) / 90.0 * fs_radius  # bodies pin to the rim
+        px = fs_cx + rr * math.sin(az_rad)
+        py = fs_cy - rr * math.cos(az_rad)
+        positions[obj['key']] = (px, py, el, az)
+        dx, dy = _aircraft_to_surface_xy(px, py, surface, display_bounds, mode)
+        dxi, dyi = int(dx), int(dy)
+
+        if kind == 'star':
+            # Dot + spikes + label come from the starfield draw; this entry
+            # exists so stars are click-selectable. Only the ring is ours.
+            if obj['key'] == selected:
+                pygame.draw.circle(surface, (255, 255, 0), (dxi, dyi), 7, 1)
+            continue
+
+        color = obj['color'] or ((205, 130, 255) if kind == 'messier'
+                                 else (90, 200, 180))
+        if below:
+            color = tuple(c // 2 for c in color)  # dimmed rim marker
+        if body_like:
+            pygame.draw.circle(surface, color, (dxi, dyi), obj['radius'])
+            if kind == 'sun':
+                pygame.draw.circle(surface, (255, 245, 160), (dxi, dyi),
+                                   obj['radius'] + 3, 1)
+            font, label_col = CELESTIAL_LABEL_FONT, (235, 235, 245)
+            label = obj['name'] + (" (below hrz)" if below else "")
+        elif kind == 'messier':
+            pygame.draw.rect(surface, color,
+                             pygame.Rect(dxi - 3, dyi - 3, 7, 7), 1)
+            font, label_col = CELESTIAL_DSO_FONT, (205, 150, 245)
+            label = obj['name'].split()[0]  # 'M31' -- full name when selected
+        else:  # ngc
+            pygame.draw.circle(surface, color, (dxi, dyi), 3, 1)
+            font, label_col = CELESTIAL_DSO_FONT, (120, 210, 190)
+            label = None  # too many to label; selected gets one below
+
+        if obj['key'] == selected:
+            pygame.draw.circle(surface, (255, 255, 0), (dxi, dyi),
+                               obj['radius'] + 5, 1)
+            label = obj['name']
+        if label:
+            ckey = (label, label_col)
+            surf = CELESTIAL_LABEL_CACHE.get(ckey)
+            if surf is None:
+                try:
+                    surf = font.render(label, True, label_col)
+                except pygame.error:
+                    surf = None
+                CELESTIAL_LABEL_CACHE[ckey] = surf
+            if surf is not None:
+                surface.blit(surf, (dxi + obj['radius'] + 3, dyi - 5))
+
+    state.celestial_positions = positions
+
+
 def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN):
     """Draw ADS-B aircraft on the skyplot: an orange diamond + label per aircraft,
     a yellow ring on the selected/hovered one, and the selected aircraft's
@@ -1278,8 +1415,12 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     self.ts = load.timescale()
                 current_tt = render_time_tt(self.tracking_vis_state, self.ts)
 
-                # Capture consistent snapshot of shared state to avoid race conditions
-                if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):
+                # Capture consistent snapshot of shared state to avoid race conditions.
+                # Render unconditionally: the celestial layer (sun/moon/planets,
+                # star markers, DSOs) is always present even with no satellites
+                # or aircraft loaded, so the old satellites-or-aircraft gate
+                # would leave the plot black exactly when a kid selects the moon.
+                if hasattr(self.tracking_vis_state, 'satellite_positions'):
                     # Capture state after satellite position updates are complete
                     # This may happen after the main thread's position update
                     satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
@@ -1292,11 +1433,6 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                         # Brief retry - position update might have happened after we checked
                         safe_time.sleep(0.001)  # Micro sleep for thread sync
                         satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
-
-                    # Only black out the surface if no satellites at all, not just if selected satellite is missing
-                    if not satellite_positions_snapshot:
-                        # Empty render if no satellites to display
-                        self.surface.fill((0, 0, 0))
 
                     # Clear surface periodically to prevent trail accumulation
                     # but not every frame to avoid frequency mismatch with main loop
@@ -1337,6 +1473,8 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.FULL_SCREEN)
                     # Now draw FOV boxes
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, None)
+                    # Celestial layer: sun/moon/planets, named-star anchors, DSOs
+                    draw_celestial_on_surface(self.surface, self.config_state, self.ts, self.tracking_vis_state, display_bounds, current_tt, PolarPlotMode.FULL_SCREEN)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.FULL_SCREEN, self.config_state)
                     # Draw ADS-B aircraft + selected aircraft track
@@ -1515,8 +1653,11 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     self.ts = load.timescale()
                 current_tt = render_time_tt(self.tracking_vis_state, self.ts)
 
-                # Capture consistent snapshot of shared state to avoid race conditions
-                if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):
+                # Capture consistent snapshot of shared state to avoid race conditions.
+                # Render unconditionally (mirrors TrackingVisualizationThread):
+                # the celestial layer is always present even with no satellites
+                # or aircraft loaded.
+                if hasattr(self.tracking_vis_state, 'satellite_positions'):
                     # Capture state after satellite position updates are complete
                     # This may happen after the main thread's position update
                     satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
@@ -1529,11 +1670,6 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                         # Brief retry - position update might have happened after we checked
                         safe_time.sleep(0.001)  # Micro sleep for thread sync
                         satellite_positions_snapshot = self.tracking_vis_state.satellite_positions.copy()
-
-                    # Only black out the surface if no satellites at all, not just if selected satellite is missing
-                    if not satellite_positions_snapshot:
-                        # Empty render if no satellites to display
-                        self.surface.fill((0, 0, 0))
 
                     # Clear surface periodically to prevent trail accumulation
                     # but not every frame to avoid frequency mismatch with main loop
@@ -1585,6 +1721,8 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                     draw_polar_plot_on_surface(self.surface, self.config_state, self.ts, current_tt, self.tracking_vis_state, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, full_screen_bounds)
                     # Now draw FOV boxes
                     draw_fov_on_surface(self.surface, self.tracking_vis_state, cx, cy, display_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, None)
+                    # Celestial layer: sun/moon/planets, named-star anchors, DSOs
+                    draw_celestial_on_surface(self.surface, self.config_state, self.ts, self.tracking_vis_state, full_screen_bounds, current_tt, PolarPlotMode.UPPER_RIGHT_QUADRANT)
                     # Now draw satellites on top
                     draw_satellites_on_surface(self.surface, self.tracking_vis_state, cx, cy, full_screen_bounds, PolarPlotMode.UPPER_RIGHT_QUADRANT, self.config_state)
                     # Draw ADS-B aircraft + selected aircraft track

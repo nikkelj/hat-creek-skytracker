@@ -469,6 +469,14 @@ class RustCoreLoopAdapter:
         Python loops agree on the target (selected satellite first, then aircraft)."""
         vis = st.tracking_vis_state
         from joystick_controller import active_program_trajectory
+        # Keep a selected celestial target's sliding window covering live time
+        # (mirrors program_track); cheap no-op when the window is fresh.
+        if vis is not None and getattr(vis, 'selected_celestial', None):
+            try:
+                from celestial import ensure_selected_trajectory
+                ensure_selected_trajectory(vis, st.config_state)
+            except Exception as e:
+                print(f"RustCoreLoopAdapter: celestial trajectory refresh failed: {e}")
         target_traj, _kind, _key = active_program_trajectory(vis)
         if vis is None or target_traj is None:
             self.loop.clear_setpoint()

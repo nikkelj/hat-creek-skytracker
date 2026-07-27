@@ -70,6 +70,16 @@ class TrackingVisState:
         self.selected_aircraft = None         # icao of the selected/tracked aircraft
         self.hovered_aircraft = None          # icao under the cursor
 
+        # Celestial targets (sun/moon/planets, top-100 named stars, Messier/NGC).
+        # Parallel to the satellite/aircraft structures: celestial_positions is
+        # published by the render thread each frame ({key: (px, py, el, az)} in
+        # full-screen pixel coords) for click hit-testing, and the selected
+        # object's sliding tracking trajectory lives in celestial_trajectories
+        # (8-col format, maintained by celestial.ensure_selected_trajectory).
+        self.selected_celestial = None        # selection key ('moon', 'M031', ...)
+        self.celestial_positions = {}         # key -> (px, py, el, az)
+        self.celestial_trajectories = {}      # key -> (rows, times_array)
+
         # Starfield state (Hipparcos catalogue rendered on the skyplot).
         # star_screen_positions is published by the render thread each frame as
         # (sx, sy, hip) tuples and consumed by the main thread for hover hit-testing.

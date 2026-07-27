@@ -23,8 +23,14 @@ capture.
   it back down. A segmented **Slew speed** indicator beside the stick display
   shows the current gear. Kid-tested design goal: you have to *earn* the fast
   rates, and letting go always lands you back in gentle mode.
-- **PROGRAM** — automatically follow a TLE satellite pass or an imported launch
-  trajectory, using interpolated angular position + rates.
+- **PROGRAM** — automatically follow a TLE satellite pass, an imported launch
+  trajectory, a tracked ADS-B aircraft, **or any celestial object** — sun,
+  moon, planets (Pluto included, because every kid asks), the 100 brightest
+  named stars, and the Messier/NGC deep-sky catalogues — using interpolated
+  angular position + rates. Celestial targets ride a sliding 90-minute
+  Skyfield-apparent trajectory window that refreshes automatically, so the
+  mount slews to the object and then follows it across the sky indefinitely.
+  Selecting the sun posts a loud solar-filter warning.
 - **HOTSPOT** — closed-loop *optical* tracker: detect the brightest ("hot")
   object in the camera frame and drive the mount to keep it centered. Intended
   as an operator hand-off once PROGRAM track has the object in frame (rockets,
@@ -79,6 +85,16 @@ physical hardware present.
 **Tracking Vis** — annotated polar sky plot with the selected object's orbit,
 orbital elements, camera FOV footprints, and a scrollable pass table.
 
+The plot carries a full **celestial layer**: the sun, moon and planets are
+always drawn (dimmed on the horizon rim when below it, so you can see where
+they'll rise), the **100 brightest stars** get gold spike markers and their
+IAU proper names (Sirius, Vega, Betelgeuse...), and the **Messier** and
+**NGC** catalogues overlay as violet squares / teal circles with independent
+On/Off toggles (NGC additionally magnitude-limited) to keep the noise
+manageable. Every one of them — plus every satellite and aircraft — is
+click-selectable, and PROGRAM mode will slew to and track it. Shown here with
+the moon selected (yellow ring):
+
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
 Both polar plots shade the **mount keepout** in light red: every sky direction
@@ -98,8 +114,10 @@ diagnostics. The PID pane's log sliders tune the gains live, and its
 **AUTOTUNE** button hands them to the online auto-tuner while tracking. The
 **Slew speed** gear bar next to the stick displays shows the adaptive
 RATE_CONTROL ceiling (green = base range, orange = boost gears earned by
-pinning the stick). Shown here in simulation with the mount and both cameras
-connected.
+pinning the stick). The skyplot quadrant carries the same celestial layer and
+click-selection as the full-screen plot, with **M** and **NGC** catalogue
+toggles in the Targets strip. Shown here in simulation with the mount and
+both cameras connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 

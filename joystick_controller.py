@@ -742,10 +742,12 @@ class JoystickModeState:
             and getattr(self.tracking_vis_state, 'launch_launched', False)
         )
         if launch_active:
-            # Drop any selected satellite so it neither competes as a target nor
-            # lingers as the highlighted "selected" object in the sky plots.
+            # Drop any selected satellite/celestial object so it neither competes
+            # as a target nor lingers as the highlighted "selected" object.
             if getattr(self.tracking_vis_state, 'selected_satellite', None) is not None:
                 self.tracking_vis_state.selected_satellite = None
+            if getattr(self.tracking_vis_state, 'selected_celestial', None) is not None:
+                self.tracking_vis_state.selected_celestial = None
             if self.tracking_mode != TrackingMode.PROGRAM:
                 self.tracking_mode = TrackingMode.PROGRAM  # reflect override in the UI
                 self._prev_dispatch_mode = TrackingMode.PROGRAM
@@ -1247,15 +1249,25 @@ class JoystickModeState:
             # Launch is actively tracking - follow launch trajectory
             return self._program_track_launch()
 
+        # A selected celestial target (sun/moon/planet/star/DSO) keeps its
+        # sliding trajectory window covering live time. Cheap no-op when fresh.
+        if getattr(self.tracking_vis_state, 'selected_celestial', None):
+            try:
+                from celestial import ensure_selected_trajectory
+                ensure_selected_trajectory(self.tracking_vis_state, self.config_state)
+            except Exception as e:
+                print(f"PROGRAM TRACK: celestial trajectory refresh failed: {e}")
+
         # Resolve the program target: a selected satellite first, then a selected
-        # aircraft (ADS-B). Both supply the same 8-column trajectory format, so the
-        # rest of the loop (bias, feed-forward, limits, PID) is target-agnostic.
+        # aircraft (ADS-B), then a celestial object. All supply the same 8-column
+        # trajectory format, so the rest of the loop (bias, feed-forward, limits,
+        # PID) is target-agnostic.
         target_traj, target_kind, target_key = active_program_trajectory(self.tracking_vis_state)
         if target_traj is None:
             # Nothing selected - switch to STANDBY and send message
             self.tracking_mode = TrackingMode.STANDBY
             if self.update_status_callback:
-                self.update_status_callback("Select a satellite or aircraft for PROGRAM tracking")
+                self.update_status_callback("Select a satellite, aircraft or sky object for PROGRAM tracking")
             else:
                 print("PROGRAM TRACK: No target selected - switched to STANDBY mode")
             return

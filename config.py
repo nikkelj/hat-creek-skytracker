@@ -36,6 +36,12 @@ class ConfigState:
         self.max_rendered_star_count = 2000    # brightest-N cap (skyplot + sim images)
         self.star_limiting_magnitude = 6.5     # faintest star ever considered
 
+        # Deep-sky overlays (celestial.py). Sun/moon/planets and the top-100
+        # named stars are always drawn; these gate the denser catalogues.
+        self.messier_enabled = True            # Messier markers on the skyplot
+        self.ngc_enabled = False               # NGC markers (noisy; off by default)
+        self.ngc_limiting_magnitude = 10.0     # faintest NGC object shown
+
         # Plate solver (tetra3) configuration
         self.plate_solve_enabled = False       # background plate-solve worker on/off
         self.plate_solve_camera_index = 0      # which camera the solver reads (0=wide/finder)
@@ -312,6 +318,9 @@ class ConfigState:
             "satellites_enabled": self.satellites_enabled,
             "satellite_labels_enabled": self.satellite_labels_enabled,
             "starfield_enabled": self.starfield_enabled,
+            "messier_enabled": self.messier_enabled,
+            "ngc_enabled": self.ngc_enabled,
+            "ngc_limiting_magnitude": self.ngc_limiting_magnitude,
             "max_rendered_star_count": self.max_rendered_star_count,
             "star_limiting_magnitude": self.star_limiting_magnitude,
             "plate_solve_enabled": self.plate_solve_enabled,
@@ -405,6 +414,10 @@ class ConfigState:
         self.satellites_enabled = config_dict.get("satellites_enabled", self.satellites_enabled)
         self.satellite_labels_enabled = config_dict.get("satellite_labels_enabled", self.satellite_labels_enabled)
         self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
+        self.messier_enabled = config_dict.get("messier_enabled", self.messier_enabled)
+        self.ngc_enabled = config_dict.get("ngc_enabled", self.ngc_enabled)
+        self.ngc_limiting_magnitude = config_dict.get(
+            "ngc_limiting_magnitude", self.ngc_limiting_magnitude)
         self.max_rendered_star_count = config_dict.get("max_rendered_star_count", self.max_rendered_star_count)
         self.star_limiting_magnitude = config_dict.get("star_limiting_magnitude", self.star_limiting_magnitude)
         self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)

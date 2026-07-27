@@ -97,6 +97,13 @@ class ConfigState:
         self.pid_alt_i_gain = 0.0
         self.pid_alt_d_gain = 0.0
 
+        # Mount 3D screen: operator seat relative to the mount (bearing from
+        # the mount, distance, eye height) -- drives the "operator view"
+        # camera so the rendered perspective matches where the user sits.
+        self.mount3d_observer_bearing_deg = 200.0
+        self.mount3d_observer_distance_m = 2.5
+        self.mount3d_eye_height_m = 1.2
+
         # Per-tracking-mode PID gain profiles, keyed "PROGRAM" / "HOTSPOT".
         # The six pid_*_gain fields above are the LIVE set both control loops
         # (and the UI sliders and auto-tuner) read; JoystickModeState.
@@ -335,6 +342,9 @@ class ConfigState:
             "pid_alt_d_gain": self.pid_alt_d_gain,
             "pid_mode_profiles": self.pid_mode_profiles,
             "pid_lead_time_sec": self.pid_lead_time_sec,
+            "mount3d_observer_bearing_deg": self.mount3d_observer_bearing_deg,
+            "mount3d_observer_distance_m": self.mount3d_observer_distance_m,
+            "mount3d_eye_height_m": self.mount3d_eye_height_m,
             "feed_forward_azm_enabled": self.feed_forward_azm_enabled,
             "feed_forward_alt_enabled": self.feed_forward_alt_enabled,
             "bias_azm_deg": self.bias_azm_deg,
@@ -427,6 +437,12 @@ class ConfigState:
         if isinstance(config_dict.get("pid_mode_profiles"), dict):
             self.pid_mode_profiles = config_dict["pid_mode_profiles"]
         self.pid_lead_time_sec = config_dict.get("pid_lead_time_sec", self.pid_lead_time_sec)
+        self.mount3d_observer_bearing_deg = config_dict.get(
+            "mount3d_observer_bearing_deg", self.mount3d_observer_bearing_deg)
+        self.mount3d_observer_distance_m = config_dict.get(
+            "mount3d_observer_distance_m", self.mount3d_observer_distance_m)
+        self.mount3d_eye_height_m = config_dict.get(
+            "mount3d_eye_height_m", self.mount3d_eye_height_m)
 
         # Load feed-forward and bias control settings
         self.feed_forward_azm_enabled = config_dict.get("feed_forward_azm_enabled", self.feed_forward_azm_enabled)

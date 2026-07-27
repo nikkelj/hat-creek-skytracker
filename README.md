@@ -98,6 +98,19 @@ alignment-rotation / ROI controls for co-boresighting the guide and main cameras
 
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
 
+**Mount 3D** — a software-3D view of the mount for building alignment
+intuition: the articulated model poses from the live axis angles through the
+**same forward transforms the tracker uses** (pinned by a parity test suite),
+per mount mode — shown here in AltAz-Side, where the cyan AZM-axis arrow lies
+on the horizon at the alignment azimuth. Both cameras' FOV cones sweep a real
+star field with satellites, aircraft, the selected trajectory, and the mount
+keepout tinted on the sky dome. Two view cameras: free **orbit** (drag/wheel)
+and an **operator view** rendered from your configured seat position (bearing
+/ distance / eye height) so the perspective matches what you actually see.
+Manual AZM/ALT sliders pose the model while disconnected.
+
+![Mount 3D](doc/screenshots/mount3d.png)
+
 ## Hardware Interfaces
 
 - **Celestron NexStar AUX** (primary; implemented in `lib/auxstar.py`)

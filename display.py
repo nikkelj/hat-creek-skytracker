@@ -227,8 +227,9 @@ class DisplaySetup:
             {"rect": pygame.Rect(10, 210, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Config Options", "mode": "config_options"},
             {"rect": pygame.Rect(10, 260, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "HW Sim", "mode": "hw_sim"},
             {"rect": pygame.Rect(10, 310, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Alignment", "mode": "alignment"},
-            {"rect": pygame.Rect(10, 360, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
-            {"rect": pygame.Rect(10, 410, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
+            {"rect": pygame.Rect(10, 360, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Mount 3D", "mode": "mount3d"},
+            {"rect": pygame.Rect(10, 410, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
+            {"rect": pygame.Rect(10, 460, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
         ]
 
         # Initialize button states for all buttons

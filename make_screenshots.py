@@ -70,6 +70,32 @@ def main():
     except Exception as e:
         print("config failed:", e)
 
+    # ---- Mount 3D screen ----
+    # AltAz-Side is the money shot: the cyan AZM-axis arrow lies ON the
+    # horizon at the alignment azimuth. Save/restore the mode so the later
+    # blocks keep the user's configured mode.
+    try:
+        from mount3d import Mount3DState, draw_mount3d
+        from skyfield.api import load as _sf_load
+        _ts = _sf_load.timescale()
+        _saved = (cfg.mount_mode, cfg.alignment_azimuth_str)
+        cfg.mount_mode = "AltAz-Side"
+        cfg.alignment_azimuth_str = "259.0"
+        m3d = Mount3DState()
+        m3d.follow_live = False
+        # Pose chosen to point well above the horizon (sky el ~ +40 deg with
+        # this pole geometry) so the FOV cones sweep visible sky.
+        m3d.manual_azm, m3d.manual_alt = 312.0, 60.0
+        # Camera on the opposite side of the boresight (sky az ~210) so the
+        # FOV cones sweep across the visible star field.
+        m3d.view_az, m3d.view_el = 40.0, 16.0
+        display.menu_screen.fill((30, 30, 30))
+        draw_mount3d(display, cfg, None, None, m3d, _ts)
+        save(display.menu_screen, "mount3d.png")
+        cfg.mount_mode, cfg.alignment_azimuth_str = _saved
+    except Exception as e:
+        print("mount3d failed:", e)
+
     # ---- HW Sim screen ----
     try:
         cfg.sim_config["enabled"] = True

@@ -51,7 +51,7 @@ def render_position_display(display, joystick_state):
 
     # Box sized to envelope its text (the old 100x65 box clipped the values).
     width, height = 140, 86
-    x_start = display.sub_x + display.sub_width // 2 - width - 12
+    x_start = display.joystick_layout_params()['divider_x'] - width - 12
     y_start = display.sub_y + 12
 
     # Background color based on stop state
@@ -144,6 +144,23 @@ def render_connection_controls(display, joystick_state):
     pygame.draw.rect(display.menu_screen, button_color, disconnect_rect)
     disconnect_text = display.small_font.render("Disconnect", True, (255, 255, 255))
     display.menu_screen.blit(disconnect_text, (disconnect_rect.x + 5, disconnect_rect.y + 5))
+
+    # Sync Home: capture the RAW encoder readings into the azm/alt offsets so
+    # the CURRENT physical attitude becomes working (0, 0) -- the mount home.
+    # Put the mount on its index marks first (AltAz-Side: scope along the
+    # polar axis at the pole azimuth). Offsets persist to config and both
+    # control loops read them live; Park also returns here. Grey until
+    # connected. (The joystick "Tare axes" button is unrelated -- it zeroes
+    # the game-controller stick centers, not the mount.)
+    sync_home_rect = pygame.Rect(display.sub_x + 190, button_y, button_width, button_height)
+    sync_hover = sync_home_rect.collidepoint(pygame.mouse.get_pos())
+    if joystick_state.telescope_connected:
+        sync_color = (110, 140, 180) if sync_hover else (100, 120, 150)
+    else:
+        sync_color = (100, 100, 100)
+    pygame.draw.rect(display.menu_screen, sync_color, sync_home_rect)
+    sync_text = display.small_font.render("Sync Home", True, (255, 255, 255))
+    display.menu_screen.blit(sync_text, (sync_home_rect.x + 4, sync_home_rect.y + 5))
 
     # Port selector
     port_y = button_y + 40
@@ -295,9 +312,9 @@ def render_joystick_target_panel(display, joystick_state, tracking_vis_state, co
     screen = display.menu_screen
     font = display.small_font
     mouse_pos = pygame.mouse.get_pos()
-    qx = display.sub_x + display.sub_width // 2
+    qx = display.joystick_layout_params()['divider_x']
     qy = display.sub_y
-    qw = display.sub_width // 2
+    qw = display.sub_x + display.sub_width - qx
     qh = display.sub_height // 2
 
     strip_x, strip_y, bh = qx + 8, qy + 6, 22
@@ -1593,6 +1610,31 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             joystick_state.disconnect_telescope()
             print("Telescope disconnected")
 
+        # Sync Home: capture the raw encoder readings into the azm/alt
+        # offsets so the current attitude (put the mount on its index marks
+        # first) becomes working (0, 0). Persisted to config; both control
+        # loops read offsets live, so it takes effect immediately.
+        sync_home_rect = pygame.Rect(display.sub_x + 190, display.sub_y + 10, 80, 30)
+        if sync_home_rect.collidepoint(pos) and joystick_state.telescope_connected:
+            cfg = joystick_state.config_state
+            raw_azm = getattr(joystick_state, 'current_azm_raw', None)
+            raw_alt = getattr(joystick_state, 'current_alt_raw', None)
+            if cfg is not None and raw_azm is not None and raw_alt is not None:
+                cfg.azm_offset_str = f"{raw_azm % 360.0:.4f}"
+                cfg.alt_offset_str = f"{raw_alt % 360.0:.4f}"
+                try:
+                    cfg.save_to_file()
+                    saved = "saved"
+                except Exception as e:
+                    saved = f"NOT saved: {e}"
+                msg = (f"Home synced: offsets AZM {cfg.azm_offset_str} "
+                       f"ALT {cfg.alt_offset_str} ({saved})")
+                print(msg)
+                if joystick_state.update_status_callback:
+                    joystick_state.update_status_callback(msg)
+            else:
+                print("Sync Home: no position read yet -- wait for the poll")
+
         # ADS-B connect/disconnect buttons (rects stored by the renderer).
         adsb_rects = getattr(joystick_state, 'adsb_button_rects', {}) or {}
         adsb_connect = adsb_rects.get('connect')
@@ -1630,9 +1672,9 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             return True
 
         # Handle satellite selection/hover in polar plot area
-        quadrant_x = display.sub_x + display.sub_width // 2
+        quadrant_x = display.joystick_layout_params()['divider_x']
         quadrant_y = display.sub_y
-        quadrant_width = display.sub_width // 2
+        quadrant_width = display.sub_x + display.sub_width - quadrant_x
         quadrant_height = display.sub_height // 2
 
         quadrant_rect = pygame.Rect(quadrant_x, quadrant_y, quadrant_width, quadrant_height)
@@ -1644,11 +1686,15 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 print(f"Click at ({pos[0]}, {pos[1]}) in polar plot quadrant")
 
-            # Pre-calculate centers and scale factor to match draw_satellites exactly
+            # Pre-calculate centers and scale factor to match
+            # draw_satellites_on_surface exactly: positions are stored in
+            # full-subarea coordinates, scaled by 0.45 about the full-subarea
+            # center, then placed about the quadrant surface's center (which
+            # sits at the blit position + half the quadrant size on screen).
             full_screen_center_x = display.sub_x + display.sub_width // 2
             full_screen_center_y = display.sub_y + display.sub_height // 2
-            quadrant_center_x = display.sub_x + display.sub_width // 2
-            quadrant_center_y = display.sub_y + display.sub_height // 2
+            quadrant_center_x = quadrant_x + quadrant_width // 2
+            quadrant_center_y = quadrant_y + quadrant_height // 2
             scale_factor = 0.45
 
             for sat, (px, py, alt, _) in tracking_vis_state.satellite_positions.items():
@@ -1742,6 +1788,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
         if handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
             return True
 
+        # Handle the star-filter toggle (PID Diagnostics pane)
+        if handle_star_filter_mouse_events(joystick_state, mouse_pos):
+            return True
+
         # Handle plate-solve pane clicks (toggle / apply alignment)
         if handle_plate_solve_mouse_events(joystick_state, mouse_pos, config_state):
             return True
@@ -1764,6 +1814,10 @@ def handle_joystick_mode_mouse_events(event, joystick_state, display, tracking_v
                     tracking_vis_state.launch_start_time = load.timescale().now().tt
                     print(f"Launch visualization started for {tracking_vis_state.selected_launch}")
                 return True
+
+        # Handle AUTOTUNE button clicks (PID pane title row)
+        if handle_autotune_button_mouse_events(joystick_state, display, mouse_pos):
+            return True
 
         # Handle PID slider clicks
         if handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
@@ -2038,6 +2092,22 @@ def render_pid_diagnostics(display, joystick_state):
     display.menu_screen.blit(
         display.small_font.render("PID Diagnostics", True, val_c), (x_start + 10, y_start + 5))
 
+    # Star-filter toggle (top-right): the HANDOFF/HOTSPOT detector rejects
+    # detections whose angular rate doesn't match the target (i.e. stars).
+    # Toggle OFF to deliberately track a star. Persisted to config.
+    cfg_sf = getattr(joystick_state, 'config_state', None)
+    sf_on = bool(getattr(cfg_sf, 'hotspot_star_filter_enabled', True))
+    sf_rect = pygame.Rect(x_start + width - 78, y_start + 4, 70, 16)
+    sf_color = ((0, 130, 0) if sf_on else (110, 90, 40)) if active else (60, 60, 70)
+    if active and sf_rect.collidepoint(pygame.mouse.get_pos()):
+        sf_color = tuple(min(255, c + 40) for c in sf_color)
+    pygame.draw.rect(display.menu_screen, sf_color, sf_rect)
+    pygame.draw.rect(display.menu_screen, (170, 170, 190), sf_rect, 1)
+    sf_text = display.tiny_font.render(
+        "no stars" if sf_on else "stars OK", True, (255, 255, 255))
+    display.menu_screen.blit(sf_text, sf_text.get_rect(center=sf_rect.center))
+    joystick_state.star_filter_button_rect = sf_rect
+
     az_err = getattr(joystick_state, 'azm_position_error', 0.0)
     el_err = getattr(joystick_state, 'alt_position_error', 0.0)
     # pid_output is in rev/sec (the command scale); show it as deg/sec.
@@ -2217,6 +2287,19 @@ def _navball_active_target(tvs):
     if tvs is None:
         return None
     cur_tt = getattr(tvs, 'current_tt', None)
+    if cur_tt is None:
+        # No shared timestamp yet (startup / mode switch): the ball still
+        # renders, just without a target overlay.
+        return None
+
+    def _interp(*args):
+        # A malformed trajectory (None rows around cur_tt) raises out of
+        # numpy's searchsorted; that must cost the target marker for a frame,
+        # not the whole navball.
+        try:
+            return interpolate_position_data_and_rates(*args)
+        except Exception:
+            return None
 
     sat = getattr(tvs, 'selected_satellite', None)
     sat_trajs = getattr(tvs, 'satellite_trajectories', None) or {}
@@ -2226,7 +2309,7 @@ def _navball_active_target(tvs):
             sunlit = getattr(tvs, 'sunlit_status_cache', {}).get(sat.name)
         except Exception:
             sunlit = None
-        res = interpolate_position_data_and_rates(traj, cur_tt)
+        res = _interp(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, sunlit, tgt[0], tgt[1]
 
@@ -2234,7 +2317,7 @@ def _navball_active_target(tvs):
     ac_trajs = getattr(tvs, 'aircraft_trajectories', None) or {}
     if icao is not None and ac_trajs.get(icao):
         traj = ac_trajs[icao]
-        res = interpolate_position_data_and_rates(traj, cur_tt)
+        res = _interp(traj, cur_tt)
         tgt = (res[4], res[2]) if res and res[0] is not None else (None, None)
         return traj, cur_tt, None, tgt[0], tgt[1]
 
@@ -2242,7 +2325,7 @@ def _navball_active_target(tvs):
     launch_trajs = getattr(tvs, 'launch_trajectories', None) or {}
     if lname and launch_trajs.get(lname):
         traj = launch_trajs[lname]
-        res = interpolate_position_data_and_rates(
+        res = _interp(
             traj, cur_tt,
             getattr(tvs, 'launch_start_time', 0) or 0,
             getattr(tvs, 'launch_launched', False))
@@ -2278,10 +2361,18 @@ def render_navball(display, joystick_state):
             align_el = float(getattr(cfg, 'alignment_elevation_str', 0.0) or 0.0)
         except (TypeError, ValueError):
             align_az = align_el = 0.0
-        if getattr(cfg, 'mount_mode', 'AltAz') == 'AltAz':
+        mount_mode = getattr(cfg, 'mount_mode', 'AltAz')
+        if mount_mode == 'AltAz':
             from transformations import AzAlt2AzEl_AltAz
             az, el = AzAlt2AzEl_AltAz(joystick_state.current_azm,
                                      joystick_state.current_alt, align_az)
+        elif mount_mode == 'AltAz-Side':
+            # Side-mounted rig: equatorial forward transform, pole on the
+            # horizon at alignment_azimuth (index-mark home)
+            from transformations import AzAlt2AzEl_AltAzSide
+            az, el = AzAlt2AzEl_AltAzSide(joystick_state.current_azm,
+                                          joystick_state.current_alt, align_az,
+                                          flip=bool(getattr(cfg, 'altaz_side_flip', False)))
         else:
             from transformations import AzAlt2AzEl
             az, el = AzAlt2AzEl(joystick_state.current_azm,
@@ -2637,9 +2728,12 @@ def render_feed_forward_toggle_buttons(display, joystick_state):
     """
     Render feed-forward toggle buttons (FF AZ / FF EL / FF OFF) as a row inside
     the bottom of the PID Gain Control pane. Always drawn so the controls are
-    visible; greyed out and non-interactable unless in PROGRAM mode.
+    visible; greyed out and non-interactable unless in a tracking mode that
+    applies feed-forward (PROGRAM/HANDOFF program track; HOTSPOT rides its
+    optical correction on the same trajectory rates).
     """
-    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
+    enabled = joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT)
 
     # Lay the buttons out along the bottom strip of the PID pane
     pane = joystick_panel_layout(display)['pid']
@@ -2736,14 +2830,16 @@ def render_pid_gain_sliders(display, joystick_state):
     Anchored to the bottom-right of the upper-left quadrant (below the Bias
     pane). The feed-forward toggle buttons are drawn inside the bottom of this
     pane by render_feed_forward_toggle_buttons(). Always drawn so its location
-    is visible; greyed out and non-interactable unless in PROGRAM mode.
+    is visible; greyed out and non-interactable unless in a tracking mode that
+    runs the shared PID loop (PROGRAM/HANDOFF/HOTSPOT).
     """
     # Only render when there's an active config_state
     if not hasattr(joystick_state, 'config_state') or joystick_state.config_state is None:
         return
 
     config_state = joystick_state.config_state
-    enabled = joystick_state.tracking_mode == TrackingMode.PROGRAM
+    enabled = joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT)
 
     # Pane hugging the bottom-right of the quadrant
     pane = joystick_panel_layout(display)['pid']
@@ -2756,9 +2852,37 @@ def render_pid_gain_sliders(display, joystick_state):
     pygame.draw.rect(display.menu_screen, (140, 140, 170),
                      (x_start, y_start, width, height), 1)
 
-    # Title
-    title_text = display.small_font.render("PID Gain Control", True, (255, 255, 255))
+    # Title, naming the active per-mode gain profile when one applies (the
+    # sliders and auto-tuner edit THAT profile's gains; see
+    # JoystickModeState.service_gain_profiles).
+    _gk = getattr(joystick_state, '_gain_profile_key', None)
+    profile_key = _gk(joystick_state.tracking_mode) if _gk else None
+    title_str = f"PID Gains - {profile_key}" if profile_key else "PID Gain Control"
+    title_text = display.small_font.render(title_str, True, (255, 255, 255))
     display.menu_screen.blit(title_text, (x_start + 10, y_start + 5))
+
+    # AUTOTUNE button (title row, right edge -- above the disabled scrim so it
+    # reads even when the sliders are greyed). Toggles the online auto-tuner
+    # (autotune.py) via joystick_state.toggle_autotune().
+    tuner = getattr(joystick_state, 'autotuner', None)
+    tuning = tuner is not None and tuner.active
+    at_rect = pygame.Rect(x_start + width - 72, y_start + 3, 64, 15)
+    display.joystick_autotune_button_rect = at_rect
+    at_armable = tuning or joystick_state.tracking_mode in (
+        TrackingMode.PROGRAM, TrackingMode.HOTSPOT)
+    if tuning:
+        at_color = (0, 150, 0)
+    elif tuner is not None and tuner.phase == 'done':
+        at_color = (0, 90, 160)
+    else:
+        at_color = (100, 100, 100) if at_armable else (70, 70, 85)
+    if at_armable and at_rect.collidepoint(pygame.mouse.get_pos()):
+        at_color = tuple(min(255, c + 40) for c in at_color)
+    pygame.draw.rect(display.menu_screen, at_color, at_rect)
+    pygame.draw.rect(display.menu_screen, (200, 200, 200), at_rect, 1)
+    at_label = display.tiny_font.render("TUNING" if tuning else "AUTOTUNE",
+                                        True, (255, 255, 255))
+    display.menu_screen.blit(at_label, at_label.get_rect(center=at_rect.center))
 
     # Define PID gain ranges (similar to camera settings)
     PID_GAIN_RANGE = (0.0, 2.0)  # From 0 to 2.0
@@ -2948,6 +3072,23 @@ def render_pid_gain_sliders(display, joystick_state):
     pygame.draw.rect(display.menu_screen, (255, 0, 0) if lead_hover else (200, 0, 0),
                      (lead_handle_x - 3, lead_track.y - 4, 6, 12))
 
+    # Status line between the lead slider and the feed-forward strip: the
+    # auto-tuner's progress while it runs (sweep/probe/last RMS); otherwise
+    # the active profile's provenance stamp -- which target these gains were
+    # auto-tuned on, and when.
+    status_line = None
+    if tuner is not None and (tuner.active or tuner.phase == 'paused'):
+        status_line = tuner.status_text()
+    elif profile_key:
+        prof = (getattr(config_state, 'pid_mode_profiles', None) or {}).get(profile_key)
+        if isinstance(prof, dict) and prof.get('tuned_on'):
+            status_line = f"tuned on {prof['tuned_on']} {prof.get('tuned_at', '')}".strip()
+    if status_line is None and tuner is not None:
+        status_line = tuner.status_text()
+    if status_line:
+        at_status = display.tiny_font.render(status_line, True, (170, 220, 255))
+        display.menu_screen.blit(at_status, (x_start + 10, y_start + 158))
+
     # Grey out the slider area when not in PROGRAM mode (the feed-forward strip
     # below is greyed separately by render_feed_forward_toggle_buttons()).
     if not enabled:
@@ -2976,6 +3117,26 @@ def handle_lead_slider_mouse_events(joystick_state, display, mouse_pos):
     return True
 
 
+def handle_autotune_button_mouse_events(joystick_state, display, mouse_pos):
+    """Click on the PID pane's AUTOTUNE button: start/stop the auto-tuner.
+    Startable only in PROGRAM or HOTSPOT (the tuner needs a live closed loop
+    to measure); a RUNNING tune is stoppable from any mode so the operator is
+    never locked out of the button."""
+    rect = getattr(display, 'joystick_autotune_button_rect', None)
+    if rect is None or not rect.collidepoint(mouse_pos):
+        return False
+    tuner = getattr(joystick_state, 'autotuner', None)
+    tuning = tuner is not None and tuner.active
+    if not tuning and joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HOTSPOT):
+        if joystick_state.update_status_callback:
+            joystick_state.update_status_callback(
+                "Auto-tune: start PROGRAM or HOTSPOT tracking first")
+        return True
+    joystick_state.toggle_autotune()
+    return True
+
+
 def handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
     """
     Handle mouse clicks on PID gain slider input fields.
@@ -3000,6 +3161,30 @@ def handle_pid_sliders_mouse_events(joystick_state, display, mouse_pos):
 
     return False
 
+def handle_star_filter_mouse_events(joystick_state, mouse_pos):
+    """
+    Handle clicks on the star-filter toggle in the PID Diagnostics pane.
+    Toggles config.hotspot_star_filter_enabled (both control loops read it)
+    and auto-saves so the choice persists across restarts.
+    """
+    rect = getattr(joystick_state, 'star_filter_button_rect', None)
+    cfg = getattr(joystick_state, 'config_state', None)
+    if rect is None or cfg is None or not rect.collidepoint(mouse_pos):
+        return False
+    if joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT):
+        return False
+    cfg.hotspot_star_filter_enabled = not bool(
+        getattr(cfg, 'hotspot_star_filter_enabled', True))
+    state = "ON (stars rejected)" if cfg.hotspot_star_filter_enabled else "OFF (stars trackable)"
+    print(f"Star filter: {state}")
+    try:
+        cfg.save_to_file()
+    except Exception as e:
+        print(f"Star filter: could not save config: {e}")
+    return True
+
+
 def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
     """
     Handle mouse clicks on feed-forward toggle buttons.
@@ -3008,8 +3193,10 @@ def handle_ff_toggle_mouse_events(joystick_state, mouse_pos):
     if not hasattr(joystick_state, 'ff_button_rects'):
         return False
 
-    # Feed-forward toggles are only interactable in PROGRAM mode (greyed otherwise)
-    if joystick_state.tracking_mode != TrackingMode.PROGRAM:
+    # Interactable while program-tracking (PROGRAM, or HANDOFF/HOTSPOT which
+    # run the same feed-forward underneath; greyed otherwise).
+    if joystick_state.tracking_mode not in (
+            TrackingMode.PROGRAM, TrackingMode.HANDOFF, TrackingMode.HOTSPOT):
         return False
 
     for label, rect in joystick_state.ff_button_rects:

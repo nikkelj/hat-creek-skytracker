@@ -199,6 +199,75 @@ class AdapterTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_CORE, "skytracker_core not built (run `maturin develop`)")
+class HandoffFramePushTests(unittest.TestCase):
+    """_push_hotspot must resolve the real camera_manager SINGLETON and push
+    the latest camera frame into the Rust loop. Regression: it imported the
+    camera_manager MODULE (which has no get_camera attribute), so every
+    HANDOFF/HOTSPOT pump raised AttributeError -- swallowed by the pump's
+    catch-all -- and the loop never received a single frame: HANDOFF sat at
+    'no detection' forever even with the target dead-centered."""
+
+    def test_push_hotspot_reaches_singleton_and_pushes_frame(self):
+        import numpy as np
+        from camera_manager import camera_manager as cm
+        from joystick_controller import TrackingMode
+        from rust_loop_adapter import RustCoreLoopAdapter
+
+        cfg = fake_config()
+        cfg.hotspot_camera_index = 0
+        cfg.hotspot_snr_threshold = 5.0
+        cfg.hotspot_gate_radius = 120
+        cfg.hotspot_coast_time_sec = 1.0
+        cfg.hotspot_x_sign = 1.0
+        cfg.hotspot_y_sign = -1.0
+        cfg.hotspot_max_rate_dps = 2.0
+        cfg.get_camera_pixel_size = lambda name: 2.9
+        cfg.get_camera_focal_length = lambda name: 162.0
+        cfg.get_camera_alignment_rotation = lambda name: 0.0
+
+        st = fake_state(FakeMount(), TrackingMode.HANDOFF)
+        adapter = RustCoreLoopAdapter(st, cfg, target_hz=50)
+
+        calls = []
+
+        class FakeLoop:
+            def set_hotspot_params(self, *a):
+                calls.append(("params",))
+
+            def push_frame(self, arr):
+                calls.append(("frame", arr.shape, str(arr.dtype)))
+
+        adapter.loop = FakeLoop()
+
+        frame = np.zeros((720, 960), dtype=np.uint8)
+        frame[360, 480] = 255
+        cam = cm.get_camera(0)
+        self.assertIsNotNone(cam, "real singleton must expose camera 0")
+        orig_thread = cam.thread
+        cam.thread = types.SimpleNamespace(
+            get_latest_raw=lambda: frame, latest_raw_seq=1)
+        try:
+            adapter._push_hotspot(st, cfg)  # must not raise
+            kinds = [c[0] for c in calls]
+            self.assertIn("params", kinds, "hotspot params must be pushed")
+            self.assertIn("frame", kinds, "camera frame must reach the loop")
+            _, shape, dtype = next(c for c in calls if c[0] == "frame")
+            self.assertEqual(shape, (720, 960))
+            self.assertEqual(dtype, "float32")
+
+            # Stale-seq gate: the same frame seq is not re-pushed...
+            calls.clear()
+            adapter._push_hotspot(st, cfg)
+            self.assertNotIn("frame", [c[0] for c in calls])
+            # ...but a new capture (seq bump) is.
+            cam.thread.latest_raw_seq = 2
+            adapter._push_hotspot(st, cfg)
+            self.assertIn("frame", [c[0] for c in calls])
+        finally:
+            cam.thread = orig_thread
+
+
+@unittest.skipUnless(_HAVE_CORE, "skytracker_core not built (run `maturin develop`)")
 class WatchdogTests(unittest.TestCase):
     """Liveness-watchdog behavior, including the old-wheel regression: a
     skytracker_core build without cycle_count in snapshots must DISABLE the

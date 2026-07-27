@@ -48,6 +48,9 @@ pub struct Outputs {
     pub hotspot_status: String,
     pub hotspot_snr: f64,
     pub hotspot_centroid: Option<(f64, f64)>,
+    /// HANDOFF's consecutive-detection progress (0 outside HANDOFF), so the
+    /// UI can show "detecting n/m" instead of a static "armed".
+    pub handoff_detection_count: u32,
 
     pub requested_mode: Option<Mode>,
     pub status_msgs: Vec<String>,
@@ -86,7 +89,11 @@ impl Shared {
     }
 }
 
-fn apply_command<T: Transport>(mount: &mut Mount<T>, cmd: &Command) {
+fn apply_command<T: Transport>(mount: &mut Mount<T>, state: &mut LoopState, cmd: &Command) {
+    // Manual commands write the wire outside the tracking dedup cache --
+    // drop it so the next tracking cycle re-sends rather than assuming the
+    // firmware still holds its last rate.
+    state.last_wire_cmd = [None, None];
     let _ = match cmd {
         Command::Stop => {
             let _ = mount.hc_slew_fixed(targets::AZM, 0);
@@ -162,7 +169,7 @@ pub fn run_cycle<T: Transport>(
         q.drain(..).collect()
     };
     for cmd in &drained {
-        apply_command(mount, cmd);
+        apply_command(mount, state, cmd);
     }
 
     // 3) Frame (Arc clone so the camera shim isn't blocked during detection).
@@ -172,27 +179,51 @@ pub fn run_cycle<T: Transport>(
     let out = state.step(&inputs, frame.as_deref(), current_azm, current_alt, now);
 
     // 5) Actuate (only when the step commands a rate). In continuous-rate mode
-    //    PROGRAM/HOTSPOT issue the fine variable-rate (guide-rate) command using
-    //    the PID's continuous output, falling back to the discrete MC_MOVE step
-    //    above guide_rate_max_dps (e.g. the near-zenith keyhole). Manual
-    //    RATE_CONTROL always uses the discrete joystick step.
+    //    the tracking modes issue the fine variable-rate (guide-rate) command
+    //    using the PID's continuous output, falling back to the discrete
+    //    MC_MOVE step above guide_rate_max_dps (e.g. the near-zenith keyhole).
+    //    HANDOFF is program tracking (step_handoff drives step_program), so it
+    //    must actuate identically — on the discrete steps its error limit-
+    //    cycles FOV-wide and the parallel hotspot detector never sees the
+    //    target long enough to hand off (the Python loop's _send_tracking_rate
+    //    is mode-agnostic). Manual RATE_CONTROL always uses the discrete
+    //    joystick step.
+    //    Unchanged commands are deduplicated (controller::wire_cmd_repeats):
+    //    the firmware holds the last rate and each AUX transaction is ~30 ms
+    //    of 9600-baud wire time, so re-sending every cycle halves the loop
+    //    rate for nothing. A failed send clears the cache slot so the next
+    //    cycle retries instead of trusting a command the mount never got.
     let continuous = inputs.continuous_rate
-        && matches!(inputs.mode, Mode::Program | Mode::Hotspot);
+        && matches!(inputs.mode, Mode::Program | Mode::Handoff | Mode::Hotspot);
     let max_dps = inputs.guide_rate_max_dps;
     if let Some(r) = out.azm_rate_cmd {
         let dps = out.azm_pid_output * 360.0;
         if continuous && dps.abs() <= max_dps {
-            let _ = mount.hc_set_rate_dps(targets::AZM, dps);
-        } else {
-            let _ = mount.hc_slew_fixed(targets::AZM, r);
+            let counts = (dps * crate::protocol::GUIDE_COUNTS_PER_DPS).round() as i64;
+            if !state.wire_cmd_repeats(0, 0, counts, now)
+                && mount.hc_set_rate_dps(targets::AZM, dps).is_err()
+            {
+                state.last_wire_cmd[0] = None;
+            }
+        } else if !state.wire_cmd_repeats(0, 1, r as i64, now)
+            && mount.hc_slew_fixed(targets::AZM, r).is_err()
+        {
+            state.last_wire_cmd[0] = None;
         }
     }
     if let Some(r) = out.alt_rate_cmd {
         let dps = out.alt_pid_output * 360.0;
         if continuous && dps.abs() <= max_dps {
-            let _ = mount.hc_set_rate_dps(targets::ALT, dps);
-        } else {
-            let _ = mount.hc_slew_fixed(targets::ALT, r);
+            let counts = (dps * crate::protocol::GUIDE_COUNTS_PER_DPS).round() as i64;
+            if !state.wire_cmd_repeats(1, 0, counts, now)
+                && mount.hc_set_rate_dps(targets::ALT, dps).is_err()
+            {
+                state.last_wire_cmd[1] = None;
+            }
+        } else if !state.wire_cmd_repeats(1, 1, r as i64, now)
+            && mount.hc_slew_fixed(targets::ALT, r).is_err()
+        {
+            state.last_wire_cmd[1] = None;
         }
     }
 
@@ -215,7 +246,22 @@ pub fn run_cycle<T: Transport>(
     }
     o.hotspot_snr = out.hotspot_snr;
     o.hotspot_centroid = out.hotspot_centroid;
-    o.requested_mode = out.requested_mode;
+    o.handoff_detection_count = out.handoff_detection_count;
+    // Latch loop-originated mode requests instead of overwriting each cycle:
+    // a request is produced on exactly ONE cycle (e.g. HANDOFF's 5th
+    // consecutive detection), and the polling adapter can miss a one-cycle
+    // snapshot value indefinitely when the two 15 Hz timers phase-lock. Hold
+    // the request until the host has actually pushed that mode back into
+    // `inputs.mode`, then clear it so a stale request can never override a
+    // later operator mode change.
+    match out.requested_mode {
+        Some(m) => o.requested_mode = Some(m),
+        None => {
+            if o.requested_mode == Some(inputs.mode) {
+                o.requested_mode = None;
+            }
+        }
+    }
     if let Some(msg) = out.status_msg {
         o.status_msgs.push(msg);
     }
@@ -275,7 +321,7 @@ impl CoreLoop {
                             // (best effort on a possibly-dead link).
                             consecutive_faults += 1;
                             if consecutive_faults >= MAX_CONSECUTIVE_FAULTS {
-                                apply_command(&mut mount, &Command::Stop);
+                                apply_command(&mut mount, &mut state, &Command::Stop);
                                 if consecutive_faults == MAX_CONSECUTIVE_FAULTS {
                                     if let Ok(mut o) = thread_shared.outputs.lock() {
                                         o.status_msgs.push(format!(
@@ -289,7 +335,7 @@ impl CoreLoop {
                             // A cycle panicked. Stop the mount, mark the loop
                             // dead so the adapter's watchdog surfaces it, and
                             // halt — the loop's state can no longer be trusted.
-                            apply_command(&mut mount, &Command::Stop);
+                            apply_command(&mut mount, &mut state, &Command::Stop);
                             if let Ok(mut o) = thread_shared.outputs.lock() {
                                 o.fresh = false;
                                 o.loop_dead = true;
@@ -318,7 +364,7 @@ impl CoreLoop {
                     }
                 }
                 // On shutdown, never leave the mount slewing.
-                apply_command(&mut mount, &Command::Stop);
+                apply_command(&mut mount, &mut state, &Command::Stop);
                 if let Ok(mut o) = thread_shared.outputs.lock() {
                     o.loop_dead = true;
                 }

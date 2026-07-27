@@ -52,6 +52,7 @@ fn mode_str(m: Mode) -> &'static str {
 fn parse_mount_mode(s: &str) -> PyResult<MountMode> {
     match s.to_ascii_lowercase().as_str() {
         "altaz" => Ok(MountMode::AltAz),
+        "altaz_side" | "altaz-side" | "altazside" => Ok(MountMode::AltAzSide),
         "passthrough" => Ok(MountMode::Passthrough),
         "eq" => Ok(MountMode::Eq),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -365,6 +366,18 @@ fn AzEl2AzAlt_AltAz(az: f64, el: f64, alignment_azimuth: f64, alignment_elevatio
 }
 
 #[pyfunction]
+#[pyo3(signature = (azm, alt, alignment_azimuth, flip=false))]
+fn AzAlt2AzEl_AltAzSide(azm: f64, alt: f64, alignment_azimuth: f64, flip: bool) -> (f64, f64) {
+    core_tf::az_alt_to_az_el_altaz_side(azm, alt, alignment_azimuth, flip)
+}
+
+#[pyfunction]
+#[pyo3(signature = (az, el, alignment_azimuth, flip=false))]
+fn AzEl2AzAlt_AltAzSide(az: f64, el: f64, alignment_azimuth: f64, flip: bool) -> (f64, f64) {
+    core_tf::az_el_to_az_alt_altaz_side(az, el, alignment_azimuth, flip)
+}
+
+#[pyfunction]
 fn AzAlt2AzEl_Passthrough(azm: f64, alt: f64) -> (f64, f64) {
     core_tf::az_alt_to_az_el_passthrough(azm, alt)
 }
@@ -455,6 +468,11 @@ impl SimCoreLoop {
         self.shared.inputs.lock().unwrap().mount_mode = parse_mount_mode(mode)?;
         Ok(())
     }
+
+    fn set_altaz_side_flip(&self, flip: bool) -> PyResult<()> {
+        self.shared.inputs.lock().unwrap().altaz_side_flip = flip;
+        Ok(())
+    }
     fn set_alignment(&self, az: f64, el: f64) {
         let mut i = self.shared.inputs.lock().unwrap();
         i.alignment_az = az;
@@ -489,7 +507,7 @@ impl SimCoreLoop {
         self.shared.inputs.lock().unwrap().handoff_min_frames = n;
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0, star_filter = false, rate_gate_dps = 0.15))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -501,6 +519,8 @@ impl SimCoreLoop {
         focal_length_mm: f64,
         rotation_deg: f64,
         max_rate_dps: f64,
+        star_filter: bool,
+        rate_gate_dps: f64,
     ) {
         self.shared.inputs.lock().unwrap().hotspot = crate::controller::HotspotParams {
             snr_threshold,
@@ -512,7 +532,14 @@ impl SimCoreLoop {
             focal_length_mm,
             rotation_deg,
             max_rate_dps,
+            star_filter,
+            rate_gate_dps,
         };
+    }
+
+    /// Feedback low-pass time constant for both PIDs (seconds; 0 disables).
+    fn set_output_filter(&self, tau_seconds: f64) {
+        self.shared.inputs.lock().unwrap().output_filter_tau = tau_seconds.max(0.0);
     }
 
     /// Publish a frame (2D float32 intensity map) for HOTSPOT mode.
@@ -588,6 +615,7 @@ impl SimCoreLoop {
         let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
         let _ = d.set_item("hotspot_snr", o.hotspot_snr);
         let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+        let _ = d.set_item("handoff_detection_count", o.handoff_detection_count);
         let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
         let _ = d.set_item("status_msgs", o.status_msgs.clone());
         let _ = d.set_item("cycle_count", o.cycle_count);
@@ -631,6 +659,11 @@ fn h_set_rate_cmd(sh: &Shared, azm: i32, alt: i32) {
 }
 fn h_set_mount_mode(sh: &Shared, s: &str) -> PyResult<()> {
     sh.inputs.lock().unwrap().mount_mode = parse_mount_mode(s)?;
+    Ok(())
+}
+
+fn h_set_altaz_side_flip(sh: &Shared, flip: bool) -> PyResult<()> {
+    sh.inputs.lock().unwrap().altaz_side_flip = flip;
     Ok(())
 }
 fn h_set_alignment(sh: &Shared, az: f64, el: f64) {
@@ -677,6 +710,8 @@ fn h_set_hotspot_params(
     fl: f64,
     rot: f64,
     max_rate_dps: f64,
+    star_filter: bool,
+    rate_gate_dps: f64,
 ) {
     sh.inputs.lock().unwrap().hotspot = HotspotParams {
         snr_threshold: snr,
@@ -688,7 +723,12 @@ fn h_set_hotspot_params(
         pixel_size_um: px,
         focal_length_mm: fl,
         rotation_deg: rot,
+        star_filter,
+        rate_gate_dps,
     };
+}
+fn h_set_output_filter(sh: &Shared, tau_seconds: f64) {
+    sh.inputs.lock().unwrap().output_filter_tau = tau_seconds.max(0.0);
 }
 fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>) {
     let view = image.as_array();
@@ -730,6 +770,7 @@ fn h_snapshot<'py>(py: Python<'py>, sh: &Shared) -> Bound<'py, PyDict> {
     let _ = d.set_item("hotspot_status", o.hotspot_status.clone());
     let _ = d.set_item("hotspot_snr", o.hotspot_snr);
     let _ = d.set_item("hotspot_centroid", o.hotspot_centroid);
+    let _ = d.set_item("handoff_detection_count", o.handoff_detection_count);
     let _ = d.set_item("requested_mode", o.requested_mode.map(mode_str));
     let _ = d.set_item("status_msgs", o.status_msgs.clone());
     let _ = d.set_item("actual_hz", o.actual_hz);
@@ -799,7 +840,9 @@ impl Transport for PyMountTransport {
                 || msg_id == protocol::MC_SET_NEG_GUIDERATE.0
             {
                 let sign = if msg_id == protocol::MC_SET_POS_GUIDERATE.0 { 1.0 } else { -1.0 };
-                let dps = sign * protocol::unpack_int3(&d) * 360.0;
+                // Calibrated firmware unit: 24-bit value = arcsec/s * 1024.
+                let dps =
+                    sign * protocol::unpack_int3(&d) * 16777216.0 / protocol::GUIDE_COUNTS_PER_DPS;
                 let _ = mount.call_method1("hc_set_rate_dps", (target, dps));
                 vec![b'#']
             } else if msg_id == protocol::MC_GOTO_FAST.0 {
@@ -888,6 +931,10 @@ impl CoreLoop {
     fn set_mount_mode(&self, mode: &str) -> PyResult<()> {
         h_set_mount_mode(self.inner.shared(), mode)
     }
+
+    fn set_altaz_side_flip(&self, flip: bool) -> PyResult<()> {
+        h_set_altaz_side_flip(self.inner.shared(), flip)
+    }
     fn set_alignment(&self, az: f64, el: f64) {
         h_set_alignment(self.inner.shared(), az, el);
     }
@@ -911,7 +958,7 @@ impl CoreLoop {
         h_set_handoff_min_frames(self.inner.shared(), n);
     }
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0))]
+    #[pyo3(signature = (snr_threshold, gate_radius, coast_time_s, x_sign, y_sign, pixel_size_um, focal_length_mm, rotation_deg, max_rate_dps = 2.0, star_filter = false, rate_gate_dps = 0.15))]
     fn set_hotspot_params(
         &self,
         snr_threshold: f64,
@@ -923,6 +970,8 @@ impl CoreLoop {
         focal_length_mm: f64,
         rotation_deg: f64,
         max_rate_dps: f64,
+        star_filter: bool,
+        rate_gate_dps: f64,
     ) {
         h_set_hotspot_params(
             self.inner.shared(),
@@ -935,7 +984,14 @@ impl CoreLoop {
             focal_length_mm,
             rotation_deg,
             max_rate_dps,
+            star_filter,
+            rate_gate_dps,
         );
+    }
+
+    /// Feedback low-pass time constant for both PIDs (seconds; 0 disables).
+    fn set_output_filter(&self, tau_seconds: f64) {
+        h_set_output_filter(self.inner.shared(), tau_seconds);
     }
     fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
         self.frame_seq += 1;
@@ -979,6 +1035,8 @@ fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(apply_rotation_to_az_el, m)?)?;
     m.add_function(wrap_pyfunction!(AzAlt2AzEl_AltAz, m)?)?;
     m.add_function(wrap_pyfunction!(AzEl2AzAlt_AltAz, m)?)?;
+    m.add_function(wrap_pyfunction!(AzAlt2AzEl_AltAzSide, m)?)?;
+    m.add_function(wrap_pyfunction!(AzEl2AzAlt_AltAzSide, m)?)?;
     m.add_function(wrap_pyfunction!(AzAlt2AzEl_Passthrough, m)?)?;
     m.add_function(wrap_pyfunction!(AzEl2AzAlt_Passthrough, m)?)?;
     m.add_function(wrap_pyfunction!(telescope_to_local_elev_az, m)?)?;

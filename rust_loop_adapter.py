@@ -44,6 +44,8 @@ def _mount_mode_str(cfg):
         return "passthrough"
     if mm == "eq":
         return "eq"
+    if mm in ("altaz-side", "altaz_side", "altazside"):
+        return "altaz_side"
     return "altaz"
 
 
@@ -70,6 +72,7 @@ class RustCoreLoopAdapter:
         self._warned_no_liveness = False
         self._last_pushed_frame_seq = None
         self._park_state = None
+        self._reported_pump_errors = set()   # one UI report per distinct error
 
     # ---- MountControlThread-compatible lifecycle ----
     def start(self):
@@ -98,6 +101,16 @@ class RustCoreLoopAdapter:
                 self._pump()
             except Exception as e:  # never let the pump die silently
                 print(f"RustCoreLoopAdapter pump error: {e}")
+                # Surface each distinct failure to the UI once — a repeating
+                # pump error otherwise scrolls by in the terminal while the
+                # operator only sees the symptom (e.g. HANDOFF never
+                # detecting because the camera push kept failing).
+                msg = f"{type(e).__name__}: {e}"
+                if msg not in self._reported_pump_errors:
+                    self._reported_pump_errors.add(msg)
+                    cb = self.state.update_status_callback
+                    if cb:
+                        cb(f"Rust loop pump error: {msg}")
             self._stop.wait(max(0.0, period - (time.perf_counter() - t0)))
         # Shutdown: stop the loop thread (it sends a final mount stop).
         if self.loop is not None:
@@ -210,6 +223,16 @@ class RustCoreLoopAdapter:
             return
         if snap.get("fresh"):
             self._read_back(st, snap)
+            # Post-snapshot services: per-mode PID gain profile swap first
+            # (so a mode change lands the right gains before the tuner sees
+            # them), then feed the auto-tuner this snapshot's errors. Both
+            # write into config_state, which _push_static hands to the Rust
+            # loop below in this same pump.
+            # getattr: adapter tests drive the pump with minimal fake states.
+            for name in ("service_gain_profiles", "service_autotune"):
+                service = getattr(st, name, None)
+                if service is not None:
+                    service()
         req = snap.get("requested_mode")
         if req:
             st.tracking_mode = _STR_TO_MODE.get(req, st.tracking_mode)
@@ -277,6 +300,12 @@ class RustCoreLoopAdapter:
             self._push_program_setpoint(st)
             self._push_hotspot(st, cfg)
         elif mode == TrackingMode.HOTSPOT:
+            # HOTSPOT also gets the program setpoint when a target is selected:
+            # its trajectory rates feed the optical loop's feed-forward (the
+            # correction rides on the target's own motion) and give the star
+            # filter the expected detection rate. Tracking bare (no target),
+            # this clears the setpoint and the loop runs correction-only.
+            self._push_program_setpoint(st)
             self._push_hotspot(st, cfg)
 
     def _read_back(self, st, snap):
@@ -293,6 +322,22 @@ class RustCoreLoopAdapter:
         st.hotspot_status = snap.get("hotspot_status", "")
         st.hotspot_acquired = snap.get("hotspot_acquired", False)
         st.hotspot_centroid = snap.get("hotspot_centroid")
+        # HANDOFF progress for the PID-diagnostics panel. The Python loop
+        # writes handoff_status from handoff_track(), which the Rust path
+        # bypasses entirely -- without this the panel shows a static "armed"
+        # and the operator can't tell whether detection is even firing.
+        if st.tracking_mode == TrackingMode.HANDOFF:
+            count = snap.get("handoff_detection_count")
+            if count is None:
+                st.handoff_status = "armed (rebuild skytracker_core for progress)"
+            elif st.hotspot_status == "star-reject":
+                st.handoff_status = "star rejected (rate gate)"
+            elif st.hotspot_status == "detecting" or count > 0:
+                need = max(1, int(getattr(self.config_state,
+                                          "handoff_min_frames", 5) or 5))
+                st.handoff_status = f"detecting {count}/{need}"
+            else:
+                st.handoff_status = "program track (no detection)"
         try:
             from lib.auxstar import f2dms
             ad, am, asec = f2dms(st.current_azm / 360.0)
@@ -326,11 +371,16 @@ class RustCoreLoopAdapter:
             float(getattr(cfg, "alt_offset_str", 0.0) or 0.0),
         )
         loop.set_mount_mode(_mount_mode_str(cfg))
+        # Side-mount tip side (older wheels predate the setter).
+        if hasattr(loop, "set_altaz_side_flip"):
+            loop.set_altaz_side_flip(bool(getattr(cfg, "altaz_side_flip", False)))
         loop.set_continuous_rate(
             bool(getattr(cfg, "continuous_rate_tracking", False)),
             float(getattr(cfg, "guide_rate_max_dps", 5.0)),
         )
         loop.set_handoff_min_frames(int(getattr(cfg, "handoff_min_frames", 5) or 5))
+        loop.set_output_filter(
+            float(getattr(cfg, "pid_output_filter_tau_sec", 0.0) or 0.0))
         try:
             loop.set_alignment(
                 float(cfg.alignment_azimuth_str), float(cfg.alignment_elevation_str)
@@ -502,7 +552,10 @@ class RustCoreLoopAdapter:
         self.loop.set_setpoint(biased_az, biased_el, az_rate_f, set_el_rate)
 
     def _push_hotspot(self, st, cfg):
-        import camera_manager
+        # The instance, NOT the module: get_camera is a method on the singleton
+        # (module-level `import camera_manager` made every HANDOFF/HOTSPOT pump
+        # die with AttributeError, silently starving the loop of frames).
+        from camera_manager import camera_manager
         import hotspot as hs
 
         cam_index = int(getattr(cfg, "hotspot_camera_index", 0))
@@ -517,6 +570,8 @@ class RustCoreLoopAdapter:
             float(cfg.get_camera_focal_length(cam_name)),
             float(cfg.get_camera_alignment_rotation(cam_name)),
             float(getattr(cfg, "hotspot_max_rate_dps", 2.0) or 2.0),
+            bool(getattr(cfg, "hotspot_star_filter_enabled", True)),
+            float(getattr(cfg, "hotspot_rate_gate_dps", 0.15) or 0.15),
         )
         camera = camera_manager.get_camera(cam_index)
         if camera is not None and getattr(camera, "thread", None) is not None:

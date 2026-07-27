@@ -89,6 +89,15 @@ class MountControlThread(threading.Thread):
         #    the cached position set above rather than hitting the wire again.
         state.tracking_control()
 
+        # 3) Post-cycle services: per-mode PID gain profile swap first (so a
+        #    mode change lands the right gains before the tuner sees them),
+        #    then feed the auto-tuner this cycle's position errors.
+        #    getattr: test rigs drive this thread with minimal fake states.
+        for name in ("service_gain_profiles", "service_autotune"):
+            service = getattr(state, name, None)
+            if service is not None:
+                service()
+
     # -------------------------------------------------------------- polling
     def _poll_position(self, controller):
         poll_start = time.perf_counter()
@@ -134,12 +143,16 @@ class MountControlThread(threading.Thread):
     # --------------------------------------------------------------- safety
     def _safe_stop_motion(self, retries=3):
         """Stop both axes, retrying briefly. Returns True when the stop was
-        acknowledged. A stop that keeps failing is the one fault the operator
+        acknowledged. Also invalidates the rate-command dedup cache: these
+        stops bypass _send_rate_command, so without this the tracking path
+        could skip its next (differing) send for up to the keepalive window.
+        A stop that keeps failing is the one fault the operator
         MUST hear about -- the mount may still be slewing on a dead link -- so
         it is surfaced through the status callback instead of swallowed.
         """
         state = self.state
         controller = state.telescope_controller
+        getattr(state, '_rate_cmd_cache', {}).clear()
         if controller is None or not state.telescope_connected:
             return True
         last_err = None

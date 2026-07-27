@@ -6,6 +6,134 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — Online PID auto-tune: twiddle on the live error stream works
+
+Added [`autotune.py`](autotune.py): one button tunes all six PID gains *while
+tracking*, no injected test signals — a coordinate-descent ("twiddle")
+optimizer in **log-gain space** (the gains span 5 decades, matching the UI's
+log sliders) that probes each gain up/down, scores a settle-then-measure RMS
+window of the live mount-axis error, keeps >3% improvements, and expands/
+shrinks its per-gain step. Both control loops re-read gains from config every
+cycle, so the tuner is loop-agnostic: it just writes candidates into
+`config_state` and watches `azm/alt_position_error` on the shared state
+(serviced from the mount-control cycle *and* the Rust adapter pump). On the
+live-fidelity sim rig (noise, backlash, periodic error, ~10 fps camera,
+15 Hz loop) a ~2.5-minute tune took the field-tuned example gains from
+**81″ → 38″ sky RMS** (encoder-error RMS 30″/13.5″ → 5.7″/4.4″ az/el).
+
+Non-obvious bits:
+
+- **Re-baseline every sweep.** Windowed RMS drifts with the pass geometry;
+  scoring candidates against a best-cost measured minutes ago either blocks
+  all acceptance or accepts regressions. Each sweep starts with a fresh
+  baseline window at the current best gains.
+- **The acceptance margin is what makes it a descent.** With ~40 samples per
+  window the RMS estimate is noisy; a plain `<` comparison random-walks the
+  gains. Requiring >3% improvement (and reverting otherwise) makes progress
+  monotone in expectation.
+- **Pause ≠ stop.** Mode change, STOP, or a lost optical lock mid-probe must
+  revert to the best-known gains and *restart the interrupted probe* on
+  resume — a half-measured window scored across the gap is garbage.
+- **Measure the plant you armed on.** PROGRAM (encoder loop) and HOTSPOT
+  (optical loop) are different plants; the tuner refuses to mix their samples.
+  Follow-through: each plant keeps its own **gain profile**
+  (`config.pid_mode_profiles`, stamped with the target it was tuned on),
+  swapped into the live gain fields automatically on mode transitions by
+  `service_gain_profiles()`. Keeping the six live fields as "the active set"
+  meant the sliders, both loops, and the tuner needed zero changes — but the
+  swap must run BEFORE the tuner's servicing each cycle, and a plant-changing
+  transition must STOP a running tune (keeping its best) so the departing
+  profile saves tuned gains, not a half-tested probe candidate.
+- **Sim-rig gotcha that looked like a tuner disaster:** the tracking-quality
+  `Rig`'s analytic target climbs at 0.5°/s elevation, so past ~120 s it
+  crosses the zenith and the rig's sky-error metric (built for el ≤ 90°)
+  reports hundreds of thousands of arcsec while the loop is actually fine.
+  A first "tune made it worse" verdict (38″ → 143″, then 430 000″) was
+  entirely this artifact; with a 0.08°/s target the same tune measured
+  cleanly. Any long-window use of `Rig` needs rates that keep el < 90°.
+
+## 2026-07-26 — The 9600-baud wire caps the control loop at ~8 Hz; dedup rate commands
+
+`bench_guiderate.py --throughput` on the real AVX: every AUX transaction costs
+~30 ms round-trip (mean 30.5, p95 41.6 — that is 9600-baud wire time, not
+software overhead), so the control cycle's 4 transactions (read AZM+ALT,
+command AZM+ALT) support only **7.7 Hz against the 15 Hz target**. Reads alone
+support ~16 Hz. The fix shipped in both loops: **rate-command deduplication** —
+the firmware *holds* the last guide rate (and MC_MOVE step), so an unchanged
+command is pure wire waste; commands are re-sent only when the wire-quantized
+value changes, with a 1 s keepalive and cache invalidation on every
+out-of-band stop path. Steady tracking now costs 2 transactions/cycle.
+
+Rehearse this reality in sim: set `sim_serial_latency_s` to `0.03` in the HW
+Sim screen — gains tuned against an instant-serial sim meet ~130 ms of
+transport lag on hardware and lose phase margin (a contributor to the first
+side-mode session's PID oscillation).
+
+Also: the mount has no software encoder tare — the "Tare axes" button tares
+the *game controller sticks*. Mount homing = power on at the index marks
+(firmware boots encoders to 0) or the joystick screen's **Sync Home** button
+(captures current raw encoder readings into azm/alt offsets; Park drives back
+to them).
+
+## 2026-07-26 — AltAz-Side home is the AVX index marks, not the zenith
+
+First PROGRAM track in the new side-mount mode drove the scope into the
+ground while the UI self-consistently displayed el +49°, and jog polarity
+*appeared* wrong on both axes. Root cause: the mode's transforms assumed
+encoder (0, 0) = zenith, but the natural (and mechanically meaningful) home
+on the AVX is the **index marks — where the scope points ALONG the polar
+axis**. In the side rig that's at the *horizon*, at the pole azimuth, with
+the dec axis vertical. The decisive field datum: at the index marks the
+scope sat on the horizon at az 259° while the model read el +17.7° — exactly
+asin(cos ALT · cos AZM) of the encoder values, confirming a coherent model
+with the wrong home.
+
+Fix: H = AZM + 90°, dec = 90° − ALT (`ALTAZ_SIDE_H0_DEG`), which also makes
+the axes behave as originally described from home (+ALT walks the horizon —
+identically 0 elevation, a strong test — and AZM sweeps the vertical circle
+once off the pole). `altaz_side_flip` mirrors the H origin for a rig laid
+down on its other side. Field procedure: index marks → Sync Home (the
+connection-panel button that captures raw encoder readings into the
+azm/alt offsets — the joystick "Tare axes" button is for the game
+controller sticks, not the mount) → enter the azimuth the scope points at
+as Alignment Azimuth.
+
+Meta-lessons: (1) an apparent *polarity* error on both axes was actually an
+*index* error — near H = 90° the sign of ∂el/∂ALT flips, so a 90° home
+offset masquerades as reversed axes; (2) "the UI agrees with itself" proves
+nothing — the navball, skyplot and FOV boxes all read from the same wrong
+transform; only an independent physical reference (the horizon) broke the
+tie; (3) define a mode's home as something the operator can *find* with the
+hardware's own markings, not an attitude they must eyeball.
+
+## 2026-07-25 — AVX guide-rate wire unit is arcsec/s × 1024, not rev/s × 2²⁴
+
+First hardware run of `bench_guiderate.py` (checklist step 2): every commanded
+continuous rate produced "NOT MOVING" with a dead-constant ratio of **0.01265 =
+1/79.1** — commanded 1.0 °/s actually moved at 45.5″/s. 79.1 is exactly the
+ratio between our assumed encoding (revolutions/sec × 2²⁴) and the firmware's
+real unit: **the 24-bit MC_SET_POS/NEG_GUIDERATE value is arcseconds/second in
+Q10 fixed point (value = arcsec/s × 1024)**. Corroboration: 24-bit full scale
+works out to 4.551 °/s — precisely the AVX max slew — and the encoder readback
+was independently validated in the same run (see below). Fixed in
+`hc_set_rate_dps` + `protocol.rs encode_set_guiderate` + both sim decoders
+(count-space rounding so full scale encodes exactly 0xFFFFFF), and
+`guide_rate_max_dps` default lowered 5.0 → 4.5 to sit under full scale.
+
+Second finding from the same run: the discrete **`RATES` table is wrong on
+this mount** — MC_MOVE rate 4 measured 0.0335 °/s = 8.0× sidereal (the classic
+Celestron HC progression), not the 0.25 °/s the table lists. That table feeds
+the discrete-rate PID path AND the simulated mount, so desk rehearsals were
+self-consistent but ~7.5× optimistic about discrete slew authority. Left
+as-is pending a full measurement: `bench_guiderate.py --survey` now measures
+all nine steps and prints a paste-ready table.
+
+Meta-lesson: the bench ordering in `doc/BENCH_CHECKLIST.md` was right — this
+was caught at guide rates with a hand on the power switch, before any
+tracking mode trusted the encoding. And a single reference measurement of a
+*known* discrete rate in the same run was what separated "encoder scale
+wrong" from "command scale wrong."
+
 ## 2026-07-07 — HOTSPOT/HANDOFF stair-steps: four coupled failure modes
 
 Field report: HANDOFF centered briefly then walked off in near-FOV-sized

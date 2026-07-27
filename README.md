@@ -34,6 +34,19 @@ capture.
   instead of freezing the loop (which previously let an axis run open-loop).
 - **PID controller** with trajectory **feed-forward**, **derivative-on-measurement**
   (no derivative kick), and **conditional-integration anti-windup**.
+- **One-click PID auto-tune** (`autotune.py`): while tracking in PROGRAM or
+  HOTSPOT, the PID pane's **AUTOTUNE** button runs an online coordinate-descent
+  optimizer over all six gains — no injected test signals, just the live
+  tracking error. It probes each gain up/down in log space, keeps measured
+  improvements, converges in a few minutes (the sliders visibly follow along),
+  and pauses safely on STOP or a lost target. Stopping keeps the best gains
+  found; works identically under the Python and Rust control loops.
+- **Per-mode gain profiles**: PROGRAM (encoder loop) and HOTSPOT (optical loop)
+  are different plants, so each keeps its own gain set in
+  `config.pid_mode_profiles` — swapped into the live gains **automatically** on
+  mode transitions (HANDOFF shares PROGRAM's). Each profile is stamped with the
+  **target it was tuned on** and the date, shown in the PID pane, so you know
+  whose tune you're flying.
 
 **Imaging & visualization**
 - Threaded camera capture (ZWO ASI) with a large circular buffer and
@@ -61,10 +74,22 @@ orbital elements, camera FOV footprints, and a scrollable pass table.
 
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
+Both polar plots shade the **mount keepout** in light red: every sky direction
+whose mount-axis solutions all fall outside the configured safety limits,
+computed through the active mount mode's command transform (including the
+over-the-zenith flip the tracking loop may use in AltAz) — so you can see at a
+glance which targets and passes are flyable before picking one. Shown here
+with an azimuth keepout wedge around north and a mount-ALT ceiling that
+forbids the lowest elevations:
+
+![Keepout overlay](doc/screenshots/keepout_overlay.png)
+
 **Joystick Loop** — the operational screen: live camera feeds (with boresight
 crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
 strip charts, mount connection/position status, tracking mode, and PID
-diagnostics. Shown here in simulation with the mount and both cameras connected.
+diagnostics. The PID pane's log sliders tune the gains live, and its
+**AUTOTUNE** button hands them to the online auto-tuner while tracking.
+Shown here in simulation with the mount and both cameras connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 
@@ -72,6 +97,19 @@ diagnostics. Shown here in simulation with the mount and both cameras connected.
 alignment-rotation / ROI controls for co-boresighting the guide and main cameras.
 
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
+
+**Mount 3D** — a software-3D view of the mount for building alignment
+intuition: the articulated model poses from the live axis angles through the
+**same forward transforms the tracker uses** (pinned by a parity test suite),
+per mount mode — shown here in AltAz-Side, where the cyan AZM-axis arrow lies
+on the horizon at the alignment azimuth. Both cameras' FOV cones sweep a real
+star field with satellites, aircraft, the selected trajectory, and the mount
+keepout tinted on the sky dome. Two view cameras: free **orbit** (drag/wheel)
+and an **operator view** rendered from your configured seat position (bearing
+/ distance / eye height) so the perspective matches what you actually see.
+Manual AZM/ALT sliders pose the model while disconnected.
+
+![Mount 3D](doc/screenshots/mount3d.png)
 
 ## Hardware Interfaces
 

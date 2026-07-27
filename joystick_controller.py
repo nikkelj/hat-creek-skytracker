@@ -23,7 +23,7 @@ class TrackingMode(Enum):
     MTI = 6          # MTI mode (stub)
 
 # Import existing components
-from lib.auxstar import NexstarHandController, RATES, Targets
+from lib.auxstar import NexstarHandController, RATES, Targets, GUIDE_COUNTS_PER_DPS
 from tracking_visuals import PolarPlotMode
 from camera_manager import camera_manager, update_camera_frames_from_buffers
 from camera_manager import render_sensor_calibration
@@ -35,6 +35,37 @@ from control import (create_pid_controllers, compute_mount_position_error,
                      sky_target_to_mount, choose_mount_target, mount_target_for)
 from trajectory import interpolate_position_data_and_rates
 from hotspot import detect_hotspot, pixel_offset_to_angles
+
+# Star-rejection rate filter tuning (shared by HANDOFF and HOTSPOT).
+# The implied-rate estimate differences a detection against a candidate at
+# least BASELINE_S older: pixel positions are captured at frame time but the
+# boresight is sampled at loop-cycle time, so the per-sample timing skew
+# (tens of ms) corrupts short-baseline rates by ~rate * skew / baseline --
+# with a consecutive-frame baseline that falsely rejected any fast target.
+# The acceptance threshold also scales with the expected rate
+# (REL_FRACTION * |trajectory rate|) for the same reason, with the
+# configured hotspot_rate_gate_dps as the absolute floor.
+RATE_FILTER_BASELINE_S = 0.35
+RATE_FILTER_MAX_AGE_S = 3.0
+RATE_FILTER_REL_FRACTION = 0.35
+
+
+def hotspot_discrete_step(total_rev_s):
+    """Discrete MC_MOVE step for a capped HOTSPOT rate (rev/s): the largest
+    step whose physical rate fits under |total|, minimum 1 so a small capped
+    correction still creeps toward center. The PID's own discretizer zeroes
+    anything below 0.01 rev/s (3.6 deg/s) -- fine for raw PID outputs, but a
+    hotspot correction capped to ~2 deg/s must still actuate in discrete
+    mode. (The continuous guide-rate path commands the exact rate instead.)"""
+    if abs(total_rev_s) <= 1e-6:
+        return 0
+    sign = 1 if total_rev_s > 0 else -1
+    mag = 1
+    for idx in range(9, 0, -1):
+        if RATES.get(idx, 0.0) <= abs(total_rev_s):
+            mag = idx
+            break
+    return sign * mag
 
 # PS4 Controller Button Labels (zero-indexed)
 BUTTON_LABELS = ["X", "O", "[]", "/\\", "Sh", "PS5", "Op", "LS", "RS", "L1", "R1", "D/\\", "D\\/", "D<", "D>", "Pad"]
@@ -94,36 +125,52 @@ def _draw_disabled_scrim(display, rect):
 
 def joystick_panel_layout(display):
     """Geometry for the control panes that hug the RIGHT edge of the joystick
-    mode's upper-left quadrant, stacked bottom-up: PID Gain (bottom), Bias above
-    it, and PID Diagnostics above that. All right-aligned to the quadrant
-    divider, which keeps the center of the quadrant clear (reserved for the
-    forthcoming navball)."""
+    mode's upper-left quadrant. On tall screens they stack bottom-up in one
+    column: PID Gain (bottom), Bias, PID Diagnostics, Plate Solve. On short
+    screens (the stack doesn't fit -- e.g. 1080p) they reflow into two
+    bottom-aligned columns: pid+bias rightmost, diag+plate to their left, and
+    the quadrant divider slides right (display.joystick_layout_params) so the
+    navball column keeps its width. All right-aligned to the divider."""
+    params = display.joystick_layout_params()
     qx, qy = display.sub_x, display.sub_y
-    qw, qh = display.sub_width // 2, display.sub_height // 2
+    qh = display.sub_height // 2
+    gap = params['gap']
+    right = params['divider_x'] - 12  # right edge of the pane block
+    bottom = qy + qh - 12
+    top_min = qy + display.JOYSTICK_PANE_TOP
 
     pid_w, pid_h = 250, 215
-    pid_x = qx + qw - pid_w - 12
-    pid_y = qy + qh - pid_h - 12
-
     bias_w, bias_h = 250, 150
-    bias_x = qx + qw - bias_w - 12
-    bias_y = pid_y - bias_h - 12
-
     diag_w, diag_h = 250, 112
-    diag_x = qx + qw - diag_w - 12
-    diag_y = bias_y - diag_h - 12
-
-    # Plate-solve pane above the diagnostics pane, clamped so it never rides up over
-    # the connect/port/status rows at the top of the quadrant.
     plate_w, plate_h = 250, 92
-    plate_x = qx + qw - plate_w - 12
-    plate_y = max(qy + 104, diag_y - plate_h - 12)
+
+    pid_x = right - pid_w
+    pid_y = bottom - pid_h
+    bias_x = pid_x
+    bias_y = pid_y - gap - bias_h
+
+    if params['two_col']:
+        # Second column left of pid/bias, bottom-aligned: plate at the bottom,
+        # diagnostics above it.
+        diag_x = pid_x - gap - diag_w
+        plate_x = diag_x
+        plate_y = bottom - plate_h
+        diag_y = plate_y - gap - diag_h
+        pane_left = diag_x
+    else:
+        diag_x = pid_x
+        diag_y = bias_y - gap - diag_h
+        plate_x = pid_x
+        # Clamped so it never rides up over the connect/port/status rows at
+        # the top of the quadrant.
+        plate_y = max(top_min, diag_y - gap - plate_h)
+        pane_left = pid_x
 
     # ADS-B pane: top-center band, above the navball and between the left
-    # status block and the right-hand panes / position-display box (which already
+    # status block and the pane block / position-display box (which already
     # own the top-left and top-right corners).
-    center_left = qx + 280
-    center_right = qx + qw - 250 - 14
+    center_left = qx + display.JOYSTICK_STATUS_W
+    center_right = pane_left - 14
     center_w = max(150, center_right - center_left)
     adsb_w = min(260, center_w)
     adsb_x = center_left + (center_w - adsb_w) // 2
@@ -136,21 +183,23 @@ def joystick_panel_layout(display):
         'diag': pygame.Rect(diag_x, diag_y, diag_w, diag_h),
         'plate': pygame.Rect(plate_x, plate_y, plate_w, plate_h),
         'adsb': pygame.Rect(adsb_x, adsb_y, adsb_w, adsb_h),
+        'pane_left': pane_left,
     }
 
 
 def joystick_center_layout(display):
-    """Geometry for the previously-unused center column of the joystick mode's
-    upper-left quadrant: the navball up top and the two PID-tuning strip charts
-    (tracking rate, position error) stacked below it. The column sits between the
-    left button/axes status block and the right-hand PID/bias/diag panes.
-    `valid` is False when the quadrant is too small to host them."""
+    """Geometry for the center column of the joystick mode's upper-left
+    quadrant: the navball up top and the two PID-tuning strip charts
+    (tracking rate, position error) stacked below it. The column sits between
+    the left button/axes status block and the right-hand pane block (one or
+    two columns wide -- see joystick_panel_layout). `valid` is False when the
+    quadrant is too small to host them."""
     qx, qy = display.sub_x, display.sub_y
-    qw, qh = display.sub_width // 2, display.sub_height // 2
+    qh = display.sub_height // 2
 
-    left = qx + 280              # clear of the button/axes status block
-    right = qx + qw - 250 - 14   # clear of the right-hand panes (250 wide + margin)
-    top = qy + 104               # below the connect/port/baud/status rows
+    left = qx + display.JOYSTICK_STATUS_W  # clear of the button/axes status block
+    right = joystick_panel_layout(display)['pane_left'] - 14  # clear of the pane block
+    top = qy + display.JOYSTICK_PANE_TOP   # below the connect/port/baud/status rows
     bottom = qy + qh - 12
     cw = right - left
     ch = bottom - top
@@ -214,6 +263,10 @@ class JoystickModeState:
         self.joysticks = {}  # Dict of active joysticks
         self.connected_joystick = None  # Currently active joystick
         self.joystick_tare = {}  # Tare values for deadzone calibration
+        # Last rate command actually sent per axis: {target: (wire_key, time)}.
+        # See _send_rate_command -- unchanged commands are not re-sent (the
+        # firmware holds the rate; the 9600-baud wire is the loop bottleneck).
+        self._rate_cmd_cache = {}
         self.stopped = False  # Stop button state
 
         # Tracking mode state
@@ -308,8 +361,18 @@ class JoystickModeState:
         self.hotspot_last_frame_seq = None   # last camera frame processed (stale gate)
         self._hotspot_last_fresh_time = 0.0  # for the measured frame interval
         self._hotspot_frame_interval = 0.2   # conservative until measured
-        self._hotspot_cmd_dps = (0.0, 0.0)   # last commanded rates (mount frame)
+        self._hotspot_cmd_dps = (0.0, 0.0)   # last commanded TOTAL rates (mount frame)
+        self._hotspot_corr_dps = (0.0, 0.0)  # optical-correction part of the command
         self._hotspot_gate_time = 0.0        # frame time the gate was anchored on
+        # Star-rejection rate filter: recent fresh-frame detection candidates
+        # as (time, cx, cy, boresight_az_sky, boresight_el_sky). Rates are
+        # measured against a candidate >= RATE_FILTER_BASELINE_S old -- a
+        # short consecutive-frame baseline made the estimate hostage to the
+        # capture-to-processing timing skew (error ~ rate * skew/dt), which
+        # falsely rejected fast targets.
+        self._track_candidates = deque()
+        self.handoff_last_frame_seq = None   # HANDOFF's own stale-frame gate
+        self.handoff_reject_reason = ""      # last star-filter rejection (UI)
 
         # PID controllers for PROGRAM track mode
         self.azm_pid = None
@@ -384,6 +447,16 @@ class JoystickModeState:
         self.target_az_rate = 0.0
         self.target_el_rate = 0.0
         self.target_el_deg = 0.0
+
+        # PID auto-tuner (autotune.py). Lives outside both control loops: it
+        # watches the per-cycle position errors published on this state and
+        # writes candidate gains into config_state, which both loops re-read
+        # every cycle. Serviced via service_autotune() from whichever loop is
+        # active; started/stopped from the PID pane's AUTOTUNE button.
+        self.autotuner = None
+        # Which per-mode gain profile currently occupies the live pid_* fields
+        # (see service_gain_profiles). None until the first PID mode is entered.
+        self._active_gain_profile = None
 
     def reset_tare(self):
         """Reset tare values for all connected joysticks"""
@@ -561,6 +634,9 @@ class JoystickModeState:
             elif self.tracking_mode == TrackingMode.HANDOFF:
                 self.handoff_detection_count = 0
                 self.handoff_status = "armed"
+                self.handoff_last_frame_seq = None
+                self._track_candidates.clear()
+                self.handoff_reject_reason = ""
                 print("HANDOFF: armed - program track + parallel hotspot detection")
             self._prev_dispatch_mode = self.tracking_mode
 
@@ -591,6 +667,171 @@ class JoystickModeState:
         elif self.tracking_mode == TrackingMode.MTI:
             # MTI: Stub implementation
             self.mti_track()
+
+    def toggle_autotune(self):
+        """Start/stop the PID auto-tuner (PID pane's AUTOTUNE button).
+        Armable while tracking in PROGRAM or HOTSPOT; stopping keeps the
+        best gains found so far (they are already live in config_state --
+        save the config to persist them)."""
+        from autotune import PIDAutoTuner
+        tuner = self.autotuner
+        if tuner is not None and tuner.active:
+            tuner.stop()
+            self._stamp_autotune_label(tuner)
+            self._drain_autotune_messages(tuner)
+            return
+        if self.tracking_mode not in (TrackingMode.PROGRAM, TrackingMode.HOTSPOT):
+            if self.update_status_callback:
+                self.update_status_callback(
+                    "Auto-tune: start PROGRAM or HOTSPOT tracking first")
+            return
+        self.autotuner = PIDAutoTuner(self.config_state, mode=self.tracking_mode)
+        # Remember what we're tuning ON (captured at arm time; the profile of
+        # this mode gets stamped with it when the tune finishes).
+        self.autotuner.target_label = self._current_target_label()
+        self.autotuner.start()
+        self._drain_autotune_messages(self.autotuner)
+
+    def service_autotune(self):
+        """Feed the auto-tuner one control-cycle sample. Called from BOTH
+        control paths (the mount-control cycle and the Rust adapter pump)
+        right after the cycle's position errors are published on this state.
+        The tuner only scores samples taken while the mode it was armed in is
+        genuinely closed-loop on the target -- PROGRAM and HOTSPOT are
+        different plants (encoder loop vs. optical loop), so a tune must not
+        mix their measurements."""
+        tuner = self.autotuner
+        if tuner is None:
+            return
+        if not tuner.active:
+            # A tune that finished (converged) but hasn't had its provenance
+            # stamped yet gets it here; _stamp_autotune_label is a no-op once
+            # stamped, so this costs nothing on later cycles.
+            if tuner.phase == 'done':
+                self._stamp_autotune_label(tuner)
+            return
+        tracking = (self.telescope_connected and not self.stopped
+                    and self.tracking_mode == tuner.armed_mode)
+        if tracking and tuner.armed_mode == TrackingMode.HOTSPOT:
+            tracking = self.hotspot_status == "locked"
+        tuner.update(time.time(), tracking,
+                     self.azm_position_error, self.alt_position_error)
+        if not tuner.active and tuner.phase == 'done':
+            self._stamp_autotune_label(tuner)
+        self._drain_autotune_messages(tuner)
+
+    def _drain_autotune_messages(self, tuner):
+        for msg in tuner.take_messages():
+            if self.update_status_callback:
+                self.update_status_callback(msg)
+
+    # ---------------------------------------------------- per-mode gain profiles
+    # The six live gain fields form "the active set" that both control loops,
+    # the UI sliders, and the auto-tuner all read/write.
+    _GAIN_PROFILE_FIELDS = ('pid_azm_p_gain', 'pid_azm_i_gain', 'pid_azm_d_gain',
+                            'pid_alt_p_gain', 'pid_alt_i_gain', 'pid_alt_d_gain')
+
+    def _gain_profile_key(self, mode):
+        """Gain-profile key for a tracking mode. HANDOFF runs program-track,
+        so it shares PROGRAM's plant (and gains); modes with no PID loop
+        (STANDBY, RATE, MTI) have no profile."""
+        if mode in (TrackingMode.PROGRAM, TrackingMode.HANDOFF):
+            return "PROGRAM"
+        if mode == TrackingMode.HOTSPOT:
+            return "HOTSPOT"
+        return None
+
+    def _current_target_label(self):
+        """Short 'what are we tracking' label for the gain-profile stamp,
+        e.g. 'satellite ISS (ZARYA)', 'aircraft A1B2C3', 'launch Starship'."""
+        vis = self.tracking_vis_state
+        if (vis is not None and getattr(vis, 'selected_launch', None)
+                and getattr(vis, 'launch_launched', False)):
+            return f"launch {vis.selected_launch}"
+        _traj, kind, key = active_program_trajectory(vis)
+        return f"{kind} {key}" if key is not None else None
+
+    def service_gain_profiles(self):
+        """Automatic per-mode PID gain lookup. PROGRAM (encoder loop) and
+        HOTSPOT (optical loop) are different plants and want different gains,
+        so each keeps its own profile in config.pid_mode_profiles: on a mode
+        transition the departing mode's live gains are saved into its profile
+        and the arriving mode's profile is loaded into the live fields (first
+        entry seeds the profile from the live gains). Runs every control
+        cycle, BEFORE service_autotune, from both control paths."""
+        cfg = self.config_state
+        if cfg is None:
+            return
+        key = self._gain_profile_key(self.tracking_mode)
+        if key is None or key == self._active_gain_profile:
+            return
+
+        # A plant change ends any running tune: its measurements belong to
+        # the departing mode, and stop() writes its best gains into the live
+        # fields so the profile save below captures them rather than a
+        # half-tested probe candidate.
+        tuner = self.autotuner
+        if (tuner is not None and tuner.active
+                and self._gain_profile_key(tuner.armed_mode) != key):
+            tuner.stop()
+            self._stamp_autotune_label(tuner)
+            self._drain_autotune_messages(tuner)
+
+        profiles = getattr(cfg, 'pid_mode_profiles', None)
+        if not isinstance(profiles, dict):
+            profiles = cfg.pid_mode_profiles = {}
+        live = {f: float(getattr(cfg, f)) for f in self._GAIN_PROFILE_FIELDS}
+
+        if self._active_gain_profile is not None:
+            entry = profiles.get(self._active_gain_profile)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry['gains'] = live
+            profiles[self._active_gain_profile] = entry
+
+        stored = profiles.get(key)
+        gains = stored.get('gains') if isinstance(stored, dict) else None
+        if isinstance(gains, dict):
+            for f in self._GAIN_PROFILE_FIELDS:
+                try:
+                    setattr(cfg, f, float(gains.get(f, getattr(cfg, f))))
+                except (TypeError, ValueError):
+                    pass
+            tuned_on = stored.get('tuned_on')
+            msg = f"PID gains: {key} profile loaded" + (
+                f" (tuned on {tuned_on})" if tuned_on else "")
+            if self.update_status_callback:
+                self.update_status_callback(msg)
+        else:
+            profiles[key] = {'gains': dict(live)}
+            print(f"PID gains: seeded new {key} profile from current gains")
+        self._active_gain_profile = key
+
+    def _stamp_autotune_label(self, tuner):
+        """Stamp the tuned mode's profile with what the tune ran against
+        (target, date, achieved RMS) and the resulting gains. Once per tune,
+        and only if it completed at least one measurement."""
+        if getattr(tuner, '_label_stamped', False):
+            return
+        if not any(ax.best_cost is not None for ax in tuner.axes.values()):
+            return
+        cfg = self.config_state
+        key = self._gain_profile_key(tuner.armed_mode)
+        if cfg is None or key is None:
+            return
+        profiles = getattr(cfg, 'pid_mode_profiles', None)
+        if not isinstance(profiles, dict):
+            profiles = cfg.pid_mode_profiles = {}
+        entry = profiles.get(key)
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        # The tuner has already applied its best gains to the live fields
+        # (stop()/convergence do so), so the live snapshot IS the tuned set.
+        entry['gains'] = {f: float(getattr(cfg, f))
+                          for f in self._GAIN_PROFILE_FIELDS}
+        entry['tuned_on'] = tuner.target_label or "unknown target"
+        entry['tuned_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        entry['tuned_rms'] = tuner.summary()
+        profiles[key] = entry
+        tuner._label_stamped = True
 
     def chart_axis_scale(self, key, values, floor):
         """Auto-range a strip chart's vertical axis (±return value). Tracks the
@@ -899,6 +1140,9 @@ class JoystickModeState:
             # the FF buttons were toggled.
             self.azm_pid.set_feed_forward_enabled(self.feed_forward_azm_enabled)
             self.alt_pid.set_feed_forward_enabled(self.feed_forward_alt_enabled)
+            _tau = getattr(self.config_state, 'pid_output_filter_tau_sec', 0.0)
+            self.azm_pid.set_output_filter_tau(_tau)
+            self.alt_pid.set_output_filter_tau(_tau)
 
         try:
             # Get configured safety limits
@@ -1105,6 +1349,9 @@ class JoystickModeState:
             # the FF buttons were toggled.
             self.azm_pid.set_feed_forward_enabled(self.feed_forward_azm_enabled)
             self.alt_pid.set_feed_forward_enabled(self.feed_forward_alt_enabled)
+            _tau = getattr(self.config_state, 'pid_output_filter_tau_sec', 0.0)
+            self.azm_pid.set_output_filter_tau(_tau)
+            self.alt_pid.set_output_filter_tau(_tau)
 
         try:
             # Get configured safety limits
@@ -1327,7 +1574,10 @@ class JoystickModeState:
 
         # 2) Run the hotspot detector in parallel (detection only, no commanding).
         needed = max(1, int(getattr(cfg, 'handoff_min_frames', 5) or 5))
-        if self._handoff_detect(cfg):
+        result = self._handoff_detect(cfg)
+        if result is None:
+            return  # stale frame: no new information, leave the counter alone
+        if result:
             self.handoff_detection_count += 1
             self.handoff_status = f"detecting {self.handoff_detection_count}/{needed}"
             if self.handoff_detection_count >= needed:
@@ -1340,12 +1590,17 @@ class JoystickModeState:
         else:
             # Require *consecutive* detections; any miss resets the counter.
             self.handoff_detection_count = 0
-            self.handoff_status = "program track (no detection)"
+            self.handoff_status = (self.handoff_reject_reason
+                                   or "program track (no detection)")
 
     def _handoff_detect(self, cfg):
-        """Run hotspot detection on the tracking camera frame and return True for
-        a solid detection. Updates the hotspot diagnostics (centroid, SNR) but
-        never commands the mount."""
+        """Run hotspot detection on a FRESH tracking-camera frame. Returns True
+        for an accepted detection, False for a miss (or a detection the star
+        filter rejected), and None when no new frame has arrived since the
+        last cycle (a stale frame carries no information, so it must neither
+        count nor reset the consecutive-detection counter). Updates the
+        hotspot diagnostics (centroid, SNR) but never commands the mount."""
+        self.handoff_reject_reason = ""
         try:
             cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
             camera = camera_manager.get_camera(cam_index)
@@ -1355,21 +1610,123 @@ class JoystickModeState:
             raw = camera.thread.get_latest_raw()
             if raw is None:
                 return False
+            frame_seq = getattr(camera.thread, 'latest_raw_seq', None)
+            if frame_seq is not None:
+                if frame_seq == self.handoff_last_frame_seq:
+                    return None
+                self.handoff_last_frame_seq = frame_seq
             detection = detect_hotspot(
                 raw,
                 gate_center=None,
                 gate_radius=None,
                 snr_threshold=float(getattr(cfg, 'hotspot_snr_threshold', 5.0)),
             )
-            if detection is not None:
-                self.hotspot_centroid = (detection.cx, detection.cy)
-                self.hotspot_snr = detection.snr
-                return True
-            self.hotspot_snr = 0.0
-            return False
+            if detection is None:
+                self.hotspot_snr = 0.0
+                return False
+            self.hotspot_centroid = (detection.cx, detection.cy)
+            self.hotspot_snr = detection.snr
+            el_sky = (90.0 - self.current_alt
+                      if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                      else self.current_alt)
+            verdict, reason = self._detection_rate_filter(
+                detection.cx, detection.cy, time.time(),
+                f"camera{cam_index + 1}", el_sky)
+            if verdict is None:
+                # Filter warming up its rate baseline: the detection is
+                # neither confirmed nor refuted -- treat like a stale frame
+                # (no count, no reset) so a star can't ride the warm-up
+                # window into a hand-off.
+                return None
+            if verdict is False:
+                self.handoff_reject_reason = f"rejected: {reason}"
+                return False
+            return True
         except Exception as e:
             print(f"HANDOFF: detection error: {e}")
             return False
+
+    def _program_target_sky_rates(self):
+        """Sky-frame trajectory rates (az_dps, el_dps) of the active program
+        target, or None when nothing is selected / interpolable. HOTSPOT uses
+        them as trajectory feed-forward; the star filter uses them as the
+        expected angular rate of a REAL detection of the selected target."""
+        try:
+            vis = self.tracking_vis_state
+            if vis is None:
+                return None
+            target_traj, _kind, _key = active_program_trajectory(vis)
+            if target_traj is None:
+                return None
+            px, _py, alt, _dist, az, az_rate, el_rate = (
+                interpolate_position_data_and_rates(target_traj, vis.current_tt))
+            if px is None or az is None or az_rate is None or el_rate is None:
+                return None
+            return float(az_rate), float(el_rate)
+        except Exception:
+            return None
+
+    def _detection_rate_filter(self, det_cx, det_cy, now, cam_name, el_sky):
+        """Star-rejection rate gate. Returns (verdict, reason) where verdict
+        is True (verified: the rate matches), False (rejected: a star or
+        wrong object), or None (unverifiable: the filter is still warming up
+        its measurement baseline).
+
+        The detection's implied SKY angular rate is the boresight motion plus
+        the pixel drift, measured against the newest recorded candidate at
+        least RATE_FILTER_BASELINE_S old (short baselines are corrupted by
+        capture-to-processing timing skew; see the constants above). A
+        detection of the program target moves at the trajectory rate; a star
+        moves at ~sidereal (near zero inertially). With a trajectory
+        available, reject mismatches beyond max(hotspot_rate_gate_dps,
+        REL_FRACTION * |trajectory rate|); tracking bare, reject near-zero
+        (star-like) rates instead. Candidates are recorded regardless of the
+        verdict, so a persistent star keeps failing the gate."""
+        cfg = self.config_state
+        if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz':
+            bs_az, bs_el = self.current_azm, 90.0 - self.current_alt
+        else:
+            bs_az, bs_el = self.current_azm, self.current_alt
+        hist = self._track_candidates
+        while hist and now - hist[0][0] > RATE_FILTER_MAX_AGE_S:
+            hist.popleft()
+        base = None
+        for cand in reversed(hist):
+            if now - cand[0] >= RATE_FILTER_BASELINE_S:
+                base = cand
+                break
+        hist.append((now, det_cx, det_cy, bs_az, bs_el))
+        if not getattr(cfg, 'hotspot_star_filter_enabled', True):
+            return True, ""
+        if base is None:
+            return None, ""  # baseline still warming up
+        t0, cx0, cy0, az0, el0 = base
+        dt = now - t0
+        da, de = pixel_offset_to_angles(
+            det_cx - cx0, det_cy - cy0,
+            pixel_size_um=float(cfg.get_camera_pixel_size(cam_name)),
+            focal_length_mm=float(cfg.get_camera_focal_length(cam_name)),
+            rotation_deg=float(cfg.get_camera_alignment_rotation(cam_name)),
+            el_deg=el_sky,
+            x_sign=float(getattr(cfg, 'hotspot_x_sign', 1.0)),
+            y_sign=float(getattr(cfg, 'hotspot_y_sign', -1.0)),
+        )
+        impl_az = ((bs_az - az0 + 180.0) % 360.0 - 180.0 + da) / dt
+        impl_el = (bs_el - el0 + de) / dt
+        gate = float(getattr(cfg, 'hotspot_rate_gate_dps', 0.15) or 0.15)
+        cos_el = max(abs(math.cos(math.radians(el_sky))), 1e-3)
+        ref = self._program_target_sky_rates()
+        if ref is not None:
+            ref_mag = math.hypot(ref[0] * cos_el, ref[1])
+            thresh = max(gate, RATE_FILTER_REL_FRACTION * ref_mag)
+            diff = math.hypot((impl_az - ref[0]) * cos_el, impl_el - ref[1])
+            if diff > thresh:
+                return False, f"rate off trajectory by {diff:.2f} deg/s"
+        else:
+            mag = math.hypot(impl_az * cos_el, impl_el)
+            if mag < gate:
+                return False, f"star-like rate {mag:.2f} deg/s"
+        return True, ""
 
     def _enter_hotspot_mode(self):
         """Reset state when HOTSPOT is engaged (handed off from another mode)."""
@@ -1383,7 +1740,9 @@ class JoystickModeState:
         self._hotspot_last_fresh_time = 0.0
         self._hotspot_frame_interval = 0.2
         self._hotspot_cmd_dps = (0.0, 0.0)
+        self._hotspot_corr_dps = (0.0, 0.0)
         self._hotspot_gate_time = 0.0
+        self._track_candidates.clear()
         if self.azm_pid:
             self.azm_pid.reset()
         if self.alt_pid:
@@ -1412,6 +1771,15 @@ class JoystickModeState:
             self.azm_pid, self.alt_pid = create_pid_controllers(cfg)
         self.azm_pid.update_gains(cfg.pid_azm_p_gain, cfg.pid_azm_i_gain, cfg.pid_azm_d_gain)
         self.alt_pid.update_gains(cfg.pid_alt_p_gain, cfg.pid_alt_i_gain, cfg.pid_alt_d_gain)
+        tau = getattr(cfg, 'pid_output_filter_tau_sec', 0.0)
+        self.azm_pid.set_output_filter_tau(tau)
+        self.alt_pid.set_output_filter_tau(tau)
+        # Trajectory feed-forward is added MANUALLY below (the correction cap
+        # must not clamp it), so zero the PIDs' own feed-forward term -- these
+        # controllers are shared with PROGRAM track, whose last
+        # set_feed_forward_rate would otherwise leak in as a stale rate bias.
+        self.azm_pid.set_feed_forward_rate(0.0)
+        self.alt_pid.set_feed_forward_rate(0.0)
 
         # Grab the latest raw frame from the configured tracking camera.
         cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
@@ -1477,7 +1845,12 @@ class JoystickModeState:
                 # distance between frames; a static gate loses the target the
                 # loop is successfully converging on.
                 cam_name = f"camera{cam_index + 1}"
-                az_dps, alt_dps = getattr(self, '_hotspot_cmd_dps', (0.0, 0.0))
+                # Predict with the CORRECTION rates, not the total command:
+                # the trajectory feed-forward moves the boresight WITH the
+                # target (no apparent pixel drift); only the correction
+                # closes on it. Predicting with the total slid the gate off
+                # a well-tracked fast target at the full feed-forward rate.
+                az_dps, alt_dps = getattr(self, '_hotspot_corr_dps', (0.0, 0.0))
                 # Predict from the frame the gate was anchored on (the last
                 # detection) -- missed frames in between extend the span, and
                 # the commanded rate has been held constant since then.
@@ -1516,6 +1889,40 @@ class JoystickModeState:
             except Exception as e:
                 print(f"HOTSPOT: detection error: {e}")
                 detection = None
+
+        # Star-rejection rate gate: a detection whose implied sky rate doesn't
+        # match the trajectory (or is star-like when tracking bare) is treated
+        # as a miss -- the gate grows and the correction decays, exactly as if
+        # nothing was found, so a bright star drifting through the gate can't
+        # capture the loop.
+        if detection is not None:
+            el_sky_gate = (90.0 - current_alt
+                           if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                           else current_alt)
+            verdict, reason = self._detection_rate_filter(
+                detection.cx, detection.cy, now,
+                f"camera{cam_index + 1}", el_sky_gate)
+            # None = filter warming up: HOTSPOT must keep commanding, so an
+            # unverifiable detection is accepted (HANDOFF already verified
+            # the object before promoting; only an explicit mismatch demotes
+            # it to a miss here).
+            if verdict is False:
+                self.hotspot_status = f"rejected: {reason}"
+                detection = None
+
+        # Trajectory feed-forward (mount frame): the optical correction rides
+        # on the program target's sky rates so a moving target no longer needs
+        # the capped correction to supply ALL of the tracking rate. Honors the
+        # same per-axis FF toggles as PROGRAM track; zero when tracking bare.
+        ff_az_mount = ff_el_mount = 0.0
+        ff = self._program_target_sky_rates()
+        if ff is not None:
+            if self.feed_forward_azm_enabled:
+                ff_az_mount = ff[0]
+            if self.feed_forward_alt_enabled:
+                ff_el_mount = (-ff[1]
+                               if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
+                               else ff[1])
 
         if detection is not None:
             # Pixel error of the object from boresight (image center).
@@ -1575,20 +1982,33 @@ class JoystickModeState:
 
             if self.telescope_connected and not self.stopped:
                 try:
-                    # Cap each axis so the correction covers at most ~90% of
+                    # Cap each axis's CORRECTION so it covers at most ~90% of
                     # the remaining error before the NEXT measurement arrives
                     # (measured fresh-frame interval). Without this, a single
                     # strong correction at a slow frame rate overshoots, exits
                     # its own tracking gate, and then COASTS at full rate
                     # through the loss window -- the FOV-sized stair-step.
+                    # The trajectory feed-forward rides UNDER the cap: it is
+                    # not a correction, it's the target's own motion.
                     cap = float(getattr(cfg, 'hotspot_max_rate_dps', 2.0) or 2.0)
                     interval = getattr(self, '_hotspot_frame_interval', 0.2)
                     az_cap = min(cap, 0.9 * abs(az_error) / interval)
                     el_cap = min(cap, 0.9 * abs(el_error) / interval)
-                    az_eff = self._issue_axis_rate(Targets.AZM, az_pid_output, az_rate_cmd, max_dps=az_cap)
-                    el_eff = self._issue_axis_rate(Targets.ALT, el_pid_output, el_rate_cmd, max_dps=el_cap)
+                    az_corr = max(-az_cap, min(az_cap, az_pid_output * 360.0))
+                    el_corr = max(-el_cap, min(el_cap, el_pid_output * 360.0))
+                    az_total = (ff_az_mount + az_corr) / 360.0
+                    el_total = (ff_el_mount + el_corr) / 360.0
+
+                    az_eff = self._issue_axis_rate(
+                        Targets.AZM, az_total, hotspot_discrete_step(az_total))
+                    el_eff = self._issue_axis_rate(
+                        Targets.ALT, el_total, hotspot_discrete_step(el_total))
                     # Remember what we commanded (mount frame): gate prediction
-                    # uses it to move the search window with our own slew.
+                    # uses the TOTAL boresight motion; the miss-path decay
+                    # bleeds only the correction while feed-forward keeps
+                    # running (coasting follows the trajectory, not a frozen
+                    # rate).
+                    self._hotspot_corr_dps = (az_corr, el_corr)
                     self._hotspot_cmd_dps = (az_eff or 0.0, el_eff or 0.0)
                 except Exception as e:
                     print(f"HOTSPOT: error sending slew commands: {e}")
@@ -1598,22 +2018,29 @@ class JoystickModeState:
         # miss -- only count misses against frames we actually examined.
         if not frame_is_stale:
             self.hotspot_miss_count += 1
-            # Bleed off the held correction: rates persist on the mount, and a
-            # correction that hasn't been confirmed by a detection must not
-            # keep integrating (that runaway is what turned a single overshoot
-            # into an FOV-sized stair-step). Halve per missed frame.
-            az_d, el_d = getattr(self, '_hotspot_cmd_dps', (0.0, 0.0))
-            if (abs(az_d) > 1e-3 or abs(el_d) > 1e-3) and self.telescope_connected and not self.stopped:
-                az_d *= 0.5
-                el_d *= 0.5
-                if abs(az_d) < 1e-3:
-                    az_d = 0.0
-                if abs(el_d) < 1e-3:
-                    el_d = 0.0
+            # Bleed off the held CORRECTION: a correction that hasn't been
+            # re-confirmed by a detection must not keep integrating (that
+            # runaway is what turned a single overshoot into an FOV-sized
+            # stair-step). Halve per missed frame. The trajectory feed-forward
+            # is NOT decayed -- coasting follows the target's motion.
+            az_c, el_c = getattr(self, '_hotspot_corr_dps', (0.0, 0.0))
+            az_c *= 0.5
+            el_c *= 0.5
+            if abs(az_c) < 1e-3:
+                az_c = 0.0
+            if abs(el_c) < 1e-3:
+                el_c = 0.0
+            self._hotspot_corr_dps = (az_c, el_c)
+            if (self.telescope_connected and not self.stopped
+                    and (az_c or el_c or ff_az_mount or ff_el_mount)):
                 try:
-                    self._issue_axis_rate(Targets.AZM, az_d / 360.0, 0)
-                    self._issue_axis_rate(Targets.ALT, el_d / 360.0, 0)
-                    self._hotspot_cmd_dps = (az_d, el_d)
+                    az_total = (ff_az_mount + az_c) / 360.0
+                    el_total = (ff_el_mount + el_c) / 360.0
+                    az_eff = self._issue_axis_rate(
+                        Targets.AZM, az_total, hotspot_discrete_step(az_total))
+                    el_eff = self._issue_axis_rate(
+                        Targets.ALT, el_total, hotspot_discrete_step(el_total))
+                    self._hotspot_cmd_dps = (az_eff or 0.0, el_eff or 0.0)
                 except Exception as e:
                     print(f"HOTSPOT: error decaying rates: {e}")
         coast_time = float(getattr(cfg, 'hotspot_coast_time_sec', 1.0))
@@ -1662,7 +2089,16 @@ class JoystickModeState:
             dps = max(-float(max_dps), min(float(max_dps), dps))
         if getattr(cfg, 'continuous_rate_tracking', False) and hasattr(self.telescope_controller, 'hc_set_rate_dps'):
             if abs(dps) <= float(getattr(cfg, 'guide_rate_max_dps', 5.0)):
-                self.telescope_controller.hc_set_rate_dps(target, dps)
+                # Dedup: the firmware HOLDS the last commanded rate, and each
+                # AUX transaction costs ~30 ms of 9600-baud wire time (measured
+                # 2026-07-26: full read+command cycle = 7.7 Hz vs 15 Hz target;
+                # reads alone support ~16 Hz). Resend only when the wire-
+                # quantized value changes, with a keepalive so an out-of-band
+                # stop can't leave the cache lying for more than a second.
+                wire = ('g', int(round(dps * GUIDE_COUNTS_PER_DPS)))
+                if not self._rate_cmd_repeats(target, wire):
+                    self.telescope_controller.hc_set_rate_dps(target, dps)
+                    self._rate_cmd_cache[target] = (wire, time.monotonic())
                 return dps
         if max_dps is not None and discrete_cmd != 0:
             sign = 1 if discrete_cmd > 0 else -1
@@ -1672,9 +2108,24 @@ class JoystickModeState:
             while mag > 1 and RATES.get(mag, 0.0) * 360.0 > float(max_dps):
                 mag -= 1
             discrete_cmd = sign * mag
-        self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+        # Same dedup for the discrete path: MC_MOVE also persists until changed.
+        wire = ('m', int(discrete_cmd))
+        if not self._rate_cmd_repeats(target, wire):
+            self.telescope_controller.hc_slew_fixed(target, discrete_cmd)
+            self._rate_cmd_cache[target] = (wire, time.monotonic())
         sign = 1.0 if discrete_cmd >= 0 else -1.0
         return sign * RATES.get(abs(int(discrete_cmd)), 0.0) * 360.0
+
+    # Resend an unchanged rate at least this often: bounds how long a stale
+    # cache entry can mask an out-of-band stop/change sent past the cache.
+    RATE_CMD_KEEPALIVE_SEC = 1.0
+
+    def _rate_cmd_repeats(self, target, wire):
+        """True when `wire` matches the last command sent to `target` recently
+        enough that the firmware is already holding it (skip the transaction)."""
+        last = self._rate_cmd_cache.get(target)
+        return (last is not None and last[0] == wire
+                and time.monotonic() - last[1] < self.RATE_CMD_KEEPALIVE_SEC)
 
     PARK_TIMEOUT_SEC = 90.0
     PARK_TOLERANCE_DEG = 1.0
@@ -1735,6 +2186,7 @@ class JoystickModeState:
     def _hotspot_stop_motion(self):
         """Best-effort stop of both axes."""
         self._hotspot_cmd_dps = (0.0, 0.0)
+        self._hotspot_corr_dps = (0.0, 0.0)
         if self.telescope_connected and self.telescope_controller is not None:
             try:
                 self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
@@ -1818,8 +2270,10 @@ class JoystickModeState:
                 return
 
             elif event.button == 6:  # Op (Options) button - mount mode toggle
-                # Cycle through AltAz, Eq, and Passthrough modes
+                # Cycle through AltAz, AltAz-Side, Eq, and Passthrough modes
                 if self.mount_mode == "AltAz":
+                    self.mount_mode = "AltAz-Side"
+                elif self.mount_mode == "AltAz-Side":
                     self.mount_mode = "Eq"
                 elif self.mount_mode == "Eq":
                     self.mount_mode = "Passthrough"

@@ -47,6 +47,13 @@ pub struct HotspotParams {
     pub pixel_size_um: f64,
     pub focal_length_mm: f64,
     pub rotation_deg: f64,
+    /// Star-rejection rate filter: accept a detection only when its implied
+    /// sky angular rate matches the trajectory (or, tracking bare, is NOT
+    /// star-like near-zero). Toggle off to deliberately track a star.
+    pub star_filter: bool,
+    /// Tolerance (deg/s) for the rate comparison above; doubles as the
+    /// "near-sidereal" threshold in bare mode.
+    pub rate_gate_dps: f64,
 }
 
 /// Everything Python pushes into the loop each time it changes. Cloned out under
@@ -71,6 +78,8 @@ pub struct Inputs {
     pub mount_mode: MountMode,
     pub alignment_az: f64,
     pub alignment_el: f64,
+    /// Side-mount tip side for MountMode::AltAzSide (see transforms).
+    pub altaz_side_flip: bool,
     pub setpoint: Option<Setpoint>,
     pub ff_azm_enabled: bool,
     pub ff_alt_enabled: bool,
@@ -81,10 +90,14 @@ pub struct Inputs {
     pub lead_time_sec: f64,
 
     // Continuous variable-rate (guide-rate) tracking instead of discrete MC_MOVE.
-    // Applies only to PROGRAM/HOTSPOT; above guide_rate_max_dps the loop falls
-    // back to the discrete step (e.g. the near-zenith keyhole).
+    // Applies to the tracking modes (PROGRAM/HANDOFF/HOTSPOT); above
+    // guide_rate_max_dps the loop falls back to the discrete step (e.g. the
+    // near-zenith keyhole).
     pub continuous_rate: bool,
     pub guide_rate_max_dps: f64,
+
+    /// Feedback low-pass time constant for both PIDs (seconds; 0 disables).
+    pub output_filter_tau: f64,
 
     // HANDOFF: hand to HOTSPOT after this many consecutive solid detections.
     pub handoff_min_frames: u32,
@@ -108,12 +121,16 @@ impl Default for Inputs {
             mount_mode: MountMode::AltAz,
             alignment_az: 0.0,
             alignment_el: 0.0,
+            altaz_side_flip: false,
             setpoint: None,
             ff_azm_enabled: false,
             ff_alt_enabled: false,
             lead_time_sec: 0.0,
             continuous_rate: false,
-            guide_rate_max_dps: 5.0,
+            // 24-bit guide-rate full scale is 4.551 dps (arcsec/s Q10); the
+            // encoder clamps there, so default the MC_MOVE fallback gate below it.
+            guide_rate_max_dps: 4.5,
+            output_filter_tau: 0.0,
             handoff_min_frames: 5,
             hotspot: HotspotParams {
                 snr_threshold: 5.0,
@@ -125,6 +142,8 @@ impl Default for Inputs {
                 pixel_size_um: 4.0,
                 focal_length_mm: 1000.0,
                 rotation_deg: 0.0,
+                star_filter: false,
+                rate_gate_dps: 0.15,
             },
         }
     }
@@ -156,6 +175,7 @@ pub struct StepOutput {
     pub hotspot_status: &'static str,
     pub hotspot_snr: f64,
     pub hotspot_centroid: Option<(f64, f64)>,
+    pub handoff_detection_count: u32,
 
     pub status_msg: Option<String>,
 }
@@ -164,19 +184,25 @@ fn wrap180(deg: f64) -> f64 {
     (deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
-/// Reduce a signed discrete rate step until its physical rate fits under
-/// `cap_rev_s` (rev/sec), keeping at least step 1 so a capped axis still
-/// creeps toward center. Mirrors joystick_controller._issue_axis_rate.
-fn clamp_discrete(rate: i32, cap_rev_s: f64) -> i32 {
-    if rate == 0 {
+/// Discrete MC_MOVE step for a capped HOTSPOT rate (rev/s): the largest step
+/// whose physical rate fits under |total|, minimum 1 so a small capped
+/// correction still creeps toward center. The PID's own discretizer zeroes
+/// anything below 0.01 rev/s (3.6 deg/s) -- fine for raw PID outputs, but a
+/// hotspot correction capped to ~2 deg/s must still actuate in discrete
+/// mode. Mirrors joystick_controller.hotspot_discrete_step.
+fn hotspot_discrete_step(total_rev_s: f64) -> i32 {
+    if total_rev_s.abs() <= 1e-6 {
         return 0;
     }
-    let sign = if rate > 0 { 1 } else { -1 };
-    let mut mag: u8 = rate.unsigned_abs().min(9) as u8;
-    while mag > 1 && crate::protocol::rate(mag) > cap_rev_s {
-        mag -= 1;
+    let sign = if total_rev_s > 0.0 { 1 } else { -1 };
+    let mut mag = 1i32;
+    for idx in (1..=9u8).rev() {
+        if crate::protocol::rate(idx) <= total_rev_s.abs() {
+            mag = idx as i32;
+            break;
+        }
     }
-    sign * mag as i32
+    sign * mag
 }
 
 /// Run hot-spot detection on a frame (gated or full-frame). Returns None when
@@ -216,6 +242,13 @@ pub struct LoopState {
     // the search gate can be shifted by the loop's own commanded motion.
     hotspot_cmd_dps: (f64, f64),
     hotspot_gate_time: f64,
+    // Optical-correction part of hotspot_cmd_dps: the miss-path decay bleeds
+    // only this, while the trajectory feed-forward keeps running.
+    hotspot_corr_dps: (f64, f64),
+    // Star-rejection rate filter: recent fresh-frame detection candidates as
+    // (time, cx, cy, boresight_az_sky, boresight_el_sky). Rates are measured
+    // against a candidate >= RATE_FILTER_BASELINE_S old (see the constants).
+    track_candidates: Vec<(f64, f64, f64, f64, f64)>,
 
     // HANDOFF: consecutive-detection counter toward the auto hand-off.
     handoff_detection_count: u32,
@@ -224,7 +257,18 @@ pub struct LoopState {
     // cleared setpoint (target set / deselected) commands an explicit stop
     // once instead of silently leaving the mount at its last commanded rate.
     program_had_setpoint: bool,
+
+    // Rate-command dedup: last wire command actually sent per axis
+    // (kind: 0 = guide-rate counts, 1 = discrete MC_MOVE step; value; time).
+    // The firmware holds the last rate and each AUX transaction costs ~30 ms
+    // of 9600-baud wire time (measured 2026-07-26: full read+command cycle
+    // ran 7.7 Hz vs the 15 Hz target), so unchanged commands are skipped,
+    // with a keepalive bounding staleness against out-of-band stops.
+    pub last_wire_cmd: [Option<(u8, i64, f64)>; 2],
 }
+
+/// Resend an unchanged rate at least this often (see `last_wire_cmd`).
+pub const RATE_CMD_KEEPALIVE_SEC: f64 = 1.0;
 
 impl LoopState {
     pub fn new() -> Self {
@@ -244,9 +288,25 @@ impl LoopState {
             hotspot_frame_interval: 0.2,
             hotspot_cmd_dps: (0.0, 0.0),
             hotspot_gate_time: 0.0,
+            hotspot_corr_dps: (0.0, 0.0),
+            track_candidates: Vec::new(),
             handoff_detection_count: 0,
             program_had_setpoint: false,
+            last_wire_cmd: [None, None],
         }
+    }
+
+    /// True when `wire` (kind, value) matches the last command sent to axis
+    /// slot `idx` recently enough that the firmware is already holding it.
+    /// Records the send otherwise. Call exactly once per actuation decision.
+    pub fn wire_cmd_repeats(&mut self, idx: usize, kind: u8, value: i64, now: f64) -> bool {
+        if let Some((k, v, t)) = self.last_wire_cmd[idx] {
+            if k == kind && v == value && now - t < RATE_CMD_KEEPALIVE_SEC {
+                return true;
+            }
+        }
+        self.last_wire_cmd[idx] = Some((kind, value, now));
+        false
     }
 
     fn dt(&mut self, now: f64) -> f64 {
@@ -302,10 +362,14 @@ impl LoopState {
                     self.hotspot_last_fresh_time = 0.0;
                     self.hotspot_frame_interval = 0.2;
                     self.hotspot_cmd_dps = (0.0, 0.0);
+                    self.hotspot_corr_dps = (0.0, 0.0);
                     self.hotspot_gate_time = 0.0;
+                    self.track_candidates.clear();
                 }
                 Mode::Handoff => {
                     self.handoff_detection_count = 0;
+                    self.hotspot_last_frame_seq = None;
+                    self.track_candidates.clear();
                 }
                 _ => {}
             }
@@ -394,6 +458,7 @@ impl LoopState {
             led_el,
             inputs.alignment_az,
             inputs.alignment_el,
+            inputs.altaz_side_flip,
         );
         let (azm_min, azm_max) = inputs.azm_limit;
         let (alt_min, alt_max) = inputs.alt_limit;
@@ -409,13 +474,16 @@ impl LoopState {
         let mut target_azm = canon.0;
         let mut target_alt = canon.1;
         let mut flipped = false;
-        if inputs.mount_mode != MountMode::Eq {
+        // Only true alt-az geometries have the mirrored-sky second solution;
+        // Eq and AltAzSide map (az+180, 180-el) to the same principal axes.
+        if matches!(inputs.mount_mode, MountMode::AltAz | MountMode::Passthrough) {
             let flip = transforms::sky_to_mount(
                 inputs.mount_mode,
                 (led_az + 180.0).rem_euclid(360.0),
                 180.0 - led_el,
                 inputs.alignment_az,
                 inputs.alignment_el,
+                inputs.altaz_side_flip,
             );
             let canon_ok = in_limits(canon);
             let flip_ok = in_limits(flip);
@@ -461,6 +529,8 @@ impl LoopState {
             .update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);
         self.alt_pid
             .update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
+        self.azm_pid.set_output_filter_tau(inputs.output_filter_tau);
+        self.alt_pid.set_output_filter_tau(inputs.output_filter_tau);
         self.azm_pid.set_feed_forward_enabled(inputs.ff_azm_enabled);
         self.alt_pid.set_feed_forward_enabled(inputs.ff_alt_enabled);
         // Sky rates -> mount feed-forward. AZM tracks azimuth directly; the
@@ -496,6 +566,92 @@ impl LoopState {
         out.alt_rate_cmd = Some(al_rate);
     }
 
+    /// Star-rejection rate gate (mirrors JoystickModeState._detection_rate_filter).
+    ///
+    /// A detection's implied SKY angular rate is the boresight motion plus
+    /// the pixel drift, measured against the newest recorded candidate at
+    /// least RATE_FILTER_BASELINE_S old -- pixel positions are captured at
+    /// frame time but the boresight at loop-cycle time, so a short
+    /// (consecutive-frame) baseline corrupts the estimate by
+    /// ~rate * timing_skew / baseline, falsely rejecting fast targets. The
+    /// program target moves at the trajectory rate; a star moves at
+    /// ~sidereal (near zero inertially). With a setpoint available, reject
+    /// mismatches beyond max(rate_gate_dps, REL_FRACTION * |trajectory
+    /// rate|); tracking bare, reject near-zero (star-like) rates.
+    ///
+    /// Returns Some(true) verified / Some(false) rejected / None while the
+    /// baseline is still warming up. ALWAYS records the candidate, so a
+    /// persistent star keeps failing.
+    fn detection_rate_verdict(
+        &mut self,
+        det: &Detection,
+        inputs: &Inputs,
+        current_azm: f64,
+        current_alt: f64,
+        el_sky: f64,
+        now: f64,
+    ) -> Option<bool> {
+        const RATE_FILTER_BASELINE_S: f64 = 0.35;
+        const RATE_FILTER_MAX_AGE_S: f64 = 3.0;
+        const RATE_FILTER_REL_FRACTION: f64 = 0.35;
+
+        let hp = &inputs.hotspot;
+        let (bs_az, bs_el) = if inputs.mount_mode == MountMode::AltAz {
+            (current_azm, 90.0 - current_alt)
+        } else {
+            (current_azm, current_alt)
+        };
+        self.track_candidates
+            .retain(|c| now - c.0 <= RATE_FILTER_MAX_AGE_S);
+        let base = self
+            .track_candidates
+            .iter()
+            .rev()
+            .find(|c| now - c.0 >= RATE_FILTER_BASELINE_S)
+            .copied();
+        self.track_candidates
+            .push((now, det.cx, det.cy, bs_az, bs_el));
+        if !hp.star_filter {
+            return Some(true);
+        }
+        let (t0, cx0, cy0, az0, el0) = base?; // None: baseline warming up
+        let dt = now - t0;
+        let (da, de) = hotspot::pixel_offset_to_angles(
+            det.cx - cx0,
+            det.cy - cy0,
+            hp.pixel_size_um,
+            hp.focal_length_mm,
+            hp.rotation_deg,
+            el_sky,
+            hp.x_sign,
+            hp.y_sign,
+            true,
+        );
+        let impl_az = (wrap180(bs_az - az0) + da) / dt;
+        let impl_el = (bs_el - el0 + de) / dt;
+        let gate = if hp.rate_gate_dps > 0.0 {
+            hp.rate_gate_dps
+        } else {
+            0.15
+        };
+        let cos_el = el_sky.to_radians().cos().abs().max(1e-3);
+        Some(match inputs.setpoint {
+            Some(sp) => {
+                let ref_mag =
+                    ((sp.ff_az_dps * cos_el).powi(2) + sp.ff_el_dps.powi(2)).sqrt();
+                let thresh = gate.max(RATE_FILTER_REL_FRACTION * ref_mag);
+                let diff = (((impl_az - sp.ff_az_dps) * cos_el).powi(2)
+                    + (impl_el - sp.ff_el_dps).powi(2))
+                .sqrt();
+                diff <= thresh
+            }
+            None => {
+                let mag = ((impl_az * cos_el).powi(2) + impl_el.powi(2)).sqrt();
+                mag >= gate
+            }
+        })
+    }
+
     /// HANDOFF: keep PROGRAM track closing the loop while running the hot-spot
     /// detector in parallel; hand the loop to HOTSPOT after `handoff_min_frames`
     /// consecutive solid detections. Mirrors JoystickModeState.handoff_track.
@@ -512,19 +668,60 @@ impl LoopState {
         // 1) Keep PROGRAM-tracking (drives the mount; includes lead + feed-forward).
         self.step_program(inputs, current_azm, current_alt, now, out);
 
-        // 2) Run the hot-spot detector in parallel (full frame, no commanding).
+        // 2) Run the hot-spot detector in parallel (full frame, no commanding),
+        //    on FRESH frames only: a stale frame carries no new information, so
+        //    it must neither count toward nor reset the consecutive-detection
+        //    requirement (which also gives the star filter distinct frames to
+        //    difference for its rate estimate).
+        let frame_is_stale = matches!(
+            (frame, self.hotspot_last_frame_seq),
+            (Some(f), Some(last)) if f.seq == last
+        );
+        if let Some(f) = frame {
+            if !frame_is_stale {
+                self.hotspot_last_frame_seq = Some(f.seq);
+            }
+        }
+        if frame_is_stale {
+            out.handoff_detection_count = self.handoff_detection_count;
+            return;
+        }
+
         let need = inputs.handoff_min_frames.max(1);
         match detect_in_frame(frame, &inputs.hotspot, None) {
             Some(d) => {
-                self.handoff_detection_count += 1;
                 out.hotspot_snr = d.snr;
                 out.hotspot_centroid = Some((d.cx, d.cy));
-                out.hotspot_status = "detecting";
-                if self.handoff_detection_count >= need {
-                    self.handoff_detection_count = 0;
-                    out.requested_mode = Some(Mode::Hotspot);
-                    out.status_msg =
-                        Some("HANDOFF: solid detection - engaging HOTSPOT tracker".to_string());
+                let el_sky = if inputs.mount_mode == MountMode::AltAz {
+                    90.0 - current_alt
+                } else {
+                    current_alt
+                };
+                match self.detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, now)
+                {
+                    Some(true) => {
+                        self.handoff_detection_count += 1;
+                        out.hotspot_status = "detecting";
+                        if self.handoff_detection_count >= need {
+                            self.handoff_detection_count = 0;
+                            out.requested_mode = Some(Mode::Hotspot);
+                            out.status_msg = Some(
+                                "HANDOFF: solid detection - engaging HOTSPOT tracker".to_string(),
+                            );
+                        }
+                    }
+                    Some(false) => {
+                        // A star (or wrong object) is not the target: reset the
+                        // consecutive count so it can never trigger the hand-off.
+                        self.handoff_detection_count = 0;
+                        out.hotspot_status = "star-reject";
+                    }
+                    None => {
+                        // Filter warming up its rate baseline: neither count
+                        // nor reset, so a star can't ride the warm-up window
+                        // into a hand-off.
+                        out.hotspot_status = "detecting";
+                    }
                 }
             }
             None => {
@@ -533,6 +730,7 @@ impl LoopState {
                 out.hotspot_status = "program";
             }
         }
+        out.handoff_detection_count = self.handoff_detection_count;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -561,6 +759,8 @@ impl LoopState {
                 Some("HOTSPOT: mount at safety limit - switched to STANDBY".to_string());
             self.hotspot_acquired = false;
             self.hotspot_gate_center = None;
+            self.hotspot_corr_dps = (0.0, 0.0);
+            self.hotspot_cmd_dps = (0.0, 0.0);
             return;
         }
 
@@ -608,7 +808,12 @@ impl LoopState {
         // and GROWS on consecutive misses so residual prediction error or
         // target motion can't strand it while the target is still in frame.
         let gate = self.hotspot_gate_center.map(|(cx, cy)| {
-            let (az_dps, alt_dps) = self.hotspot_cmd_dps;
+            // Predict with the CORRECTION rates, not the total command: the
+            // trajectory feed-forward moves the boresight WITH the target
+            // (no apparent pixel drift); only the correction closes on it.
+            // Predicting with the total slid the gate off a well-tracked
+            // fast target at the full feed-forward rate.
+            let (az_dps, alt_dps) = self.hotspot_corr_dps;
             let gate_dt = (now - self.hotspot_gate_time).max(0.0);
             let (mut gx, mut gy) = (cx, cy);
             if gate_dt > 0.0 && (az_dps != 0.0 || alt_dps != 0.0) {
@@ -635,6 +840,47 @@ impl LoopState {
             (gx, gy, hp.gate_radius * growth)
         });
         let detection = detect_in_frame(frame, &hp, gate);
+
+        // Star-rejection rate gate: a detection whose implied sky rate doesn't
+        // match the trajectory (or is star-like when tracking bare) is treated
+        // as a miss -- the gate grows and the correction decays, so a bright
+        // star drifting through the gate can't capture the loop.
+        // None (baseline warming up) is accepted: HOTSPOT must keep
+        // commanding, and HANDOFF already verified the object before
+        // promoting -- only an explicit mismatch demotes to a miss.
+        let detection = match detection {
+            Some(d) => {
+                if self.detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, now)
+                    == Some(false)
+                {
+                    out.hotspot_status = "star-reject";
+                    None
+                } else {
+                    Some(d)
+                }
+            }
+            None => None,
+        };
+
+        // Trajectory feed-forward (mount frame): the optical correction rides
+        // on the program target's sky rates so a moving target no longer needs
+        // the capped correction to supply ALL of the tracking rate. Honors the
+        // same per-axis FF toggles as PROGRAM; zero when tracking bare.
+        let (ff_az, ff_el) = match inputs.setpoint {
+            Some(sp) => (
+                if inputs.ff_azm_enabled { sp.ff_az_dps } else { 0.0 },
+                if inputs.ff_alt_enabled {
+                    if inputs.mount_mode == MountMode::AltAz {
+                        -sp.ff_el_dps
+                    } else {
+                        sp.ff_el_dps
+                    }
+                } else {
+                    0.0
+                },
+            ),
+            None => (0.0, 0.0),
+        };
 
         if let Some(det) = detection {
             let (h, w) = frame.map(|f| (f.h, f.w)).unwrap_or((0, 0));
@@ -667,30 +913,43 @@ impl LoopState {
                 .update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);
             self.alt_pid
                 .update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
+            self.azm_pid.set_output_filter_tau(inputs.output_filter_tau);
+            self.alt_pid.set_output_filter_tau(inputs.output_filter_tau);
+            // Feed-forward is added MANUALLY below (the correction cap must
+            // not clamp it), so zero the PIDs' own FF term -- these
+            // controllers are shared with step_program, whose last
+            // set_feed_forward_rate would otherwise leak in as a stale bias.
+            self.azm_pid.set_feed_forward_rate(0.0);
+            self.alt_pid.set_feed_forward_rate(0.0);
 
             let dt = self.dt(now);
-            let (az_out, az_rate) =
+            let (az_out, _az_rate) =
                 self.azm_pid
                     .compute_pid_output(az_error, dt, Some(current_azm));
-            let (al_out, al_rate) =
+            let (al_out, _al_rate) =
                 self.alt_pid
                     .compute_pid_output(el_error, dt, Some(current_alt));
 
-            // Cap each axis so the correction covers at most ~90% of the
+            // Cap each axis's CORRECTION so it covers at most ~90% of the
             // remaining error before the NEXT measurement (measured frame
             // interval): a correction that outruns its measurements
             // overshoots, exits its own gate, and coasts into a stair-step.
+            // The trajectory feed-forward rides UNDER the cap: it is not a
+            // correction, it's the target's own motion.
             let interval = self.hotspot_frame_interval.max(0.05);
             let cap_az = (hp.max_rate_dps / 360.0).min(0.9 * az_error.abs() / interval / 360.0);
             let cap_al = (hp.max_rate_dps / 360.0).min(0.9 * el_error.abs() / interval / 360.0);
-            let az_out = az_out.clamp(-cap_az, cap_az);
-            let al_out = al_out.clamp(-cap_al, cap_al);
-            let az_rate = clamp_discrete(az_rate, cap_az);
-            let al_rate = clamp_discrete(al_rate, cap_al);
-            // Remember what we commanded (mount frame, deg/s) for the gate
-            // prediction. The threaded loop actuates az_out/al_out (continuous)
-            // or the discrete steps; either way this is the commanded motion.
-            self.hotspot_cmd_dps = (az_out * 360.0, al_out * 360.0);
+            let az_corr = az_out.clamp(-cap_az, cap_az);
+            let al_corr = al_out.clamp(-cap_al, cap_al);
+            let az_total = ff_az / 360.0 + az_corr;
+            let al_total = ff_el / 360.0 + al_corr;
+            let az_rate = hotspot_discrete_step(az_total);
+            let al_rate = hotspot_discrete_step(al_total);
+            // Remember what we commanded (mount frame, deg/s): the gate
+            // prediction uses the TOTAL boresight motion; the miss-path decay
+            // bleeds only the correction while feed-forward keeps running.
+            self.hotspot_corr_dps = (az_corr * 360.0, al_corr * 360.0);
+            self.hotspot_cmd_dps = (az_total * 360.0, al_total * 360.0);
 
             self.hotspot_gate_center = Some((det.cx, det.cy));
             self.hotspot_gate_time = now;
@@ -700,8 +959,8 @@ impl LoopState {
 
             out.azm_error = az_error;
             out.alt_error = el_error;
-            out.azm_pid_output = az_out;
-            out.alt_pid_output = al_out;
+            out.azm_pid_output = az_total;
+            out.alt_pid_output = al_total;
             out.hotspot_acquired = true;
             out.hotspot_status = "locked";
             out.hotspot_snr = det.snr;
@@ -715,25 +974,29 @@ impl LoopState {
         // not a miss -- only count misses against frames actually examined.
         if !frame_is_stale {
             self.hotspot_miss_count += 1;
-            // Bleed off the held correction: rates persist on the mount, and
-            // a correction that hasn't been re-confirmed by a detection must
-            // not keep integrating (a single overshoot would otherwise coast
-            // into an FOV-sized stair-step). Halve per missed frame.
-            let (mut az_d, mut el_d) = self.hotspot_cmd_dps;
-            if az_d.abs() > 1e-3 || el_d.abs() > 1e-3 {
-                az_d *= 0.5;
-                el_d *= 0.5;
-                if az_d.abs() < 1e-3 {
-                    az_d = 0.0;
-                }
-                if el_d.abs() < 1e-3 {
-                    el_d = 0.0;
-                }
-                self.hotspot_cmd_dps = (az_d, el_d);
-                out.azm_pid_output = az_d / 360.0;
-                out.alt_pid_output = el_d / 360.0;
-                out.azm_rate_cmd = Some(0);
-                out.alt_rate_cmd = Some(0);
+            // Bleed off the held CORRECTION: a correction that hasn't been
+            // re-confirmed by a detection must not keep integrating (a single
+            // overshoot would otherwise coast into an FOV-sized stair-step).
+            // Halve per missed frame. The trajectory feed-forward is NOT
+            // decayed -- coasting follows the target's motion.
+            let (mut az_c, mut el_c) = self.hotspot_corr_dps;
+            az_c *= 0.5;
+            el_c *= 0.5;
+            if az_c.abs() < 1e-3 {
+                az_c = 0.0;
+            }
+            if el_c.abs() < 1e-3 {
+                el_c = 0.0;
+            }
+            self.hotspot_corr_dps = (az_c, el_c);
+            if az_c != 0.0 || el_c != 0.0 || ff_az != 0.0 || ff_el != 0.0 {
+                let az_total = (ff_az + az_c) / 360.0;
+                let el_total = (ff_el + el_c) / 360.0;
+                self.hotspot_cmd_dps = (az_total * 360.0, el_total * 360.0);
+                out.azm_pid_output = az_total;
+                out.alt_pid_output = el_total;
+                out.azm_rate_cmd = Some(hotspot_discrete_step(az_total));
+                out.alt_rate_cmd = Some(hotspot_discrete_step(el_total));
             }
         }
 
@@ -763,6 +1026,8 @@ impl LoopState {
         out.status_msg = Some("HOTSPOT: lost lock - falling back to PROGRAM track".to_string());
         self.hotspot_acquired = false;
         self.hotspot_gate_center = None;
+        self.hotspot_corr_dps = (0.0, 0.0);
+        self.hotspot_cmd_dps = (0.0, 0.0);
     }
 }
 

@@ -76,6 +76,119 @@ fn program_tracks_a_moving_setpoint() {
 }
 
 #[test]
+fn handoff_tracks_as_tightly_as_program_under_continuous_rate() {
+    // Regression: the continuous guide-rate actuation gate in run_cycle must
+    // include HANDOFF. HANDOFF program-tracks underneath (step_handoff drives
+    // step_program), but when actuation fell back to the discrete MC_MOVE
+    // steps (…, 1, 2, 5, 10 deg/s) a ~3 deg/s target limit-cycled between
+    // steps by several tenths of a degree — enough to swing the target out of
+    // the tracking camera's ±0.4 deg FOV, so the parallel hotspot detector
+    // never saw 5 consecutive frames and the hand-off never fired.
+    let ramp_dps = 3.0;
+    for (mode, label) in [(Mode::Program, "program"), (Mode::Handoff, "handoff")] {
+        let mut inputs = program_inputs(0.0, 20.0);
+        inputs.mode = mode;
+        inputs.continuous_rate = true;
+        inputs.guide_rate_max_dps = 5.0;
+        inputs.ff_azm_enabled = true;
+        inputs.ff_alt_enabled = true;
+        let shared = Shared::new(inputs);
+        let mut mount = Mount::new(LoopbackTransport::new(SimResponder::new_manual(0.0, 0.0)));
+        let mut state = LoopState::new();
+
+        let mut now = 0.0;
+        let mut target_az = 0.0;
+        let mut worst_settled: f64 = 0.0;
+        for cycle in 0..300 {
+            now += 0.1;
+            target_az += ramp_dps * 0.1;
+            shared.inputs.lock().unwrap().setpoint = Some(Setpoint {
+                az_deg: target_az,
+                el_deg: 20.0,
+                ff_az_dps: ramp_dps,
+                ff_el_dps: 0.0,
+            });
+            mount.io.responder.advance_time(0.1);
+            run_cycle(&mut mount, &mut state, &shared, now);
+            if cycle >= 150 {
+                let err = (shared.outputs.lock().unwrap().azm - target_az).abs();
+                worst_settled = worst_settled.max(err);
+            }
+        }
+        // With feed-forward + continuous guide-rate the settled error is tiny;
+        // on the discrete steps it limit-cycles at several tenths of a degree.
+        assert!(
+            worst_settled < 0.1,
+            "{label}: settled tracking error {worst_settled:.3} deg (continuous \
+             guide-rate not applied?)"
+        );
+    }
+}
+
+#[test]
+fn handoff_promotion_request_is_latched_until_mode_applied() {
+    // Regression: requested_mode was republished from scratch every cycle, so
+    // the one-cycle Some(Hotspot) produced by HANDOFF's 5th consecutive
+    // detection could be overwritten by the next cycle's None before the
+    // (polling) Python adapter ever saw it. It must latch until the host
+    // pushes the requested mode back into inputs.mode.
+    let mut inputs = program_inputs(50.0, 30.0);
+    inputs.mode = Mode::Handoff;
+    inputs.handoff_min_frames = 5;
+    inputs.hotspot.snr_threshold = 5.0;
+    let shared = Shared::new(inputs);
+    let mut mount = Mount::new(LoopbackTransport::new(SimResponder::new_manual(50.0, 30.0)));
+    let mut state = LoopState::new();
+
+    // A frame with one bright compact blob on a flat background.
+    let mut data = vec![6.0_f32; 64 * 64];
+    for dy in -1i64..=1 {
+        for dx in -1i64..=1 {
+            data[((32 + dy) * 64 + (32 + dx)) as usize] = 200.0;
+        }
+    }
+    *shared.frame.lock().unwrap() = Some(Arc::new(skytracker_core::controller::Frame {
+        data: Arc::new(data),
+        h: 64,
+        w: 64,
+        seq: 1,
+    }));
+
+    let mut now = 0.0;
+    for seq in 1..=8u64 {
+        now += 0.1;
+        // Detections only count on FRESH frames now: bump the seq each cycle
+        // (the shared blob just gets a new sequence number, like a camera
+        // re-capturing a static scene).
+        if let Some(f) = shared.frame.lock().unwrap().as_mut() {
+            *f = Arc::new(skytracker_core::controller::Frame {
+                data: Arc::clone(&f.data),
+                h: f.h,
+                w: f.w,
+                seq,
+            });
+        }
+        mount.io.responder.advance_time(0.1);
+        run_cycle(&mut mount, &mut state, &shared, now);
+    }
+    // 8 fresh frames > handoff_min_frames: the request fired on the 5th and
+    // must still be visible now (later cycles produced no new request).
+    assert_eq!(
+        shared.outputs.lock().unwrap().requested_mode,
+        Some(Mode::Hotspot),
+        "promotion request was not latched"
+    );
+
+    // Host applies the mode; the latch must clear on the next cycle so a
+    // stale request can never override a later operator mode change.
+    shared.inputs.lock().unwrap().mode = Mode::Hotspot;
+    now += 0.1;
+    mount.io.responder.advance_time(0.1);
+    run_cycle(&mut mount, &mut state, &shared, now);
+    assert_eq!(shared.outputs.lock().unwrap().requested_mode, None);
+}
+
+#[test]
 fn focus_axis_moves_and_reads_back_independently() {
     // A focus move (MC_MOVE on Targets::FOCUS) integrates a separate focus axis
     // and must NOT disturb az/el — the regression this guards is FOCUS being

@@ -316,6 +316,45 @@ def azel_to_eq_mount(az_deg, el_deg, pole_az_deg, pole_alt_deg):
     return ha, dec
 
 
+# Side-mount index-home convention. Field-calibrated 2026-07-26: at the AVX
+# index marks the scope points ALONG the horizontal polar axis (= at the
+# horizon, at azimuth alignment_azimuth), and the dec axis stands vertical,
+# so the first +ALT motion sweeps the horizon. Mapping encoder zero to that
+# home means H = AZM + 90 and dec = 90 - ALT. (The first field session
+# assumed encoder zero = zenith; the model then read el +49 with the scope
+# in the dirt.) flip=True mirrors the H origin for a rig laid down on its
+# other side (first +ALT jog sweeps toward pole_az+90 instead of -90).
+ALTAZ_SIDE_H0_DEG = 90.0
+
+
+def AzAlt2AzEl_AltAzSide(AZM, ALT, alignment_azimuth, flip=False):
+    """Side-mounted AltAz (e.g. an AVX lying on its side for center-of-gravity):
+    mount coordinates (AZM, ALT) -> true sky (az, el).
+
+    In this rig the mount's AZM axis is HORIZONTAL, pointing at azimuth
+    `alignment_azimuth`, so AZM motion sweeps a vertical great circle
+    (elevation-like), and the ALT axis initially sweeps the horizon.
+    Geometrically this is an equatorial mount whose pole sits ON the horizon:
+    AZM turns about that horizontal pole (hour-angle-like), ALT is 90 deg
+    minus declination. pole_alt is exactly 0 by construction of the rig --
+    deliberately NOT the Eq mode's "0 means use site latitude" convention.
+
+    HOME = the AVX index marks: encoder (0, 0) puts the boresight ON the
+    pole (horizon, azimuth alignment_azimuth). Tare the axes at the index
+    marks and enter the azimuth the scope points at as Alignment Azimuth.
+    """
+    h0 = -ALTAZ_SIDE_H0_DEG if flip else ALTAZ_SIDE_H0_DEG
+    return eq_mount_to_azel(AZM + h0, 90.0 - ALT, alignment_azimuth, 0.0)
+
+
+def AzEl2AzAlt_AltAzSide(az, el, alignment_azimuth, flip=False):
+    """Inverse of :func:`AzAlt2AzEl_AltAzSide`: true sky (az, el) -> mount
+    (AZM, ALT) for the side-mounted AltAz rig (index-mark home)."""
+    h0 = -ALTAZ_SIDE_H0_DEG if flip else ALTAZ_SIDE_H0_DEG
+    ha, dec = azel_to_eq_mount(az, el, alignment_azimuth, 0.0)
+    return (ha - h0) % 360.0, 90.0 - dec
+
+
 def compute_fov_for_camera(pixel_size_um, focal_length_mm, roi_width_pct, roi_height_pct,
                           camera_width_pixels, camera_height_pixels):
     """

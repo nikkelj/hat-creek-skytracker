@@ -102,6 +102,22 @@ RATES = {
     8 : 5/360,
     9 : 10/360
 }
+# WARNING: this MC_MOVE step table is SUSPECT on the real AVX. Bench
+# measurement 2026-07-25: rate 4 moved at 0.0335 dps = 8.0x sidereal, not the
+# 0.25 dps listed here (the classic Celestron HC progression is 0.5/1/4/8/16/
+# 64x sidereal then deg/s steps). The sim and the discrete-rate PID path use
+# this table, so until it is re-measured (bench_guiderate.py --survey) treat
+# discrete-mode rate expectations as approximate; continuous guide-rate
+# tracking (hc_set_rate_dps, calibrated below) does not depend on it.
+
+# Firmware guide-rate unit for MC_SET_POS/NEG_GUIDERATE, CALIBRATED on the
+# real AVX (bench_guiderate.py, 2026-07-25): the 24-bit value is arcseconds
+# per second in Q10 fixed point -- value = arcsec_per_sec * 1024. The LSB is
+# ~0.001"/s and full scale (2^24 - 1) is 4.551 deg/s, matching the AVX max
+# slew. (The previous rev/sec * 2^24 assumption ran 79.1x slow -- commanded
+# rates produced "no movement".)
+GUIDE_COUNTS_PER_DPS = 3600.0 * 1024.0
+GUIDE_RATE_MAX_DPS = (2 ** 24 - 1) / GUIDE_COUNTS_PER_DPS  # 4.551 deg/s
 
 # Utility functions
 def checksum(msg):
@@ -365,12 +381,17 @@ class NexstarHandController:
         10-step MC_MOVE. This is the smooth-tracking path that avoids the
         rate-quantization sawtooth.
 
-        Encoding assumes the rev/sec convention shared with the RATES table
-        (pack_int3(rate_rev_per_sec) = int(rate/360 * 2**24), ~0.077"/s LSB). This
-        on-wire scale is UNVERIFIED on real hardware -- calibrate the scale and the
-        max sustainable rate with bench_guiderate.py before trusting it.
+        On-wire scale CALIBRATED on the real AVX (bench_guiderate.py,
+        2026-07-25): value = arcsec_per_sec * 1024 (GUIDE_COUNTS_PER_DPS).
+        Rates beyond the 24-bit full scale (GUIDE_RATE_MAX_DPS, 4.551 dps) are
+        clamped; callers gate via config.guide_rate_max_dps and fall back to
+        MC_MOVE above it anyway.
         """
-        return self.hc_set_guide_rate(target, dps / 360.0)
+        # Round+clamp in COUNT space so full scale encodes exactly 0xFFFFFF
+        # (clamping in deg/s and converting back can land one LSB short).
+        counts = min(int(round(abs(dps) * GUIDE_COUNTS_PER_DPS)), 2 ** 24 - 1)
+        fraction = counts / 2 ** 24  # exact: pack_int3 recovers `counts`
+        return self.hc_set_guide_rate(target, fraction if dps >= 0 else -fraction)
 
     def hc_slew_fixed(self, target, rate):
         """Move axis. Axis will keep moving until a stop is sent!

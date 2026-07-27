@@ -242,7 +242,7 @@ def main():
         display.menu_screen.fill((30, 30, 30), (display.sub_x, display.sub_y, display.sub_width, display.sub_height))
         jsurf = jviz.get_latest_surface()
         if jsurf:
-            display.menu_screen.blit(jsurf, (display.sub_x + display.sub_width // 2, display.sub_y))
+            display.menu_screen.blit(jsurf, (display.joystick_layout_params()['divider_x'], display.sub_y))
         for fn in (lambda: render_connection_controls(display, jms),
                    lambda: render_joystick_status(display, jms),
                    lambda: render_position_display(display, jms),

@@ -44,6 +44,14 @@ class PIDController:
         # Feed-forward state
         self.current_feed_forward_rate = 0.0
 
+        # Low-pass (EMA) on the FEEDBACK term only: encoder noise / backlash
+        # jitter rides the P and D terms straight into the rate command, and
+        # on hardware that dominates the residual motion. Feed-forward is
+        # added AFTER the filter so trajectory response stays crisp. tau in
+        # seconds; 0 disables.
+        self.output_filter_tau = 0.0
+        self._filtered_feedback = 0.0
+
         # Error tracking for display
         self.current_position_error = 0.0
         self.current_rate_error = 0.0
@@ -60,6 +68,11 @@ class PIDController:
         self.previous_error = 0.0
         self.previous_measurement = None
         self.last_update_time = None
+        self._filtered_feedback = 0.0
+
+    def set_output_filter_tau(self, tau_seconds):
+        """Set the feedback low-pass time constant (seconds; 0 disables)."""
+        self.output_filter_tau = max(0.0, float(tau_seconds or 0.0))
 
     def update_gains(self, p_gain, i_gain, d_gain):
         """Update PID gains."""
@@ -150,6 +163,17 @@ class PIDController:
             i_term = self.i_gain * self.integral_error
             pid_feedback_output = p_term + i_term + d_term
             total_output = pid_feedback_output + self.current_feed_forward_rate
+
+        # Feedback low-pass (EMA): smooth measurement jitter out of the rate
+        # command. Applied to the feedback term only -- feed-forward is added
+        # after so trajectory-rate changes pass through unfiltered.
+        if self.output_filter_tau > 0.0:
+            alpha = dt_seconds / (self.output_filter_tau + dt_seconds)
+            self._filtered_feedback += alpha * (pid_feedback_output - self._filtered_feedback)
+            pid_feedback_output = self._filtered_feedback
+            total_output = pid_feedback_output + self.current_feed_forward_rate
+        else:
+            self._filtered_feedback = pid_feedback_output
 
         # Store feedback components for display
         self.current_feedback_output = pid_feedback_output
@@ -359,6 +383,18 @@ def sky_target_to_mount(config_state, target_az_deg, target_el_deg):
             target_az_deg,
             target_el_deg
         )
+    elif mount_mode == 'AltAz-Side':
+        # Side-mounted AltAz (mount lying on its side for center-of-gravity):
+        # equatorial geometry with the pole ON the horizon at alignment_azimuth.
+        # The pole elevation is exactly 0 by construction of the rig -- no
+        # latitude fallback like Eq mode. Neither pointing model applies (the
+        # 7-term model is alt-az specific, the eq model assumes a polar-aligned
+        # axis), so the transform is used directly.
+        from transformations import AzEl2AzAlt_AltAzSide
+        target_azm_deg, target_alt_deg = AzEl2AzAlt_AltAzSide(
+            target_az_deg, target_el_deg,
+            float(getattr(config_state, 'alignment_azimuth_str', 0.0) or 0.0),
+            flip=bool(getattr(config_state, 'altaz_side_flip', False)))
     else:
         # Equatorial mode: convert the target sky position to mount (hour-angle, dec) axes
         # for a polar axis pointing at (pole_az, pole_alt). pole_az defaults to due north
@@ -536,5 +572,9 @@ def create_pid_controllers(config_state):
 
     azm_controller = PIDController(azm_p, azm_i, azm_d, axis_name="AZM")
     alt_controller = PIDController(alt_p, alt_i, alt_d, axis_name="ALT")
+
+    tau = getattr(config_state, 'pid_output_filter_tau_sec', 0.0)
+    azm_controller.set_output_filter_tau(tau)
+    alt_controller.set_output_filter_tau(tau)
 
     return azm_controller, alt_controller

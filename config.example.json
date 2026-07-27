@@ -57,7 +57,7 @@
   "pid_alt_p_gain": 0.015,
   "pid_alt_i_gain": 0.00028,
   "pid_alt_d_gain": 0.0009,
-  "pid_lead_time_sec": 0.15,
+  "pid_lead_time_sec": 0.06,
   "feed_forward_azm_enabled": true,
   "feed_forward_alt_enabled": true,
   "bias_azm_deg": 0.0,
@@ -71,6 +71,9 @@
   "handoff_min_frames": 5,
   "hotspot_x_sign": 1.0,
   "hotspot_y_sign": -1.0,
+  "hotspot_star_filter_enabled": true,
+  "hotspot_rate_gate_dps": 0.15,
+  "pid_output_filter_tau_sec": 0.2,
   "sim_config": {
     "enabled": true,
     "cam_width": 960,

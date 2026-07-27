@@ -48,6 +48,12 @@ pub struct PidController {
 
     pub current_feed_forward_rate: f64,
 
+    // Low-pass (EMA) on the FEEDBACK term only (mirrors control.py): tau in
+    // seconds, 0 disables. Feed-forward is added after the filter so
+    // trajectory-rate changes pass through unfiltered.
+    pub output_filter_tau: f64,
+    filtered_feedback: f64,
+
     // Diagnostics (read by the UI in Python).
     pub current_position_error: f64,
     pub current_pid_output: f64,
@@ -71,6 +77,8 @@ impl PidController {
             previous_error: 0.0,
             previous_measurement: None,
             current_feed_forward_rate: 0.0,
+            output_filter_tau: 0.0,
+            filtered_feedback: 0.0,
             current_position_error: 0.0,
             current_pid_output: 0.0,
         }
@@ -80,6 +88,12 @@ impl PidController {
         self.integral_error = 0.0;
         self.previous_error = 0.0;
         self.previous_measurement = None;
+        self.filtered_feedback = 0.0;
+    }
+
+    /// Feedback low-pass time constant (seconds; 0 disables).
+    pub fn set_output_filter_tau(&mut self, tau_seconds: f64) {
+        self.output_filter_tau = tau_seconds.max(0.0);
     }
 
     pub fn update_gains(&mut self, p_gain: f64, i_gain: f64, d_gain: f64) {
@@ -161,6 +175,18 @@ impl PidController {
             total_output = pid_feedback_output + self.current_feed_forward_rate;
         }
 
+        // Feedback low-pass (EMA): smooth measurement jitter out of the rate
+        // command; feed-forward is added after so trajectory-rate changes
+        // pass through unfiltered. Mirrors control.py.
+        if self.output_filter_tau > 0.0 {
+            let alpha = dt_seconds / (self.output_filter_tau + dt_seconds);
+            self.filtered_feedback += alpha * (pid_feedback_output - self.filtered_feedback);
+            pid_feedback_output = self.filtered_feedback;
+            total_output = pid_feedback_output + self.current_feed_forward_rate;
+        } else {
+            self.filtered_feedback = pid_feedback_output;
+        }
+
         self.current_position_error = error_degrees;
         self.current_pid_output = total_output;
 
@@ -169,8 +195,10 @@ impl PidController {
     }
 
     /// Map output (rev/sec) to a signed discrete rate (-9..=9), preserving sign
-    /// and biasing slightly toward higher rates to reduce undershoot.
-    fn error_to_discrete_rate(pid_output_rev_per_sec: f64) -> i32 {
+    /// and biasing slightly toward higher rates to reduce undershoot. Public so
+    /// HOTSPOT can recompute the discrete step for its feed-forward + correction
+    /// total (the PID's own discrete output covers the correction only).
+    pub fn error_to_discrete_rate(pid_output_rev_per_sec: f64) -> i32 {
         let sign: i32 = if pid_output_rev_per_sec >= 0.0 { 1 } else { -1 };
         let requested = pid_output_rev_per_sec.abs();
         if requested < 0.01 {

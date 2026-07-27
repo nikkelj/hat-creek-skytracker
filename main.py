@@ -186,6 +186,13 @@ global alignment_state
 alignment_state = AlignmentState()
 print(f"Hardware simulator ready (enabled={hardware_sim.sim_enabled()}).")
 
+# Mount 3D screen state (view camera, manual pose, HUD hit rects).
+from mount3d import (Mount3DState, draw_mount3d, handle_mount3d_mouse_down,
+                     handle_mount3d_mouse_motion, handle_mount3d_mouse_up,
+                     handle_mount3d_wheel)
+global mount3d_state
+mount3d_state = Mount3DState()
+
 # Dedicated real-time mount control thread. Owns all serial traffic to the
 # mount and runs the read -> PID -> command cycle at a fixed cadence, decoupled
 # from this render loop. It no-ops while the telescope is disconnected.
@@ -599,6 +606,10 @@ while running:
                     handle_alignment_click(pos, display, config_state, alignment_state,
                                            joystick_mode_state, tracking_vis_state, ts, status_messages)
 
+            elif current_mode == "mount3d":
+                handle_mount3d_mouse_down(pos, event.button, display,
+                                          mount3d_state, config_state)
+
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
                 try:
@@ -661,6 +672,9 @@ while running:
                 # Handle camera control slider dragging on the right-half camera panel
                 if getattr(alignment_state, 'view_mode', 'camera') == 'camera':
                     handle_alignment_camera_events(event, display, config_state, update_status_callback)
+            elif current_mode == "mount3d":
+                handle_mount3d_mouse_motion(event.pos, event.rel, event.buttons,
+                                            display, mount3d_state)
             elif current_mode == "joystick_loop":
                 # Handle camera control slider dragging on the half-height feeds
                 handle_joystick_camera_control_events(event, display, config_state, update_status_callback)
@@ -732,6 +746,8 @@ while running:
             # Reset all button clicked states - essential for UI feedback
             for btn in display.buttons:
                 display.button_states[btn["mode"]]["clicked"] = False
+            if current_mode == "mount3d":
+                handle_mount3d_mouse_up(event.pos, mount3d_state)
             if current_mode is None:
                 pass
             elif current_mode == "post_process" and post_process_state is not None:
@@ -762,6 +778,8 @@ while running:
             if display.get_status_panel_rect().collidepoint(wheel_pos):
                 display.status_scroll_offset = max(
                     0, min(display.status_scroll_offset + event.y, display.status_max_scroll))
+            elif current_mode == "mount3d":
+                handle_mount3d_wheel(event.y, mount3d_state)
             # Scroll the run list in the post-process library
             elif current_mode == "post_process" and post_process_state is not None:
                 handle_pp_wheel(wheel_pos, display, post_process_state, event.y)
@@ -808,6 +826,9 @@ while running:
         draw_hw_sim_options(display, config_state, hardware_sim)
     elif current_mode == "alignment":
         draw_alignment_options(display, config_state, alignment_state, joystick_mode_state)
+    elif current_mode == "mount3d":
+        draw_mount3d(display, config_state, tracking_vis_state,
+                     joystick_mode_state, mount3d_state, ts)
     elif current_mode == "tracking_vis" and tracking_vis_state.tle_loaded:
         # Only clear if we don't have a thread surface (initial loading)
         # This prevents washing away the displayed surface while thread is rendering
@@ -921,7 +942,7 @@ while running:
         # Blit pre-rendered polar plot from joystick visual thread
         joystick_surface = joystick_viz_thread.get_latest_surface()
         if joystick_surface:
-            display.menu_screen.blit(joystick_surface, (display.sub_x + display.sub_width // 2, display.sub_y))
+            display.menu_screen.blit(joystick_surface, (display.joystick_layout_params()['divider_x'], display.sub_y))
             # Update tracking surface for capture functionality in joystick mode
             current_tracking_surface = joystick_surface
         else:
@@ -934,7 +955,7 @@ while running:
         if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
             # Create joystick launch button rectangle (lower left of upper right quadrant)
             joystick_launch_button = pygame.Rect(
-                display.sub_x + display.sub_width // 2 + 10,  # Left edge of quadrant + margin
+                display.joystick_layout_params()['divider_x'] + 10,  # Left edge of quadrant + margin
                 display.sub_y + display.sub_height // 2 - 45,  # Bottom of quadrant - button height - margin
                 70, 30  # Same size as main launch button
             )

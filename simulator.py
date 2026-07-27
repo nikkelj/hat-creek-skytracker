@@ -167,7 +167,20 @@ def injected_boresight(config_state, nominal_az_deg, nominal_el_deg):
     recover all seven terms end-to-end (not just the encoder-bias IA/IE)."""
     s = getattr(config_state, 'sim_config', {}) or {}
     az, el = float(nominal_az_deg), float(nominal_el_deg)
-    terms = s.get('mount_pointing_model') or None
+    if 'mount_pointing_model' in s:
+        terms = s.get('mount_pointing_model') or None
+    else:
+        # No explicit injection configured: default to the APP's fitted
+        # pointing-model terms, i.e. simulate the mount those terms were
+        # fitted on. Without this, a config carrying real-hardware terms
+        # made the control loop pre-correct setpoints for an error the sim
+        # never had -- every tracking mode sat a constant ~0.1 deg off the
+        # true target ("biased off-center"), and only optical feedback
+        # could pull it out. An explicit sim_config['mount_pointing_model']
+        # (including {}) still overrides, so alignment-recovery tests that
+        # inject their own model are unaffected.
+        terms = (getattr(config_state, 'pointing_model_terms', None)
+                 if getattr(config_state, 'pointing_model_enabled', False) else None)
     if terms and any(abs(float(v)) > 0.0 for v in terms.values()):
         from pointing_model import PointingModel
         az, el = PointingModel(terms).predict_observed(az, el)
@@ -432,14 +445,17 @@ class SimMount:
         return True
 
     # Fine continuous-rate primitive (MC_SET_POS/NEG_GUIDERATE). Sets the axis
-    # rate directly in deg/s, quantized to the real 24-bit guide-rate LSB so the
-    # sim faithfully shows "effectively continuous" tracking (vs the 10-step
-    # MC_MOVE used by hc_slew_fixed).
-    _GUIDE_LSB_DPS = 360.0 / 2 ** 24  # ~0.077 arcsec/s
+    # rate directly in deg/s, quantized (and clamped) to the real 24-bit
+    # guide-rate scale -- arcsec/s * 1024, calibrated on the AVX 2026-07-25 --
+    # so the sim faithfully shows "effectively continuous" tracking (vs the
+    # 10-step MC_MOVE used by hc_slew_fixed).
+    _GUIDE_LSB_DPS = 1.0 / 3686400.0  # 1/(3600*1024) deg/s, ~0.001 arcsec/s
 
     def hc_set_rate_dps(self, target, dps):
+        from lib.auxstar import GUIDE_RATE_MAX_DPS
         with self._lock:
             self._advance()
+            dps = max(-GUIDE_RATE_MAX_DPS, min(GUIDE_RATE_MAX_DPS, dps))
             q = round(dps / self._GUIDE_LSB_DPS) * self._GUIDE_LSB_DPS
             if target == Targets.ALT:
                 self._el_rate_dps = q
@@ -533,7 +549,10 @@ class SimSerialDevice:
                 # sidereal / solar / lunar specials -- accept as an ack.
                 self.mount.hc_set_guide_rate(target, sign)
             else:
-                dps = unpack_int3(data) * 360.0  # rev/s convention -> deg/s
+                # Calibrated firmware unit: 24-bit value = arcsec/s * 1024
+                # (unpack_int3 returns value/2^24 -> scale back to counts).
+                from lib.auxstar import GUIDE_COUNTS_PER_DPS
+                dps = unpack_int3(data) * (2 ** 24) / GUIDE_COUNTS_PER_DPS
                 self.mount.hc_set_rate_dps(target, sign * dps)
             return b""
         if msg_id in (0x24, 0x25):               # MC_MOVE_POS / MC_MOVE_NEG
@@ -778,15 +797,28 @@ class HardwareSimulator:
             # Equatorial: mount AZM=hour angle, ALT=declination, rotating about the TRUE
             # polar axis. The sim's true pole can be mis-set (sim_pole_az/alt_err) so a
             # polar-alignment run has a real error to measure; it defaults to the assumed
-            # pole (north, latitude) -> perfect alignment.
+            # pole (north, latitude) -> perfect alignment. AltAz-Side is the same
+            # geometry with the pole ON the horizon (exactly 0, no latitude
+            # fallback -- the rig's az axis is horizontal by construction).
             from transformations import eq_mount_to_azel
             lat = float(getattr(cfg, 'lat_str', 0.0) or 0.0)
             true_pole_az = align_az + float(s.get('sim_pole_az_err_deg', 0.0))
-            base_alt = align_el if align_el != 0.0 else lat
+            if mount_mode == 'AltAz-Side':
+                base_alt = 0.0
+            else:
+                base_alt = align_el if align_el != 0.0 else lat
             true_pole_alt = base_alt + float(s.get('sim_pole_alt_err_deg', 0.0))
             # Residual mount errors (cone/index/flexure) on top of the polar misalignment:
             # distort the mount HA/Dec by the injected equatorial model before the pole geometry.
             h_m, d_m = self.mount.az_true_deg, self.mount.el_true_deg
+            if mount_mode == 'AltAz-Side':
+                # Index-mark home: encoder (0,0) points the scope ALONG the
+                # pole (H = AZM + h0, dec = 90 - ALT). Mirrors
+                # transformations.AzAlt2AzEl_AltAzSide.
+                from transformations import ALTAZ_SIDE_H0_DEG
+                h0 = (-ALTAZ_SIDE_H0_DEG if getattr(cfg, 'altaz_side_flip', False)
+                      else ALTAZ_SIDE_H0_DEG)
+                h_m, d_m = h_m + h0, 90.0 - d_m
             eqterms = s.get('mount_eq_pointing_model') or None
             if eqterms and any(abs(float(v)) > 0.0 for v in eqterms.values()):
                 from eq_pointing_model import EquatorialPointingModel
@@ -805,6 +837,10 @@ class HardwareSimulator:
         # the pointing error and an alignment run can recover the seven terms end-to-end.
         if mount_mode == 'AltAz':
             cam_az, cam_el = injected_boresight(cfg, cam_az, cam_el)
+
+        # Final rendered boresight, observable by tests (mode-machine and
+        # transform tests verify mount->sky geometry against this).
+        self.last_boresight_azel = (cam_az, cam_el)
 
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 

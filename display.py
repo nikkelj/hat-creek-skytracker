@@ -44,6 +44,44 @@ class DisplaySetup:
     FPS_TARGET = 30
     WINDOW_POSITION = "0,0"
 
+    # Joystick-screen layout policy (shared by joystick_controller layout
+    # helpers, rendering_threads and main so every consumer agrees on where
+    # the upper-left control quadrant ends and the skyplot quadrant begins).
+    JOYSTICK_PANE_W = 250                       # control pane width
+    JOYSTICK_PANE_HEIGHTS = (215, 150, 112, 92)  # pid, bias, diag, plate
+    JOYSTICK_PANE_TOP = 104     # below connect/port/status + position box
+    JOYSTICK_PANE_MARGIN = 12
+    JOYSTICK_STATUS_W = 280     # left button/axes status block
+    JOYSTICK_CENTER_MIN = 200   # navball/strip-chart column minimum width
+
+    def joystick_layout_params(self):
+        """Divider policy for the joystick screen.
+
+        The right-edge control-pane stack needs ~720 px of quadrant height to
+        fit in one column; on shorter screens (e.g. 1080p laptop) it reflows
+        into two columns, and the control quadrant widens (divider slides
+        right) so the navball column keeps its designed width. The skyplot
+        circle is height-bound well past that shift, so it loses nothing.
+        """
+        qh = self.sub_height // 2
+        stack = sum(self.JOYSTICK_PANE_HEIGHTS)
+        avail = qh - self.JOYSTICK_PANE_TOP - self.JOYSTICK_PANE_MARGIN
+        two_col = avail < stack + 3 * 6  # can't fit even with 6 px gaps
+        if two_col:
+            gap = self.JOYSTICK_PANE_MARGIN
+            pane_block_w = 2 * self.JOYSTICK_PANE_W + gap
+        else:
+            gap = min(self.JOYSTICK_PANE_MARGIN, max(6, (avail - stack) // 3))
+            pane_block_w = self.JOYSTICK_PANE_W
+        needed = (self.JOYSTICK_STATUS_W + self.JOYSTICK_CENTER_MIN
+                  + pane_block_w + 3 * self.JOYSTICK_PANE_MARGIN + 2)
+        split = min(max(self.sub_width // 2, needed), int(self.sub_width * 0.62))
+        return {
+            'divider_x': self.sub_x + split,
+            'two_col': two_col,
+            'gap': gap,
+        }
+
     def __init__(self):
         pygame.init()
         display_info = pygame.display.Info()
@@ -88,44 +126,66 @@ class DisplaySetup:
         except pygame.error:
             print(f"Warning: '{self.BACKGROUND_FILENAME}' not found for author background. Using fallback color.")
 
-        # Define input rectangles
-        self.input_rects = {
-            'lat': pygame.Rect(self.sub_x + 20, self.sub_y + 60, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'lon': pygame.Rect(self.sub_x + 20, self.sub_y + 150, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alt': pygame.Rect(self.sub_x + 20, self.sub_y + 240, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'elevation_mask': pygame.Rect(self.sub_x + 20, self.sub_y + 330, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alignment_azimuth': pygame.Rect(self.sub_x + 20, self.sub_y + 410, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alignment_elevation': pygame.Rect(self.sub_x + 20, self.sub_y + 490, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'azm_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 570, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alt_offset': pygame.Rect(self.sub_x + 20, self.sub_y + 650, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+        # ---- Config-options layout -----------------------------------------
+        # Five equal columns of grouped fields: Site, Mount & Limits,
+        # Camera 1, Camera 2, PID. Every label/box/group position derives from
+        # the constants below so the columns cannot drift out of register the
+        # way the old hand-tuned literals did (overlapping labels, cramped
+        # bottom rows, a group box running under the Save/Load footer). The
+        # group rects are consumed by config.draw_config_options; the field
+        # keys are unchanged (main.py's click-to-focus loop relies on them).
+        CFG_COL_PITCH = 250     # column-to-column spacing
+        CFG_COL_W = 240         # group box width
+        CFG_FIRST_BOX = 75      # first input box top, relative to group top
+        CFG_PITCH = 66          # per-field pitch (label sits 22 px above box)
+        cfg_group_y = self.sub_y + 12
 
-            # Hardware safety limits input rectangles
-            'azm_limit_min': pygame.Rect(self.sub_x + 20, self.sub_y + 720, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'azm_limit_max': pygame.Rect(self.sub_x + 20, self.sub_y + 780, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alt_limit_min': pygame.Rect(self.sub_x + 20, self.sub_y + 840, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'alt_limit_max': pygame.Rect(self.sub_x + 20, self.sub_y + 900, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+        def _cfg_col_x(col):
+            return self.sub_x + 15 + col * CFG_COL_PITCH
 
-            # PID gain configuration input rectangles
-            'pid_azm_p_gain': pygame.Rect(self.sub_x + 480, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_azm_i_gain': pygame.Rect(self.sub_x + 590, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_azm_d_gain': pygame.Rect(self.sub_x + 700, self.sub_y + 70, 90, self.INPUT_HEIGHT),
-            'pid_alt_p_gain': pygame.Rect(self.sub_x + 480, self.sub_y + 140, 90, self.INPUT_HEIGHT),
-            'pid_alt_i_gain': pygame.Rect(self.sub_x + 590, self.sub_y + 140, 90, self.INPUT_HEIGHT),
-            'pid_alt_d_gain': pygame.Rect(self.sub_x + 700, self.sub_y + 140, 90, self.INPUT_HEIGHT),
+        def _cfg_col_rects(names, col):
+            return {name: pygame.Rect(_cfg_col_x(col) + 10,
+                                      cfg_group_y + CFG_FIRST_BOX + k * CFG_PITCH,
+                                      self.INPUT_WIDTH, self.INPUT_HEIGHT)
+                    for k, name in enumerate(names)}
 
-            # Camera configuration input rectangles
-            'camera1_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 55, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera1_array_size_diagonal': pygame.Rect(self.sub_x + 250, self.sub_y + 110, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera1_focal_length': pygame.Rect(self.sub_x + 250, self.sub_y + 165, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera1_alignment_rotation': pygame.Rect(self.sub_x + 250, self.sub_y + 225, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera1_gain': pygame.Rect(self.sub_x + 250, self.sub_y + 285, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera1_exposure': pygame.Rect(self.sub_x + 250, self.sub_y + 345, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_pixel_size': pygame.Rect(self.sub_x + 250, self.sub_y + 435, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_array_size_diagonal': pygame.Rect(self.sub_x + 250, self.sub_y + 490, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_focal_length': pygame.Rect(self.sub_x + 250, self.sub_y + 545, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_alignment_rotation': pygame.Rect(self.sub_x + 250, self.sub_y + 605, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_gain': pygame.Rect(self.sub_x + 250, self.sub_y + 665, self.INPUT_WIDTH, self.INPUT_HEIGHT),
-            'camera2_exposure': pygame.Rect(self.sub_x + 250, self.sub_y + 715, self.INPUT_WIDTH, self.INPUT_HEIGHT),
+        self.input_rects = {}
+        self.input_rects.update(_cfg_col_rects(
+            ['lat', 'lon', 'alt', 'elevation_mask',
+             'alignment_azimuth', 'alignment_elevation'], 0))
+        self.input_rects.update(_cfg_col_rects(
+            ['azm_offset', 'alt_offset', 'azm_limit_min', 'azm_limit_max',
+             'alt_limit_min', 'alt_limit_max'], 1))
+        self.input_rects.update(_cfg_col_rects(
+            ['camera1_pixel_size', 'camera1_array_size_diagonal',
+             'camera1_focal_length', 'camera1_alignment_rotation',
+             'camera1_gain', 'camera1_exposure'], 2))
+        self.input_rects.update(_cfg_col_rects(
+            ['camera2_pixel_size', 'camera2_array_size_diagonal',
+             'camera2_focal_length', 'camera2_alignment_rotation',
+             'camera2_gain', 'camera2_exposure'], 3))
+
+        # PID column: a 3-wide grid (P/I/D) x 2 rows (AZM/ALT) of narrower boxes.
+        pid_x = _cfg_col_x(4)
+        PID_BOX_W = 95
+        for row, axis in enumerate(('azm', 'alt')):
+            for col, gain in enumerate(('p', 'i', 'd')):
+                self.input_rects[f'pid_{axis}_{gain}_gain'] = pygame.Rect(
+                    pid_x + 10 + col * (PID_BOX_W + 10),
+                    cfg_group_y + CFG_FIRST_BOX + row * CFG_PITCH,
+                    PID_BOX_W, self.INPUT_HEIGHT)
+
+        # Group boxes: the four 6-field columns share one height; the PID box
+        # is shorter (2 field rows + the feed-forward status row).
+        col_h = CFG_FIRST_BOX + 5 * CFG_PITCH + self.INPUT_HEIGHT + 15
+        pid_w = 10 + 3 * (PID_BOX_W + 10)
+        pid_h = CFG_FIRST_BOX + CFG_PITCH + self.INPUT_HEIGHT + 60
+        self.config_group_rects = {
+            'site': pygame.Rect(_cfg_col_x(0), cfg_group_y, CFG_COL_W, col_h),
+            'mount': pygame.Rect(_cfg_col_x(1), cfg_group_y, CFG_COL_W, col_h),
+            'camera1': pygame.Rect(_cfg_col_x(2), cfg_group_y, CFG_COL_W, col_h),
+            'camera2': pygame.Rect(_cfg_col_x(3), cfg_group_y, CFG_COL_W, col_h),
+            'pid': pygame.Rect(pid_x, cfg_group_y, pid_w, pid_h),
         }
 
         # Define button rectangles
@@ -167,8 +227,9 @@ class DisplaySetup:
             {"rect": pygame.Rect(10, 210, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Config Options", "mode": "config_options"},
             {"rect": pygame.Rect(10, 260, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "HW Sim", "mode": "hw_sim"},
             {"rect": pygame.Rect(10, 310, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Alignment", "mode": "alignment"},
-            {"rect": pygame.Rect(10, 360, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
-            {"rect": pygame.Rect(10, 410, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
+            {"rect": pygame.Rect(10, 360, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Mount 3D", "mode": "mount3d"},
+            {"rect": pygame.Rect(10, 410, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Author Info", "mode": "author_info"},
+            {"rect": pygame.Rect(10, 460, self.BUTTON_WIDTH, self.BUTTON_HEIGHT), "text": "Exit", "mode": "exit"},
         ]
 
         # Initialize button states for all buttons

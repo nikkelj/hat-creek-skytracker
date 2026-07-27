@@ -87,5 +87,66 @@ class TestStarCatalogFastPath(unittest.TestCase):
         self.assertGreaterEqual(big['cutoff_mag'], small['cutoff_mag'])
 
 
+class TestRenderThreadTimeSource(unittest.TestCase):
+    """Regression: the render threads must draw the sky at the app's tracking
+    clock (tracking_vis_state.current_tt -- slider / paused / live), NOT at
+    wall-clock now. When they used ts.now() directly, scrubbing the time
+    slider moved the satellites (positioned from current_tt in main.py) while
+    the starfield stayed frozen at real time."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+        import pygame
+        pygame.init()
+        cls.ts = load.timescale()
+
+    def test_render_time_prefers_scrubbed_current_tt(self):
+        import types
+        from rendering_threads import render_time_tt
+        scrubbed = self.ts.now().tt - 0.5   # 12 h in the past
+        tvs = types.SimpleNamespace(current_tt=scrubbed)
+        self.assertAlmostEqual(render_time_tt(tvs, self.ts), scrubbed, places=9)
+
+    def test_render_time_falls_back_to_now_when_unset(self):
+        import types
+        from rendering_threads import render_time_tt
+        now = self.ts.now().tt
+        for tvs in (types.SimpleNamespace(current_tt=0.0),
+                    types.SimpleNamespace(current_tt=None),
+                    types.SimpleNamespace()):
+            tt = render_time_tt(tvs, self.ts)
+            self.assertAlmostEqual(tt, now, delta=1.0 / 86400.0)
+
+    def test_starfield_moves_when_time_is_scrubbed(self):
+        """End-to-end at the 2D-plot level: two starfield draws 1 h of
+        TRACKING time apart must produce different pixels."""
+        import types
+        import pygame
+        from rendering_threads import _draw_starfield_on_surface
+
+        class Cfg:
+            lat_str = str(LAT)
+            lon_str = str(LON)
+            alt_str = str(ELEV)
+            max_rendered_star_count = 800
+            star_limiting_magnitude = 6.5
+
+        t0 = self.ts.utc(2026, 6, 17, 5, 0, 0).tt
+        frames = []
+        for tt in (t0, t0 + 1.0 / 24.0):
+            state = types.SimpleNamespace(ephemeris=None)
+            surf = pygame.Surface((500, 500))
+            _draw_starfield_on_surface(surf, Cfg(), self.ts, tt, state,
+                                       250, 250, 200, 0.0,
+                                       draw_labels=False, publish_positions=False)
+            frames.append(pygame.surfarray.array3d(surf))
+        diff = int(np.count_nonzero(np.any(frames[0] != frames[1], axis=2)))
+        self.assertGreater(diff, 100,
+                           f"only {diff} pixels changed over 1 h of scrubbed "
+                           "time -- starfield is ignoring the tracking clock")
+
+
 if __name__ == '__main__':
     unittest.main()

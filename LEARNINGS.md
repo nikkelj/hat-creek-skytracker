@@ -6,6 +6,24 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — The stars WERE frozen — under the time slider, not the live clock
+
+Correction to the entry below: after "verified NOT the case," the user
+reported the precise repro that was the case — scrub the tracking-vis time
+slider and the stars don't move while the satellites do. Both render
+threads computed their own `current_tt = ts.now().tt` (wall clock) and drew
+the starfield + launch overlays at it, while the satellites were positioned
+in main.py from `tracking_vis_state.current_tt` (the app's tracking clock:
+slider position while scrubbing, `paused_tt` while paused, live otherwise).
+Two clocks, one scene — the halves disagree exactly when the user scrubs.
+Fix: `render_time_tt()` in rendering_threads.py resolves the tracking clock
+(with a live-now fallback before the first 10 Hz tick) and both threads use
+it; pinned by a scrubbed-starfield pixel-diff test in test_star_catalog.py.
+
+Lesson: "does X update with time?" has TWO answers per surface — live time
+and scrubbed time — and a test that only advances the live clock proves
+nothing about the slider. The earlier verification tested the wrong one.
+
 ## 2026-07-26 — Mount 3D: below-horizon orbit, and "is the star sky frozen?"
 
 Two follow-ups on the Mount 3D tab. (1) The orbit camera's elevation clamp

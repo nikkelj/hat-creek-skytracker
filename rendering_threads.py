@@ -146,6 +146,22 @@ def draw_keepout_overlay_on_surface(surface, config_state, cx, cy, radius):
 # SURFACE-BASED DRAWING FUNCTIONS FOR THREADED RENDERING
 # ==============================================================================
 
+def render_time_tt(tracking_vis_state, ts):
+    """The TT time the render threads must draw the sky at.
+
+    main.py maintains tracking_vis_state.current_tt at 10 Hz as the app's
+    single tracking clock: the slider position while scrubbing, paused_tt
+    while paused, live now otherwise. The render threads must use IT -- not
+    wall-clock now -- or the starfield and launch overlays freeze at real
+    time while the satellites (positioned from current_tt in main.py) follow
+    the slider. Falls back to live now only before the first 10 Hz tick
+    (current_tt unset/0.0; real TT Julian dates are ~2.4e6)."""
+    tt = float(getattr(tracking_vis_state, 'current_tt', 0.0) or 0.0)
+    if tt > 2400000.0:
+        return tt
+    return ts.now().tt
+
+
 def draw_hexagon_on_surface(surface, x, y, color, size=5):
     """Draw hexagon shape on a specified surface."""
     points = [(x + size * math.cos(math.radians(60 * i)), y + size * math.sin(math.radians(60 * i))) for i in range(6)]
@@ -1236,11 +1252,12 @@ class TrackingVisualizationThread(VisualizationRenderingThread):
                 continue
 
             try:
-                # Create time object for current rendering
+                # Render at the app's tracking clock (slider / paused / live),
+                # not wall-clock now -- see render_time_tt.
                 if not self.ts:
                     from skyfield.api import load
                     self.ts = load.timescale()
-                current_tt = self.ts.now().tt
+                current_tt = render_time_tt(self.tracking_vis_state, self.ts)
 
                 # Capture consistent snapshot of shared state to avoid race conditions
                 if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):
@@ -1472,11 +1489,12 @@ class JoystickVisualizationThread(VisualizationRenderingThread):
                 continue
 
             try:
-                # Create time object for current rendering
+                # Render at the app's tracking clock (slider / paused / live),
+                # not wall-clock now -- see render_time_tt.
                 if not self.ts:
                     from skyfield.api import load
                     self.ts = load.timescale()
-                current_tt = self.ts.now().tt
+                current_tt = render_time_tt(self.tracking_vis_state, self.ts)
 
                 # Capture consistent snapshot of shared state to avoid race conditions
                 if hasattr(self.tracking_vis_state, 'satellite_positions') and (self.tracking_vis_state.satellite_positions or getattr(self.tracking_vis_state, 'aircraft_positions', None)):

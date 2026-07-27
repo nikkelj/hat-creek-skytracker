@@ -942,6 +942,11 @@ class Mp4Exporter:
         h, w = first.shape[:2]
 
         # FPS: explicit, else from median capture interval (clamped to a sane range).
+        # KNOWN LIMITATION: the export writes one video frame per captured frame
+        # at this constant fps, so captures with dropped frames or a mid-run
+        # rate change are time-warped relative to the timestamp-paced replay UI.
+        # The per-frame overlay text stays correct; don't measure rates off the
+        # exported video.
         fps = self.fps
         if fps is None:
             times = [f["t"] for f in frames]

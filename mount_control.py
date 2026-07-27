@@ -47,6 +47,12 @@ class MountControlThread(threading.Thread):
     # ------------------------------------------------------------------ loop
     def run(self):
         print(f"MountControlThread starting ({1.0 / self.period:.0f} Hz target)...")
+        # Deadline scheduling, not sleep(period - work): Event.wait() overshoots
+        # by up to the OS timer quantum (~15.6 ms default on Windows), and
+        # subtracting only the work time never repays that overshoot -- at 15 Hz
+        # the loop drifted to ~12-13 Hz. Sleeping toward an absolute next-cycle
+        # deadline repays overshoot on the following cycle.
+        next_deadline = time.perf_counter() + self.period
         while not self._stop_event.is_set():
             cycle_start = time.perf_counter()
             try:
@@ -65,10 +71,15 @@ class MountControlThread(threading.Thread):
             self.last_cycle_ms = elapsed * 1000.0
             self._update_rate_stats()
 
-            sleep_time = self.period - elapsed
+            sleep_time = next_deadline - time.perf_counter()
             if sleep_time > 0:
                 # Interruptible sleep so stop() takes effect promptly.
                 self._stop_event.wait(sleep_time)
+            next_deadline += self.period
+            # More than a full period behind (long serial stall): don't burst
+            # to catch up -- rebase the schedule.
+            if next_deadline < time.perf_counter():
+                next_deadline = time.perf_counter() + self.period
 
         # On shutdown, guarantee the mount is not left slewing.
         self._safe_stop_motion()

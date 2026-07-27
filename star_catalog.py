@@ -82,12 +82,15 @@ class StarCatalog:
         self.bright_hip = self.hip[self._bright_idx]
 
         # Anchor cache (guarded; the render thread and main thread both call in).
+        # A small MRU LIST of anchors, not a single slot: the app queries this
+        # singleton from TWO clock domains at once -- the render threads at the
+        # tracking clock (which the time slider can scrub hours away) and the
+        # hardware simulator at live time. With one slot, those alternating
+        # queries would each miss and trigger a full Skyfield recompute per
+        # call, on the render thread, under this lock.
         self._lock = threading.Lock()
-        self._anchor_xyz = None       # (M, 3) horizontal unit vectors at anchor
-        self._anchor_tt = None        # anchor time (TT Julian date)
-        self._anchor_lst_rad = None   # local apparent sidereal time at anchor (radians)
-        self._anchor_key = None       # (lat, lon, elev) the anchor was built for
-        self._pole = None             # celestial-pole axis in (E,N,U) for this latitude
+        self._anchors = []            # MRU list of anchor dicts (newest last)
+        self._max_anchors = 4
 
     # ---- public API ---------------------------------------------------------
 
@@ -161,36 +164,44 @@ class StarCatalog:
         """Current (az, el) of the bright subset, re-anchoring via Skyfield as needed."""
         with self._lock:
             key = (round(lat_deg, 6), round(lon_deg, 6), round(elev_m, 1))
-            t = ts.tt(jd=t_tt)
-            need_anchor = (
-                self._anchor_xyz is None
-                or self._anchor_key != key
-                or abs((t_tt - self._anchor_tt) * 86400.0) > ANCHOR_MAX_AGE_SEC
-            )
-            if need_anchor:
-                self._build_anchor(lat_deg, lon_deg, elev_m, ts, t, key)
+            t = ts.tt_jd(t_tt)
+            anchor = None
+            for i in range(len(self._anchors) - 1, -1, -1):
+                a = self._anchors[i]
+                if a['key'] == key and abs((t_tt - a['tt']) * 86400.0) <= ANCHOR_MAX_AGE_SEC:
+                    anchor = a
+                    if i != len(self._anchors) - 1:  # move to MRU position
+                        self._anchors.append(self._anchors.pop(i))
+                    break
+            if anchor is None:
+                anchor = self._build_anchor(lat_deg, lon_deg, elev_m, t, key)
+                self._anchors.append(anchor)
+                if len(self._anchors) > self._max_anchors:
+                    self._anchors.pop(0)
 
             # Advance the anchored sky by the change in local sidereal time. Diurnal
             # motion is a rigid rotation of the celestial sphere about the pole.
             lst_rad = self._lst_rad(t, lon_deg)
-            dtheta = lst_rad - self._anchor_lst_rad
-            xyz = _rotate_about_axis(self._anchor_xyz, self._pole, dtheta)
+            dtheta = lst_rad - anchor['lst_rad']
+            xyz = _rotate_about_axis(anchor['xyz'], anchor['pole'], dtheta)
             return _altaz_from_xyz(xyz)
 
-    def _build_anchor(self, lat_deg, lon_deg, elev_m, ts, t, key):
+    def _build_anchor(self, lat_deg, lon_deg, elev_m, t, key):
         topos = wgs84.latlon(lat_deg, lon_deg, elevation_m=elev_m)
         observer = self._earth + topos
         alt, az, _ = observer.at(t).observe(self._bright_star).apparent().altaz()
         az_rad = az.radians
         el_rad = alt.radians
-        self._anchor_xyz = _xyz_from_altaz(az_rad, el_rad)
-        self._anchor_tt = t.tt
-        self._anchor_lst_rad = self._lst_rad(t, lon_deg)
-        self._anchor_key = key
         phi = math.radians(lat_deg)
         # Celestial pole direction in (E, N, U). For the southern hemisphere phi<0
         # points the axis below the horizon toward the south pole, which is correct.
-        self._pole = np.array([0.0, math.cos(phi), math.sin(phi)])
+        return {
+            'key': key,
+            'tt': t.tt,
+            'lst_rad': self._lst_rad(t, lon_deg),
+            'xyz': _xyz_from_altaz(az_rad, el_rad),
+            'pole': np.array([0.0, math.cos(phi), math.sin(phi)]),
+        }
 
     @staticmethod
     def _lst_rad(t, lon_deg):
@@ -287,7 +298,7 @@ class DeepStarCatalog:
         """(az, el, mag) of catalogue stars near the boresight (cone-masked)."""
         with self._lock:
             observer = self._observer(lat_deg, lon_deg, elev_m)
-            t = ts.tt(jd=t_tt)
+            t = ts.tt_jd(t_tt)
             # Boresight -> apparent RA/Dec -> ICRF unit vector for the cone mask.
             ra_b, dec_b, _ = observer.at(t).from_altaz(
                 alt_degrees=boresight_el, az_degrees=boresight_az).radec()

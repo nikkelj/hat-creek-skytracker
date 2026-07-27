@@ -33,7 +33,7 @@ from utils import draw_button
 # Import PID controller and helper functions
 from control import (create_pid_controllers, compute_mount_position_error,
                      sky_target_to_mount, choose_mount_target, mount_target_for)
-from trajectory import interpolate_position_data_and_rates
+from trajectory import interpolate_position_data_and_rates, live_tt
 from hotspot import detect_hotspot, pixel_offset_to_angles
 
 # Star-rejection rate filter tuning (shared by HANDOFF and HOTSPOT).
@@ -374,10 +374,10 @@ class JoystickModeState:
         self.handoff_last_frame_seq = None   # HANDOFF's own stale-frame gate
         self.handoff_reject_reason = ""      # last star-filter rejection (UI)
 
-        # PID controllers for PROGRAM track mode
+        # PID controllers for PROGRAM track mode (each times its own control
+        # cycle internally on time.monotonic(); see control.get_current_rates)
         self.azm_pid = None
         self.alt_pid = None
-        self.pid_last_update = 0.0
 
         # Park request, set by the UI thread and serviced by the control
         # thread (tracking_control) so no blocking serial happens on the UI.
@@ -1158,10 +1158,14 @@ class JoystickModeState:
 
             # Get target position from the resolved trajectory (satellite or aircraft)
             if target_traj is not None:
-                # Interpolate current target position and rates
+                # Interpolate current target position and rates at LIVE time --
+                # never the UI tracking clock (vis.current_tt), which follows
+                # the time slider and freezes while paused. The slider is
+                # visualization-only; the mount must aim where the target
+                # actually is now.
                 px, py, target_alt, dist, target_az_deg, az_rate, el_rate = interpolate_position_data_and_rates(
                     target_traj,
-                    self.tracking_vis_state.current_tt
+                    live_tt()
                 )
 
                 if px is not None and target_az_deg is not None:
@@ -1277,13 +1281,13 @@ class JoystickModeState:
                             alt_sign = -alt_sign
                         self.alt_pid.set_feed_forward_rate(alt_sign * el_rate)
 
-                    # Update PID controllers
-                    current_time = time.time()
+                    # Update PID controllers. dt is measured inside
+                    # get_current_rates on time.monotonic() and clamped -- see
+                    # control.DT_MAX_SECONDS.
                     az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
-                        az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+                        az_error, measurement_degrees=current_azm)
                     el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
-                        el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
-                    self.pid_last_update = current_time
+                        el_error, measurement_degrees=current_alt)
 
                     # Store diagnostic values for display
                     self.azm_position_error = az_error
@@ -1372,9 +1376,10 @@ class JoystickModeState:
                 self.tracking_mode = TrackingMode.STANDBY
                 return
 
+            # Live time, not the UI tracking clock -- see program_track.
             px, py, alt, dist, az_deg, az_rate_dps, el_rate_dps = interpolate_position_data_and_rates(
                 self.tracking_vis_state.launch_trajectories[launch_name],
-                self.tracking_vis_state.current_tt,
+                live_tt(),
                 self.tracking_vis_state.launch_start_time,
                 self.tracking_vis_state.launch_launched
             )
@@ -1478,13 +1483,11 @@ class JoystickModeState:
                     alt_sign = -alt_sign
                 self.alt_pid.set_feed_forward_rate(alt_sign * el_rate_dps)
 
-            # Update PID controllers
-            current_time = time.time()
+            # Update PID controllers (self-timed on monotonic; see program_track)
             az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
-                az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+                az_error, measurement_degrees=current_azm)
             el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
-                el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
-            self.pid_last_update = current_time
+                el_error, measurement_degrees=current_alt)
 
             # Store diagnostic values for display
             self.azm_position_error = az_error
@@ -1554,7 +1557,6 @@ class JoystickModeState:
             self.azm_pid.reset()
         if self.alt_pid:
             self.alt_pid.reset()
-        self.pid_last_update = 0.0
 
     def handoff_track(self):
         """HANDOFF: keep PROGRAM track closing the loop while running the hotspot
@@ -1607,14 +1609,20 @@ class JoystickModeState:
             if camera is None or getattr(camera, 'thread', None) is None:
                 self.hotspot_snr = 0.0
                 return False
-            raw = camera.thread.get_latest_raw()
+            frame_time = None
+            if hasattr(camera.thread, 'get_latest_raw_with_meta'):
+                raw, frame_seq, frame_time = camera.thread.get_latest_raw_with_meta()
+            else:
+                raw = camera.thread.get_latest_raw()
+                frame_seq = getattr(camera.thread, 'latest_raw_seq', None)
             if raw is None:
                 return False
-            frame_seq = getattr(camera.thread, 'latest_raw_seq', None)
             if frame_seq is not None:
                 if frame_seq == self.handoff_last_frame_seq:
                     return None
                 self.handoff_last_frame_seq = frame_seq
+            if frame_time is None:
+                frame_time = time.perf_counter()
             detection = detect_hotspot(
                 raw,
                 gate_center=None,
@@ -1629,8 +1637,10 @@ class JoystickModeState:
             el_sky = (90.0 - self.current_alt
                       if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
                       else self.current_alt)
+            # Stamp the candidate with the frame's exposure midpoint so the
+            # rate baseline measures true image-to-image motion.
             verdict, reason = self._detection_rate_filter(
-                detection.cx, detection.cy, time.time(),
+                detection.cx, detection.cy, frame_time,
                 f"camera{cam_index + 1}", el_sky)
             if verdict is None:
                 # Filter warming up its rate baseline: the detection is
@@ -1658,8 +1668,10 @@ class JoystickModeState:
             target_traj, _kind, _key = active_program_trajectory(vis)
             if target_traj is None:
                 return None
+            # Live time, not the UI tracking clock -- these rates feed the
+            # HOTSPOT feed-forward and star filter, which act on the mount now.
             px, _py, alt, _dist, az, az_rate, el_rate = (
-                interpolate_position_data_and_rates(target_traj, vis.current_tt))
+                interpolate_position_data_and_rates(target_traj, live_tt()))
             if px is None or az is None or az_rate is None or el_rate is None:
                 return None
             return float(az_rate), float(el_rate)
@@ -1747,8 +1759,9 @@ class JoystickModeState:
             self.azm_pid.reset()
         if self.alt_pid:
             self.alt_pid.reset()
-        self.pid_last_update = time.time()
-        self.hotspot_entry_time = time.time()
+        # Same clock as the hotspot loop's `now` (perf_counter) for the
+        # acquisition-grace window.
+        self.hotspot_entry_time = time.perf_counter()
         self.hotspot_status = "acquiring"
         print("HOTSPOT: engaged - acquiring...")
 
@@ -1781,14 +1794,20 @@ class JoystickModeState:
         self.azm_pid.set_feed_forward_rate(0.0)
         self.alt_pid.set_feed_forward_rate(0.0)
 
-        # Grab the latest raw frame from the configured tracking camera.
+        # Grab the latest raw frame from the configured tracking camera,
+        # with its seq and exposure-midpoint stamp (tear-free protocol).
         cam_index = int(getattr(cfg, 'hotspot_camera_index', 0))
         camera = camera_manager.get_camera(cam_index)
         raw = None
         frame_seq = None
+        frame_time = None
         if camera is not None and getattr(camera, 'thread', None) is not None:
-            raw = camera.thread.get_latest_raw()
-            frame_seq = getattr(camera.thread, 'latest_raw_seq', None)
+            thread = camera.thread
+            if hasattr(thread, 'get_latest_raw_with_meta'):
+                raw, frame_seq, frame_time = thread.get_latest_raw_with_meta()
+            else:
+                raw = thread.get_latest_raw()
+                frame_seq = getattr(thread, 'latest_raw_seq', None)
 
         # Stale-frame gate: with real exposures longer than the control period
         # the same frame stays "latest" across several cycles. Re-detecting it
@@ -1821,17 +1840,30 @@ class JoystickModeState:
         except (ValueError, AttributeError):
             pass
 
-        now = time.time()
+        # Two timestamps, one clock (time.perf_counter() -- monotonic AND
+        # high-resolution; time.monotonic() on Windows/CPython<=3.12 has a
+        # 15.6 ms quantum): `now` is the control cycle's own time, used only
+        # for coast/grace timeouts; `frame_time` is the frame's EXPOSURE
+        # MIDPOINT, used for everything derived from the image (frame
+        # intervals, gate prediction, the star filter). Stamping
+        # image-derived quantities with pickup time instead aliased the
+        # control period into the measured frame interval (the correction
+        # cap jittered +/-50%) and injected frame-age jitter into the star
+        # filter's implied rates.
+        now = time.perf_counter()
+        if frame_time is None:
+            frame_time = now
 
         # Measured fresh-frame interval (hit OR miss): gate prediction and the
         # correction-rate cap are sized to it, so the loop never outruns its
-        # own measurements.
-        elapsed_since_fresh = 0.0
+        # own measurements. Midpoint-to-midpoint, i.e. the camera's true
+        # cadence, not the loop's observation cadence.
         if raw is not None:
             if self._hotspot_last_fresh_time > 0.0:
-                elapsed_since_fresh = max(0.0, now - self._hotspot_last_fresh_time)
-                self._hotspot_frame_interval = max(0.05, min(2.0, elapsed_since_fresh))
-            self._hotspot_last_fresh_time = now
+                interval = frame_time - self._hotspot_last_fresh_time
+                if interval > 0.0:
+                    self._hotspot_frame_interval = max(0.05, min(2.0, interval))
+            self._hotspot_last_fresh_time = frame_time
 
         detection = None
         if raw is not None:
@@ -1853,8 +1885,10 @@ class JoystickModeState:
                 az_dps, alt_dps = getattr(self, '_hotspot_corr_dps', (0.0, 0.0))
                 # Predict from the frame the gate was anchored on (the last
                 # detection) -- missed frames in between extend the span, and
-                # the commanded rate has been held constant since then.
-                gate_dt = max(0.0, now - getattr(self, '_hotspot_gate_time', now))
+                # the commanded rate has been held constant since then. Both
+                # endpoints are exposure midpoints, so the span is the true
+                # boresight-motion interval between the two images.
+                gate_dt = max(0.0, frame_time - getattr(self, '_hotspot_gate_time', frame_time))
                 if gate_dt > 0.0 and (az_dps or alt_dps):
                     el_sky_dps = (-alt_dps
                                   if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
@@ -1900,7 +1934,7 @@ class JoystickModeState:
                            if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz'
                            else current_alt)
             verdict, reason = self._detection_rate_filter(
-                detection.cx, detection.cy, now,
+                detection.cx, detection.cy, frame_time,
                 f"camera{cam_index + 1}", el_sky_gate)
             # None = filter warming up: HOTSPOT must keep commanding, so an
             # unverifiable detection is accepted (HANDOFF already verified
@@ -1958,17 +1992,18 @@ class JoystickModeState:
             if getattr(cfg, 'mount_mode', 'Eq') == 'AltAz':
                 el_error = -el_error
 
-            # Drive the mount to null the optical error using the shared PID.
-            current_time = now
+            # Drive the mount to null the optical error using the shared PID
+            # (self-timed on monotonic; see program_track).
             az_pid_output, az_rate_cmd = self.azm_pid.get_current_rates(
-                az_error, current_time - self.pid_last_update, measurement_degrees=current_azm)
+                az_error, measurement_degrees=current_azm)
             el_pid_output, el_rate_cmd = self.alt_pid.get_current_rates(
-                el_error, current_time - self.pid_last_update, measurement_degrees=current_alt)
-            self.pid_last_update = current_time
+                el_error, measurement_degrees=current_alt)
 
-            # Update lock state and diagnostics.
+            # Update lock state and diagnostics. The gate anchors on the
+            # detection frame's exposure midpoint; the coast timer runs on
+            # the loop clock.
             self.hotspot_gate_center = (detection.cx, detection.cy)
-            self._hotspot_gate_time = now
+            self._hotspot_gate_time = frame_time
             self.hotspot_centroid = (detection.cx, detection.cy)
             self.hotspot_snr = detection.snr
             self.hotspot_acquired = True
@@ -2149,9 +2184,12 @@ class JoystickModeState:
         except (TypeError, ValueError):
             target_azm = target_alt = 0.0
 
-        now = time.time()
+        # Monotonic (perf_counter), matching the Rust adapter's _service_park
+        # mirror in spirit: an NTP step on wall time could spuriously time
+        # out (or extend) a park slew.
+        now = time.perf_counter()
         if self._park_state is None:
-            self._park_state = {'start': now, 'last_cmd': 0.0}
+            self._park_state = {'start': now, 'last_cmd': now - self.PARK_REISSUE_SEC}
             if self.update_status_callback:
                 self.update_status_callback(
                     f"Parking to AZM {target_azm:.1f}° / ALT {target_alt:.1f}°...")
@@ -2361,12 +2399,6 @@ class JoystickModeState:
                 print("No cameras available for capture")
 
     # Helper methods to get states from global scope - removed to avoid circular import
-
-    def update_polar_plot_time(self):
-        """Update current time for polar plot"""
-        if not self.ts:
-            self.ts = load.timescale()
-        self.current_tt = self.ts.now().tt
 
 
 # ---------------------------------------------------------------------------

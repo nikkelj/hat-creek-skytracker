@@ -71,16 +71,20 @@ fn azalt_to_azel_zenith_alignment() {
 
 #[test]
 fn sky_to_mount_modes() {
-    // AltAz and Passthrough match their dedicated functions.
+    // AltAz and Passthrough match their dedicated functions. (The final bool
+    // is the AltAz-Side flip flag; irrelevant to these modes.)
     assert_eq!(
-        sky_to_mount(MountMode::AltAz, 100.0, 40.0, 10.0, 2.0),
+        sky_to_mount(MountMode::AltAz, 100.0, 40.0, 10.0, 2.0, false),
         az_el_to_az_alt_altaz(100.0, 40.0, 10.0, 2.0)
     );
     assert_eq!(
-        sky_to_mount(MountMode::Passthrough, 100.0, 40.0, 10.0, 2.0),
+        sky_to_mount(MountMode::Passthrough, 100.0, 40.0, 10.0, 2.0, false),
         (100.0, 40.0)
     );
     // Eq returns (azm, alt) = reordered local_elev_az_to_telescope.
     let (alt, azm) = local_elev_az_to_telescope(40.0, 100.0, 2.0);
-    assert_eq!(sky_to_mount(MountMode::Eq, 100.0, 40.0, 10.0, 2.0), (azm, alt));
+    assert_eq!(
+        sky_to_mount(MountMode::Eq, 100.0, 40.0, 10.0, 2.0, false),
+        (azm, alt)
+    );
 }

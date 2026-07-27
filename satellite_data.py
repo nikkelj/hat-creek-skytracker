@@ -75,6 +75,25 @@ def load_satellite_data(state, update_status_callback=None):
             update_status_callback(f"TLEs ready ({len(state.satellites)} satellites)")
         state.tle_loaded = True
 
+        # TLE element-set staleness: the cache-file mtime only says when the
+        # FILE was downloaded -- the elements inside carry their own epochs,
+        # and SGP4 along-track error grows ~1-3 km/day past epoch. Surface a
+        # warning when the median element age is large so a stale set isn't
+        # mistaken for fresh just because the download succeeded.
+        try:
+            ts = load.timescale()
+            now_tt = ts.now().tt
+            ages = sorted(now_tt - sat.model.jdsatepoch - sat.model.jdsatepochF
+                          for sat in state.satellites)
+            if ages:
+                median_age_days = ages[len(ages) // 2]
+                if median_age_days > 3.0 and update_status_callback:
+                    update_status_callback(
+                        f"WARNING: median TLE epoch age {median_age_days:.1f} days"
+                        " - expect degraded prediction accuracy")
+        except Exception:
+            pass
+
     except Exception as e:
         if update_status_callback:
             update_status_callback(f"Error loading TLEs: {str(e)}")

@@ -156,6 +156,11 @@ pub struct Frame {
     pub h: usize,
     pub w: usize,
     pub seq: u64,
+    /// Exposure-midpoint estimate on the loop clock (Shared.epoch seconds).
+    /// Image-derived timing (frame intervals, gate prediction, the star
+    /// filter) uses THIS, not the cycle's `now` -- pickup-time stamping
+    /// aliases the control period into those measurements.
+    pub time: f64,
 }
 
 /// What the loop wants done this cycle. `None` rate = leave the axis as-is
@@ -221,7 +226,10 @@ fn detect_in_frame(
 pub struct LoopState {
     pub azm_pid: PidController,
     pub alt_pid: PidController,
-    pid_last_update: f64,
+    // None until the first control cycle (0.0 is a legal timestamp here: the
+    // loop clock is monotonic seconds since spawn, so a magic-zero sentinel
+    // would be indistinguishable from a genuine early cycle).
+    pid_last_update: Option<f64>,
 
     // STANDBY one-shot stop guard.
     standby_stopped: bool,
@@ -231,7 +239,10 @@ pub struct LoopState {
     hotspot_gate_center: Option<(f64, f64)>,
     hotspot_acquired: bool,
     hotspot_miss_count: u32,
-    hotspot_last_detection_time: f64,
+    // None until a real detection: with the monotonic-since-spawn loop clock,
+    // a 0.0 sentinel made HOTSPOT engaged within the first coast_time_s of
+    // loop life report "coasting" on a lock that was never acquired.
+    hotspot_last_detection_time: Option<f64>,
     hotspot_entry_time: f64,
     hotspot_last_frame_seq: Option<u64>,
     // Fresh-frame arrival time + measured camera cadence (sec) — corrections
@@ -275,13 +286,13 @@ impl LoopState {
         LoopState {
             azm_pid: PidController::new(1.0, 0.0, 0.0, "AZM".to_string(), false),
             alt_pid: PidController::new(1.0, 0.0, 0.0, "ALT".to_string(), false),
-            pid_last_update: 0.0,
+            pid_last_update: None,
             standby_stopped: false,
             prev_mode: None,
             hotspot_gate_center: None,
             hotspot_acquired: false,
             hotspot_miss_count: 0,
-            hotspot_last_detection_time: 0.0,
+            hotspot_last_detection_time: None,
             hotspot_entry_time: 0.0,
             hotspot_last_frame_seq: None,
             hotspot_last_fresh_time: 0.0,
@@ -310,12 +321,13 @@ impl LoopState {
     }
 
     fn dt(&mut self, now: f64) -> f64 {
-        let dt = if self.pid_last_update == 0.0 {
-            0.1
-        } else {
-            now - self.pid_last_update
+        // The upper clamp lives in PidController::compute_pid_output
+        // (pid::DT_MAX_SECONDS), matching the Python side.
+        let dt = match self.pid_last_update {
+            None => 0.1,
+            Some(last) => now - last,
         };
-        self.pid_last_update = now;
+        self.pid_last_update = Some(now);
         dt
     }
 
@@ -356,7 +368,7 @@ impl LoopState {
                     self.hotspot_gate_center = None;
                     self.hotspot_acquired = false;
                     self.hotspot_miss_count = 0;
-                    self.hotspot_last_detection_time = 0.0;
+                    self.hotspot_last_detection_time = None;
                     self.hotspot_entry_time = now;
                     self.hotspot_last_frame_seq = None;
                     self.hotspot_last_fresh_time = 0.0;
@@ -365,6 +377,12 @@ impl LoopState {
                     self.hotspot_corr_dps = (0.0, 0.0);
                     self.hotspot_gate_time = 0.0;
                     self.track_candidates.clear();
+                    // Parity with _enter_hotspot_mode (joystick_controller.py):
+                    // fresh PID state + a fresh dt epoch on engagement, so the
+                    // first cycle can't integrate whatever gap preceded it.
+                    self.azm_pid.reset();
+                    self.alt_pid.reset();
+                    self.pid_last_update = None;
                 }
                 Mode::Handoff => {
                     self.handoff_detection_count = 0;
@@ -686,6 +704,8 @@ impl LoopState {
             out.handoff_detection_count = self.handoff_detection_count;
             return;
         }
+        // Image epoch for the star filter: the frame's exposure midpoint.
+        let frame_time = frame.map(|f| f.time).unwrap_or(now);
 
         let need = inputs.handoff_min_frames.max(1);
         match detect_in_frame(frame, &inputs.hotspot, None) {
@@ -697,8 +717,9 @@ impl LoopState {
                 } else {
                     current_alt
                 };
-                match self.detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, now)
-                {
+                match self.detection_rate_verdict(
+                    &d, inputs, current_azm, current_alt, el_sky, frame_time,
+                ) {
                     Some(true) => {
                         self.handoff_detection_count += 1;
                         out.hotspot_status = "detecting";
@@ -779,16 +800,22 @@ impl LoopState {
             }
         }
         let frame = if frame_is_stale { None } else { frame };
+        // This cycle's image epoch: the frame's exposure midpoint (falls back
+        // to `now` only when there is no fresh frame to reason about).
+        let frame_time = frame.map(|f| f.time).unwrap_or(now);
 
         // Measured fresh-frame interval (hit OR miss): gate prediction and the
         // correction-rate cap are sized to it, so the loop never outruns its
-        // own measurements. Mirrors hotspot_track.
+        // own measurements. Midpoint-to-midpoint (the camera's true cadence),
+        // not observation-to-observation. Mirrors hotspot_track.
         if frame.is_some() {
             if self.hotspot_last_fresh_time > 0.0 {
-                self.hotspot_frame_interval =
-                    (now - self.hotspot_last_fresh_time).clamp(0.05, 2.0);
+                let interval = frame_time - self.hotspot_last_fresh_time;
+                if interval > 0.0 {
+                    self.hotspot_frame_interval = interval.clamp(0.05, 2.0);
+                }
             }
-            self.hotspot_last_fresh_time = now;
+            self.hotspot_last_fresh_time = frame_time;
         }
 
         // The optical geometry needs the SKY elevation (azimuth compresses by
@@ -814,7 +841,9 @@ impl LoopState {
             // Predicting with the total slid the gate off a well-tracked
             // fast target at the full feed-forward rate.
             let (az_dps, alt_dps) = self.hotspot_corr_dps;
-            let gate_dt = (now - self.hotspot_gate_time).max(0.0);
+            // Anchor-frame midpoint -> this frame's midpoint: the true span
+            // of boresight motion between the two images.
+            let gate_dt = (frame_time - self.hotspot_gate_time).max(0.0);
             let (mut gx, mut gy) = (cx, cy);
             if gate_dt > 0.0 && (az_dps != 0.0 || alt_dps != 0.0) {
                 let el_sky_dps = if inputs.mount_mode == MountMode::AltAz {
@@ -850,7 +879,10 @@ impl LoopState {
         // promoting -- only an explicit mismatch demotes to a miss.
         let detection = match detection {
             Some(d) => {
-                if self.detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, now)
+                // Candidates are stamped with the frame midpoint so the
+                // filter's implied rates measure image-to-image motion.
+                if self
+                    .detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, frame_time)
                     == Some(false)
                 {
                     out.hotspot_status = "star-reject";
@@ -952,10 +984,12 @@ impl LoopState {
             self.hotspot_cmd_dps = (az_total * 360.0, al_total * 360.0);
 
             self.hotspot_gate_center = Some((det.cx, det.cy));
-            self.hotspot_gate_time = now;
+            // Gate anchors on the detection frame's exposure midpoint; the
+            // coast timer (hotspot_last_detection_time) runs on the loop clock.
+            self.hotspot_gate_time = frame_time;
             self.hotspot_acquired = true;
             self.hotspot_miss_count = 0;
-            self.hotspot_last_detection_time = now;
+            self.hotspot_last_detection_time = Some(now);
 
             out.azm_error = az_error;
             out.alt_error = el_error;
@@ -1002,11 +1036,14 @@ impl LoopState {
 
         if self.hotspot_acquired {
             // Coast: leave the last continuous slew running (no new command)
-            // through a brief dropout before declaring the lock lost.
-            if now - self.hotspot_last_detection_time < hp.coast_time_s {
-                out.hotspot_status = "coasting";
-                out.hotspot_acquired = true;
-                return;
+            // through a brief dropout before declaring the lock lost. Only a
+            // real prior detection can coast (None = never locked).
+            if let Some(last_det) = self.hotspot_last_detection_time {
+                if now - last_det < hp.coast_time_s {
+                    out.hotspot_status = "coasting";
+                    out.hotspot_acquired = true;
+                    return;
+                }
             }
         } else if now - self.hotspot_entry_time < hp.coast_time_s.max(1.0) {
             // Acquisition grace: just entered HOTSPOT (manual or handed off). Give

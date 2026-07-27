@@ -110,7 +110,11 @@ class Aircraft:
         self.callsign = ""
         # Rolling history of observed fixes: dicts {tt, lat, lon, alt_m}.
         self.history = deque()
-        self.last_seen = 0.0          # wall-clock time of last update (for pruning)
+        self.last_seen = 0.0          # perf_counter time of last update (for
+                                      # pruning; monotonic so an NTP wall-clock
+                                      # step can't mass-prune, and high-res --
+                                      # Windows time.monotonic() has a 15.6 ms
+                                      # quantum on CPython<=3.12)
         self.last_fix_tt = None       # TT of last positional fix
         # Latest decoded scalar fields (for the info panel).
         self.lat = None
@@ -174,7 +178,7 @@ class AdsbTracker:
         ac.lat, ac.lon, ac.alt_m = lat, lon, alt_m
         ac.history.append({"tt": tt, "lat": lat, "lon": lon, "alt_m": alt_m})
         ac.last_fix_tt = tt
-        ac.last_seen = time.time()
+        ac.last_seen = time.perf_counter()
         ac.dirty = True
         self._trim_history(ac)
 
@@ -186,13 +190,13 @@ class AdsbTracker:
             ac.track_deg = track_deg
         if vert_rate is not None:
             ac.vert_rate = vert_rate
-        ac.last_seen = time.time()
+        ac.last_seen = time.perf_counter()
 
     def ingest_identification(self, icao, callsign):
         ac = self._get(icao)
         if callsign:
             ac.callsign = callsign
-        ac.last_seen = time.time()
+        ac.last_seen = time.perf_counter()
 
     def _trim_history(self, ac):
         keep = self._history_seconds()
@@ -253,14 +257,14 @@ class AdsbTracker:
                 ac.dirty = True
 
         obs = self._observer()
-        now_wall = time.time()
+        now_mono = time.perf_counter()
         timeout = self._stale_timeout()
 
         trajectories = dict(getattr(self.tvs, "aircraft_trajectories", {}) or {})
         positions = {}
 
         for icao, ac in list(self.aircraft.items()):
-            if timeout > 0 and (now_wall - ac.last_seen) > timeout:
+            if timeout > 0 and (now_mono - ac.last_seen) > timeout:
                 self.aircraft.pop(icao, None)
                 trajectories.pop(icao, None)
                 if getattr(self.tvs, "selected_aircraft", None) == icao:

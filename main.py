@@ -385,7 +385,8 @@ while running:
         start_precompute_worker(current_utc, duration_minutes_auto, observer)
         last_trajectory_update = current_time
 
-    # Compute satellite positions at 10 Hz
+    # Compute satellite positions at the update_interval rate (30 Hz target;
+    # see the update_interval definition above)
     if current_time - last_update_time >= update_interval:
         # Thread-safety here comes from atomic dict rebinds (see NOTE below),
         # not from a lock: the position_update_lock that used to wrap this
@@ -416,7 +417,10 @@ while running:
                 fraction = (current_tt - tracking_vis_state.t0.tt) / (tracking_vis_state.t1.tt - tracking_vis_state.t0.tt)
                 display.slider_rect.x = display.scroll_bar_rect.x + int(fraction * (display.scroll_bar_rect.width - display.slider_rect.width))
 
-        # Update the current time in the state for use by other components (like PROGRAM tracking)
+        # Publish the TRACKING CLOCK for the visualization surfaces (render
+        # threads, Mount 3D, overlays, readouts). The control loops do NOT
+        # read this -- they interpolate at trajectory.live_tt() -- so pausing
+        # or scrubbing rewinds the scene, never the mount.
         tracking_vis_state.current_tt = current_tt
 
         # Use state-direct mutation approach for satellite position updates
@@ -874,8 +878,10 @@ while running:
         if hasattr(tracking_vis_state, 'selected_launch') and tracking_vis_state.selected_launch:
             # Display launch elapsed time above button
             if hasattr(tracking_vis_state, 'launch_start_time') and tracking_vis_state.launch_start_time and tracking_vis_state.launch_launched:
-                # Convert TT difference to seconds for display
-                elapsed_seconds = (ts.now().tt - tracking_vis_state.launch_start_time) * 86400  # TT is in days, convert to seconds
+                # Tracking clock, not wall clock: the drawn rocket follows
+                # current_tt, so the T+ readout must too or they disagree
+                # while paused/scrubbing. (TT is in days -> seconds.)
+                elapsed_seconds = (current_tt - tracking_vis_state.launch_start_time) * 86400
                 elapsed_text = f"{elapsed_seconds:.1f}s"
                 elapsed_surface = display.small_font.render(elapsed_text, True, (0, 255, 0))  # Green text
                 display.menu_screen.blit(elapsed_surface, (display.launch_button.x + display.launch_button.width // 2 - elapsed_surface.get_width() // 2, display.launch_button.y - 20))
@@ -962,8 +968,8 @@ while running:
 
             # Display launch elapsed time above button
             if hasattr(tracking_vis_state, 'launch_start_time') and tracking_vis_state.launch_start_time and tracking_vis_state.launch_launched:
-                # Convert TT difference to seconds for display
-                elapsed_seconds = (ts.now().tt - tracking_vis_state.launch_start_time) * 86400  # TT is in days, convert to seconds
+                # Tracking clock, not wall clock -- see the main launch button.
+                elapsed_seconds = (current_tt - tracking_vis_state.launch_start_time) * 86400
                 elapsed_text = f"{elapsed_seconds:.1f}s"
                 elapsed_surface = display.small_font.render(elapsed_text, True, (0, 255, 0))  # Green text
                 display.menu_screen.blit(elapsed_surface, (joystick_launch_button.x + joystick_launch_button.width // 2 - elapsed_surface.get_width() // 2, joystick_launch_button.y - 20))

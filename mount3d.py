@@ -570,11 +570,14 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     R, cam, focal = _camera(m3d, config_state, w, h)
     f = _config_floats(config_state)
 
-    current_tt = getattr(tracking_vis_state, 'current_tt', None) \
-        if tracking_vis_state is not None else None
-    if current_tt is None and ts is not None:
+    # Shared tracking-clock policy (slider / paused / live, with the
+    # unset-guard) -- one implementation, so this can't drift from the
+    # render threads' notion of scene time.
+    current_tt = None
+    if ts is not None:
         try:
-            current_tt = ts.now().tt
+            from rendering_threads import render_time_tt
+            current_tt = render_time_tt(tracking_vis_state, ts)
         except Exception:
             current_tt = None
 
@@ -646,8 +649,8 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         except Exception as e:
             print(f"Mount3D starfield error: {e}")
 
-    # Satellites (+ aircraft): nearest trajectory sample; cols 1/2 are sky
-    # el/az (cols 4/5 are baked polar-plot pixels -- never those).
+    # Satellites (+ aircraft): interpolated trajectory position; cols 1/2 are
+    # sky el/az (cols 4/5 are baked polar-plot pixels -- never those).
     def draw_traj_markers(positions, trajectories, selected, color):
         if not positions or not trajectories or current_tt is None:
             return
@@ -659,8 +662,18 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
             rows, times = traj[0], traj[1]
             if len(rows) == 0 or len(times) == 0:
                 continue
-            i = int(np.clip(np.searchsorted(times, current_tt), 0, len(rows) - 1))
-            el_s, az_s = float(rows[i][1]), float(rows[i][2])
+            # searchsorted returns the sample AFTER current_tt; every other
+            # interpolation site subtracts 1 and blends. Snapping to the next
+            # sample made Mount 3D lead the skyplot by up to one 30 s sample.
+            i = int(np.clip(np.searchsorted(times, current_tt) - 1, 0, len(rows) - 1))
+            if i < len(rows) - 1 and times[i + 1] > times[i]:
+                frac = (current_tt - times[i]) / (times[i + 1] - times[i])
+                frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+                el_s = float(rows[i][1]) + frac * (float(rows[i + 1][1]) - float(rows[i][1]))
+                d_az = ((float(rows[i + 1][2]) - float(rows[i][2]) + 180.0) % 360.0) - 180.0
+                az_s = (float(rows[i][2]) + frac * d_az) % 360.0
+            else:
+                el_s, az_s = float(rows[i][1]), float(rows[i][2])
             if el_s <= 0.0:
                 continue
             d = unit_from_azel(az_s, el_s)

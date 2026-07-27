@@ -234,7 +234,7 @@ class HandoffFramePushTests(unittest.TestCase):
             def set_hotspot_params(self, *a):
                 calls.append(("params",))
 
-            def push_frame(self, arr):
+            def push_frame(self, arr, age_s=None):
                 calls.append(("frame", arr.shape, str(arr.dtype)))
 
         adapter.loop = FakeLoop()

@@ -42,13 +42,15 @@ class TestStarCatalogFastPath(unittest.TestCase):
         t0 = self.ts.utc(2026, 6, 17, 5, 0, 0)
         # Prime the anchor at t0.
         self.cat._project(LAT, LON, ELEV, self.ts, t0.tt)
-        anchor_tt = self.cat._anchor_tt
+        anchor_tt = self.cat._anchors[-1]['tt']
         self.assertAlmostEqual(anchor_tt, t0.tt, places=9)
+        n_anchors = len(self.cat._anchors)
 
         t1 = self.ts.utc(2026, 6, 17, 5, 5, 0)  # +300 s, still within ANCHOR_MAX_AGE_SEC
         az_fast, el_fast = self.cat._project(LAT, LON, ELEV, self.ts, t1.tt)
         # Confirm it did NOT re-anchor (still the fast path).
-        self.assertAlmostEqual(self.cat._anchor_tt, t0.tt, places=9)
+        self.assertAlmostEqual(self.cat._anchors[-1]['tt'], t0.tt, places=9)
+        self.assertEqual(len(self.cat._anchors), n_anchors)
 
         # Independent Skyfield truth for the same bright subset.
         alt, az, _ = (self.eph['earth'] + wgs84.latlon(LAT, LON, elevation_m=ELEV)).at(t1) \

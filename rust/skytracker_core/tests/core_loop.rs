@@ -152,6 +152,7 @@ fn handoff_promotion_request_is_latched_until_mode_applied() {
         h: 64,
         w: 64,
         seq: 1,
+        time: 0.0,
     }));
 
     let mut now = 0.0;
@@ -166,6 +167,7 @@ fn handoff_promotion_request_is_latched_until_mode_applied() {
                 h: f.h,
                 w: f.w,
                 seq,
+                time: now,
             });
         }
         mount.io.responder.advance_time(0.1);

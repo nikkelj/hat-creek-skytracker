@@ -437,8 +437,10 @@ def local_elev_az_to_telescope(el_local_deg, az_local_deg, lat_deg=45.0):
     
     return alt_tel_deg, az_tel_deg
 
-# Equatorial coordinates from local horizontal
-def altaz_local_to_radec(el_deg, az_deg, lat_deg=45.0, lst_hours=17.89):
+# Equatorial coordinates from local horizontal. lat_deg and lst_hours are
+# REQUIRED: the old defaults (45.0, 17.89) were a test fixture's values, and
+# any caller omitting them would silently get plausible garbage for their site.
+def altaz_local_to_radec(el_deg, az_deg, lat_deg, lst_hours):
     el = np.deg2rad(el_deg)
     az = np.deg2rad(az_deg)
     lat = np.deg2rad(lat_deg)

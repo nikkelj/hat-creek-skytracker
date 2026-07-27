@@ -216,7 +216,12 @@ class SimMount:
         # integrator so the focus read-back tracks the trigger commands.
         self.focus_true_deg = 0.0
         self._focus_rate_dps = 0.0
-        self._last_t = time.time()
+        # perf_counter: monotonic (an NTP/wall-clock step would otherwise
+        # freeze or teleport the simulated mount mid-run) and high-resolution
+        # (Windows time.monotonic() has a 15.6 ms quantum on CPython<=3.12,
+        # which would quantize the physics dt). Same clock as the exposure
+        # model in SimCap.
+        self._last_t = time.perf_counter()
         self._t0 = self._last_t
         self._lock = threading.RLock()
         self._rng = rng if rng is not None else np.random.default_rng()
@@ -252,7 +257,7 @@ class SimMount:
         return math.hypot(self._az_rate_dps, self._el_rate_dps)
 
     def _advance(self):
-        now = time.time()
+        now = time.perf_counter()
         dt = now - self._last_t
         self._last_t = now
         if dt <= 0:
@@ -753,9 +758,19 @@ class HardwareSimulator:
         return 0.0, 0.0, None, False
 
     # --- render a full sensor frame for a camera (mono uint8) ---
-    def render_frame(self, cam_index):
+    def render_frame(self, cam_index, exposure_us=None):
         cfg = self.config_state
         s = self._sim()
+
+        # Integrate the mount physics up to NOW before reading its pose. The
+        # mount advances lazily (only inside the serial handlers), and this
+        # runs on the camera thread: without an advance the rendered boresight
+        # is the pose as of the last serial poll (up to a control period old)
+        # while the target below is placed at fresh time -- a systematically
+        # signed pixel bias (~rate x poll age) that the HOTSPOT integrator
+        # nulls out, baking a sim-only artifact into any gains tuned here.
+        with self.mount._lock:
+            self.mount._advance()
         w = int(s.get('cam_width', 960))
         h = int(s.get('cam_height', 720))
         frame = np.zeros((h, w), dtype=np.float32)
@@ -845,7 +860,14 @@ class HardwareSimulator:
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 
         brightness = float(s.get('target_brightness', 200.0))
-        exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
+        # Prefer the LIVE exposure the capture object is pacing with
+        # (set_control_value); config_state.camera_configs only updates on an
+        # explicit save, so after a slider change the frame cadence and the
+        # streak lengths would disagree.
+        if exposure_us is not None:
+            exposure_s = max(1e-4, float(exposure_us) / 1e6)
+        else:
+            exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
 
         # Star field (streaked by mount motion during the exposure).
         ifd = ifov_deg(pix, foc)
@@ -1015,7 +1037,8 @@ class SimCap:
         # any render failure here is logged (so the real cause is visible) and we still
         # return a valid background frame, keeping the feed alive.
         try:
-            frame = self.simulator.render_frame(self.cam_index)
+            frame = self.simulator.render_frame(self.cam_index,
+                                                exposure_us=self._exposure_us)
         except Exception as e:
             import traceback
             print(f"SimCap render_frame error (cam {self.cam_index}): {e}")

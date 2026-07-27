@@ -1895,9 +1895,12 @@ def _plate_solve_worker(joystick_state):
                 continue
 
             # Snapshot the encoder position and time paired with this frame.
+            # The time is the FRAME's exposure stamp (sky rotates ~15 arcsec/s;
+            # now() would bias the solve by the frame's age).
             mount_azm = joystick_state.current_azm_raw
             mount_alt = joystick_state.current_alt_raw
-            t = ts.now()
+            from alignment import frame_skyfield_time
+            t = frame_skyfield_time(camera, ts)
 
             result = solver.solve(raw)
             if result is None or not result.solved:

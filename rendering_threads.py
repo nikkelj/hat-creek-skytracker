@@ -149,13 +149,15 @@ def draw_keepout_overlay_on_surface(surface, config_state, cx, cy, radius):
 def render_time_tt(tracking_vis_state, ts):
     """The TT time the render threads must draw the sky at.
 
-    main.py maintains tracking_vis_state.current_tt at 10 Hz as the app's
-    single tracking clock: the slider position while scrubbing, paused_tt
-    while paused, live now otherwise. The render threads must use IT -- not
-    wall-clock now -- or the starfield and launch overlays freeze at real
-    time while the satellites (positioned from current_tt in main.py) follow
-    the slider. Falls back to live now only before the first 10 Hz tick
-    (current_tt unset/0.0; real TT Julian dates are ~2.4e6)."""
+    main.py maintains tracking_vis_state.current_tt (at its ~30 Hz update
+    cadence) as the app's single tracking clock: the slider position while
+    scrubbing, paused_tt while paused, live now otherwise. The render threads
+    must use IT -- not wall-clock now -- or the starfield and launch overlays
+    freeze at real time while the satellites (positioned from current_tt in
+    main.py) follow the slider. Falls back to live now only before the first
+    tick (current_tt unset/0.0; real TT Julian dates are ~2.4e6). Note this
+    is a VISUALIZATION clock only: the control loops interpolate their
+    setpoints at trajectory.live_tt() and ignore it."""
     tt = float(getattr(tracking_vis_state, 'current_tt', 0.0) or 0.0)
     if tt > 2400000.0:
         return tt
@@ -413,15 +415,22 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
         if state.selected_satellite in state.satellite_trajectories and state.satellite_trajectories[state.selected_satellite]:
             trajectory_data, times_array = state.satellite_trajectories[state.selected_satellite]
 
-            # Use cached sunlit status for performance optimization
+            # Use cached sunlit status for performance optimization. The cache
+            # is index-parallel to times_array; a length mismatch means the
+            # trajectory was re-gridded under us (fine recompute) -- rebuild.
             sat_name = state.selected_satellite.name
+            _cached_sunlit = state.sunlit_status_cache.get(sat_name)
+            if _cached_sunlit is not None and len(_cached_sunlit) != len(times_array):
+                state.sunlit_status_cache.pop(sat_name, None)
             if sat_name not in state.sunlit_status_cache:
                 # Compute sunlit status and cache it
                 try:
-                    # Create Skyfield Time objects for current trajectory times
-                    state.sunlit_status_cache[sat_name] = []
-                    for tt_time in times_array:
-                        state.sunlit_status_cache[sat_name].append(state.selected_satellite.at(ts.tt(jd=tt_time)).is_sunlit(state.ephemeris))
+                    # One vectorized Skyfield call over the whole time grid
+                    # (a per-sample Python loop here cost ~100x on the render
+                    # thread; ts.tt(jd=) is also deprecated in Skyfield).
+                    t_vec = ts.tt_jd(np.asarray(times_array, dtype=float))
+                    sunlit = state.selected_satellite.at(t_vec).is_sunlit(state.ephemeris)
+                    state.sunlit_status_cache[sat_name] = list(np.atleast_1d(sunlit))
 
                 except Exception as e:
                     # Fallback if sunlit calculation fails
@@ -490,7 +499,12 @@ def draw_polar_plot_on_surface(surface, config_state, ts, current_tt, state, dis
 
         else:
             # Fallback: draw basic arc segments without sunlit detection when no trajectory data available
-            for x0, y0, x1, y1, color in state.satellite_arc_segments[state.selected_satellite]:
+            for seg in state.satellite_arc_segments[state.selected_satellite]:
+                x0, y0, x1, y1, color = seg[:5]
+                if len(seg) >= 6 and current_tt:
+                    # Recolor against the tracking clock so the arcs follow
+                    # the time slider instead of the baked window-start split.
+                    color = (255, 0, 0) if seg[5] > current_tt else (128, 128, 128)
                 # Apply coordinate transformation to surface coordinates
                 if mode == PolarPlotMode.FULL_SCREEN:
                     # screen to surface: subtract display origin
@@ -1076,7 +1090,12 @@ def draw_launch_trajectory_on_surface(surface, state, current_tt, display_bounds
     arc_segments = state.launch_trajectories[arc_key]
 
     # Draw arc segments
-    for start_x, start_y, end_x, end_y, color in arc_segments:
+    for seg in arc_segments:
+        start_x, start_y, end_x, end_y, color = seg[:5]
+        if len(seg) >= 6 and current_tt:
+            # Recolor against the tracking clock (cyan future / gray past) so
+            # the launch arc follows the time slider.
+            color = (0, 255, 255) if seg[5] > current_tt else (128, 128, 128)
         # Apply coordinate transformation based on mode
         if mode == PolarPlotMode.FULL_SCREEN:
             # screen to surface: subtract display origin

@@ -543,22 +543,12 @@ impl SimCoreLoop {
     }
 
     /// Publish a frame (2D float32 intensity map) for HOTSPOT mode.
-    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
-        let view = image.as_array();
-        let (h, w) = (view.shape()[0], view.shape()[1]);
-        let mut data = Vec::with_capacity(h * w);
-        for i in 0..h {
-            for j in 0..w {
-                data.push(view[[i, j]]);
-            }
-        }
+    /// `age_s` back-dates the frame's timestamp to its exposure midpoint
+    /// (seconds between the midpoint and this call, measured by the caller).
+    #[pyo3(signature = (image, age_s=None))]
+    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>, age_s: Option<f64>) {
         self.frame_seq += 1;
-        *self.shared.frame.lock().unwrap() = Some(Arc::new(Frame {
-            data: Arc::new(data),
-            h,
-            w,
-            seq: self.frame_seq,
-        }));
+        h_push_frame(&self.shared, self.frame_seq, image, age_s);
     }
 
     fn submit_stop(&self) {
@@ -730,7 +720,7 @@ fn h_set_hotspot_params(
 fn h_set_output_filter(sh: &Shared, tau_seconds: f64) {
     sh.inputs.lock().unwrap().output_filter_tau = tau_seconds.max(0.0);
 }
-fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>) {
+fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>, age_s: Option<f64>) {
     let view = image.as_array();
     let (h, w) = (view.shape()[0], view.shape()[1]);
     let mut data = Vec::with_capacity(h * w);
@@ -739,11 +729,15 @@ fn h_push_frame(sh: &Shared, seq: u64, image: PyReadonlyArray2<'_, f32>) {
             data.push(view[[i, j]]);
         }
     }
+    // Stamp the frame on the loop clock, back-dated by the caller-supplied
+    // age (push time - exposure midpoint, measured on the Python side).
+    let time = sh.epoch.elapsed().as_secs_f64() - age_s.unwrap_or(0.0).max(0.0);
     *sh.frame.lock().unwrap() = Some(Arc::new(Frame {
         data: Arc::new(data),
         h,
         w,
         seq,
+        time,
     }));
 }
 fn h_submit(sh: &Shared, cmd: Command) {
@@ -993,9 +987,11 @@ impl CoreLoop {
     fn set_output_filter(&self, tau_seconds: f64) {
         h_set_output_filter(self.inner.shared(), tau_seconds);
     }
-    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>) {
+    /// `age_s`: seconds between the frame's exposure midpoint and this call.
+    #[pyo3(signature = (image, age_s=None))]
+    fn push_frame(&mut self, image: PyReadonlyArray2<'_, f32>, age_s: Option<f64>) {
         self.frame_seq += 1;
-        h_push_frame(self.inner.shared(), self.frame_seq, image);
+        h_push_frame(self.inner.shared(), self.frame_seq, image, age_s);
     }
     fn submit_stop(&self) {
         h_submit(self.inner.shared(), Command::Stop);

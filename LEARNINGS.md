@@ -6,6 +6,47 @@ Newest entries first.
 
 ---
 
+## 2026-07-27 — Project-wide timing audit: three clocks, and who may read which
+
+A full audit ("something is off" — sky objects disagreeing in time) found the
+root pattern behind a dozen bugs: the app has THREE clock domains and
+consumers were picking freely. The rules now enforced in code:
+
+* **Tracking clock** (`tracking_vis_state.current_tt`: slider / paused / live)
+  is for VISUALIZATION ONLY — starfield, overlays, arc colors, T+ readouts,
+  Mount 3D. The control loops must never read it: they interpolate setpoints
+  at `trajectory.live_tt()` (the mount cannot time-travel; pausing the UI
+  used to freeze the setpoint mid-track with feed-forward still running).
+  Pause now latches `current_tt` (not wall now), so pausing a scrubbed scene
+  doesn't snap it back to live.
+* **Wall clock** (`time.time()` / `ts.now()`) is for absolute sky time only.
+  Every dt/elapsed/timeout now runs on **`time.perf_counter()`** — the PID
+  cycle dt (which also silently DISCARDED the dt its callers passed:
+  shadowed parameter), park timeout, ADS-B pruning, sim mount physics,
+  hotspot coast. NOT `time.monotonic()`: on Windows/CPython ≤ 3.12 that is
+  GetTickCount64 with a **15.625 ms quantum** (measured here: `sleep(0.01)`
+  reads as 0.0 elapsed) — ±25% dt noise at a 15 Hz loop, and it silently
+  broke a stale-pruning test. perf_counter is QPC: equally monotonic,
+  sub-microsecond. dt is clamped to [DT_MIN, DT_MAX] in control.py AND
+  pid.rs, so the first cycle after a standby can't integrate the whole idle
+  gap (that pinned the integrator at its clip in one cycle → max-rate burst
+  on resume).
+* **Frames carry their own time**: the capture thread stamps a monotonic
+  exposure-midpoint (`latest_raw_time`, seq/payload/seq tear-free protocol;
+  Rust `Frame.time` on the shared loop epoch, back-dated by `age_s` at
+  push). Everything image-derived — hotspot frame interval, gate prediction,
+  star-filter rates, plate-solve pairing — uses frame time; pickup-time
+  stamping aliased the control period into those measurements (correction
+  cap jittered ±50%; frame-age jitter ≈ the star-filter gate itself).
+
+Repeat offenders worth remembering: 0.0 as a timestamp sentinel is safe
+under a wall clock (epoch ~1.8e9) and WRONG under a monotonic/loop clock
+(Rust "coasting on a lock never acquired") — use Option/None. Azimuth
+differences must take the short arc EVERYWHERE (rates fed a ±360°/dt
+feed-forward spike on due-north crossings). And caches keyed by less than
+what the value depends on (sunlit lists vs their time grid, trajectories vs
+observer+plot geometry) rot silently — key them fully or clear at the source.
+
 ## 2026-07-26 — The stars WERE frozen — under the time slider, not the live clock
 
 Correction to the entry below: after "verified NOT the case," the user

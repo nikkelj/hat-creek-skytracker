@@ -145,9 +145,15 @@ def handle_tracking_vis_mouse_events_state(state, event, pos, display, button_st
     elif display.pause_button.collidepoint(pos):
         button_states["pause"]["clicked"] = True
         state.paused = True
-        # Import ts at the module level for pause functionality
-        from skyfield.api import load
-        state.paused_tt = load.timescale().now().tt
+        # Freeze the tracking clock AT ITS CURRENT VALUE -- which is the
+        # slider position if the user scrubbed. Latching wall-clock now here
+        # would snap a scrubbed scene back to live time on pause.
+        cur = float(getattr(state, 'current_tt', 0.0) or 0.0)
+        if cur > 2400000.0:  # real TT Julian dates are ~2.46e6; 0/None = unset
+            state.paused_tt = cur
+        else:
+            from skyfield.api import load
+            state.paused_tt = load.timescale().now().tt
         return True
 
     elif display.play_button.collidepoint(pos):

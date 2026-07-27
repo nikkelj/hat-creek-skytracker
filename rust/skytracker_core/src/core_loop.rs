@@ -75,6 +75,10 @@ pub struct Shared {
     pub frame: Mutex<Option<Arc<Frame>>>,
     pub commands: Mutex<VecDeque<Command>>,
     pub stop: AtomicBool,
+    /// Epoch of the loop clock: every `now` inside the loop AND every
+    /// Frame.time stamped at push is `epoch.elapsed()` seconds. One shared
+    /// epoch keeps frame timestamps and loop timestamps directly comparable.
+    pub epoch: std::time::Instant,
 }
 
 impl Shared {
@@ -85,6 +89,7 @@ impl Shared {
             frame: Mutex::new(None),
             commands: Mutex::new(VecDeque::new()),
             stop: AtomicBool::new(false),
+            epoch: std::time::Instant::now(),
         })
     }
 }
@@ -295,10 +300,17 @@ impl CoreLoop {
         let handle = std::thread::Builder::new()
             .name("CoreLoop".into())
             .spawn(move || {
-                let start = Instant::now();
+                // Loop clock = the Shared epoch (same clock that stamps
+                // Frame.time at push), so frame ages are directly measurable.
+                let start = thread_shared.epoch;
                 let mut count = 0u32;
                 let mut window = Instant::now();
                 let mut consecutive_faults = 0u32;
+                // Deadline scheduling (mirrors MountControlThread.run): sleep
+                // toward an absolute next-cycle deadline so OS sleep overshoot
+                // (up to the Windows ~15.6 ms timer quantum) is repaid on the
+                // next cycle instead of accumulating into a lower actual rate.
+                let mut next_deadline = Instant::now() + period;
                 while !thread_shared.stop.load(Ordering::Relaxed) {
                     let cycle_start = Instant::now();
                     let now = start.elapsed().as_secs_f64();
@@ -359,8 +371,14 @@ impl CoreLoop {
                         count = 0;
                         window = Instant::now();
                     }
-                    if let Some(sleep) = period.checked_sub(elapsed) {
+                    if let Some(sleep) = next_deadline.checked_duration_since(Instant::now()) {
                         std::thread::sleep(sleep);
+                    }
+                    next_deadline += period;
+                    // More than a full period behind (serial stall): rebase
+                    // rather than bursting to catch up.
+                    if next_deadline < Instant::now() {
+                        next_deadline = Instant::now() + period;
                     }
                 }
                 // On shutdown, never leave the mount slewing.

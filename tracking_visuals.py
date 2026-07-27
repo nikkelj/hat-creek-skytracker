@@ -1,7 +1,7 @@
 import math
 import pygame
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from utils import get_altitude_color, draw_button
 from skyfield.api import wgs84, load
 from enum import Enum
@@ -344,7 +344,6 @@ PASS_TABLE_HEADER_SORTED_COLOR = (60, 60, 60)   # Sorted header background
 SATELLITE_NAME_MAX_LENGTH = 20     # Max length for displayed satellite names
 TIME_STRING_MILLISECONDS_PRECISION = 3   # Precision for time string milliseconds
 DEFAULT_ELEVATION_MASK_DEG = 10.0        # Default elevation mask (degrees)
-HOUR_OFFSET_PDT = 7                     # PDT offset from UTC (hours)
 
 # ==============================================================================
 # VISUALIZATION FUNCTIONS
@@ -580,8 +579,10 @@ def draw_time_display(display):
     State-direct mutation function for drawing time display.
     Takes display object directly instead of individual parameters.
     """
-    current_utc = datetime.utcnow()
-    current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
+    # System timezone via astimezone() -- a hardcoded UTC-7 was an hour wrong
+    # from November to March and arbitrarily wrong outside the Pacific.
+    current_utc = datetime.now(timezone.utc)
+    current_local = current_utc.astimezone()
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     time_text = f"UTC: {utc_time_str}  Local: {local_time_str}"
@@ -619,8 +620,9 @@ def draw_scroll_time_display(display, current_tt, ts):
     Takes display object, current_tt, and ts directly instead of individual parameters.
     """
     radius = min(display.sub_width, display.sub_height) // 2 - 50
-    current_utc = ts.tt(jd=current_tt).utc_datetime()
-    current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
+    current_utc = ts.tt_jd(current_tt).utc_datetime()
+    # System timezone (DST-correct), not a hardcoded PDT offset.
+    current_local = current_utc.astimezone()
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]
     time_text = f"Scroll UTC: {utc_time_str}  Local: {local_time_str}"

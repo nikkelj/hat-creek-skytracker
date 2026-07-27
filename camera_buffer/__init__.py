@@ -58,9 +58,9 @@ class CameraThread(threading.Thread):
         self.camera_index = camera_index
         self.camera_cap = camera_cap
         self.running = True
+        # Informational only: the capture loop free-runs at the exposure
+        # cadence -- there is deliberately no frame-rate throttle.
         self.target_fps = target_fps
-        self.frame_interval = 1.0 / target_fps
-        self.last_capture = 0
         self.capture_timeout = 5.0
         self.error_count = 0
         self.max_errors = 5
@@ -87,11 +87,19 @@ class CameraThread(threading.Thread):
         # a stale one (real exposures outlast the control period).
         self.latest_raw = None
         self.latest_raw_seq = 0
+        # time.perf_counter() estimate of the latest raw frame's EXPOSURE
+        # MIDPOINT (perf_counter: monotonic AND high-resolution -- Windows
+        # time.monotonic() has a 15.6 ms quantum on CPython<=3.12). Control
+        # loops must judge frame age / measure frame intervals against this,
+        # not against when they happened to pick the frame up -- pickup-time
+        # stamping injects control-period aliasing into the hotspot rate
+        # filter and correction cap.
+        self.latest_raw_time = None
 
         # MEMORY OPTIMIZATION: Pre-allocate frame data structure
         self._frame_data_template = {
             'frame': None,
-            'timestamp': 0,
+            'monotonic_midpoint': 0,
             'datetime_utc': '',
             'datetime_local': '',
             'camera_index': camera_index,
@@ -114,6 +122,23 @@ class CameraThread(threading.Thread):
     def get_latest_raw(self):
         """Get the most recent raw numpy frame for detection (or None)."""
         return self.latest_raw
+
+    def get_latest_raw_with_meta(self):
+        """(raw, seq, mono_midpoint) of the newest raw frame, tear-free.
+
+        The producer publishes payload first, seq last; reading in the naive
+        order (payload, then seq) can hand back frame N's pixels labelled
+        seq N+1 -- the loop then marks N+1 processed and silently drops the
+        real N+1 as stale. Read seq / payload / seq and retry on mismatch.
+        mono_midpoint is the time.perf_counter() exposure-midpoint estimate.
+        """
+        for _ in range(3):
+            seq0 = self.latest_raw_seq
+            raw = self.latest_raw
+            t = self.latest_raw_time
+            if self.latest_raw_seq == seq0:
+                return raw, seq0, t
+        return raw, self.latest_raw_seq, t
 
     def get_buffer_fps(self):
         """Get current buffer FPS"""
@@ -183,6 +208,18 @@ class CameraThread(threading.Thread):
                 return None, None
 
             frames = list(self.circular_buffer.buffer)
+            # The capture thread may have appended one more frame between the
+            # flag flip above and the snapshot; it carries
+            # sequence_in_capture == 0 (not part of this capture) yet would
+            # become end_idx, shifting the saved image set one frame against
+            # the trajectory CSV. Drop any such tail frames (only frames that
+            # EXPLICITLY carry seq 0 -- a missing key means a non-camera
+            # producer, which must not be dropped).
+            while frames and frames[-1].get('sequence_in_capture', 1) == 0:
+                frames.pop()
+            if not frames:
+                print(f"Camera {self.camera_index}: No frames captured")
+                return None, None
             capture_end_idx = len(frames) - 1
 
             # Return buffer range and metadata for dump
@@ -261,15 +298,6 @@ class CameraThread(threading.Thread):
         except Exception:
             # Silent failure to maintain speed
             return None
-
-    def calculate_fps(self):
-        """Calculate FPS - called externally to avoid main loop overhead"""
-        if time.time() - self.fps_timer >= 1.0:
-            self.fps = self.frame_counter / (time.time() - self.fps_timer)
-            self.fps_timer = time.time()
-            self.frame_counter = 0
-            return True
-        return False
 
     def _init_frame_buffers(self):
         """Pre-allocate fixed-size buffers for different ROI configurations"""
@@ -358,8 +386,6 @@ class CameraThread(threading.Thread):
         self.capture_sequence_counter = 0
 
         while self.running:
-            current_time = time.perf_counter()
-
             try:
                 if not self.camera_cap:
                     self.running = False
@@ -369,25 +395,37 @@ class CameraThread(threading.Thread):
                 capture_start_time = time.perf_counter()
                 raw_frame = self._ultra_fast_capture()
                 capture_process_time = time.perf_counter() - capture_start_time
+                # Sample the clocks HERE, immediately after readout -- not
+                # after the RGB expansion below. Sampling after processing
+                # back-dated from the wrong instant, leaving every stamp late
+                # by the full mono->RGB conversion time.
+                utc_after_capture = datetime.now(timezone.utc)
+                mono_midpoint = time.perf_counter() - max(0.0, capture_process_time) / 2.0
 
                 # Only handle frames that exist and are not timed out
                 if raw_frame is not None and raw_frame.size > 0 and capture_process_time < self.capture_timeout:
                     # Keep the raw frame available for the hot-spot detector.
+                    # Payload (array + midpoint stamp) is published BEFORE the
+                    # seq bump -- consumers rely on seq/payload/seq re-checks
+                    # (get_latest_raw_with_meta) to detect torn reads.
                     self.latest_raw = raw_frame
+                    self.latest_raw_time = mono_midpoint
                     self.latest_raw_seq += 1
                     # Process frame - minimal error handling
                     surface = self._process_raw_frame(raw_frame)
                     if surface is not None:
                         # Microsecond-precision UTC timestamp, back-dated to
                         # the exposure midpoint (see exposure_midpoint_utc).
-                        utc_now = exposure_midpoint_utc(capture_process_time)
-                        local_now = datetime.now() - timedelta(
-                            seconds=capture_process_time / 2.0)
+                        utc_now = exposure_midpoint_utc(capture_process_time,
+                                                        now=utc_after_capture)
+                        # Local display stamp, derived from the same midpoint.
+                        local_now = utc_now.astimezone().replace(tzinfo=None)
 
                         # Prepare frame data for both latest frame and buffer
                         frame_data = {
                             'frame': surface,
-                            'timestamp': current_time,
+                            # Same clock/instant as latest_raw_time.
+                            'monotonic_midpoint': mono_midpoint,
                             'datetime_utc': utc_now.isoformat(),
                             'datetime_utc_microseconds': f"{utc_now.strftime('%Y-%m-%dT%H:%M:%S')}.{utc_now.microsecond:06d}Z",
                             'datetime_local': local_now.isoformat(),

@@ -105,8 +105,9 @@ def fake_config():
 
 
 def fake_state(controller, mode, joystick=None):
-    from joystick_controller import JoystickModeState, TrackingMode
+    from joystick_controller import JoystickModeState, TrackingMode, AdaptiveRateMapper
     st = types.SimpleNamespace(
+        rate_mapper=AdaptiveRateMapper(),  # adaptive gearbox (_push_rate needs it)
         telescope_connected=True,
         telescope_controller=controller,
         update_status_callback=None,
@@ -155,6 +156,10 @@ class AdapterTests(unittest.TestCase):
             adapter.stop()
             adapter.join(timeout=2.0)
         # The mount moved under the +AZM rate and the snapshot was read back.
+        # With the adaptive gearbox a pinned stick starts at the base ceiling
+        # (step 5 = 0.5 dps) and winds up after 0.8 s, so 1.2 s pinned gives
+        # ~0.8 deg -- comfortably past the 0.5 deg threshold, but far less
+        # than the old instant step 9 (10 dps) would have.
         self.assertGreater(fm.az, 0.5, "fake mount AZM should have advanced")
         self.assertTrue(st.position_fresh)
         self.assertGreater(st.current_azm, 0.5, "read-back should reflect motion")

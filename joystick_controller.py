@@ -225,19 +225,135 @@ def joystick_center_layout(display):
 # JOYSTICK MODE STATE CLASS
 # ==============================================================================
 
-def axis_to_rate(axis_value):
-    """Map a (tared) joystick axis value to a discrete rate (-9..=9).
+def axis_to_rate(axis_value, ceiling=9):
+    """Map a (tared) joystick axis value to a discrete rate (-ceiling..=ceiling).
 
-    0 = stop; |rate| ramps from 1 at the deadband edge to 9 by ~0.9 deflection.
+    0 = stop; |rate| ramps from 1 at the deadband edge to `ceiling` by ~0.9
+    deflection, so the full stick travel always spans exactly the allowed steps.
     Extracted from the RATE_CONTROL handler so the Rust-core-loop adapter pushes
-    exactly the same mapping (single source of truth).
+    exactly the same mapping (single source of truth). The adaptive gearbox
+    (AdaptiveRateMapper) supplies the ceiling; bare calls keep the legacy full
+    1..9 range.
     """
     axis_value = max(-1.0, min(1.0, axis_value))
     if abs(axis_value) < 0.01:  # deadband
         return 0
     normalized = min((abs(axis_value) - 0.01) / (0.9 - 0.01), 1.0)
-    rate = max(1, min(9, int(math.ceil(normalized * 9))))
+    rate = max(1, min(ceiling, int(math.ceil(normalized * ceiling))))
     return rate * (1 if axis_value > 0 else -1)
+
+
+# AdaptiveRateMapper tuning. The MC_MOVE step table is ~exponential (steps 6-9
+# are 1/2/5/10 deg/s nominal), so mapping the whole 1..9 range onto the stick
+# put a 5x rate jump inside ~10% of stick travel -- one over-eager nudge and a
+# 0.5-deg-wide moon is gone. The mapper caps full deflection at BASE_CEILING
+# until the operator clearly asks for more by pinning the stick.
+JOY_BASE_CEILING = 5       # full stick = steps 1..this at first touch (~0.5 deg/s)
+JOY_MAX_CEILING = 9
+JOY_ENGAGE_DEFLECTION = 0.95   # |axis| at/above this counts as "pinned"
+JOY_RELEASE_DEFLECTION = 0.70  # below this the ceiling winds back down
+JOY_ENGAGE_DELAY_S = 0.8   # pin held this long before the first step up
+JOY_STEP_UP_S = 0.5        # per additional step while still pinned
+JOY_STEP_DOWN_S = 0.3      # per step down while backed off (faster than up)
+JOY_IDLE_RESET_S = 0.5     # stick centered this long -> snap back to base
+JOY_REVERSAL_DROP = 2      # hard direction flip (= overshoot) sheds steps
+JOY_STALE_RESET_S = 1.0    # not serviced this long (mode switch/stop) -> reset
+
+
+class AdaptiveRateMapper:
+    """Adaptive rate ceiling for RATE_CONTROL: an automatic gearbox over
+    axis_to_rate.
+
+    Full stick deflection is always safe at first touch (capped at
+    base_ceiling); holding the stick pinned deliberately for a while raises
+    the ceiling step by step to max_ceiling, and backing off / releasing /
+    reversing winds it back down. Both control loops (Python
+    _handle_rate_control and the Rust adapter's _push_rate) call through the
+    single instance on JoystickModeState, so the two paths cannot disagree.
+
+    The ceiling is shared across both axes (one "gear" the operator is in,
+    driven by the larger deflection) so diagonal moves feel consistent and
+    the UI can show a single speed indicator.
+
+    All timing is against the caller-supplied monotonic `now` (defaults to
+    time.monotonic()) so tests drive it deterministically.
+    """
+
+    def __init__(self, base_ceiling=JOY_BASE_CEILING, max_ceiling=JOY_MAX_CEILING,
+                 engage_delay_s=JOY_ENGAGE_DELAY_S):
+        self.base_ceiling = max(1, min(int(base_ceiling), 9))
+        self.max_ceiling = max(self.base_ceiling, min(int(max_ceiling), 9))
+        self.engage_delay_s = float(engage_delay_s)
+        self.ceiling = self.base_ceiling
+        self._next_step_up = None    # absolute time of the next ceiling raise
+        self._next_step_down = None  # absolute time of the next ceiling drop
+        self._idle_since = None
+        self._last_signs = [0, 0]    # last strong (|axis|>=0.5) sign per axis
+        self._last_update = None
+
+    def reset(self):
+        self.ceiling = self.base_ceiling
+        self._next_step_up = None
+        self._next_step_down = None
+        self._idle_since = None
+        self._last_signs = [0, 0]
+
+    def update(self, az_axis, alt_axis, now=None):
+        """Advance the gearbox one control cycle and map both (tared) axis
+        values to discrete rates under the current ceiling. Returns
+        (az_rate, alt_rate)."""
+        if now is None:
+            now = time.monotonic()
+        # A service gap means RATE_CONTROL wasn't active (mode switch, STOP,
+        # disconnect...): whatever gear was reached is stale context.
+        if self._last_update is not None and now - self._last_update > JOY_STALE_RESET_S:
+            self.reset()
+        self._last_update = now
+
+        # A hard direction flip on either axis almost always means "I
+        # overshot" -- shed gears immediately so the correction is gentle.
+        for idx, val in enumerate((az_axis, alt_axis)):
+            sign = 1 if val >= 0.5 else (-1 if val <= -0.5 else 0)
+            if sign and self._last_signs[idx] and sign != self._last_signs[idx]:
+                self.ceiling = max(self.base_ceiling, self.ceiling - JOY_REVERSAL_DROP)
+                self._next_step_up = None
+            if sign:
+                self._last_signs[idx] = sign
+
+        deflection = min(1.0, max(abs(az_axis), abs(alt_axis)))
+        if deflection >= JOY_ENGAGE_DEFLECTION:
+            # Pinned: wind up after the engage delay, then one step per
+            # interval. Absolute-deadline bookkeeping keeps the cadence exact
+            # regardless of the control-cycle rate.
+            self._idle_since = None
+            self._next_step_down = None
+            if self._next_step_up is None:
+                self._next_step_up = now + self.engage_delay_s
+            while self.ceiling < self.max_ceiling and now >= self._next_step_up:
+                self.ceiling += 1
+                self._next_step_up += JOY_STEP_UP_S
+        else:
+            self._next_step_up = None
+            if deflection < 0.01:  # released to center
+                if self._idle_since is None:
+                    self._idle_since = now
+                elif now - self._idle_since >= JOY_IDLE_RESET_S:
+                    self.reset()
+            else:
+                self._idle_since = None
+            if deflection < JOY_RELEASE_DEFLECTION:
+                # Backed off: wind down toward base, faster than the wind-up.
+                if self._next_step_down is None:
+                    self._next_step_down = now + JOY_STEP_DOWN_S
+                while self.ceiling > self.base_ceiling and now >= self._next_step_down:
+                    self.ceiling -= 1
+                    self._next_step_down += JOY_STEP_DOWN_S
+            else:
+                # Hysteresis band between release and engage: hold the gear.
+                self._next_step_down = None
+
+        return (axis_to_rate(az_axis, self.ceiling),
+                axis_to_rate(alt_axis, self.ceiling))
 
 
 class JoystickModeState:
@@ -268,6 +384,18 @@ class JoystickModeState:
         # firmware holds the rate; the 9600-baud wire is the loop bottleneck).
         self._rate_cmd_cache = {}
         self.stopped = False  # Stop button state
+
+        # Adaptive RATE_CONTROL gearbox, shared by both control loops (the
+        # Python handler and the Rust adapter's rate push) so the mapping has
+        # a single owner. Base ceiling / wind-up delay honor config overrides.
+        self.rate_mapper = AdaptiveRateMapper(
+            base_ceiling=getattr(config_state, 'joy_rate_base_ceiling', JOY_BASE_CEILING),
+            engage_delay_s=getattr(config_state, 'joy_rate_windup_delay_s', JOY_ENGAGE_DELAY_S))
+        # Last discrete rate actually sent per MC_MOVE axis in RATE_CONTROL
+        # ({2: az, 3: alt}) so unchanged rates are not re-sent every cycle --
+        # and, critically, so returning to center DOES send the one stop
+        # command (rate 0) that halts the slew.
+        self._joy_rate_sent = {2: None, 3: None}
 
         # Tracking mode state
         self.tracking_mode = TrackingMode.STANDBY  # Default to standby mode (user preference)
@@ -578,6 +706,9 @@ class JoystickModeState:
         if self.stopped:
             self.park_requested = False   # STOP cancels an in-flight park
             self._park_state = None
+            # STOP writes zeros directly, so the RATE_CONTROL send-on-change
+            # cache no longer reflects the firmware: force a re-send after.
+            self._joy_rate_sent = {2: None, 3: None}
             try:
                 self.telescope_controller.hc_slew_fixed(Targets.AZM, 0)
                 self.telescope_controller.hc_slew_fixed(Targets.ALT, 0)
@@ -629,6 +760,11 @@ class JoystickModeState:
 
         # Run per-mode entry logic on a mode transition.
         if self.tracking_mode != self._prev_dispatch_mode:
+            if self.tracking_mode == TrackingMode.RATE_CONTROL:
+                # Whatever another mode last commanded is unknown to the
+                # send-on-change cache; None forces the first command out
+                # (including an initial 0 = stop).
+                self._joy_rate_sent = {2: None, 3: None}
             if self.tracking_mode == TrackingMode.HOTSPOT:
                 self._enter_hotspot_mode()
             elif self.tracking_mode == TrackingMode.HANDOFF:
@@ -939,21 +1075,23 @@ class JoystickModeState:
             print(f"Warning: Could not read telescope limits for safety checks: {e}")
             azm_limit_min = azm_limit_max = alt_limit_min = alt_limit_max = float('inf')
 
-        # Process axes 2 and 3 (PlayStation right stick)
-        for i in [2, 3]:  # AZM and ALT axes
+        # Read both stick axes (2=AZM, 3=ALT, PlayStation right stick), tared.
+        def tared_axis(i):
+            if i >= joy.get_numaxes():
+                return 0.0
+            axis_value = joy.get_axis(i)
+            if self.connected_joystick in self.joystick_tare:
+                axis_value -= self.joystick_tare[self.connected_joystick][i]
+            return axis_value
+
+        # Map to telescope rates through the adaptive gearbox: full stick is
+        # capped at the base ceiling until the operator holds it pinned, and
+        # the ceiling winds back down when they back off (kid-proofing).
+        az_rate, alt_rate = self.rate_mapper.update(tared_axis(2), tared_axis(3))
+
+        for i, rate in ((2, az_rate), (3, alt_rate)):
             if i >= joy.get_numaxes():
                 continue
-
-            axis_value = joy.get_axis(i)
-
-            # Apply tare if available
-            if self.connected_joystick in self.joystick_tare:
-                tare_value = self.joystick_tare[self.connected_joystick][i]
-                axis_value -= tare_value
-
-            # Map to telescope rates (-9 to 9)
-            # Clamp values to avoid extreme movements
-            rate = axis_to_rate(axis_value)
 
             # Hardware safety checks - prevent movement that would approach limits
             safe_to_move = True
@@ -982,19 +1120,21 @@ class JoystickModeState:
                     if self.update_status_callback:
                         self.update_status_callback(f"ALT safety limit exceeded ({current_alt:.1f} <= {alt_limit_min}) - switched to STANDBY")
 
-            # Send command only if safe
+            # Send on change only (the firmware holds the rate; re-sending an
+            # unchanged command just loads the 9600-baud wire). This includes
+            # the change TO zero: the old rate!=0 guard never sent the stop,
+            # so a released stick left the mount slewing at the last rate.
             if safe_to_move:
+                if rate == self._joy_rate_sent.get(i):
+                    continue
+                axis_name = "AZM" if i == 2 else "ALT"
+                target = Targets.AZM if i == 2 else Targets.ALT
                 try:
-                    if i == 2:  # AZM
-                        if rate != 0:
-                            success = self.telescope_controller.hc_slew_fixed(Targets.AZM, rate)
-                            if not success:
-                                print(f"Warning: AZM slew command failed (rate={rate})")
-                    elif i == 3:  # ALT
-                        if rate != 0:
-                            success = self.telescope_controller.hc_slew_fixed(Targets.ALT, rate)
-                            if not success:
-                                print(f"Warning: ALT slew command failed (rate={rate})")
+                    success = self.telescope_controller.hc_slew_fixed(target, rate)
+                    if success:
+                        self._joy_rate_sent[i] = rate
+                    else:
+                        print(f"Warning: {axis_name} slew command failed (rate={rate})")
                 except Exception as e:
                     print(f"Error sending slew command: {e}")
                     # Try to reconnect or handle the error

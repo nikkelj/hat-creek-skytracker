@@ -513,6 +513,7 @@ def render_joystick_status(display, joystick_state):
     axes_label = display.small_font.render("Axes:", True, (255, 255, 255))
     display.menu_screen.blit(axes_label, (base_x, current_y))
     current_y += 20
+    axes_top = current_y  # anchor for the slew-speed gear column to the right
 
     # First two axis pairs as 2D crosshair boxes (left/right sticks)
     box_size = 60
@@ -592,6 +593,41 @@ def render_joystick_status(display, joystick_state):
     pos_text = display.tiny_font.render(pos_str, True, (0, 255, 0) if tele_connected else (160, 160, 160))
     display.menu_screen.blit(pos_text, (bar_x + bar_w + 10, bar_y + 9))
     current_y += bar_h + 10
+
+    # Slew speed gear: the adaptive RATE_CONTROL ceiling (kid-proof gearbox).
+    # Anchored in the free column right of the stick boxes -- NOT in the
+    # bottom flow, which overflows the quadrant on short screens (the focus
+    # rows already clip there) and would hide exactly the feedback this
+    # exists to give. Green segments are the always-available base range;
+    # orange segments are the boost gears earned by holding the stick pinned,
+    # draining away when it is released. Greyed outside RATE_CONTROL.
+    mapper = getattr(joystick_state, 'rate_mapper', None)
+    if mapper is not None:
+        gear_x = base_x + 140
+        gear_y = axes_top + 4
+        in_rate_mode = joystick_state.tracking_mode == TrackingMode.RATE_CONTROL
+        boosted = mapper.ceiling > mapper.base_ceiling
+        label_color = (255, 255, 255) if in_rate_mode else (140, 140, 140)
+        suffix = "  BOOST" if (in_rate_mode and boosted) else ""
+        gear_label = display.small_font.render(
+            f"Slew speed: {mapper.ceiling}/{mapper.max_ceiling}{suffix}",
+            True, (255, 160, 0) if suffix else label_color)
+        display.menu_screen.blit(gear_label, (gear_x, gear_y))
+        gear_y += 20
+        seg_w, seg_h, seg_gap = 10, 12, 2
+        for s in range(1, mapper.max_ceiling + 1):
+            rect = pygame.Rect(gear_x + (s - 1) * (seg_w + seg_gap), gear_y,
+                               seg_w, seg_h)
+            if in_rate_mode and s <= mapper.ceiling:
+                color = (0, 200, 0) if s <= mapper.base_ceiling else (255, 160, 0)
+            else:
+                color = (80, 80, 80)
+            pygame.draw.rect(display.menu_screen, color, rect)
+            pygame.draw.rect(display.menu_screen, (150, 150, 150), rect, 1)
+        gear_y += seg_h + 6
+        hint = display.tiny_font.render("hold stick hard to boost", True,
+                                        label_color)
+        display.menu_screen.blit(hint, (gear_x, gear_y))
 
     # Hat information
     num_hats = joy.get_numhats() if connected else 0

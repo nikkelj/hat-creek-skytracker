@@ -156,6 +156,13 @@ class ConfigState:
         # hands the loop to HOTSPOT after this many consecutive solid detections.
         self.handoff_min_frames = 5
 
+        # RATE_CONTROL adaptive gearbox (joystick_controller.AdaptiveRateMapper):
+        # full stick deflection commands at most base_ceiling (MC_MOVE step,
+        # 1-9) until the stick has been held pinned for windup_delay seconds,
+        # after which the ceiling steps toward 9. Tune the feel here.
+        self.joy_rate_base_ceiling = 5
+        self.joy_rate_windup_delay_s = 0.8
+
         # Hardware simulator configuration (mount + camera sim). enabled=False
         # leaves all real-hardware behavior unchanged.
         self.sim_config = {
@@ -361,6 +368,8 @@ class ConfigState:
             "hotspot_star_filter_enabled": self.hotspot_star_filter_enabled,
             "hotspot_rate_gate_dps": self.hotspot_rate_gate_dps,
             "pid_output_filter_tau_sec": self.pid_output_filter_tau_sec,
+            "joy_rate_base_ceiling": self.joy_rate_base_ceiling,
+            "joy_rate_windup_delay_s": self.joy_rate_windup_delay_s,
             "sim_config": self.sim_config,
             "mount_mode": self.mount_mode,
             "altaz_side_flip": self.altaz_side_flip,
@@ -465,6 +474,10 @@ class ConfigState:
             "hotspot_rate_gate_dps", self.hotspot_rate_gate_dps)
         self.pid_output_filter_tau_sec = config_dict.get(
             "pid_output_filter_tau_sec", self.pid_output_filter_tau_sec)
+        self.joy_rate_base_ceiling = config_dict.get(
+            "joy_rate_base_ceiling", self.joy_rate_base_ceiling)
+        self.joy_rate_windup_delay_s = config_dict.get(
+            "joy_rate_windup_delay_s", self.joy_rate_windup_delay_s)
 
         # Merge hardware simulator settings (keep defaults for missing keys)
         if "sim_config" in config_dict and isinstance(config_dict["sim_config"], dict):

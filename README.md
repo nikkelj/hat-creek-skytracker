@@ -15,7 +15,14 @@ capture.
 
 **Tracking modes** (cycle through them from the Joystick Loop):
 - **STANDBY** — poll/display mount position only.
-- **RATE_CONTROL** — manual joystick slewing with hardware safety limits.
+- **RATE_CONTROL** — manual joystick slewing with hardware safety limits,
+  through an **adaptive speed gearbox**: full stick deflection is capped at a
+  gentle base rate (~0.5°/s) so a slammed stick can't fling the target out of
+  frame; holding the stick pinned deliberately winds the ceiling up toward the
+  mount's full 10°/s, and backing off, releasing, or reversing direction winds
+  it back down. A segmented **Slew speed** indicator beside the stick display
+  shows the current gear. Kid-tested design goal: you have to *earn* the fast
+  rates, and letting go always lands you back in gentle mode.
 - **PROGRAM** — automatically follow a TLE satellite pass or an imported launch
   trajectory, using interpolated angular position + rates.
 - **HOTSPOT** — closed-loop *optical* tracker: detect the brightest ("hot")
@@ -88,8 +95,11 @@ forbids the lowest elevations:
 crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
 strip charts, mount connection/position status, tracking mode, and PID
 diagnostics. The PID pane's log sliders tune the gains live, and its
-**AUTOTUNE** button hands them to the online auto-tuner while tracking.
-Shown here in simulation with the mount and both cameras connected.
+**AUTOTUNE** button hands them to the online auto-tuner while tracking. The
+**Slew speed** gear bar next to the stick displays shows the adaptive
+RATE_CONTROL ceiling (green = base range, orange = boost gears earned by
+pinning the stick). Shown here in simulation with the mount and both cameras
+connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 

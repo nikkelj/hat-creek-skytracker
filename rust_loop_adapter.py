@@ -24,7 +24,7 @@ import time
 import numpy as np
 
 import skytracker_core as rc
-from joystick_controller import TrackingMode, axis_to_rate
+from joystick_controller import TrackingMode
 from trajectory import interpolate_position_data_and_rates, live_tt
 
 _MODE_TO_STR = {
@@ -445,6 +445,8 @@ class RustCoreLoopAdapter:
         if st.connected_joystick is not None:
             joy = st.joysticks.get(st.connected_joystick)
         if joy is None:
+            # Keep servicing the gearbox so its idle wind-down/reset still runs.
+            st.rate_mapper.update(0.0, 0.0)
             self.loop.set_rate_cmd(0, 0)
             return
         tare = st.joystick_tare.get(st.connected_joystick)
@@ -455,7 +457,9 @@ class RustCoreLoopAdapter:
                 v -= tare[i]
             return v
 
-        self.loop.set_rate_cmd(axis_to_rate(axis(2)), axis_to_rate(axis(3)))
+        # Shared adaptive gearbox (same instance the Python loop uses): full
+        # stick is capped at the base ceiling until deliberately held pinned.
+        self.loop.set_rate_cmd(*st.rate_mapper.update(axis(2), axis(3)))
 
     def _push_program_setpoint(self, st):
         """Satellite/aircraft tracking setpoint. (Launch tracking is handled

@@ -350,6 +350,19 @@ def _arrow(base, axis, length, color, stage):
     return [shaft, head]
 
 
+# Fork-arm sculpt dimensions (model metres). Rigid attachment chain:
+# tripod/pier -> center of the AXIS-1 (AZ) tube -> its top end carries one
+# end of the AXIS-2 (ALT) tube -> whose far end carries the OTA by its side
+# (single fork arm, NexStar/AVX alt-az style). The OTA centerline is offset
+# from the head along axis 2 by OTA_ARM_OFFSET -- the boresight ray and FOV
+# cone apex use the same offset so the optics emanate from the tube, not
+# from inside the arm.
+AZ_TUBE_R, AZ_TUBE_LEN = 0.10, 0.40
+ALT_TUBE_R, ALT_TUBE_LEN = 0.085, 0.32
+OTA_R, OTA_LEN = 0.14, 1.00
+OTA_ARM_OFFSET = ALT_TUBE_LEN + OTA_R * 0.85   # OTA side flush on the arm end
+
+
 def build_mount_geometry(pose):
     """Model parts in WORLD coordinates at the mount-home pose (AZM=ALT=0).
     Stages: 'base' fixed, 'ax1' rotates with axis 1, 'ax2' with the full
@@ -378,15 +391,30 @@ def build_mount_geometry(pose):
         lu, lv = _ortho_pair(leg_dir)
         parts.append(_box(mid, (lu * 0.025, lv * 0.025, leg_dir * (leg_len / 2)),
                           (55, 55, 65), 'base'))
-    # AX1 stage: housing along the axis-1 direction + its arrow.
-    parts.append(_tube(_HEAD - p * 0.24, p, 0.085, 0.48, (110, 112, 125), 'ax1'))
-    parts.extend(_arrow(_HEAD + p * 0.24, p, 0.62, AXIS1_COLOR, 'ax1'))
-    # AX2 stage: OTA tube (long axis = boresight), guide stub, axis-2 arrow.
-    ota_base = _HEAD + saddle_up * 0.17 - b0 * 0.38
-    parts.append(_tube(ota_base, b0, 0.085, 0.95, (168, 172, 185), 'ax2'))
-    parts.append(_tube(ota_base + saddle_up * 0.13 + b0 * 0.25, b0,
-                       0.032, 0.42, (140, 150, 170), 'ax2'))
-    parts.extend(_arrow(_HEAD + a2 * 0.12, a2, 0.55, AXIS2_COLOR, 'ax2'))
+
+    # AX1 stage: the AZ-axis tube, its CENTER sitting on the pier top (the
+    # tripod attachment), its top end reaching the head where the ALT tube
+    # bolts on. Plus the cyan axis-1 arrow.
+    az_base = _HEAD - p * (0.18 + AZ_TUBE_LEN / 2)   # center at pier top
+    parts.append(_tube(az_base, p, AZ_TUBE_R, AZ_TUBE_LEN, (110, 112, 125), 'ax1'))
+    parts.extend(_arrow(_HEAD + p * 0.06, p, 0.62, AXIS1_COLOR, 'ax1'))
+
+    # AX1 stage: the ALT-axis tube (fork arm). One end cap rigidly at the AZ
+    # tube's top end (the head); it extends sideways along axis 2. It swings
+    # with azimuth but not with altitude, hence 'ax1'.
+    parts.append(_tube(_HEAD, a2, ALT_TUBE_R, ALT_TUBE_LEN, (120, 122, 138), 'ax1'))
+
+    # AX2 stage: the OTA, fatter, side-mounted -- its side surface rides the
+    # far end of the ALT tube, centerline on the axis-2 line so it pivots in
+    # place. Guide-scope stub on top, magenta axis-2 arrow poking out past
+    # the far side of the OTA.
+    ota_center = _HEAD + a2 * OTA_ARM_OFFSET
+    ota_base = ota_center - b0 * (OTA_LEN * 0.45)
+    parts.append(_tube(ota_base, b0, OTA_R, OTA_LEN, (168, 172, 185), 'ax2', nsides=10))
+    parts.append(_tube(ota_base + saddle_up * (OTA_R + 0.032) + b0 * (OTA_LEN * 0.3),
+                       b0, 0.032, 0.42, (140, 150, 170), 'ax2'))
+    parts.extend(_arrow(_HEAD + a2 * (OTA_ARM_OFFSET + OTA_R + 0.02), a2,
+                        0.45, AXIS2_COLOR, 'ax2'))
     return parts
 
 
@@ -847,16 +875,19 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     for _z, poly, col in faces:
         pygame.draw.polygon(surface, col, poly)
 
-    # Boresight ray (thin, from the tube out toward the sky sphere).
-    tip = _HEAD + pose['boresight'] * 0.62
-    far = _HEAD + pose['boresight'] * (R_SKY * 0.5)
+    # Boresight ray (thin, from the tube out toward the sky sphere). The OTA
+    # centerline sits OTA_ARM_OFFSET out along the posed axis 2 (fork arm),
+    # so the ray/cones originate there, not at the head inside the arm.
+    ota_origin = _HEAD + pose['axis2_world'] * OTA_ARM_OFFSET
+    tip = ota_origin + pose['boresight'] * (OTA_LEN * 0.58)
+    far = ota_origin + pose['boresight'] * (R_SKY * 0.5)
     bsx, bsy, bz = project_points(np.array([tip, far]), R, cam, cx, cy, focal)
     if bz[0] > 0.05 and bz[1] > 0.05:
         pygame.draw.line(overlay, (255, 255, 255, 110),
                          (int(bsx[0]), int(bsy[0])), (int(bsx[1]), int(bsy[1])), 1)
 
     # --- FOV cones ----------------------------------------------------------
-    apex = _HEAD + pose['boresight'] * 0.6
+    apex = ota_origin + pose['boresight'] * (OTA_LEN * 0.56)
     for spec in camera_fov_specs(config_state):
         corners = fov_corner_dirs(pose['boresight'], pose['axis2_world'],
                                   spec['fov_width_deg'], spec['fov_height_deg'],

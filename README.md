@@ -129,7 +129,9 @@ alignment-rotation / ROI controls for co-boresighting the guide and main cameras
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
 
 **Mount 3D** — a software-3D view of the mount for building alignment
-intuition: the articulated model poses from the live axis angles through the
+intuition: the articulated single-fork-arm model (tripod → AZ-axis tube →
+ALT-axis arm → side-mounted OTA, each rigidly attached like the real
+hardware) poses from the live axis angles through the
 **same forward transforms the tracker uses** (pinned by a parity test suite),
 per mount mode — shown here in AltAz-Side, where the cyan AZM-axis arrow lies
 on the horizon at the alignment azimuth. Both cameras' FOV cones sweep a real

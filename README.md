@@ -107,9 +107,15 @@ star field with satellites, aircraft, the selected trajectory, and the mount
 keepout tinted on the sky dome. Two view cameras: free **orbit** (drag/wheel)
 and an **operator view** rendered from your configured seat position (bearing
 / distance / eye height) so the perspective matches what you actually see.
-Manual AZM/ALT sliders pose the model while disconnected.
+Manual AZM/ALT sliders pose the model while disconnected. The orbit camera
+dives the full ±89° — below the ground plane you look straight up through
+the translucent ground at the mount and the whole sky dome. The star field
+advances in real time with the tracking clock (sidereal rotation, pinned by
+a regression test).
 
 ![Mount 3D](doc/screenshots/mount3d.png)
+
+![Mount 3D from below](doc/screenshots/mount3d_below_horizon.png)
 
 ## Hardware Interfaces
 

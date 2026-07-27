@@ -252,8 +252,10 @@ def _camera(m3d, config_state, viewport_w, viewport_h):
         fwd = unit_from_azel(m3d.look_az, max(-89.0, min(89.0, m3d.look_el)))
         focal = 0.9 * viewport_h * m3d.eye_zoom
     else:
+        # Full +/-89 orbit range: diving below the ground plane and looking
+        # straight up through the mount is a legitimate (and requested) view.
         cam_dir = unit_from_azel(m3d.view_az,
-                                 max(-5.0, min(89.0, m3d.view_el)))
+                                 max(-89.0, min(89.0, m3d.view_el)))
         cam = head + cam_dir * (BASE_DIST / m3d.zoom)
         fwd = -cam_dir
         focal = 0.9 * viewport_h
@@ -576,6 +578,10 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         except Exception:
             current_tt = None
 
+    # Two translucent layers: sky-level tint (keepout dots, ground disc)
+    # composites UNDER the mount model so it can't wash over the hardware;
+    # the top layer (boresight ray, FOV cones) composites over everything.
+    overlay_sky = pygame.Surface((w, h), pygame.SRCALPHA)
     overlay = pygame.Surface((w, h), pygame.SRCALPHA)
 
     # --- Sky pass -----------------------------------------------------------
@@ -605,7 +611,7 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         vis = z > 0.08
         for X, Y in zip(sx[vis], sy[vis]):
             if -20 <= X <= w + 20 and -20 <= Y <= h + 20:
-                pygame.draw.circle(overlay, (255, 70, 70, 46),
+                pygame.draw.circle(overlay_sky, (255, 70, 70, 46),
                                    (int(X), int(Y)), 3)
 
     # Stars.
@@ -727,7 +733,10 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     gsx, gsy, gz = project_points(np.array(ring), R, cam, cx, cy, focal)
     pts = [(int(x), int(y)) for x, y, zz in zip(gsx, gsy, gz) if zz > 0.05]
     if len(pts) >= 3:
-        pygame.draw.polygon(overlay, (30, 60, 34, 90), pts)
+        pygame.draw.polygon(overlay_sky, (30, 60, 34, 90), pts)
+    # Sky-level tint (keepout dots + ground disc) composites here, UNDER the
+    # seat marker and mount model, so translucency can't wash over hardware.
+    surface.blit(overlay_sky, (0, 0))
     seat_bearing = f('mount3d_observer_bearing_deg', 200.0)
     seat_dist = max(0.5, f('mount3d_observer_distance_m', 2.5))
     seat = unit_from_azel(seat_bearing, 0.0) * seat_dist
@@ -953,7 +962,7 @@ def handle_mount3d_mouse_motion(pos, rel, buttons, display, m3d):
                 m3d.look_el = min(89.0, max(-89.0, m3d.look_el - rel[1] * 0.15))
         else:
             m3d.view_az = (m3d.view_az - rel[0] * 0.4) % 360.0
-            m3d.view_el = min(89.0, max(-5.0, m3d.view_el + rel[1] * 0.4))
+            m3d.view_el = min(89.0, max(-89.0, m3d.view_el + rel[1] * 0.4))
 
 
 def handle_mount3d_mouse_up(pos, m3d):

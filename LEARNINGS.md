@@ -6,6 +6,30 @@ Newest entries first.
 
 ---
 
+## 2026-07-26 — Mount 3D: below-horizon orbit, and "is the star sky frozen?"
+
+Two follow-ups on the Mount 3D tab. (1) The orbit camera's elevation clamp
+was floored at -5°; it now runs the full ±89°, so you can dive under the
+translucent ground disc and look straight up through the mount at the sky
+dome. That exposed a layering bug worth remembering: everything translucent
+lived on ONE overlay blitted after the mount model, so the ground/keepout
+tint washed over the hardware. Translucent layers need to composite in
+scene order — sky-level tint under the mount, boresight ray + FOV cones
+over it — which means two overlays, not one.
+
+(2) "The star catalogue seems fixed at one epoch" — verified NOT the case,
+and now pinned by a test instead of a code-reading argument:
+`tracking_vis_state.current_tt` advances at 10 Hz **unconditionally** in the
+main loop (not gated by the active screen), and `star_catalog.current_altaz`
+applies exact LST rotation per query around a 600-s re-anchor. The
+regression test renders the 3D scene twice, 2 h of tracking-time apart, with
+everything but the stars held constant, and asserts the frames diverge. The
+first version of that test "confirmed" the freeze with 0 changed pixels —
+because it had passed `ts` into the wrong positional slot and the star pass
+was silently excepting. A silent `except -> print` in a render path turns a
+test bug into a false confirmation of the very fear being tested; check the
+console line, not just the assertion.
+
 ## 2026-07-26 — Online PID auto-tune: twiddle on the live error stream works
 
 Added [`autotune.py`](autotune.py): one button tunes all six PID gains *while

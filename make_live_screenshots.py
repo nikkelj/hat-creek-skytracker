@@ -160,13 +160,28 @@ def main():
     # Render the full-screen polar plot directly via the same draw functions the
     # thread uses (deterministic; no thread-timing dependence).
     from rendering_threads import (draw_polar_plot_on_surface, draw_fov_on_surface,
-                                   draw_satellites_on_surface, draw_celestial_on_surface)
+                                   draw_satellites_on_surface, draw_celestial_on_surface,
+                                   draw_launch_trajectory_on_surface,
+                                   draw_launch_position_on_surface)
     from tracking_visuals import PolarPlotMode
+    import tooltips
     try:
-        # Select the moon for the screenshot so the celestial selection ring +
-        # sliding trajectory are visible (falls back gracefully if below mask).
-        from celestial import select_celestial
-        select_celestial(tvs, cfg, 'moon')
+        # Showcase real targets: keep the SELECTED SATELLITE (arc + details
+        # panel) and light up a launch trajectory mid-flight so the rocket's
+        # ground-to-orbit arc is on the plot. The always-on celestial layer
+        # (sun/moon/planets, named stars, Messier) rides along.
+        from trajectory import read_launch_trajectories
+        try:
+            tvs.launch_trajectories = read_launch_trajectories("./launches", display, cb)
+            if tvs.launch_trajectories:
+                tvs.selected_launch = next(iter(tvs.launch_trajectories))
+                tvs.launch_launched = True
+                tvs.launch_start_time = ts.now().tt - 30.0 / 86400.0  # T+30 s
+        except Exception:
+            import traceback; traceback.print_exc()
+        # No selected satellite here: a selection focuses the plot on that one
+        # object, and the showcase shot wants the WHOLE catalogue + the rocket.
+        tvs.selected_satellite = None
 
         display.menu_screen.fill((0, 0, 0))
         plot = pygame.Surface((display.sub_width, display.sub_height))
@@ -181,7 +196,10 @@ def main():
         for fn in (lambda: draw_polar_plot_on_surface(plot, cfg, ts, cur_tt, tvs, db, PolarPlotMode.FULL_SCREEN),
                    lambda: draw_fov_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN, None),
                    lambda: draw_celestial_on_surface(plot, cfg, ts, tvs, db, cur_tt, PolarPlotMode.FULL_SCREEN),
-                   lambda: draw_satellites_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN, cfg)):
+                   lambda: draw_satellites_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN, cfg),
+                   lambda: __import__('trajectory').update_launch_positions(tvs, cur_tt),
+                   lambda: draw_launch_trajectory_on_surface(plot, tvs, cur_tt, db, PolarPlotMode.FULL_SCREEN),
+                   lambda: draw_launch_position_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN)):
             try:
                 fn()
             except Exception:
@@ -203,6 +221,10 @@ def main():
                 fn()
             except Exception:
                 pass
+        try:
+            tooltips.render(display, cfg, 'tracking_vis', tvs, None, None)
+        except Exception:
+            pass
         save(display.menu_screen, "tracking_vis.png")
     except Exception:
         import traceback; traceback.print_exc()
@@ -267,6 +289,16 @@ def main():
                 fn()
             except Exception:
                 import traceback; traceback.print_exc()
+        # Tooltip demo for the README: hover the PID pane so the explanation
+        # box is visible in the screenshot (plus the Tips chip).
+        try:
+            import tooltips
+            from joystick_controller import joystick_panel_layout
+            pane = joystick_panel_layout(display)['pid']
+            tooltips.render(display, cfg, 'joystick', tvs, jms, None,
+                            mouse_pos=(pane.centerx - 40, pane.centery + 30))
+        except Exception:
+            import traceback; traceback.print_exc()
         save(display.menu_screen, "joystick_loop.png")
     except Exception:
         import traceback; traceback.print_exc()

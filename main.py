@@ -32,6 +32,7 @@ from post_process_ui import (
 from alignment_ui import draw_alignment_options, handle_alignment_click, handle_alignment_camera_events
 from alignment import AlignmentState
 from tracking_visuals import TrackingVisState, draw_legend, draw_details, draw_camera_fov_details, draw_filters, draw_time_display, draw_satellite_count, draw_scroll_bar, draw_scroll_time_display, draw_satellite_pass_table, filter_and_sort_pass_table, draw_object_toggles, handle_object_toggle_click
+import tooltips
 from satellite_data import load_satellite_data, create_satellite_labels_and_metadata
 from camera_manager import camera_manager, render_sensor_calibration, render_camera_sliders, render_camera_roi_controls, render_combined_view_controls, handle_sensor_calib_events
 from joystick_controller import JoystickModeState, handle_joystick_mode_mouse_events, render_bias_control_grid, render_feed_forward_toggle_buttons, render_pid_diagnostics, render_connection_controls, render_joystick_status, render_position_display, render_capture_controls, render_camera_feeds, render_pid_gain_sliders, handle_pid_sliders_mouse_events, handle_joystick_camera_control_events, render_navball, render_tracking_strip_charts, handle_lead_slider_mouse_events, render_plate_solve_panel, render_adsb_connection_controls, handle_adsb_fit_slider_mouse_events, render_joystick_target_panel
@@ -516,6 +517,9 @@ while running:
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             pos = event.pos
+            # Global Tips On/Off chip (drawn by tooltips.render on every screen).
+            if event.button == 1 and tooltips.handle_click(pos, config_state):
+                continue
             # Always check main menu buttons first (allows switching back to menu or between modes)
             menu_result = None
             for btn in display.buttons:
@@ -1045,6 +1049,13 @@ while running:
         contact_text = "Jonathan Nikkel - @NikkelJonathan"
         text2 = display.large_font.render(contact_text, True, (255, 255, 255))
         display.menu_screen.blit(text2, (display.sub_x + 10, display.sub_y + 50))
+
+    # Explanatory hover tooltips + the Tips On/Off chip, topmost on every screen.
+    try:
+        tooltips.render(display, config_state, current_mode,
+                        tracking_vis_state, joystick_mode_state, mount3d_state)
+    except Exception as _tt_e:
+        print(f"Tooltip render error: {_tt_e}")
 
     pygame.display.flip()
     clock.tick(display.FPS_TARGET)  # Limit to FPS_TARGET FPS for better responsiveness

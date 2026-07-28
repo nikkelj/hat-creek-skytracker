@@ -37,6 +37,10 @@ class ConfigState:
         self.max_rendered_star_count = 2000    # brightest-N cap (skyplot + sim images)
         self.star_limiting_magnitude = 6.5     # faintest star ever considered
 
+        # Explanatory hover tooltips (tooltips.py) - global on/off, toggled by
+        # the Tips chip in the bottom-right corner of every screen.
+        self.tooltips_enabled = True
+
         # Deep-sky overlays (celestial.py). Sun/moon/planets and the top-100
         # named stars are always drawn; these gate the denser catalogues.
         self.messier_enabled = True            # Messier markers on the skyplot
@@ -320,6 +324,7 @@ class ConfigState:
             "satellite_labels_enabled": self.satellite_labels_enabled,
             "starfield_enabled": self.starfield_enabled,
             "aircraft_enabled": self.aircraft_enabled,
+            "tooltips_enabled": self.tooltips_enabled,
             "messier_enabled": self.messier_enabled,
             "ngc_enabled": self.ngc_enabled,
             "ngc_limiting_magnitude": self.ngc_limiting_magnitude,
@@ -417,6 +422,7 @@ class ConfigState:
         self.satellite_labels_enabled = config_dict.get("satellite_labels_enabled", self.satellite_labels_enabled)
         self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
         self.aircraft_enabled = config_dict.get("aircraft_enabled", self.aircraft_enabled)
+        self.tooltips_enabled = config_dict.get("tooltips_enabled", self.tooltips_enabled)
         self.messier_enabled = config_dict.get("messier_enabled", self.messier_enabled)
         self.ngc_enabled = config_dict.get("ngc_enabled", self.ngc_enabled)
         self.ngc_limiting_magnitude = config_dict.get(

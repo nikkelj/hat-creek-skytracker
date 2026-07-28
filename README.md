@@ -9,6 +9,9 @@ camera and a narrow long-focal-length camera) and provides a fast, game-like UI
 with selectable tracking modes, real-time closed-loop control, and labeled data
 capture.
 
+Pass predictions are cross-validated against heavens-above.com to the
+seconds level across orbit classes — see [`VALIDATION.md`](VALIDATION.md).
+
 ![Main menu](doc/screenshots/main_menu.png)
 
 ## Current Capabilities

@@ -208,7 +208,7 @@ def main():
         from tracking_visuals import draw_object_toggles
         for fn in (lambda: draw_filters(display, tvs),
                    lambda: draw_object_toggles(display, tvs, cfg),
-                   lambda: draw_legend(display),
+                   lambda: draw_legend(display, tvs, cfg),
                    lambda: draw_details(display, tvs),
                    lambda: draw_camera_fov_details(display, tvs, 290),
                    lambda: draw_time_display(display),

@@ -1003,7 +1003,18 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
     # is the focus and the dense label cloud is just visual noise (the dots stay).
     hide_labels = bool(getattr(state, 'launch_launched', False) and getattr(state, 'selected_launch', None))
 
+    meo_on = config_state is None or getattr(config_state, 'meo_enabled', True)
+    geo_on = config_state is None or getattr(config_state, 'geo_enabled', True)
+
     for sat, (px, py, alt, _) in satellites_to_draw.items():
+        # Orbit-class visibility (legend-click toggles). Class tests mirror
+        # the marker-shape branches below exactly.
+        _ma = state.satellite_mean_altitudes.get(sat, 0.0)
+        _is_meo = 2000 < _ma <= 35786
+        _is_geo = (not _is_meo) and abs(_ma - 35786) <= 1000
+        if (_is_meo and not meo_on) or (_is_geo and not geo_on):
+            continue
+
         # Satellite positions are absolute screen coordinates
         # Convert to surface coordinates based on mode
 

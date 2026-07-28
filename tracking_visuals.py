@@ -440,32 +440,89 @@ def draw_filters(display, state, rects=None):
                             (filter_below_alt_rect.x + 5 + start_width, filter_below_alt_rect.y + 5,
                              end_width - start_width, 20), 2)
 
-def draw_legend(display):
-    """
-    State-direct mutation function for drawing orbit legend.
-    Takes display object directly instead of individual parameters.
-    """
-    pygame.draw.rect(display.menu_screen, (50, 50, 50), (display.legend_x, display.legend_y, 150, 140))  # Larger legend
-    pygame.draw.line(display.menu_screen, (255, 255, 255), (display.legend_x, display.legend_y + 20), (display.legend_x + 150, display.legend_y + 20), 1)  # Title line
+LEGEND_GRADIENT_MAX_KM = 1000.0
+
+
+def draw_legend(display, state=None, config_state=None):
+    """Orbit legend -- now interactive: left/right click on the altitude
+    gradient sets the above/below altitude filters, and clicking the MEO/GEO
+    rows toggles those orbit classes on the plot (config meo/geo_enabled;
+    rows grey out when hidden). Publishes state.legend_rects for the click
+    handler and the hover tooltips."""
+    lx, ly = display.legend_x, display.legend_y
+    pygame.draw.rect(display.menu_screen, (50, 50, 50), (lx, ly, 150, 140))  # Larger legend
+    pygame.draw.line(display.menu_screen, (255, 255, 255), (lx, ly + 20), (lx + 150, ly + 20), 1)  # Title line
     legend_title = display.small_font.render("Orbit Legend", True, (255, 255, 255))
-    display.menu_screen.blit(legend_title, (display.legend_x + 5, display.legend_y + 5))
+    display.menu_screen.blit(legend_title, (lx + 5, ly + 5))
     # LEO heatmap
     for i in range(150):
-        alt = i / 150 * 1000  # Scale from 0 to 1000 km
+        alt = i / 150 * LEGEND_GRADIENT_MAX_KM
         color = get_altitude_color(alt) or (0, 255, 0)  # Fallback to green if out of range
-        pygame.draw.line(display.menu_screen, color, (display.legend_x + i, display.legend_y + 40), (display.legend_x + i, display.legend_y + 60))
+        pygame.draw.line(display.menu_screen, color, (lx + i, ly + 40), (lx + i, ly + 60))
+    # Filter markers on the gradient when altitude filters are set.
+    if state is not None:
+        for text, col in ((getattr(state, 'filter_above_alt_text', ''), (255, 255, 255)),
+                          (getattr(state, 'filter_below_alt_text', ''), (30, 30, 30))):
+            try:
+                frac = min(1.0, max(0.0, float(text) / LEGEND_GRADIENT_MAX_KM))
+                pygame.draw.line(display.menu_screen, col,
+                                 (lx + int(frac * 149), ly + 38),
+                                 (lx + int(frac * 149), ly + 62), 2)
+            except ValueError:
+                pass
     low_alt = display.small_font.render("0 km", True, (255, 255, 255))
     high_alt = display.small_font.render("1000 km", True, (255, 255, 255))
-    display.menu_screen.blit(low_alt, (display.legend_x, display.legend_y + 70))
-    display.menu_screen.blit(high_alt, (display.legend_x + 140, display.legend_y + 70))
-    # MEO hexagon
-    draw_hexagon(display.menu_screen, display.legend_x + 20, display.legend_y + 90, (255, 165, 0))  # Orange
-    meo_label = display.small_font.render("MEO (Orange)", True, (255, 255, 255))
-    display.menu_screen.blit(meo_label, (display.legend_x + 40, display.legend_y + 85))
-    # GEO triangle with line break
-    draw_triangle(display.menu_screen, display.legend_x + 20, display.legend_y + 110, (128, 0, 128))  # Purple
-    geo_label = display.small_font.render("GEO (Purple)", True, (255, 255, 255))
-    display.menu_screen.blit(geo_label, (display.legend_x + 40, display.legend_y + 105))
+    display.menu_screen.blit(low_alt, (lx, ly + 70))
+    display.menu_screen.blit(high_alt, (lx + 140, ly + 70))
+    # MEO / GEO rows, greyed when toggled off.
+    meo_on = config_state is None or getattr(config_state, 'meo_enabled', True)
+    geo_on = config_state is None or getattr(config_state, 'geo_enabled', True)
+    draw_hexagon(display.menu_screen, lx + 20, ly + 90,
+                 (255, 165, 0) if meo_on else (95, 75, 45))
+    meo_label = display.small_font.render(
+        "MEO (Orange)" if meo_on else "MEO (off)", True,
+        (255, 255, 255) if meo_on else (120, 120, 120))
+    display.menu_screen.blit(meo_label, (lx + 40, ly + 85))
+    draw_triangle(display.menu_screen, lx + 20, ly + 110,
+                  (128, 0, 128) if geo_on else (65, 45, 65))
+    geo_label = display.small_font.render(
+        "GEO (Purple)" if geo_on else "GEO (off)", True,
+        (255, 255, 255) if geo_on else (120, 120, 120))
+    display.menu_screen.blit(geo_label, (lx + 40, ly + 105))
+
+    if state is not None:
+        state.legend_rects = {
+            'gradient': pygame.Rect(lx, ly + 36, 150, 40),
+            'meo': pygame.Rect(lx + 5, ly + 82, 140, 20),
+            'geo': pygame.Rect(lx + 5, ly + 102, 140, 20),
+        }
+
+
+def handle_legend_click(state, config_state, pos, button):
+    """Legend interactivity: LEFT click on the gradient sets the 'above'
+    altitude filter, RIGHT click sets the 'below' filter (click again at the
+    same spot... just edit the filter boxes to clear); clicking MEO/GEO
+    toggles those classes. Returns True if the click was consumed."""
+    rects = getattr(state, 'legend_rects', None) or {}
+    grad = rects.get('gradient')
+    if grad and grad.collidepoint(pos) and button in (1, 3):
+        frac = min(1.0, max(0.0, (pos[0] - grad.x) / max(1, grad.width - 1)))
+        alt_km = round(frac * LEGEND_GRADIENT_MAX_KM / 10.0) * 10  # 10 km steps
+        if button == 1:
+            state.filter_above_alt_text = str(int(alt_km))
+        else:
+            state.filter_below_alt_text = str(int(alt_km))
+        return True
+    if button == 1 and config_state is not None:
+        meo = rects.get('meo')
+        if meo and meo.collidepoint(pos):
+            config_state.meo_enabled = not getattr(config_state, 'meo_enabled', True)
+            return True
+        geo = rects.get('geo')
+        if geo and geo.collidepoint(pos):
+            config_state.geo_enabled = not getattr(config_state, 'geo_enabled', True)
+            return True
+    return False
 
 
 def draw_camera_fov_details(display, state, y_offset, mode=PolarPlotMode.FULL_SCREEN):
@@ -624,11 +681,12 @@ OBJECT_TOGGLES = (
 
 
 def draw_object_toggles(display, state, config_state):
-    """Column of object-type show/hide buttons on the tracking-vis left panel
-    (below the satellite count). Publishes state.object_toggle_rects for
-    handle_object_toggle_click."""
-    x = display.sub_x + 10
-    y = display.sub_y + 270
+    """Column of object-type show/hide buttons in the LOWER-RIGHT corner,
+    stacked directly above the orbit legend (the old left-panel spot sat
+    underneath the pass-selection table). Publishes state.object_toggle_rects
+    for handle_object_toggle_click."""
+    x = display.legend_x
+    y = display.legend_y - 10 - (22 + len(OBJECT_TOGGLES) * 26)
     label = display.small_font.render("Show objects:", True, (255, 255, 255))
     display.menu_screen.blit(label, (x, y))
     y += 22
@@ -636,7 +694,7 @@ def draw_object_toggles(display, state, config_state):
     rects = {}
     for attr, name, default in OBJECT_TOGGLES:
         on = bool(getattr(config_state, attr, default))
-        rect = pygame.Rect(x, y, 110, 22)
+        rect = pygame.Rect(x, y, 150, 22)
         base = (70, 110, 70) if on else (90, 70, 70)
         col = tuple(min(255, c + 25) for c in base) if rect.collidepoint(mouse_pos) else base
         pygame.draw.rect(display.menu_screen, col, rect)

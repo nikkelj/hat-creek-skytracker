@@ -248,7 +248,13 @@ class CameraManager:
             buffer_size = getattr(config_state, 'buffer_size', 1000)
 
         camera.threads_running = True
-        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size, target_fps=30)
+        # SIM cameras are paced down: each synthetic frame costs ~10 ms of
+        # numpy on the GIL, and two cams chasing 30 FPS starved the render
+        # and control threads. Real cameras keep the full 30 FPS target
+        # (their exposure/readout waits release the GIL inside the SDK).
+        is_sim = getattr(camera.cap, 'simulator', None) is not None
+        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size,
+                                     target_fps=15 if is_sim else 30)
         camera.thread.start()
 
         if config_state:
@@ -427,29 +433,42 @@ roi_label_texts = ["1.0", ".5", ".25", ".125", ".063", ".032"]
 # GAMMA CORRECTION FUNCTIONS
 # ==============================================================================
 
+# Gamma lookup tables, cached per gamma value (the slider quantizes to a few
+# dozen distinct values in practice).
+_GAMMA_LUTS = {}
+
+
 def apply_gamma_correction(surface, gamma):
-    """Apply gamma correction to a pygame surface and return the corrected surface"""
+    """Apply gamma correction to a pygame surface and return the corrected
+    surface (the input is never modified).
+
+    Fast path: cached 256-entry LUT + one np.take writing straight into the
+    output surface's pixel view. The previous implementation copied the frame
+    three times (array3d copy, fancy-index allocation, make_surface copy) and
+    rebuilt the LUT per call -- ~30 ms per full-resolution frame, GIL-held,
+    per camera. Callers should also prefer gamma AFTER scaling to display
+    size: pygame.transform.scale point-samples, so a monotone per-pixel LUT
+    commutes with it (pixel-identical result, ~6x fewer pixels)."""
     if surface is None or gamma <= 0:
         return surface
 
     try:
-        # Convert pygame surface to numpy array
-        # Use pygame.surfarray to get the pixel array
-        pixel_array = pygame.surfarray.array3d(surface)
+        gkey = round(float(gamma), 4)
+        lut = _GAMMA_LUTS.get(gkey)
+        if lut is None:
+            if len(_GAMMA_LUTS) > 64:
+                _GAMMA_LUTS.clear()
+            ramp = np.arange(256, dtype=np.float32) / 255.0
+            lut = _GAMMA_LUTS[gkey] = np.clip(
+                np.power(ramp, gamma) * 255.0, 0, 255).astype(np.uint8)
 
-        # Apply gamma correction to each channel
-        # Create lookup table for gamma correction
-        lookUpTable = np.empty((1, 256), np.uint8)
-        for i in range(256):
-            lookUpTable[0, i] = np.clip(np.power(i / 255.0, gamma) * 255.0, 0, 255)
-
-        # Apply lookup table to each color channel
-        corrected_array = lookUpTable[0][pixel_array]
-
-        # Create new surface from corrected array
-        corrected_surface = pygame.surfarray.make_surface(corrected_array)
-
-        return corrected_surface
+        arr = pygame.surfarray.array3d(surface)   # contiguous copy
+        try:
+            import cv2
+            cv2.LUT(arr, lut, dst=arr)            # SIMD, ~2.5x numpy take
+        except ImportError:
+            np.take(lut, arr, out=arr)
+        return pygame.surfarray.make_surface(arr)
 
     except Exception as e:
         # If gamma correction fails, return original surface
@@ -609,13 +628,11 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
         # Original separate camera display logic
         if camera1.connected and camera1.frame is not None:
             try:
-                # Apply gamma correction if enabled
-                camera1_frame_processed = camera1.frame
+                # Resize first, then gamma if enabled: scale point-samples, so
+                # the LUT commutes -- same pixels, ~6x fewer of them to gamma.
+                camera1_frame_display = pygame.transform.scale(camera1.frame, (cam_display_width, cam_display_height))
                 if camera1.gamma_enabled:
-                    camera1_frame_processed = apply_gamma_correction(camera1.frame, camera1.gamma)
-
-                # Resize camera frame to fit left half
-                camera1_frame_display = pygame.transform.scale(camera1_frame_processed, (cam_display_width, cam_display_height))
+                    camera1_frame_display = apply_gamma_correction(camera1_frame_display, camera1.gamma)
 
                 # Apply alignment rotation to camera 1 image - keep centered and crop corners
                 if camera1.alignment_rotation != 0.0:
@@ -711,13 +728,11 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
     if not combined_view_active:
         if camera2_connected and camera2.frame is not None:
             try:
-                # Apply gamma correction if enabled
-                camera2_frame_processed = camera2.frame
+                # Resize first, then gamma if enabled: scale point-samples, so
+                # the LUT commutes -- same pixels, ~6x fewer of them to gamma.
+                camera2_frame_display = pygame.transform.scale(camera2.frame, (cam_display_width, cam_display_height))
                 if camera2.gamma_enabled:
-                    camera2_frame_processed = apply_gamma_correction(camera2.frame, camera2.gamma)
-
-                # Resize camera frame to fit right half
-                camera2_frame_display = pygame.transform.scale(camera2_frame_processed, (cam_display_width, cam_display_height))
+                    camera2_frame_display = apply_gamma_correction(camera2_frame_display, camera2.gamma)
 
                 # Apply alignment rotation to camera 2 image - keep centered and crop corners
                 if camera2.alignment_rotation != 0.0:

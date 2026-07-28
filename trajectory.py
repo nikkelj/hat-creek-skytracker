@@ -53,8 +53,11 @@ MINIMUM_VISIBLE_ALTITUDE_DEGREES = 0.0  # Minimum altitude to consider for visib
 # FUNCTIONS
 # ==============================================================================
 
-# Global cache for trajectories to avoid recomputation
+# Global cache for trajectories to avoid recomputation. Scoped to one
+# (observer, plot geometry) tuple -- see the scope guard in
+# precompute_trajectories; a site/geometry change clears it wholesale.
 TRAJECTORY_CACHE = {}
+_TRAJECTORY_CACHE_SCOPE = None
 SUN_EPHEMERIS_CACHE = None
 
 # ---- Disk-backed trajectory cache --------------------------------------------
@@ -83,6 +86,29 @@ def clear_trajectory_cache():
     global TRAJECTORY_CACHE, SUN_EPHEMERIS_CACHE
     TRAJECTORY_CACHE.clear()
     SUN_EPHEMERIS_CACHE = None
+
+
+_LIVE_TS = None
+
+
+def live_tt():
+    """Current TT Julian date from the real (wall) clock.
+
+    The control loops must aim the mount at where the target is NOW.
+    `tracking_vis_state.current_tt` is the UI's *tracking clock* -- it follows
+    the time slider while scrubbing and freezes while paused -- so it is the
+    right time base for visualization but the wrong one for hardware: a mount
+    cannot time-travel. Every control-path setpoint interpolation uses this
+    instead."""
+    global _LIVE_TS
+    if _LIVE_TS is None:
+        _LIVE_TS = load.timescale()
+    return _LIVE_TS.now().tt
+
+
+def _unwrap_az_diff(d):
+    """Shortest-arc azimuth difference in degrees (wraps 0/360 seam)."""
+    return (d + 180.0) % 360.0 - 180.0
 
 
 def _file_fingerprint(path):
@@ -349,12 +375,15 @@ def _compute_one_trajectory(sat, observer, times, cx, cy, radius):
     dt_seconds = (times_array[1] - times_array[0]) * 86400.0 if len(times_array) > 1 else 1.0
     az_rates_dps = np.zeros(len(times_array))
     el_rates_dps = np.zeros(len(times_array))
+    # Azimuth differences take the short arc: a pass crossing due north jumps
+    # 359->1 deg, and the raw difference would feed a spurious ~360deg/dt spike
+    # straight into the feed-forward rate.
     for i in range(1, len(times_array) - 1):
-        az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
+        az_rates_dps[i] = _unwrap_az_diff(az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
         el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
     if len(times_array) > 1:
-        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
-        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
+        az_rates_dps[0] = _unwrap_az_diff(az_deg[1] - az_deg[0]) / dt_seconds
+        az_rates_dps[-1] = _unwrap_az_diff(az_deg[-1] - az_deg[-2]) / dt_seconds
         el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
         el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
 
@@ -394,6 +423,15 @@ def compute_fine_selected_trajectory(state, sat, observer, ts, display, t0, t1,
         new_arcs[sat] = segments
         state.satellite_trajectories = new_traj
         state.satellite_arc_segments = new_arcs
+        # The sunlit cache is a list index-parallel to this sat's times_array;
+        # the fine grid just changed its length (and times), so the cached
+        # entry would silently mis-index (tail painted shadowed). Drop it.
+        try:
+            new_sunlit = dict(state.sunlit_status_cache)
+            new_sunlit.pop(getattr(sat, 'name', None), None)
+            state.sunlit_status_cache = new_sunlit
+        except AttributeError:
+            pass
         return True
     except Exception:
         return False
@@ -412,6 +450,28 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
     cx = display.sub_x + display.sub_width // 2
     cy = display.sub_y + display.sub_height // 2
     radius = min(display.sub_width, display.sub_height) // 2 - 50
+
+    # Cache scope guard: TRAJECTORY_CACHE entries bake in the observer AND the
+    # polar-plot pixel geometry (columns 4/5), but the per-sat keys only carry
+    # the time window. If the site or the plot geometry changed since the cache
+    # was filled, every entry is stale -- and the dict otherwise grows without
+    # bound as the auto-refresh advances the window. Scope the whole cache to
+    # one (observer, geometry) tuple and clear it on any change.
+    global _TRAJECTORY_CACHE_SCOPE
+    try:
+        scope = (round(float(observer.latitude.degrees), 6),
+                 round(float(observer.longitude.degrees), 6),
+                 round(float(observer.elevation.m), 1),
+                 int(cx), int(cy), int(radius))
+    except AttributeError:
+        scope = (int(cx), int(cy), int(radius))
+    if scope != _TRAJECTORY_CACHE_SCOPE:
+        TRAJECTORY_CACHE.clear()
+        _TRAJECTORY_CACHE_SCOPE = scope
+    elif len(TRAJECTORY_CACHE) > 6000:
+        # ~3 windows of ~1700 sats: entries from old windows are never
+        # revisited (keys carry t0/t1), so growth is pure leak -- reset.
+        TRAJECTORY_CACHE.clear()
 
     # Get global sun ephemeris if not already loaded
     global SUN_EPHEMERIS_CACHE
@@ -498,6 +558,11 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
     # complete previous set or this complete new one, never a partial fill.
     state.satellite_trajectories = trajectories
     state.satellite_arc_segments = arc_segments
+    # New time grid: every cached per-sat sunlit list is index-parallel to the
+    # OLD grid (same length, different times after a window refresh), so it
+    # would color the new arcs with the old window's shadow pattern.
+    if hasattr(state, 'sunlit_status_cache'):
+        state.sunlit_status_cache = {}
     # Also publish a packed array view of the columns the per-frame position
     # update needs (alt, dist, px, py), so that update can interpolate every
     # satellite in one vectorized shot instead of a Python loop. Single-tuple
@@ -548,15 +613,18 @@ def _create_arc_segments_simple(trajectory_data, start_time):
     if not above_horizon.any():
         return []
 
-    # Determine colors based on time and sunlit status
+    # Segments carry (x0, y0, x1, y1, future_color, seg_tt): the future/past
+    # choice is made at DRAW time against the tracking clock (current_tt), not
+    # baked here -- baking froze every segment's color at window start, so the
+    # arcs never followed the time slider. `start_time` only seeds the legacy
+    # baked color for any consumer that ignores seg_tt.
     segments = []
     for i in range(len(trajectory_data) - 1):
         if above_horizon[i]:
-            is_future = times[i] > start_time
             # For sunlit trajectory display, all satellites get time-based coloring
             # Individual satellite sunlit status will be recomputed for selected satellites
-            color = (255, 0, 0) if is_future else (128, 128, 128)
-            segments.append((px[i], py[i], px_next[i], py_next[i], color))
+            color = (255, 0, 0) if times[i] > start_time else (128, 128, 128)
+            segments.append((px[i], py[i], px_next[i], py_next[i], color, times[i]))
 
     return segments
 
@@ -641,7 +709,9 @@ def interpolate_position_data_and_rates(trajectory_data, current_tt, launch_tt=0
         py = py0 + fraction * (py1 - py0)
         alt = alt0 + fraction * (alt1 - alt0)
         dist = dist0 + fraction * (dist1 - dist0)
-        az = az0 + fraction * (az1 - az0)
+        # Interpolate azimuth on the short arc: raw interpolation across the
+        # 0/360 seam swings the target to the antipode for one sample interval.
+        az = (az0 + fraction * _unwrap_az_diff(az1 - az0)) % 360.0
         return px, py, alt, dist, az, 0.0, 0.0
 
     elif len(trajectory[0]) >= 8:  # New format with rates
@@ -663,7 +733,8 @@ def interpolate_position_data_and_rates(trajectory_data, current_tt, launch_tt=0
         py = py0 + fraction * (py1 - py0)
         alt = alt0 + fraction * (alt1 - alt0)
         dist = dist0 + fraction * (dist1 - dist0)
-        az = az0 + fraction * (az1 - az0)
+        # Short-arc azimuth interpolation (see the 6-column branch above).
+        az = (az0 + fraction * _unwrap_az_diff(az1 - az0)) % 360.0
         az_rate = az_rate0 + fraction * (az_rate1 - az_rate0)
         el_rate = el_rate0 + fraction * (el_rate1 - el_rate0)
 
@@ -678,6 +749,20 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     Update satellite positions for the current timestamp with filtering.
     Modifies state object directly with updated satellite_positions dictionary.
     """
+    # Scrubbed outside the computed window: there is no data at this time, so
+    # show nothing. The old clamp-to-endpoint behavior froze every satellite
+    # at the window edge -- a static, fictitious constellation at both ends
+    # of the slider.
+    t0 = getattr(state, 't0', None)
+    t1 = getattr(state, 't1', None)
+    if t0 is not None and t1 is not None:
+        try:
+            if current_tt < t0.tt - 1e-9 or current_tt > t1.tt + 1e-9:
+                state.satellite_positions = {}
+                return
+        except AttributeError:
+            pass
+
     # Build into a local dict and publish it in a single atomic rebind at the
     # end. The rendering thread reads state.satellite_positions live every
     # frame; if we cleared and incrementally repopulated the live attribute
@@ -832,15 +917,13 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
             min_dist_idx = np.argmin(visible_distances)
             closest_time = visible_times[min_dist_idx]
 
-    # Format closest approach time as local time string
+    # Format closest approach time as local time string (display only -- all
+    # comparisons use the raw TT below).
     closest_approach_time = "--:--"
     if closest_time is not None:
         try:
-            # Convert TT (Terrestrial Time) to UTC datetime
-            closest_datetime = ts.tt(jd=closest_time).utc_datetime()
-            # Convert to local time (PDT/PDT)
-            closest_datetime = closest_datetime.replace(tzinfo=timezone.utc)
-            closest_datetime = closest_datetime.astimezone()
+            closest_datetime = ts.tt_jd(closest_time).utc_datetime()
+            closest_datetime = closest_datetime.astimezone()  # system local tz
             closest_approach_time = closest_datetime.strftime("%H:%M")
         except Exception:
             closest_approach_time = "--:--"
@@ -852,6 +935,11 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
         'max_elevation': max_elevation,
         'azimuth_at_max': azimuth_at_max,
         'closest_approach_time': closest_approach_time,
+        # Raw TT Julian date of the closest approach: time math must use
+        # this, never re-parse the local "HH:MM" display string (that
+        # round-trip lost the date and produced day=32 ValueErrors when
+        # splicing onto month-end "today").
+        'closest_time_tt': closest_time,
         'is_visible': np.any(visible_points)
     }
 
@@ -880,29 +968,17 @@ def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=N
                 if state.satellite_positions and sat in state.satellite_positions:
                     include_in_table = True
                 else:
-                    # Check if the closest approach time is in the future
-                    closest_time_str = pass_data.get('closest_approach_time', '--:--')
-                    if closest_time_str != '--:--':
+                    # Include when the closest approach lies 0..2 h in the
+                    # future. Compared directly in TT -- re-parsing the local
+                    # "HH:MM" display string lost the date and required a
+                    # hand-rolled (and month-end-broken) day rollover.
+                    closest_tt = pass_data.get('closest_time_tt')
+                    if closest_tt is not None and ts is not None:
                         try:
-                            # Convert time string back to local time for comparison
-                            h, m = map(int, closest_time_str.split(':'))                                                            
-                            closest_datetime = current_local.replace(hour=h, minute=m, second=0, microsecond=0)
-
-                            # Handle case where closest time is before current time (next day)
-                            if closest_datetime < current_local:
-                                closest_datetime = closest_datetime.replace(
-                                    day=current_local.day + 1,
-                                    month=current_local.month if current_local.day < 31 else current_local.month + 1,
-                                    year=current_local.year
-                                )
-
-                            # If closest approach is within 2 hours from now, include it
-                            time_diff = closest_datetime - current_local
-                            if time_diff.total_seconds() >= 0 and time_diff.total_seconds() <= 7200:  # 7200 seconds = 2 hours
+                            diff_seconds = (float(closest_tt) - ts.now().tt) * 86400.0
+                            if 0.0 <= diff_seconds <= 7200.0:  # within 2 hours
                                 include_in_table = True
-                        except (ValueError, IndexError):
-                            # If time parsing fails, check if satellite has any visibility points
-                            # This is a fallback for cases where the time format is unexpected
+                        except Exception:
                             pass
 
                 if include_in_table:
@@ -1247,15 +1323,16 @@ def read_tracking_trajectory(filepath, display=None, update_status_callback=None
         if len(times_rel) > 1:
             dt_seconds = times_rel[1] - times_rel[0]
 
-        # Calculate rates using finite differences
+        # Calculate rates using finite differences (azimuth on the short arc --
+        # see the north-crossing note in _compute_one_trajectory)
         for i in range(1, len(times_array) - 1):
-            az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
+            az_rates_dps[i] = _unwrap_az_diff(az_deg[i + 1] - az_deg[i - 1]) / (2 * dt_seconds)
             el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / (2 * dt_seconds)
 
         # Handle endpoints
         if len(times_array) > 1:
-            az_rates_dps[0] = (az_deg[1] - az_deg[0]) / dt_seconds
-            az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / dt_seconds
+            az_rates_dps[0] = _unwrap_az_diff(az_deg[1] - az_deg[0]) / dt_seconds
+            az_rates_dps[-1] = _unwrap_az_diff(az_deg[-1] - az_deg[-2]) / dt_seconds
             el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / dt_seconds
             el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / dt_seconds
 
@@ -1303,7 +1380,9 @@ def _create_tracking_arc_segments(trajectory_data, start_time):
 
             is_future = times[i] > start_time
             color = (255, 255, 0) if is_future else (128, 128, 128)  # Yellow for tracking trajectories
-            segments.append((px[i], py[i], px_next[i], py_next[i], color))
+            # seg_tt appended so renderers can recolor against the tracking
+            # clock (see _create_arc_segments_simple).
+            segments.append((px[i], py[i], px_next[i], py_next[i], color, times[i]))
 
     return segments
 
@@ -1441,10 +1520,12 @@ def read_launch_trajectories(launches_dir="./launches", display=None, update_sta
                 el_rates_dps = np.zeros(len(times_array))
 
                 for i in range(1, len(times_array) - 1):
-                    # Use central differences for better accuracy
+                    # Use central differences for better accuracy (azimuth on
+                    # the short arc -- see the north-crossing note in
+                    # _compute_one_trajectory)
                     actual_dt = (times_tt[i+1] - times_tt[i-1]) * 86400  # Time step in seconds
                     if actual_dt > 0:
-                        az_rates_dps[i] = (az_deg[i + 1] - az_deg[i - 1]) / actual_dt
+                        az_rates_dps[i] = _unwrap_az_diff(az_deg[i + 1] - az_deg[i - 1]) / actual_dt
                         el_rates_dps[i] = (alt_deg[i + 1] - alt_deg[i - 1]) / actual_dt
 
                 # Handle endpoints with forward/backward differences
@@ -1453,11 +1534,11 @@ def read_launch_trajectories(launches_dir="./launches", display=None, update_sta
                     actual_dt_start = (times_tt[-1] - times_tt[-2]) * 86400
 
                     if actual_dt_end > 0:
-                        az_rates_dps[0] = (az_deg[1] - az_deg[0]) / actual_dt_end
+                        az_rates_dps[0] = _unwrap_az_diff(az_deg[1] - az_deg[0]) / actual_dt_end
                         el_rates_dps[0] = (alt_deg[1] - alt_deg[0]) / actual_dt_end
 
                     if actual_dt_start > 0:
-                        az_rates_dps[-1] = (az_deg[-1] - az_deg[-2]) / actual_dt_start
+                        az_rates_dps[-1] = _unwrap_az_diff(az_deg[-1] - az_deg[-2]) / actual_dt_start
                         el_rates_dps[-1] = (alt_deg[-1] - alt_deg[-2]) / actual_dt_start
 
                 # Create trajectory data array
@@ -1521,7 +1602,9 @@ def _create_launch_arc_segments(trajectory_data, start_time):
         if above_horizon[i]:
             is_future = times[i] > start_time
             color = (0, 255, 255) if is_future else (128, 128, 128)  # Cyan for future, gray for past
-            segments.append((px[i], py[i], px_next[i], py_next[i], color))
+            # seg_tt appended so renderers can recolor against the tracking
+            # clock (see _create_arc_segments_simple).
+            segments.append((px[i], py[i], px_next[i], py_next[i], color, times[i]))
 
     return segments
 

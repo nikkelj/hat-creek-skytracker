@@ -93,7 +93,9 @@ class ParkServiceTests(unittest.TestCase):
         state.current_azm_raw = 200.0
         state.current_alt_raw = 200.0
         state._service_park()  # arms _park_state
-        state._park_state['start'] = time.time() - (state.PARK_TIMEOUT_SEC + 1)
+        # _service_park runs on time.perf_counter() (NTP-step immune), so the
+        # backdate must use the same clock.
+        state._park_state['start'] = time.perf_counter() - (state.PARK_TIMEOUT_SEC + 1)
         state._service_park()
         self.assertFalse(state.park_requested)
         self.assertTrue(any("TIMED OUT" in m for m in self.messages))

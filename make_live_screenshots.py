@@ -53,7 +53,8 @@ def main():
                                      render_pid_diagnostics, render_camera_feeds,
                                      render_navball, render_tracking_strip_charts,
                                      render_bias_control_grid, render_pid_gain_sliders,
-                                     render_feed_forward_toggle_buttons, TrackingMode)
+                                     render_feed_forward_toggle_buttons, TrackingMode,
+                                     render_joystick_target_panel)
     from utils import draw_button_with_objects
 
     msgs = []
@@ -159,9 +160,14 @@ def main():
     # Render the full-screen polar plot directly via the same draw functions the
     # thread uses (deterministic; no thread-timing dependence).
     from rendering_threads import (draw_polar_plot_on_surface, draw_fov_on_surface,
-                                   draw_satellites_on_surface)
+                                   draw_satellites_on_surface, draw_celestial_on_surface)
     from tracking_visuals import PolarPlotMode
     try:
+        # Select the moon for the screenshot so the celestial selection ring +
+        # sliding trajectory are visible (falls back gracefully if below mask).
+        from celestial import select_celestial
+        select_celestial(tvs, cfg, 'moon')
+
         display.menu_screen.fill((0, 0, 0))
         plot = pygame.Surface((display.sub_width, display.sub_height))
         plot.fill((0, 0, 0))
@@ -174,13 +180,16 @@ def main():
             pass
         for fn in (lambda: draw_polar_plot_on_surface(plot, cfg, ts, cur_tt, tvs, db, PolarPlotMode.FULL_SCREEN),
                    lambda: draw_fov_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN, None),
+                   lambda: draw_celestial_on_surface(plot, cfg, ts, tvs, db, cur_tt, PolarPlotMode.FULL_SCREEN),
                    lambda: draw_satellites_on_surface(plot, tvs, ccx, ccy, db, PolarPlotMode.FULL_SCREEN, cfg)):
             try:
                 fn()
             except Exception:
                 import traceback; traceback.print_exc()
         display.menu_screen.blit(plot, (display.sub_x, display.sub_y))
+        from tracking_visuals import draw_object_toggles
         for fn in (lambda: draw_filters(display, tvs),
+                   lambda: draw_object_toggles(display, tvs, cfg),
                    lambda: draw_legend(display),
                    lambda: draw_details(display, tvs),
                    lambda: draw_camera_fov_details(display, tvs, 290),
@@ -252,7 +261,8 @@ def main():
                    lambda: render_feed_forward_toggle_buttons(display, jms),
                    lambda: render_navball(display, jms),
                    lambda: render_tracking_strip_charts(display, jms),
-                   lambda: render_camera_feeds(display, jms)):
+                   lambda: render_camera_feeds(display, jms),
+                   lambda: render_joystick_target_panel(display, jms, tvs, cfg)):
             try:
                 fn()
             except Exception:

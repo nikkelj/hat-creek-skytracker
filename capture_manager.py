@@ -73,6 +73,17 @@ class CaptureDumpThread(threading.Thread):
                 # Fallback to index calculation
                 total_frames = min(1000, buffer_length)  # Reasonable limit
 
+            # A capture longer than the ring buffer has already evicted its
+            # oldest frames: only the last `buffer_length` remain. Without
+            # this cap the backwards walk wraps around and re-yields already
+            # emitted indices -- the same frame submitted twice under one
+            # filename (two save workers racing one path) and a progress
+            # ratio past 100%.
+            if total_frames > buffer_length:
+                print(f"Capture dump: {total_frames} frames captured but only "
+                      f"{buffer_length} still buffered - saving those")
+                total_frames = buffer_length
+
             self.status = f"Preparing to save {total_frames} frames..."
             self.progress = 0.05
 
@@ -237,12 +248,22 @@ class CaptureDumpThread(threading.Thread):
                     alt_m = float(getattr(self.config_state, 'alt_str', 0))
                     observer = wgs84.latlon(lat, lon, elevation_m=alt_m)
 
-                for i, (time_val, alt, az, dist, px, py) in enumerate(trajectory_data):
+                # Rows are 8-column since the rates columns were added
+                # ([time, alt, az, dist, px, py, az_rate, el_rate]); unpack
+                # inside the try so one malformed row skips, not the whole
+                # dump (the old 6-name unpack in the for-header raised
+                # "too many values" on the FIRST row and aborted everything
+                # after it -- per-frame rows, image, config copy).
+                for i, row in enumerate(trajectory_data):
                     try:
+                        time_val, alt, az, dist, px, py = row[:6]
                         # Convert TT (Terrestrial Time) to UTC timestamp correctly
-                        skyfield_time = ts.tt(jd=time_val)
+                        skyfield_time = ts.tt_jd(time_val)
                         utc_dt = skyfield_time.utc_datetime()
-                        timestamp_str = utc_dt.isoformat() + "Z"
+                        # utc_datetime() is tz-aware: isoformat() already ends
+                        # "+00:00", so appending "Z" produced "+00:00Z" --
+                        # unparseable by standard ISO parsers.
+                        timestamp_str = utc_dt.isoformat().replace("+00:00", "Z")
 
                         writer.writerow({
                             'timestamp': timestamp_str,

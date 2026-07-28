@@ -252,8 +252,10 @@ def _camera(m3d, config_state, viewport_w, viewport_h):
         fwd = unit_from_azel(m3d.look_az, max(-89.0, min(89.0, m3d.look_el)))
         focal = 0.9 * viewport_h * m3d.eye_zoom
     else:
+        # Full +/-89 orbit range: diving below the ground plane and looking
+        # straight up through the mount is a legitimate (and requested) view.
         cam_dir = unit_from_azel(m3d.view_az,
-                                 max(-5.0, min(89.0, m3d.view_el)))
+                                 max(-89.0, min(89.0, m3d.view_el)))
         cam = head + cam_dir * (BASE_DIST / m3d.zoom)
         fwd = -cam_dir
         focal = 0.9 * viewport_h
@@ -348,6 +350,19 @@ def _arrow(base, axis, length, color, stage):
     return [shaft, head]
 
 
+# Fork-arm sculpt dimensions (model metres). Rigid attachment chain:
+# tripod/pier -> center of the AXIS-1 (AZ) tube -> its top end carries one
+# end of the AXIS-2 (ALT) tube -> whose far end carries the OTA by its side
+# (single fork arm, NexStar/AVX alt-az style). The OTA centerline is offset
+# from the head along axis 2 by OTA_ARM_OFFSET -- the boresight ray and FOV
+# cone apex use the same offset so the optics emanate from the tube, not
+# from inside the arm.
+AZ_TUBE_R, AZ_TUBE_LEN = 0.10, 0.40
+ALT_TUBE_R, ALT_TUBE_LEN = 0.085, 0.32
+OTA_R, OTA_LEN = 0.14, 1.00
+OTA_ARM_OFFSET = ALT_TUBE_LEN + OTA_R * 0.85   # OTA side flush on the arm end
+
+
 def build_mount_geometry(pose):
     """Model parts in WORLD coordinates at the mount-home pose (AZM=ALT=0).
     Stages: 'base' fixed, 'ax1' rotates with axis 1, 'ax2' with the full
@@ -376,15 +391,30 @@ def build_mount_geometry(pose):
         lu, lv = _ortho_pair(leg_dir)
         parts.append(_box(mid, (lu * 0.025, lv * 0.025, leg_dir * (leg_len / 2)),
                           (55, 55, 65), 'base'))
-    # AX1 stage: housing along the axis-1 direction + its arrow.
-    parts.append(_tube(_HEAD - p * 0.24, p, 0.085, 0.48, (110, 112, 125), 'ax1'))
-    parts.extend(_arrow(_HEAD + p * 0.24, p, 0.62, AXIS1_COLOR, 'ax1'))
-    # AX2 stage: OTA tube (long axis = boresight), guide stub, axis-2 arrow.
-    ota_base = _HEAD + saddle_up * 0.17 - b0 * 0.38
-    parts.append(_tube(ota_base, b0, 0.085, 0.95, (168, 172, 185), 'ax2'))
-    parts.append(_tube(ota_base + saddle_up * 0.13 + b0 * 0.25, b0,
-                       0.032, 0.42, (140, 150, 170), 'ax2'))
-    parts.extend(_arrow(_HEAD + a2 * 0.12, a2, 0.55, AXIS2_COLOR, 'ax2'))
+
+    # AX1 stage: the AZ-axis tube, its CENTER sitting on the pier top (the
+    # tripod attachment), its top end reaching the head where the ALT tube
+    # bolts on. Plus the cyan axis-1 arrow.
+    az_base = _HEAD - p * (0.18 + AZ_TUBE_LEN / 2)   # center at pier top
+    parts.append(_tube(az_base, p, AZ_TUBE_R, AZ_TUBE_LEN, (110, 112, 125), 'ax1'))
+    parts.extend(_arrow(_HEAD + p * 0.06, p, 0.62, AXIS1_COLOR, 'ax1'))
+
+    # AX1 stage: the ALT-axis tube (fork arm). One end cap rigidly at the AZ
+    # tube's top end (the head); it extends sideways along axis 2. It swings
+    # with azimuth but not with altitude, hence 'ax1'.
+    parts.append(_tube(_HEAD, a2, ALT_TUBE_R, ALT_TUBE_LEN, (120, 122, 138), 'ax1'))
+
+    # AX2 stage: the OTA, fatter, side-mounted -- its side surface rides the
+    # far end of the ALT tube, centerline on the axis-2 line so it pivots in
+    # place. Guide-scope stub on top, magenta axis-2 arrow poking out past
+    # the far side of the OTA.
+    ota_center = _HEAD + a2 * OTA_ARM_OFFSET
+    ota_base = ota_center - b0 * (OTA_LEN * 0.45)
+    parts.append(_tube(ota_base, b0, OTA_R, OTA_LEN, (168, 172, 185), 'ax2', nsides=10))
+    parts.append(_tube(ota_base + saddle_up * (OTA_R + 0.032) + b0 * (OTA_LEN * 0.3),
+                       b0, 0.032, 0.42, (140, 150, 170), 'ax2'))
+    parts.extend(_arrow(_HEAD + a2 * (OTA_ARM_OFFSET + OTA_R + 0.02), a2,
+                        0.45, AXIS2_COLOR, 'ax2'))
     return parts
 
 
@@ -568,14 +598,21 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     R, cam, focal = _camera(m3d, config_state, w, h)
     f = _config_floats(config_state)
 
-    current_tt = getattr(tracking_vis_state, 'current_tt', None) \
-        if tracking_vis_state is not None else None
-    if current_tt is None and ts is not None:
+    # Shared tracking-clock policy (slider / paused / live, with the
+    # unset-guard) -- one implementation, so this can't drift from the
+    # render threads' notion of scene time.
+    current_tt = None
+    if ts is not None:
         try:
-            current_tt = ts.now().tt
+            from rendering_threads import render_time_tt
+            current_tt = render_time_tt(tracking_vis_state, ts)
         except Exception:
             current_tt = None
 
+    # Two translucent layers: sky-level tint (keepout dots, ground disc)
+    # composites UNDER the mount model so it can't wash over the hardware;
+    # the top layer (boresight ray, FOV cones) composites over everything.
+    overlay_sky = pygame.Surface((w, h), pygame.SRCALPHA)
     overlay = pygame.Surface((w, h), pygame.SRCALPHA)
 
     # --- Sky pass -----------------------------------------------------------
@@ -605,7 +642,7 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         vis = z > 0.08
         for X, Y in zip(sx[vis], sy[vis]):
             if -20 <= X <= w + 20 and -20 <= Y <= h + 20:
-                pygame.draw.circle(overlay, (255, 70, 70, 46),
+                pygame.draw.circle(overlay_sky, (255, 70, 70, 46),
                                    (int(X), int(Y)), 3)
 
     # Stars.
@@ -640,8 +677,8 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         except Exception as e:
             print(f"Mount3D starfield error: {e}")
 
-    # Satellites (+ aircraft): nearest trajectory sample; cols 1/2 are sky
-    # el/az (cols 4/5 are baked polar-plot pixels -- never those).
+    # Satellites (+ aircraft): interpolated trajectory position; cols 1/2 are
+    # sky el/az (cols 4/5 are baked polar-plot pixels -- never those).
     def draw_traj_markers(positions, trajectories, selected, color):
         if not positions or not trajectories or current_tt is None:
             return
@@ -653,8 +690,18 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
             rows, times = traj[0], traj[1]
             if len(rows) == 0 or len(times) == 0:
                 continue
-            i = int(np.clip(np.searchsorted(times, current_tt), 0, len(rows) - 1))
-            el_s, az_s = float(rows[i][1]), float(rows[i][2])
+            # searchsorted returns the sample AFTER current_tt; every other
+            # interpolation site subtracts 1 and blends. Snapping to the next
+            # sample made Mount 3D lead the skyplot by up to one 30 s sample.
+            i = int(np.clip(np.searchsorted(times, current_tt) - 1, 0, len(rows) - 1))
+            if i < len(rows) - 1 and times[i + 1] > times[i]:
+                frac = (current_tt - times[i]) / (times[i + 1] - times[i])
+                frac = 0.0 if frac < 0.0 else (1.0 if frac > 1.0 else frac)
+                el_s = float(rows[i][1]) + frac * (float(rows[i + 1][1]) - float(rows[i][1]))
+                d_az = ((float(rows[i + 1][2]) - float(rows[i][2]) + 180.0) % 360.0) - 180.0
+                az_s = (float(rows[i][2]) + frac * d_az) % 360.0
+            else:
+                el_s, az_s = float(rows[i][1]), float(rows[i][2])
             if el_s <= 0.0:
                 continue
             d = unit_from_azel(az_s, el_s)
@@ -675,12 +722,70 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
 
     tvs = tracking_vis_state
     if tvs is not None:
-        draw_traj_markers(getattr(tvs, 'satellite_positions', None),
-                          getattr(tvs, 'satellite_trajectories', None),
-                          getattr(tvs, 'selected_satellite', None), (170, 190, 140))
-        draw_traj_markers(getattr(tvs, 'aircraft_positions', None),
-                          getattr(tvs, 'aircraft_trajectories', None),
-                          getattr(tvs, 'selected_aircraft', None), (90, 200, 220))
+        if getattr(config_state, 'satellites_enabled', True):
+            draw_traj_markers(getattr(tvs, 'satellite_positions', None),
+                              getattr(tvs, 'satellite_trajectories', None),
+                              getattr(tvs, 'selected_satellite', None), (170, 190, 140))
+        if getattr(config_state, 'aircraft_enabled', True):
+            draw_traj_markers(getattr(tvs, 'aircraft_positions', None),
+                              getattr(tvs, 'aircraft_trajectories', None),
+                              getattr(tvs, 'selected_aircraft', None), (90, 200, 220))
+
+    # Celestial layer on the sky dome: sun/moon/planets always (pinned dimmed
+    # on the horizon when below it, like the skyplot), Messier/NGC per the
+    # toggles. Stars come from the starfield above; 'star' anchor entries are
+    # selection-only on the skyplot and are skipped here.
+    if current_tt is not None:
+        try:
+            from celestial import get_celestial
+            cat = get_celestial(getattr(tvs, 'ephemeris', None)
+                                if tvs is not None else None)
+            objs = cat.compute_plot_objects(config_state, ts, current_tt,
+                                            elevation_mask=0.0)
+            sel = getattr(tvs, 'selected_celestial', None) if tvs is not None else None
+            for obj in objs:
+                kind = obj['kind']
+                if kind == 'star':
+                    continue
+                el = obj['el']
+                body_like = kind in ('sun', 'moon', 'planet')
+                below = el < 0.0
+                if below and not body_like:
+                    continue
+                d = unit_from_azel(obj['az'], max(el, 0.0))
+                sx, sy, z = project_dirs(d[None, :], R, cx, cy, focal)
+                if z[0] <= 0.08:
+                    continue
+                X, Y = int(sx[0]), int(sy[0])
+                if not (-10 <= X < w + 10 and -10 <= Y < h + 10):
+                    continue
+                color = obj['color'] or ((205, 130, 255) if kind == 'messier'
+                                         else (90, 200, 180))
+                if below:
+                    color = tuple(c // 2 for c in color)
+                if body_like:
+                    pygame.draw.circle(surface, color, (X, Y), obj['radius'] + 1)
+                    if obj['key'] == 'sun':
+                        pygame.draw.circle(surface, (255, 245, 160), (X, Y),
+                                           obj['radius'] + 4, 1)
+                    name = obj['name'] + (" (below hrz)" if below else "")
+                    t = _font(16).render(name, True, (235, 235, 245))
+                    surface.blit(t, (X + obj['radius'] + 5, Y - 8))
+                elif kind == 'messier':
+                    pygame.draw.rect(surface, color,
+                                     pygame.Rect(X - 3, Y - 3, 7, 7), 1)
+                    t = _font(14).render(obj['name'].split()[0], True,
+                                         (205, 150, 245))
+                    surface.blit(t, (X + 6, Y - 7))
+                else:  # ngc
+                    pygame.draw.circle(surface, color, (X, Y), 3, 1)
+                if obj['key'] == sel:
+                    pygame.draw.circle(surface, (255, 255, 0), (X, Y),
+                                       obj['radius'] + 7, 1)
+        except Exception as e:
+            print(f"Mount3D celestial error: {e}")
+
+    if tvs is not None:
 
         # Selected-target trajectory polyline (navball color rules).
         try:
@@ -727,7 +832,10 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     gsx, gsy, gz = project_points(np.array(ring), R, cam, cx, cy, focal)
     pts = [(int(x), int(y)) for x, y, zz in zip(gsx, gsy, gz) if zz > 0.05]
     if len(pts) >= 3:
-        pygame.draw.polygon(overlay, (30, 60, 34, 90), pts)
+        pygame.draw.polygon(overlay_sky, (30, 60, 34, 90), pts)
+    # Sky-level tint (keepout dots + ground disc) composites here, UNDER the
+    # seat marker and mount model, so translucency can't wash over hardware.
+    surface.blit(overlay_sky, (0, 0))
     seat_bearing = f('mount3d_observer_bearing_deg', 200.0)
     seat_dist = max(0.5, f('mount3d_observer_distance_m', 2.5))
     seat = unit_from_azel(seat_bearing, 0.0) * seat_dist
@@ -767,16 +875,19 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     for _z, poly, col in faces:
         pygame.draw.polygon(surface, col, poly)
 
-    # Boresight ray (thin, from the tube out toward the sky sphere).
-    tip = _HEAD + pose['boresight'] * 0.62
-    far = _HEAD + pose['boresight'] * (R_SKY * 0.5)
+    # Boresight ray (thin, from the tube out toward the sky sphere). The OTA
+    # centerline sits OTA_ARM_OFFSET out along the posed axis 2 (fork arm),
+    # so the ray/cones originate there, not at the head inside the arm.
+    ota_origin = _HEAD + pose['axis2_world'] * OTA_ARM_OFFSET
+    tip = ota_origin + pose['boresight'] * (OTA_LEN * 0.58)
+    far = ota_origin + pose['boresight'] * (R_SKY * 0.5)
     bsx, bsy, bz = project_points(np.array([tip, far]), R, cam, cx, cy, focal)
     if bz[0] > 0.05 and bz[1] > 0.05:
         pygame.draw.line(overlay, (255, 255, 255, 110),
                          (int(bsx[0]), int(bsy[0])), (int(bsx[1]), int(bsy[1])), 1)
 
     # --- FOV cones ----------------------------------------------------------
-    apex = _HEAD + pose['boresight'] * 0.6
+    apex = ota_origin + pose['boresight'] * (OTA_LEN * 0.56)
     for spec in camera_fov_specs(config_state):
         corners = fov_corner_dirs(pose['boresight'], pose['axis2_world'],
                                   spec['fov_width_deg'], spec['fov_height_deg'],
@@ -834,6 +945,17 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
     bx = button('follow_toggle', "FOLLOW LIVE" if m3d.follow_live else "MANUAL POSE",
                 bx, y + 4, m3d.follow_live)
     y += 30
+
+    # Object-type show/hide toggles: the same config flags as the skyplot
+    # (tracking_visuals.OBJECT_TOGGLES), so the two views always agree.
+    # Sun/moon/planets and the named stars stay always-on by design.
+    from tracking_visuals import OBJECT_TOGGLES
+    bx = 10
+    for attr, label, default in OBJECT_TOGGLES:
+        on = bool(getattr(config_state, attr, default))
+        bx = button('toggle_' + attr, f"{label} {'On' if on else 'Off'}",
+                    bx, y + 4, on)
+    y += 26
 
     # Operator-seat controls (always visible; they also move the marker).
     seat_y = y + 4
@@ -921,6 +1043,14 @@ def handle_mount3d_mouse_down(pos, button, display, m3d, config_state):
         if name == 'follow_toggle':
             m3d.follow_live = not m3d.follow_live
             return True
+        if name.startswith('toggle_'):
+            # Object-type visibility flags shared with the skyplot views.
+            attr = name[len('toggle_'):]
+            from tracking_visuals import OBJECT_TOGGLES
+            default = next((d for a, _n, d in OBJECT_TOGGLES if a == attr), True)
+            setattr(config_state, attr,
+                    not bool(getattr(config_state, attr, default)))
+            return True
         if name in _SEAT_STEPS:
             attr, step, default = _SEAT_STEPS[name]
             cur = _config_floats(config_state)(attr, default)
@@ -953,7 +1083,7 @@ def handle_mount3d_mouse_motion(pos, rel, buttons, display, m3d):
                 m3d.look_el = min(89.0, max(-89.0, m3d.look_el - rel[1] * 0.15))
         else:
             m3d.view_az = (m3d.view_az - rel[0] * 0.4) % 360.0
-            m3d.view_el = min(89.0, max(-5.0, m3d.view_el + rel[1] * 0.4))
+            m3d.view_el = min(89.0, max(-89.0, m3d.view_el + rel[1] * 0.4))
 
 
 def handle_mount3d_mouse_up(pos, m3d):

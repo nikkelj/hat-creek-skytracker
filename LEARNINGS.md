@@ -6,6 +6,137 @@ Newest entries first.
 
 ---
 
+## 2026-07-27 — Perf scrub: the "memory leak" was the camera ring; the FPS was the GIL
+
+Field report: ~4 FPS on cam1, ~9 on cam2, and memory growing until the app
+had to be killed. A measured scrub (headless sim rig, per-function wall
+timers + tracemalloc diff) found two independent causes:
+
+* **The "leak": every camera frame was appended to a 1000-deep ring buffer
+  as a full pygame Surface, capture armed or not.** At real sensor sizes
+  that is multiple GB per camera, accumulating over minutes — indistinguishable
+  from an unbounded leak from the outside. The ring exists only for the
+  post-capture dump (which walks BACK from the end by captured-frame count;
+  `start_idx` is informational), so frames are now buffered only while a
+  capture is armed, the ring is cleared at capture start, and cleared again
+  after the stop-snapshot hands the dump its list. Idle memory is now flat.
+  (Remaining benign growth: the Tycho deep catalogue loads ~40 MB once, in
+  the background, minutes after startup.)
+* **The FPS: the two skyplot render threads each spent ~56 ms/frame in
+  draw_polar_plot_on_surface** — at 2×10 FPS targets that alone can consume
+  the entire interpreter, and the camera threads only got GIL scraps
+  (single-digit capture FPS on real hardware). None of that drawing needed
+  to be per-frame: the grid/labels/keepout background is static (now a
+  cached surface, keyed on geometry+mask+keepout config), the starfield
+  moves ~0.02 px/s at plot scale (now a cached layer on a 5 s time quantum
+  — same trick as the navball's quantized-pointing cache), and the selected
+  satellite's ~600-segment sunlit polyline only changes at the past/future
+  boundary (cached on the same quantum). draw_polar is now ~4 ms measured
+  isolated (14x). Sim-only: add_noise regenerated a full-frame rng.normal
+  every frame (~10 ms, the largest single sim-camera cost) — replaced with
+  pre-generated zero-mean unit-sigma noise planes applied at random crop
+  offsets (normalize them exactly, or sum-based tests get flaky).
+
+Follow-up, same session: **gamma correction cost ~44 ms per camera frame**
+(user-confirmed lag when stretching to see dim targets — which is exactly
+when you need the UI responsive for hand-steering). Three stacked fixes,
+verified pixel-identical: gamma AFTER scale-to-display instead of before
+(`pygame.transform.scale` point-samples, so a monotone per-pixel LUT
+commutes — ~6x fewer pixels), the LUT cached per gamma value instead of
+rebuilt per call, and `cv2.LUT` (SIMD, ~2.5x numpy's take; numpy fallback
+kept) on one contiguous copy instead of three full-frame copies. Pipeline
+measured 43.8 -> 4.4 ms. Gotcha discovered en route: writing through
+`surfarray.pixels3d` views is SLOWER than copy-transform-copy — the views
+are strided, and numpy fancy-indexing into them crawls; stay contiguous.
+
+Meta-lesson repeated from the render-cache entry below: on this app the GIL
+is the shared budget — a cost on ANY thread is a cost on EVERY thread, and
+"only 20 ms" on a 10 FPS render thread is 20% of the whole interpreter.
+Layer-cache anything whose true rate of change is seconds, not frames.
+
+## 2026-07-27 — Project-wide timing audit: three clocks, and who may read which
+
+A full audit ("something is off" — sky objects disagreeing in time) found the
+root pattern behind a dozen bugs: the app has THREE clock domains and
+consumers were picking freely. The rules now enforced in code:
+
+* **Tracking clock** (`tracking_vis_state.current_tt`: slider / paused / live)
+  is for VISUALIZATION ONLY — starfield, overlays, arc colors, T+ readouts,
+  Mount 3D. The control loops must never read it: they interpolate setpoints
+  at `trajectory.live_tt()` (the mount cannot time-travel; pausing the UI
+  used to freeze the setpoint mid-track with feed-forward still running).
+  Pause now latches `current_tt` (not wall now), so pausing a scrubbed scene
+  doesn't snap it back to live.
+* **Wall clock** (`time.time()` / `ts.now()`) is for absolute sky time only.
+  Every dt/elapsed/timeout now runs on **`time.perf_counter()`** — the PID
+  cycle dt (which also silently DISCARDED the dt its callers passed:
+  shadowed parameter), park timeout, ADS-B pruning, sim mount physics,
+  hotspot coast. NOT `time.monotonic()`: on Windows/CPython ≤ 3.12 that is
+  GetTickCount64 with a **15.625 ms quantum** (measured here: `sleep(0.01)`
+  reads as 0.0 elapsed) — ±25% dt noise at a 15 Hz loop, and it silently
+  broke a stale-pruning test. perf_counter is QPC: equally monotonic,
+  sub-microsecond. dt is clamped to [DT_MIN, DT_MAX] in control.py AND
+  pid.rs, so the first cycle after a standby can't integrate the whole idle
+  gap (that pinned the integrator at its clip in one cycle → max-rate burst
+  on resume).
+* **Frames carry their own time**: the capture thread stamps a monotonic
+  exposure-midpoint (`latest_raw_time`, seq/payload/seq tear-free protocol;
+  Rust `Frame.time` on the shared loop epoch, back-dated by `age_s` at
+  push). Everything image-derived — hotspot frame interval, gate prediction,
+  star-filter rates, plate-solve pairing — uses frame time; pickup-time
+  stamping aliased the control period into those measurements (correction
+  cap jittered ±50%; frame-age jitter ≈ the star-filter gate itself).
+
+Repeat offenders worth remembering: 0.0 as a timestamp sentinel is safe
+under a wall clock (epoch ~1.8e9) and WRONG under a monotonic/loop clock
+(Rust "coasting on a lock never acquired") — use Option/None. Azimuth
+differences must take the short arc EVERYWHERE (rates fed a ±360°/dt
+feed-forward spike on due-north crossings). And caches keyed by less than
+what the value depends on (sunlit lists vs their time grid, trajectories vs
+observer+plot geometry) rot silently — key them fully or clear at the source.
+
+## 2026-07-26 — The stars WERE frozen — under the time slider, not the live clock
+
+Correction to the entry below: after "verified NOT the case," the user
+reported the precise repro that was the case — scrub the tracking-vis time
+slider and the stars don't move while the satellites do. Both render
+threads computed their own `current_tt = ts.now().tt` (wall clock) and drew
+the starfield + launch overlays at it, while the satellites were positioned
+in main.py from `tracking_vis_state.current_tt` (the app's tracking clock:
+slider position while scrubbing, `paused_tt` while paused, live otherwise).
+Two clocks, one scene — the halves disagree exactly when the user scrubs.
+Fix: `render_time_tt()` in rendering_threads.py resolves the tracking clock
+(with a live-now fallback before the first 10 Hz tick) and both threads use
+it; pinned by a scrubbed-starfield pixel-diff test in test_star_catalog.py.
+
+Lesson: "does X update with time?" has TWO answers per surface — live time
+and scrubbed time — and a test that only advances the live clock proves
+nothing about the slider. The earlier verification tested the wrong one.
+
+## 2026-07-26 — Mount 3D: below-horizon orbit, and "is the star sky frozen?"
+
+Two follow-ups on the Mount 3D tab. (1) The orbit camera's elevation clamp
+was floored at -5°; it now runs the full ±89°, so you can dive under the
+translucent ground disc and look straight up through the mount at the sky
+dome. That exposed a layering bug worth remembering: everything translucent
+lived on ONE overlay blitted after the mount model, so the ground/keepout
+tint washed over the hardware. Translucent layers need to composite in
+scene order — sky-level tint under the mount, boresight ray + FOV cones
+over it — which means two overlays, not one.
+
+(2) "The star catalogue seems fixed at one epoch" — verified NOT the case,
+and now pinned by a test instead of a code-reading argument:
+`tracking_vis_state.current_tt` advances at 10 Hz **unconditionally** in the
+main loop (not gated by the active screen), and `star_catalog.current_altaz`
+applies exact LST rotation per query around a 600-s re-anchor. The
+regression test renders the 3D scene twice, 2 h of tracking-time apart, with
+everything but the stars held constant, and asserts the frames diverge. The
+first version of that test "confirmed" the freeze with 0 changed pixels —
+because it had passed `ts` into the wrong positional slot and the star pass
+was silently excepting. A silent `except -> print` in a render path turns a
+test bug into a false confirmation of the very fear being tested; check the
+console line, not just the assertion.
+
 ## 2026-07-26 — Online PID auto-tune: twiddle on the live error stream works
 
 Added [`autotune.py`](autotune.py): one button tunes all six PID gains *while

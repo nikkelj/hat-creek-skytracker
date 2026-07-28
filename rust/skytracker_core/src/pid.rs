@@ -15,6 +15,12 @@
 
 use crate::protocol;
 
+/// Upper clamp on the control-cycle dt. Mirrored in control.py
+/// (DT_MAX_SECONDS) -- keep in sync. Without it, the first cycle after a
+/// stall or an idle mode integrates the whole gap in one step, pinning the
+/// integrator at its clip and bursting the mount at max rate on resume.
+pub const DT_MAX_SECONDS: f64 = 0.5;
+
 /// Saturation threshold the controller uses: RATES[9] (rev/sec).
 fn max_rate() -> f64 {
     protocol::rate(9)
@@ -129,6 +135,9 @@ impl PidController {
         if dt_seconds <= 0.0 {
             return (0.0, 0);
         }
+        // Clamp dt so one late cycle cannot integrate a whole idle gap
+        // (mirrors control.py).
+        let dt_seconds = dt_seconds.min(DT_MAX_SECONDS);
 
         let error_degrees = clip(error_degrees, -180.0, 180.0);
 

@@ -10,6 +10,16 @@ import math
 import time
 from lib.auxstar import RATES
 
+# Sanity bounds on the measured control-cycle dt. Mirrored in
+# rust/skytracker_core/src/pid.rs (DT_MAX_SECONDS) -- keep in sync.
+# Upper bound: after a stall or a mode sitting idle (STANDBY -> PROGRAM with
+# the same target), the first cycle would otherwise integrate the whole gap in
+# one step -- `integral_error += error * dt` pins the integrator at its clip
+# and the mount bursts at max rate on resume. Lower bound: a duplicate call in
+# the same cycle would divide the derivative by a near-zero dt.
+DT_MIN_SECONDS = 0.005
+DT_MAX_SECONDS = 0.5
+
 
 class PIDController:
     """
@@ -119,6 +129,9 @@ class PIDController:
         """
         if dt_seconds <= 0:
             return 0.0, 0
+        # Clamp dt so one late cycle cannot integrate a whole idle gap
+        # (see DT_MAX_SECONDS above; mirrored in pid.rs).
+        dt_seconds = min(dt_seconds, DT_MAX_SECONDS)
 
         # Clamp error to reasonable range
         error_degrees = np.clip(error_degrees, -180, 180)
@@ -183,7 +196,7 @@ class PIDController:
         self.current_pid_output = total_output
 
         # Convert to signed discrete rate using combined output
-        discrete_rate = self._error_to_discrete_rate(total_output, dt_seconds)
+        discrete_rate = self._error_to_discrete_rate(total_output)
 
         # Store target rate and rate error for display (use sign and magnitude correctly)
         rate_magnitude = abs(discrete_rate)
@@ -192,12 +205,13 @@ class PIDController:
 
         return total_output, discrete_rate
 
-    def _error_to_discrete_rate(self, pid_output_deg_per_sec, dt_seconds):
+    def _error_to_discrete_rate(self, pid_output_rev_per_sec):
         """
         Map PID output to signed discrete rate setting (-9 to +9).
 
-        This function properly preserves the sign information from PID output,
-        ensuring correct directionality for telescope motion.
+        The PID output and the RATES table are both in revolutions/second
+        (see set_feed_forward_rate) -- the Rust mirror names this parameter
+        identically (pid.rs).
 
         Algorithm:
         1. Extract sign from PID output (direction)
@@ -209,10 +223,10 @@ class PIDController:
                                 negative for counter-clockwise/decreasing
         """
         # Store the sign of the requested motion
-        sign = 1 if pid_output_deg_per_sec >= 0 else -1
+        sign = 1 if pid_output_rev_per_sec >= 0 else -1
 
         # Get magnitude for rate computation
-        requested_velocity = abs(pid_output_deg_per_sec)
+        requested_velocity = abs(pid_output_rev_per_sec)
 
         # Zero velocity gets zero rate
         if requested_velocity < 0.01:
@@ -237,42 +251,34 @@ class PIDController:
         # Return signed rate (-9 to +9) - CRITICAL: preserves directionality
         return sign * best_rate_magnitude
 
-    def _max_fixable_error_degrees(self, dt_seconds):
-        """
-        Calculate maximum position error that can be fixed in one control cycle.
-
-        Args:
-            dt_seconds: Control cycle time
-
-        Returns:
-            Maximum fixable error in degrees
-        """
-        # Maximum theoretical correction per cycle at max rate
-        max_correction_per_cycle = RATES[self.max_rate] * dt_seconds
-        return max_correction_per_cycle
-
-    def get_current_rates(self, error_degrees, dt_seconds=0.1, measurement_degrees=None):
+    def get_current_rates(self, error_degrees, dt_seconds=None, measurement_degrees=None):
         """
         Get current PID output and discrete rate for this control cycle.
 
         Args:
             error_degrees: Current position error in degrees
-            dt_seconds: Time since last update
+            dt_seconds: Time since last update. When None (the normal control
+                path), it is measured internally on time.perf_counter() --
+                monotonic (an NTP step on wall time would hand the integrator
+                a negative or multi-second dt mid-track) AND high-resolution
+                (time.monotonic() on Windows/CPython<=3.12 is GetTickCount64
+                with a 15.6 ms quantum -- +/-25% dt noise at a 15 Hz loop).
+                Either way the value is clamped to
+                [DT_MIN_SECONDS, DT_MAX_SECONDS].
             measurement_degrees: Current measured position (enables
                 derivative-on-measurement; see compute_pid_output)
 
         Returns:
             tuple: (pid_output_deg_per_sec, discrete_rate)
         """
-        import time
-        current_time = time.time()
-
-        if self.last_update_time is None:
-            dt_seconds = 0.1  # Default dt for first call
-        else:
-            dt_seconds = current_time - self.last_update_time
-
-        self.last_update_time = current_time
+        now = time.perf_counter()
+        if dt_seconds is None:
+            if self.last_update_time is None:
+                dt_seconds = 0.1  # Default dt for first call
+            else:
+                dt_seconds = now - self.last_update_time
+        self.last_update_time = now
+        dt_seconds = min(max(float(dt_seconds), DT_MIN_SECONDS), DT_MAX_SECONDS)
 
         pid_output, discrete_rate = self.compute_pid_output(
             error_degrees, dt_seconds, measurement_degrees=measurement_degrees

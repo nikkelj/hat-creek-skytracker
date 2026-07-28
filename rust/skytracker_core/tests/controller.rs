@@ -32,6 +32,7 @@ fn blob_frame(w: usize, h: usize, cx: f64, cy: f64) -> Frame {
         h,
         w,
         seq: 1,
+        time: 0.0,
     }
 }
 
@@ -431,6 +432,7 @@ fn handoff_star_filter_rejects_static_blob() {
     });
     let mut f = blob_frame(256, 200, 138.0, 110.0);
     f.seq = 1;
+    f.time = 1.0; // star-filter rates are frame-time based
     // First fresh detection: rate baseline warming up -- neither counted nor
     // rejected (a star must not build count during the warm-up window).
     let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0);
@@ -439,6 +441,7 @@ fn handoff_star_filter_rejects_static_blob() {
     // Subsequent frames >= the 0.35s baseline are verified and rejected.
     for seq in 2..=6u64 {
         f.seq = seq;
+        f.time = 1.0 + 0.4 * (seq - 1) as f64;
         let o = s.step(&i, Some(&f), 10.0, 20.0, 1.0 + 0.4 * (seq - 1) as f64);
         assert_eq!(o.hotspot_status, "star-reject");
         assert_eq!(o.requested_mode, None, "a star must never trigger the hand-off");
@@ -466,14 +469,17 @@ fn handoff_star_filter_accepts_matching_rate() {
     });
     let mut f = blob_frame(256, 200, 138.0, 110.0);
     f.seq = 1;
+    f.time = 1.0; // star-filter rates are frame-time based
     let o1 = s.step(&i, Some(&f), 10.0, 20.0, 1.0); // warm-up: not counted
     assert_eq!(o1.hotspot_status, "detecting");
     assert_eq!(o1.handoff_detection_count, 0);
     f.seq = 2;
+    f.time = 1.4;
     let o2 = s.step(&i, Some(&f), 10.0, 20.0, 1.4); // verified: count 1
     assert_eq!(o2.requested_mode, None);
     assert_eq!(o2.handoff_detection_count, 1);
     f.seq = 3;
+    f.time = 1.8;
     let o3 = s.step(&i, Some(&f), 10.0, 20.0, 1.8); // verified: count 2 -> engage
     assert_eq!(o3.requested_mode, Some(Mode::Hotspot));
 }

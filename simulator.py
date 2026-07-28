@@ -148,10 +148,44 @@ def render_v2mini(frame, px, py, amp, rotation_deg=0.0, scale=1.0):
     paint(bus_w // 2, bus_h // 2, amp)               # bus (bright)
 
 
+# Pre-generated unit-normal noise planes for add_noise. A fresh full-frame
+# rng.normal() cost ~10 ms per 720p frame -- the single largest slice of the
+# sim camera budget, GIL time stolen from the render/control threads (sim
+# cameras visibly starved everything at 2x30 FPS targets). Planes are padded
+# so a random crop offset de-correlates consecutive frames.
+_NOISE_PAD = 64
+_NOISE_PLANES = 4
+_NOISE_BANK = {}   # (h, w) -> [unit-normal float32 planes]
+
+
 def add_noise(frame, read_noise, rng):
-    """Add shot-ish + read noise, in place."""
+    """Add shot-ish + read noise, in place.
+
+    Applies a randomly chosen, randomly offset crop of a pre-generated
+    unit-normal plane scaled by read_noise: statistically equivalent for
+    display/detection purposes at ~1% of the per-frame cost of rng.normal."""
     if read_noise > 0:
-        frame += rng.normal(0.0, read_noise, frame.shape)
+        h, w = frame.shape[0], frame.shape[1]
+        bank = _NOISE_BANK.get((h, w))
+        if bank is None:
+            bank = []
+            for i in range(_NOISE_PLANES):
+                plane = np.random.default_rng(0xB0B + i).normal(
+                    0.0, 1.0, (h + _NOISE_PAD, w + _NOISE_PAD)).astype(np.float32)
+                # Exactly zero-mean / unit-sigma: a raw finite sample carries a
+                # small net offset, which showed up as frame-total drift
+                # between plane picks (flaky sum-based comparisons).
+                plane -= plane.mean()
+                plane /= plane.std()
+                bank.append(plane)
+            _NOISE_BANK[(h, w)] = bank
+        plane = bank[int(rng.integers(len(bank)))]
+        dy = int(rng.integers(_NOISE_PAD + 1))
+        dx = int(rng.integers(_NOISE_PAD + 1))
+        if frame.ndim == 2:
+            frame += read_noise * plane[dy:dy + h, dx:dx + w]
+        else:
+            frame += read_noise * plane[dy:dy + h, dx:dx + w, None]
     np.clip(frame, 0, None, out=frame)
 
 
@@ -216,7 +250,12 @@ class SimMount:
         # integrator so the focus read-back tracks the trigger commands.
         self.focus_true_deg = 0.0
         self._focus_rate_dps = 0.0
-        self._last_t = time.time()
+        # perf_counter: monotonic (an NTP/wall-clock step would otherwise
+        # freeze or teleport the simulated mount mid-run) and high-resolution
+        # (Windows time.monotonic() has a 15.6 ms quantum on CPython<=3.12,
+        # which would quantize the physics dt). Same clock as the exposure
+        # model in SimCap.
+        self._last_t = time.perf_counter()
         self._t0 = self._last_t
         self._lock = threading.RLock()
         self._rng = rng if rng is not None else np.random.default_rng()
@@ -252,7 +291,7 @@ class SimMount:
         return math.hypot(self._az_rate_dps, self._el_rate_dps)
 
     def _advance(self):
-        now = time.time()
+        now = time.perf_counter()
         dt = now - self._last_t
         self._last_t = now
         if dt <= 0:
@@ -753,9 +792,19 @@ class HardwareSimulator:
         return 0.0, 0.0, None, False
 
     # --- render a full sensor frame for a camera (mono uint8) ---
-    def render_frame(self, cam_index):
+    def render_frame(self, cam_index, exposure_us=None):
         cfg = self.config_state
         s = self._sim()
+
+        # Integrate the mount physics up to NOW before reading its pose. The
+        # mount advances lazily (only inside the serial handlers), and this
+        # runs on the camera thread: without an advance the rendered boresight
+        # is the pose as of the last serial poll (up to a control period old)
+        # while the target below is placed at fresh time -- a systematically
+        # signed pixel bias (~rate x poll age) that the HOTSPOT integrator
+        # nulls out, baking a sim-only artifact into any gains tuned here.
+        with self.mount._lock:
+            self.mount._advance()
         w = int(s.get('cam_width', 960))
         h = int(s.get('cam_height', 720))
         frame = np.zeros((h, w), dtype=np.float32)
@@ -845,7 +894,14 @@ class HardwareSimulator:
         cx, cy = w / 2.0 + off_x, h / 2.0 + off_y
 
         brightness = float(s.get('target_brightness', 200.0))
-        exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
+        # Prefer the LIVE exposure the capture object is pacing with
+        # (set_control_value); config_state.camera_configs only updates on an
+        # explicit save, so after a slider change the frame cadence and the
+        # streak lengths would disagree.
+        if exposure_us is not None:
+            exposure_s = max(1e-4, float(exposure_us) / 1e6)
+        else:
+            exposure_s = max(1e-4, float(cfg.get_camera_exposure(cam_name)) / 1e6)
 
         # Star field (streaked by mount motion during the exposure).
         ifd = ifov_deg(pix, foc)
@@ -1015,7 +1071,8 @@ class SimCap:
         # any render failure here is logged (so the real cause is visible) and we still
         # return a valid background frame, keeping the feed alive.
         try:
-            frame = self.simulator.render_frame(self.cam_index)
+            frame = self.simulator.render_frame(self.cam_index,
+                                                exposure_us=self._exposure_us)
         except Exception as e:
             import traceback
             print(f"SimCap render_frame error (cam {self.cam_index}): {e}")

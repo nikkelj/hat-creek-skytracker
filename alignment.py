@@ -355,7 +355,10 @@ class EqGuiSampler(GuiSampler):
                if camera is not None and getattr(camera, 'thread', None) is not None else None)
         if raw is None:
             return None
-        t = self.ts.now()
+        # The frame's exposure time, not now(): the sky rotates ~15 arcsec/s,
+        # so pairing the solve with now() biases every Eq alignment sample by
+        # the frame's age (same fix the AltAz GuiSampler already has).
+        t = frame_skyfield_time(camera, self.ts)
         result = self.solver.solve(raw)
         if result is None or not result.solved:
             return None

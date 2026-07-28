@@ -40,9 +40,17 @@ def noise_frame(w=256, h=256, seed=0):
 class _FakeThread:
     def __init__(self, raw):
         self.raw = raw
+        self.latest_raw_seq = 0
+        # Explicit frame timestamp (perf_counter-clock seconds). Tests set
+        # this per frame so rate-filter dt math is deterministic instead of
+        # depending on real sleep() jitter.
+        self.latest_raw_time = None
 
     def get_latest_raw(self):
         return self.raw
+
+    def get_latest_raw_with_meta(self):
+        return self.raw, self.latest_raw_seq, self.latest_raw_time
 
 
 class _FakeCamera:
@@ -127,7 +135,9 @@ class HotspotIntegrationTests(unittest.TestCase):
 
         # Now feed noise (no detection) and pretend the coast window elapsed.
         jc.camera_manager.get_camera = lambda idx: _FakeCamera(noise_frame())
-        state.hotspot_last_detection_time = time.time() - 5.0
+        # The hotspot loop clock is time.perf_counter() (frame/coast timing);
+        # backdate on the same clock.
+        state.hotspot_last_detection_time = time.perf_counter() - 5.0
         state.telescope_controller.cmds.clear()
         state.hotspot_track()
 
@@ -214,11 +224,15 @@ class StarFilterTests(unittest.TestCase):
 
     def _fresh_detect_twice(self, state, cam):
         """Two _handoff_detect calls on FRESH frames far enough apart for a
-        rate estimate. The static blob + static mount = implied rate ~0."""
+        rate estimate. The static blob + static mount = implied rate ~0.
+        Frame times are stamped explicitly (0.05 s apart) so the filter's dt
+        is exact -- no real sleep, no timer-jitter flakiness."""
+        t0 = time.perf_counter()
         cam.thread.latest_raw_seq = 1
+        cam.thread.latest_raw_time = t0
         first = state._handoff_detect(self.cfg)
-        time.sleep(0.05)
         cam.thread.latest_raw_seq = 2
+        cam.thread.latest_raw_time = t0 + 0.05
         return first, state._handoff_detect(self.cfg)
 
     def test_static_blob_rejected_when_target_moves(self):
@@ -255,13 +269,17 @@ class StarFilterTests(unittest.TestCase):
             cam = _FakeCamera(blob_frame())
             state = self._make_state(cam, (rate, 0.0))
             # Fake the boresight moving at (rate - 0.4): implied rate ends up
-            # 0.4 deg/s short of the trajectory.
-            cam.thread.latest_raw_seq = 1
-            self.assertIsNone(state._handoff_detect(self.cfg))
+            # 0.4 deg/s short of the trajectory. dt is exact because the fake
+            # frames carry explicit timestamps (the filter measures frame
+            # time, not wall time).
             dt = 0.05
-            time.sleep(dt)
+            t0 = time.perf_counter()
+            cam.thread.latest_raw_seq = 1
+            cam.thread.latest_raw_time = t0
+            self.assertIsNone(state._handoff_detect(self.cfg))
             state.current_azm += (rate - 0.4) * dt
             cam.thread.latest_raw_seq = 2
+            cam.thread.latest_raw_time = t0 + dt
             got = state._handoff_detect(self.cfg)
             self.assertEqual(bool(got), expect,
                              f"rate={rate}: expected accept={expect}")

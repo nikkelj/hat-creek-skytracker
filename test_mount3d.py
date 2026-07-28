@@ -231,31 +231,36 @@ class FovConeTests(unittest.TestCase):
             self.assertGreater(dot, 1.0 - 1e-9)
 
 
+def _prep_render_cfg(cfg, stars=False):
+    """Minimal extra config surface the renderer reads."""
+    cfg.camera_configs = {
+        'camera1': {'pixel_size': 2.9, 'focal_length': 162.0,
+                    'alignment_rotation': 0.0},
+        'camera2': {'pixel_size': 2.4, 'focal_length': 2000.0,
+                    'alignment_rotation': 3.0},
+    }
+    cfg.azm_limit_min_str = "25"
+    cfg.azm_limit_max_str = "335"
+    cfg.alt_limit_min_str = "5"
+    cfg.alt_limit_max_str = "78"
+    cfg.elevation_mask_str = "10"
+    cfg.starfield_enabled = stars   # catalog access only when asked
+    cfg.lon_str = "-120.4"
+    cfg.alt_str = "110"
+    cfg.pointing_model_enabled = False
+    cfg.mount3d_observer_bearing_deg = 200.0
+    cfg.mount3d_observer_distance_m = 2.5
+    cfg.mount3d_eye_height_m = 1.2
+    return cfg
+
+
 class SmokeRenderTests(unittest.TestCase):
 
     def test_render_every_mode(self):
         from mount3d import Mount3DState, render_mount3d_on_surface
         for cfg in (Cfg('AltAz'), Cfg('AltAz-Side', align_az=259.0),
                     Cfg('Eq', align_az=0, align_el=34.9), Cfg('Passthrough')):
-            # minimal extra config surface for the renderer
-            cfg.camera_configs = {
-                'camera1': {'pixel_size': 2.9, 'focal_length': 162.0,
-                            'alignment_rotation': 0.0},
-                'camera2': {'pixel_size': 2.4, 'focal_length': 2000.0,
-                            'alignment_rotation': 3.0},
-            }
-            cfg.azm_limit_min_str = "25"
-            cfg.azm_limit_max_str = "335"
-            cfg.alt_limit_min_str = "5"
-            cfg.alt_limit_max_str = "78"
-            cfg.elevation_mask_str = "10"
-            cfg.starfield_enabled = False   # no catalog download in unit tests
-            cfg.lon_str = "-120.4"
-            cfg.alt_str = "110"
-            cfg.pointing_model_enabled = False
-            cfg.mount3d_observer_bearing_deg = 200.0
-            cfg.mount3d_observer_distance_m = 2.5
-            cfg.mount3d_eye_height_m = 1.2
+            _prep_render_cfg(cfg)
             for view in ('orbit', 'operator'):
                 m3d = Mount3DState()
                 m3d.view_mode = view
@@ -268,6 +273,78 @@ class SmokeRenderTests(unittest.TestCase):
                 del arr
                 self.assertGreater(nonbg, 500,
                                    f"{cfg.mount_mode}/{view}: scene looks empty")
+
+    def test_below_horizon_orbit_looks_up_through_the_mount(self):
+        """The orbit camera may dive to view_el=-89 (under the ground plane,
+        looking straight up). The scene must still render non-empty."""
+        from mount3d import Mount3DState, render_mount3d_on_surface
+        cfg = _prep_render_cfg(Cfg('AltAz'))
+        m3d = Mount3DState()
+        m3d.view_mode = 'orbit'
+        m3d.follow_live = False
+        m3d.manual_azm, m3d.manual_alt = 40.0, 30.0
+        m3d.view_el = -85.0
+        surf = pygame.Surface((800, 600))
+        render_mount3d_on_surface(surf, cfg, None, None, m3d, None)
+        arr = pygame.surfarray.pixels3d(surf)
+        nonbg = int(np.count_nonzero(arr.sum(axis=2) > 60))
+        del arr
+        self.assertGreater(nonbg, 500, "below-horizon view renders empty")
+
+    def test_view_el_clamp_allows_minus_89(self):
+        from mount3d import Mount3DState, handle_mount3d_mouse_motion
+        m3d = Mount3DState()
+        m3d.view_mode = 'orbit'
+        m3d.dragging_view = True
+        m3d.dragging_slider = None
+        # Drag convention: positive rel[1] (mouse down) RAISES view_el
+        # (grab-the-scene feel), negative lowers it.
+        handle_mount3d_mouse_motion((400, 300), (0, 1000), (1, 0, 0),
+                                    None, m3d)
+        self.assertLessEqual(m3d.view_el, 89.0, "upper clamp")
+        handle_mount3d_mouse_motion((400, 300), (0, -1000), (1, 0, 0),
+                                    None, m3d)
+        self.assertGreaterEqual(m3d.view_el, -89.0, "lower clamp")
+        self.assertLess(m3d.view_el, -80.0,
+                        "drag should reach the below-horizon range")
+
+
+class StarTimeProgressionTests(unittest.TestCase):
+    """The 3D sky must rotate as tracking time advances (the catalog is NOT
+    frozen at one epoch): two renders 2 h apart must differ in many pixels,
+    with everything except the stars held identical."""
+
+    def test_sky_rotates_between_renders(self):
+        import types
+        from mount3d import Mount3DState, render_mount3d_on_surface
+        try:
+            from skyfield.api import load
+            ts = load.timescale()
+            from star_catalog import get_catalog
+            probe = get_catalog(None).current_altaz(
+                34.87, -120.4, 110.0, ts, ts.now().tt,
+                elevation_mask=0.0, max_count=50, limiting_mag=4.0)
+            if probe is None or len(probe.get('az', [])) == 0:
+                raise RuntimeError("catalog empty")
+        except Exception as e:
+            self.skipTest(f"star catalog unavailable here: {e}")
+
+        cfg = _prep_render_cfg(Cfg('AltAz'), stars=True)
+        t0 = ts.now().tt
+        frames = []
+        for tt in (t0, t0 + 2.0 / 24.0):
+            tvs = types.SimpleNamespace(current_tt=tt, ephemeris=None)
+            m3d = Mount3DState()
+            m3d.view_mode = 'orbit'
+            m3d.follow_live = False
+            m3d.manual_azm, m3d.manual_alt = 40.0, 30.0
+            surf = pygame.Surface((800, 600))
+            render_mount3d_on_surface(surf, cfg, tvs, None, m3d, ts)
+            frames.append(pygame.surfarray.array3d(surf))
+        diff = int(np.count_nonzero(np.any(frames[0] != frames[1], axis=2)))
+        self.assertGreater(diff, 200,
+                           f"only {diff} pixels changed over 2 h -- star sky "
+                           "appears frozen in time")
 
 
 if __name__ == '__main__':

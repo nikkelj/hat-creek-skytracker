@@ -9,15 +9,31 @@ camera and a narrow long-focal-length camera) and provides a fast, game-like UI
 with selectable tracking modes, real-time closed-loop control, and labeled data
 capture.
 
+Pass predictions are cross-validated against heavens-above.com to the
+seconds level across orbit classes — see [`VALIDATION.md`](VALIDATION.md).
+
 ![Main menu](doc/screenshots/main_menu.png)
 
 ## Current Capabilities
 
 **Tracking modes** (cycle through them from the Joystick Loop):
 - **STANDBY** — poll/display mount position only.
-- **RATE_CONTROL** — manual joystick slewing with hardware safety limits.
-- **PROGRAM** — automatically follow a TLE satellite pass or an imported launch
-  trajectory, using interpolated angular position + rates.
+- **RATE_CONTROL** — manual joystick slewing with hardware safety limits,
+  through an **adaptive speed gearbox**: full stick deflection is capped at a
+  gentle base rate (~0.5°/s) so a slammed stick can't fling the target out of
+  frame; holding the stick pinned deliberately winds the ceiling up toward the
+  mount's full 10°/s, and backing off, releasing, or reversing direction winds
+  it back down. A segmented **Slew speed** indicator beside the stick display
+  shows the current gear. Kid-tested design goal: you have to *earn* the fast
+  rates, and letting go always lands you back in gentle mode.
+- **PROGRAM** — automatically follow a TLE satellite pass, an imported launch
+  trajectory, a tracked ADS-B aircraft, **or any celestial object** — sun,
+  moon, planets (Pluto included, because every kid asks), the 100 brightest
+  named stars, and the Messier/NGC deep-sky catalogues — using interpolated
+  angular position + rates. Celestial targets ride a sliding 90-minute
+  Skyfield-apparent trajectory window that refreshes automatically, so the
+  mount slews to the object and then follows it across the sky indefinitely.
+  Selecting the sun posts a loud solar-filter warning.
 - **HOTSPOT** — closed-loop *optical* tracker: detect the brightest ("hot")
   object in the camera frame and drive the mount to keep it centered. Intended
   as an operator hand-off once PROGRAM track has the object in frame (rockets,
@@ -58,11 +74,15 @@ capture.
 - **ADS-B aircraft tracking** (RTL-SDR / Nooelec): nearby aircraft appear on the
   skyplot and navball and can be selected, slewed to, and tracked like a satellite.
 
-**Rendering performance.** The render thread invariant-caches its expensive
-per-frame work so it doesn't starve the GIL the camera capture thread needs: the
-navball's hemisphere/grid is cached on quantized pointing (~33× cheaper when the
-mount is stationary) and each processed camera feed is cached on its capture
-sequence so an unchanged frame isn't re-scaled. See [`LEARNINGS.md`](LEARNINGS.md).
+**Rendering performance.** The render threads invariant-cache their expensive
+per-frame work so they don't starve the GIL the camera capture threads need:
+the navball's hemisphere/grid is cached on quantized pointing, each processed
+camera feed is cached on its capture sequence, and the skyplot's static
+background (grid/labels/keepout), starfield, and selected-satellite arc are
+cached layers rebuilt on a seconds-scale quantum instead of drawn per frame
+(~14× cheaper). Camera frames are buffered into the capture ring **only while
+a capture is armed** — idle memory stays flat instead of accumulating up to
+1000 full-resolution frames per camera. See [`LEARNINGS.md`](LEARNINGS.md).
 
 **Hardware simulator** (see below) — run the entire tracking loop without any
 physical hardware present.
@@ -71,6 +91,18 @@ physical hardware present.
 
 **Tracking Vis** — annotated polar sky plot with the selected object's orbit,
 orbital elements, camera FOV footprints, and a scrollable pass table.
+
+The plot carries a full **celestial layer**: the sun, moon and planets are
+always drawn (dimmed on the horizon rim when below it, so you can see where
+they'll rise), the **100 brightest stars** get gold spike markers and their
+IAU proper names (Sirius, Vega, Betelgeuse...), and the **Messier** and
+**NGC** catalogues overlay as violet squares / teal circles (NGC additionally
+magnitude-limited) to keep the noise manageable. A **Show objects** toggle
+column on the left panel switches each object type on/off — satellites, their
+labels, aircraft, stars, Messier, NGC — with the sun/moon/planets and named
+stars deliberately always-on. Every object — plus every satellite and
+aircraft — is click-selectable, and PROGRAM mode will slew to and track it.
+Shown here with the moon selected (yellow ring):
 
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
@@ -88,8 +120,13 @@ forbids the lowest elevations:
 crosshairs), a polar-plot quadrant, an attitude navball, tracking-rate/error
 strip charts, mount connection/position status, tracking mode, and PID
 diagnostics. The PID pane's log sliders tune the gains live, and its
-**AUTOTUNE** button hands them to the online auto-tuner while tracking.
-Shown here in simulation with the mount and both cameras connected.
+**AUTOTUNE** button hands them to the online auto-tuner while tracking. The
+**Slew speed** gear bar next to the stick displays shows the adaptive
+RATE_CONTROL ceiling (green = base range, orange = boost gears earned by
+pinning the stick). The skyplot quadrant carries the same celestial layer and
+click-selection as the full-screen plot, with **M** and **NGC** catalogue
+toggles in the Targets strip. Shown here in simulation with the mount and
+both cameras connected.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 
@@ -99,17 +136,27 @@ alignment-rotation / ROI controls for co-boresighting the guide and main cameras
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
 
 **Mount 3D** — a software-3D view of the mount for building alignment
-intuition: the articulated model poses from the live axis angles through the
+intuition: the articulated single-fork-arm model (tripod → AZ-axis tube →
+ALT-axis arm → side-mounted OTA, each rigidly attached like the real
+hardware) poses from the live axis angles through the
 **same forward transforms the tracker uses** (pinned by a parity test suite),
 per mount mode — shown here in AltAz-Side, where the cyan AZM-axis arrow lies
 on the horizon at the alignment azimuth. Both cameras' FOV cones sweep a real
-star field with satellites, aircraft, the selected trajectory, and the mount
-keepout tinted on the sky dome. Two view cameras: free **orbit** (drag/wheel)
+star field with satellites, aircraft, the sun/moon/planets and the
+Messier/NGC overlays, the selected trajectory, and the mount keepout tinted
+on the sky dome — with the same object-type toggle buttons as the skyplot in
+its HUD (the two views share one set of config flags). Two view cameras: free **orbit** (drag/wheel)
 and an **operator view** rendered from your configured seat position (bearing
 / distance / eye height) so the perspective matches what you actually see.
-Manual AZM/ALT sliders pose the model while disconnected.
+Manual AZM/ALT sliders pose the model while disconnected. The orbit camera
+dives the full ±89° — below the ground plane you look straight up through
+the translucent ground at the mount and the whole sky dome. The star field
+advances in real time with the tracking clock (sidereal rotation, pinned by
+a regression test).
 
 ![Mount 3D](doc/screenshots/mount3d.png)
+
+![Mount 3D from below](doc/screenshots/mount3d_below_horizon.png)
 
 ## Hardware Interfaces
 

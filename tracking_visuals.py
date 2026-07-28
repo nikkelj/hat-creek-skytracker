@@ -1,7 +1,7 @@
 import math
 import pygame
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from utils import get_altitude_color, draw_button
 from skyfield.api import wgs84, load
 from enum import Enum
@@ -69,6 +69,16 @@ class TrackingVisState:
         self.aircraft_trajectories = {}       # icao -> (rows, times_array), 8-col format
         self.selected_aircraft = None         # icao of the selected/tracked aircraft
         self.hovered_aircraft = None          # icao under the cursor
+
+        # Celestial targets (sun/moon/planets, top-100 named stars, Messier/NGC).
+        # Parallel to the satellite/aircraft structures: celestial_positions is
+        # published by the render thread each frame ({key: (px, py, el, az)} in
+        # full-screen pixel coords) for click hit-testing, and the selected
+        # object's sliding tracking trajectory lives in celestial_trajectories
+        # (8-col format, maintained by celestial.ensure_selected_trajectory).
+        self.selected_celestial = None        # selection key ('moon', 'M031', ...)
+        self.celestial_positions = {}         # key -> (px, py, el, az)
+        self.celestial_trajectories = {}      # key -> (rows, times_array)
 
         # Starfield state (Hipparcos catalogue rendered on the skyplot).
         # star_screen_positions is published by the render thread each frame as
@@ -344,7 +354,6 @@ PASS_TABLE_HEADER_SORTED_COLOR = (60, 60, 60)   # Sorted header background
 SATELLITE_NAME_MAX_LENGTH = 20     # Max length for displayed satellite names
 TIME_STRING_MILLISECONDS_PRECISION = 3   # Precision for time string milliseconds
 DEFAULT_ELEVATION_MASK_DEG = 10.0        # Default elevation mask (degrees)
-HOUR_OFFSET_PDT = 7                     # PDT offset from UTC (hours)
 
 # ==============================================================================
 # VISUALIZATION FUNCTIONS
@@ -580,8 +589,10 @@ def draw_time_display(display):
     State-direct mutation function for drawing time display.
     Takes display object directly instead of individual parameters.
     """
-    current_utc = datetime.utcnow()
-    current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
+    # System timezone via astimezone() -- a hardcoded UTC-7 was an hour wrong
+    # from November to March and arbitrarily wrong outside the Pacific.
+    current_utc = datetime.now(timezone.utc)
+    current_local = current_utc.astimezone()
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]  # Millisecond precision
     time_text = f"UTC: {utc_time_str}  Local: {local_time_str}"
@@ -597,6 +608,57 @@ def draw_satellite_count(display, state):
     count_text = f"Satellites in view: {sat_count}"
     count_surface = display.small_font.render(count_text, True, (255, 255, 255))
     display.menu_screen.blit(count_surface, (display.sub_x + 10, display.sub_y + 240))  # Moved below filter boxes
+
+# Object-type visibility toggles, shared by the full-screen tracking vis
+# (draw_object_toggles below) and the Mount 3D HUD: (config attr, label,
+# default). The sun/moon/planets and the top-100 named stars are deliberately
+# NOT toggleable -- they are always visible (kid-friendly invariant).
+OBJECT_TOGGLES = (
+    ('satellites_enabled', 'Satellites', True),
+    ('satellite_labels_enabled', 'Sat labels', True),
+    ('aircraft_enabled', 'Aircraft', True),
+    ('starfield_enabled', 'Stars', True),
+    ('messier_enabled', 'Messier', True),
+    ('ngc_enabled', 'NGC', False),
+)
+
+
+def draw_object_toggles(display, state, config_state):
+    """Column of object-type show/hide buttons on the tracking-vis left panel
+    (below the satellite count). Publishes state.object_toggle_rects for
+    handle_object_toggle_click."""
+    x = display.sub_x + 10
+    y = display.sub_y + 270
+    label = display.small_font.render("Show objects:", True, (255, 255, 255))
+    display.menu_screen.blit(label, (x, y))
+    y += 22
+    mouse_pos = pygame.mouse.get_pos()
+    rects = {}
+    for attr, name, default in OBJECT_TOGGLES:
+        on = bool(getattr(config_state, attr, default))
+        rect = pygame.Rect(x, y, 110, 22)
+        base = (70, 110, 70) if on else (90, 70, 70)
+        col = tuple(min(255, c + 25) for c in base) if rect.collidepoint(mouse_pos) else base
+        pygame.draw.rect(display.menu_screen, col, rect)
+        pygame.draw.rect(display.menu_screen, (150, 150, 160), rect, 1)
+        text = display.small_font.render(f"{name} {'On' if on else 'Off'}", True,
+                                         (255, 255, 255))
+        display.menu_screen.blit(text, (rect.x + 6, rect.y + 3))
+        rects[attr] = rect
+        y += 26
+    state.object_toggle_rects = rects
+
+
+def handle_object_toggle_click(state, config_state, pos):
+    """Flip the config flag for a clicked object-type toggle. Returns True if
+    the click was consumed."""
+    for attr, rect in (getattr(state, 'object_toggle_rects', {}) or {}).items():
+        if rect.collidepoint(pos):
+            default = next((d for a, _n, d in OBJECT_TOGGLES if a == attr), True)
+            setattr(config_state, attr, not bool(getattr(config_state, attr, default)))
+            return True
+    return False
+
 
 def draw_scroll_bar(display, state):
     """
@@ -619,8 +681,9 @@ def draw_scroll_time_display(display, current_tt, ts):
     Takes display object, current_tt, and ts directly instead of individual parameters.
     """
     radius = min(display.sub_width, display.sub_height) // 2 - 50
-    current_utc = ts.tt(jd=current_tt).utc_datetime()
-    current_local = current_utc - timedelta(hours=7)  # PDT is UTC-7
+    current_utc = ts.tt_jd(current_tt).utc_datetime()
+    # System timezone (DST-correct), not a hardcoded PDT offset.
+    current_local = current_utc.astimezone()
     utc_time_str = current_utc.strftime("%H:%M:%S.%f")[:-3]
     local_time_str = current_local.strftime("%H:%M:%S.%f")[:-3]
     time_text = f"Scroll UTC: {utc_time_str}  Local: {local_time_str}"

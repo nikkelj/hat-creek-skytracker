@@ -30,11 +30,18 @@ class ConfigState:
         # surfaced as toggle buttons in the joystick-mode skyplot overlay).
         self.satellites_enabled = True          # draw satellite markers on the skyplot
         self.satellite_labels_enabled = True    # draw satellite name labels
+        self.aircraft_enabled = True            # draw ADS-B aircraft markers
 
         # Star catalogue / starfield configuration
         self.starfield_enabled = True          # draw catalogue stars on the skyplot
         self.max_rendered_star_count = 2000    # brightest-N cap (skyplot + sim images)
         self.star_limiting_magnitude = 6.5     # faintest star ever considered
+
+        # Deep-sky overlays (celestial.py). Sun/moon/planets and the top-100
+        # named stars are always drawn; these gate the denser catalogues.
+        self.messier_enabled = True            # Messier markers on the skyplot
+        self.ngc_enabled = False               # NGC markers (noisy; off by default)
+        self.ngc_limiting_magnitude = 10.0     # faintest NGC object shown
 
         # Plate solver (tetra3) configuration
         self.plate_solve_enabled = False       # background plate-solve worker on/off
@@ -155,6 +162,13 @@ class ConfigState:
         # HANDOFF mode: PROGRAM track runs the hotspot detector in parallel and
         # hands the loop to HOTSPOT after this many consecutive solid detections.
         self.handoff_min_frames = 5
+
+        # RATE_CONTROL adaptive gearbox (joystick_controller.AdaptiveRateMapper):
+        # full stick deflection commands at most base_ceiling (MC_MOVE step,
+        # 1-9) until the stick has been held pinned for windup_delay seconds,
+        # after which the ceiling steps toward 9. Tune the feel here.
+        self.joy_rate_base_ceiling = 5
+        self.joy_rate_windup_delay_s = 0.8
 
         # Hardware simulator configuration (mount + camera sim). enabled=False
         # leaves all real-hardware behavior unchanged.
@@ -305,6 +319,10 @@ class ConfigState:
             "satellites_enabled": self.satellites_enabled,
             "satellite_labels_enabled": self.satellite_labels_enabled,
             "starfield_enabled": self.starfield_enabled,
+            "aircraft_enabled": self.aircraft_enabled,
+            "messier_enabled": self.messier_enabled,
+            "ngc_enabled": self.ngc_enabled,
+            "ngc_limiting_magnitude": self.ngc_limiting_magnitude,
             "max_rendered_star_count": self.max_rendered_star_count,
             "star_limiting_magnitude": self.star_limiting_magnitude,
             "plate_solve_enabled": self.plate_solve_enabled,
@@ -361,6 +379,8 @@ class ConfigState:
             "hotspot_star_filter_enabled": self.hotspot_star_filter_enabled,
             "hotspot_rate_gate_dps": self.hotspot_rate_gate_dps,
             "pid_output_filter_tau_sec": self.pid_output_filter_tau_sec,
+            "joy_rate_base_ceiling": self.joy_rate_base_ceiling,
+            "joy_rate_windup_delay_s": self.joy_rate_windup_delay_s,
             "sim_config": self.sim_config,
             "mount_mode": self.mount_mode,
             "altaz_side_flip": self.altaz_side_flip,
@@ -396,6 +416,11 @@ class ConfigState:
         self.satellites_enabled = config_dict.get("satellites_enabled", self.satellites_enabled)
         self.satellite_labels_enabled = config_dict.get("satellite_labels_enabled", self.satellite_labels_enabled)
         self.starfield_enabled = config_dict.get("starfield_enabled", self.starfield_enabled)
+        self.aircraft_enabled = config_dict.get("aircraft_enabled", self.aircraft_enabled)
+        self.messier_enabled = config_dict.get("messier_enabled", self.messier_enabled)
+        self.ngc_enabled = config_dict.get("ngc_enabled", self.ngc_enabled)
+        self.ngc_limiting_magnitude = config_dict.get(
+            "ngc_limiting_magnitude", self.ngc_limiting_magnitude)
         self.max_rendered_star_count = config_dict.get("max_rendered_star_count", self.max_rendered_star_count)
         self.star_limiting_magnitude = config_dict.get("star_limiting_magnitude", self.star_limiting_magnitude)
         self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)
@@ -465,6 +490,10 @@ class ConfigState:
             "hotspot_rate_gate_dps", self.hotspot_rate_gate_dps)
         self.pid_output_filter_tau_sec = config_dict.get(
             "pid_output_filter_tau_sec", self.pid_output_filter_tau_sec)
+        self.joy_rate_base_ceiling = config_dict.get(
+            "joy_rate_base_ceiling", self.joy_rate_base_ceiling)
+        self.joy_rate_windup_delay_s = config_dict.get(
+            "joy_rate_windup_delay_s", self.joy_rate_windup_delay_s)
 
         # Merge hardware simulator settings (keep defaults for missing keys)
         if "sim_config" in config_dict and isinstance(config_dict["sim_config"], dict):

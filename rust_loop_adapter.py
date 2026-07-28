@@ -24,8 +24,8 @@ import time
 import numpy as np
 
 import skytracker_core as rc
-from joystick_controller import TrackingMode, axis_to_rate
-from trajectory import interpolate_position_data_and_rates
+from joystick_controller import TrackingMode
+from trajectory import interpolate_position_data_and_rates, live_tt
 
 _MODE_TO_STR = {
     TrackingMode.STANDBY: "standby",
@@ -95,8 +95,10 @@ class RustCoreLoopAdapter:
     # ---- loop ----
     def _run(self):
         period = 1.0 / self.target_hz
+        # Deadline scheduling (see MountControlThread.run): repay the OS timer
+        # quantum's sleep overshoot so the pump actually paces at target_hz.
+        next_deadline = time.perf_counter() + period
         while not self._stop.is_set():
-            t0 = time.perf_counter()
             try:
                 self._pump()
             except Exception as e:  # never let the pump die silently
@@ -111,7 +113,10 @@ class RustCoreLoopAdapter:
                     cb = self.state.update_status_callback
                     if cb:
                         cb(f"Rust loop pump error: {msg}")
-            self._stop.wait(max(0.0, period - (time.perf_counter() - t0)))
+            self._stop.wait(max(0.0, next_deadline - time.perf_counter()))
+            next_deadline += period
+            if next_deadline < time.perf_counter():
+                next_deadline = time.perf_counter() + period
         # Shutdown: stop the loop thread (it sends a final mount stop).
         if self.loop is not None:
             self.loop.stop()
@@ -400,7 +405,11 @@ class RustCoreLoopAdapter:
             target_azm = target_alt = 0.0
 
         if self._park_state is None:
-            self._park_state = {"start": now, "last_cmd": 0.0}
+            # last_cmd is backdated one reissue period so the first goto goes
+            # out immediately without relying on a 0.0 sentinel (monotonic 0.0
+            # is a legal timestamp).
+            self._park_state = {"start": now,
+                                "last_cmd": now - float(getattr(st, "PARK_REISSUE_SEC", 1.0))}
             if st.update_status_callback:
                 st.update_status_callback(
                     f"Parking to AZM {target_azm:.1f}° / ALT {target_alt:.1f}°...")
@@ -436,6 +445,8 @@ class RustCoreLoopAdapter:
         if st.connected_joystick is not None:
             joy = st.joysticks.get(st.connected_joystick)
         if joy is None:
+            # Keep servicing the gearbox so its idle wind-down/reset still runs.
+            st.rate_mapper.update(0.0, 0.0)
             self.loop.set_rate_cmd(0, 0)
             return
         tare = st.joystick_tare.get(st.connected_joystick)
@@ -446,7 +457,9 @@ class RustCoreLoopAdapter:
                 v -= tare[i]
             return v
 
-        self.loop.set_rate_cmd(axis_to_rate(axis(2)), axis_to_rate(axis(3)))
+        # Shared adaptive gearbox (same instance the Python loop uses): full
+        # stick is capped at the base ceiling until deliberately held pinned.
+        self.loop.set_rate_cmd(*st.rate_mapper.update(axis(2), axis(3)))
 
     def _push_program_setpoint(self, st):
         """Satellite/aircraft tracking setpoint. (Launch tracking is handled
@@ -456,12 +469,24 @@ class RustCoreLoopAdapter:
         Python loops agree on the target (selected satellite first, then aircraft)."""
         vis = st.tracking_vis_state
         from joystick_controller import active_program_trajectory
+        # Keep a selected celestial target's sliding window covering live time
+        # (mirrors program_track); cheap no-op when the window is fresh.
+        if vis is not None and getattr(vis, 'selected_celestial', None):
+            try:
+                from celestial import ensure_selected_trajectory
+                ensure_selected_trajectory(vis, st.config_state)
+            except Exception as e:
+                print(f"RustCoreLoopAdapter: celestial trajectory refresh failed: {e}")
         target_traj, _kind, _key = active_program_trajectory(vis)
         if vis is None or target_traj is None:
             self.loop.clear_setpoint()
             return
+        # Interpolate at LIVE time -- never vis.current_tt, the UI tracking
+        # clock that follows the time slider and freezes while paused. The
+        # slider is visualization-only; the mount aims at the target's real
+        # current position (mirrors joystick_controller.program_track).
         px, py, target_alt, dist, target_az, az_rate, el_rate = (
-            interpolate_position_data_and_rates(target_traj, vis.current_tt)
+            interpolate_position_data_and_rates(target_traj, live_tt())
         )
         if px is None or target_az is None or target_alt is None or target_alt <= 0:
             self.loop.clear_setpoint()
@@ -512,8 +537,9 @@ class RustCoreLoopAdapter:
             return
 
         # launched=True applies the relative-time indexing (file T-0 + elapsed).
+        # Live time, not the UI tracking clock -- see _push_program_setpoint.
         px, py, alt, dist, az, az_rate, el_rate = interpolate_position_data_and_rates(
-            traj, vis.current_tt,
+            traj, live_tt(),
             getattr(vis, "launch_start_time", 0) or 0,
             bool(getattr(vis, "launch_launched", False)),
         )
@@ -575,12 +601,25 @@ class RustCoreLoopAdapter:
         )
         camera = camera_manager.get_camera(cam_index)
         if camera is not None and getattr(camera, "thread", None) is not None:
-            raw = camera.thread.get_latest_raw()
+            thread = camera.thread
+            frame_time = None
+            if hasattr(thread, "get_latest_raw_with_meta"):
+                raw, seq, frame_time = thread.get_latest_raw_with_meta()
+            else:
+                raw = thread.get_latest_raw()
+                seq = getattr(thread, "latest_raw_seq", None)
             # Only push frames the camera hasn't already delivered: push_frame
             # assigns a new seq per call, so re-pushing the same raw frame would
             # defeat the loop's stale-frame gate (and costs a full-frame FFI
             # copy every pump cycle for nothing).
-            seq = getattr(camera.thread, "latest_raw_seq", None)
             if raw is not None and (seq is None or seq != self._last_pushed_frame_seq):
-                self.loop.push_frame(hs.to_intensity(raw).astype(np.float32))
+                # Frame age (exposure midpoint -> now) rides along so the Rust
+                # loop can stamp the frame on its own clock: image-derived
+                # timing (frame intervals, gate prediction, star filter) then
+                # measures true camera cadence, not pump-observation cadence.
+                age_s = None
+                if frame_time is not None:
+                    # Same clock the capture thread stamped with (perf_counter).
+                    age_s = max(0.0, time.perf_counter() - frame_time)
+                self.loop.push_frame(hs.to_intensity(raw).astype(np.float32), age_s)
                 self._last_pushed_frame_seq = seq

@@ -752,6 +752,35 @@ def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset,
         current_y += panel_height + 0  # Panel height + spacing
 
 
+def _draw_celestial_details_on_surface(surface, state, mode):
+    """Details panel for a selected celestial object (same slot the satellite
+    panel uses). No-op when nothing celestial is selected."""
+    if not getattr(state, 'selected_celestial', None):
+        return
+    try:
+        from celestial import selected_object_info_lines
+        info = selected_object_info_lines(state)
+    except Exception:
+        info = None
+    if not info:
+        return
+    surface_width, surface_height = surface.get_size()
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        panel_x, panel_width = _quadrant_info_panel_geometry(surface_width, surface_height)
+    else:
+        panel_x, panel_width = surface_width - 190, 170
+    pygame.font.init()
+    font = pygame.font.Font(None, 16)
+    line_h = 15
+    panel_y = 20
+    panel_h = len(info) * line_h + 14
+    pygame.draw.rect(surface, (50, 50, 50), (panel_x, panel_y, panel_width, panel_h))
+    pygame.draw.rect(surface, (0, 0, 0), (panel_x, panel_y, panel_width, panel_h), 2)
+    for i, (label, value) in enumerate(info):
+        s = font.render(f"{label}: {value}", True, (255, 255, 255))
+        surface.blit(s, (panel_x + 6, panel_y + 7 + i * line_h))
+
+
 def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """
     Draw satellite details panel on a specified surface with given bounds.
@@ -760,6 +789,9 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
     global SATELLITE_LABEL_FONT
 
     if not (state.hovered_satellite or state.selected_satellite):
+        # The info box serves ANY selected object: a celestial selection
+        # (star/Messier/NGC/planet/sun/moon) reuses the same panel.
+        _draw_celestial_details_on_surface(surface, state, mode)
         return
 
     # Get the satellite to display details for
@@ -1234,6 +1266,8 @@ def draw_celestial_on_surface(surface, config_state, ts, state, display_bounds,
                 surface.blit(surf, (dxi + obj['radius'] + 3, dyi - 5))
 
     state.celestial_positions = positions
+    # Per-frame object lookup for the details box (celestial.selected_object_info_lines).
+    state.celestial_plot_objects = {o['key']: o for o in objs}
 
 
 def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN, config_state=None):

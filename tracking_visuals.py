@@ -641,6 +641,29 @@ def draw_details(display, state, mode=PolarPlotMode.FULL_SCREEN):
             text_surface = font_to_use.render(line, True, (255, 255, 255))
             display.menu_screen.blit(text_surface, (details_rect.x + padding, details_rect.y + padding + i * line_height))
 
+    elif getattr(state, 'selected_celestial', None):
+        # The info box serves ANY selected object: stars, Messier/NGC DSOs,
+        # planets, the sun and moon reuse the satellite details panel.
+        try:
+            from celestial import selected_object_info_lines
+            info = selected_object_info_lines(state)
+        except Exception:
+            info = None
+        if not info:
+            return
+        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 90, display.sub_y + 20, 85, 125)
+            font_to_use, line_height, padding = display.tiny_font, 12, 3
+        else:
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 190, display.sub_y + 20, 170, 250)
+            font_to_use, line_height, padding = display.small_font, 15, 5
+        pygame.draw.rect(display.menu_screen, (50, 50, 50), details_rect)
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), details_rect, 2)
+        for i, (label, value) in enumerate(info):
+            text_surface = font_to_use.render(f"{label}: {value}", True, (255, 255, 255))
+            display.menu_screen.blit(text_surface, (details_rect.x + padding, details_rect.y + padding + i * line_height))
+
+
 def draw_time_display(display):
     """
     State-direct mutation function for drawing time display.

@@ -679,7 +679,12 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
 
     # Satellites (+ aircraft): interpolated trajectory position; cols 1/2 are
     # sky el/az (cols 4/5 are baked polar-plot pixels -- never those).
-    def draw_traj_markers(positions, trajectories, selected, color):
+    # Clickable sky targets collected during this render (surface-local px):
+    # [(x, y, kind, key)] consumed by handle_mount3d_mouse_down so satellites,
+    # aircraft and celestial objects are selectable in the 3D view too.
+    _click_targets = []
+
+    def draw_traj_markers(positions, trajectories, selected, color, kind):
         if not positions or not trajectories or current_tt is None:
             return
         drawn = 0
@@ -716,6 +721,7 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
                                (X, Y), 4 if is_sel else 2)
             if is_sel:
                 pygame.draw.circle(surface, (255, 255, 100), (X, Y), 8, 1)
+            _click_targets.append((X, Y, kind, key_obj))
             drawn += 1
             if drawn > 500:
                 break
@@ -725,11 +731,13 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
         if getattr(config_state, 'satellites_enabled', True):
             draw_traj_markers(getattr(tvs, 'satellite_positions', None),
                               getattr(tvs, 'satellite_trajectories', None),
-                              getattr(tvs, 'selected_satellite', None), (170, 190, 140))
+                              getattr(tvs, 'selected_satellite', None), (170, 190, 140),
+                              'satellite')
         if getattr(config_state, 'aircraft_enabled', True):
             draw_traj_markers(getattr(tvs, 'aircraft_positions', None),
                               getattr(tvs, 'aircraft_trajectories', None),
-                              getattr(tvs, 'selected_aircraft', None), (90, 200, 220))
+                              getattr(tvs, 'selected_aircraft', None), (90, 200, 220),
+                              'aircraft')
 
     # Celestial layer on the sky dome: sun/moon/planets always (pinned dimmed
     # on the horizon when below it, like the skyplot), Messier/NGC per the
@@ -745,8 +753,6 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
             sel = getattr(tvs, 'selected_celestial', None) if tvs is not None else None
             for obj in objs:
                 kind = obj['kind']
-                if kind == 'star':
-                    continue
                 el = obj['el']
                 body_like = kind in ('sun', 'moon', 'planet')
                 below = el < 0.0
@@ -758,6 +764,13 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
                     continue
                 X, Y = int(sx[0]), int(sy[0])
                 if not (-10 <= X < w + 10 and -10 <= Y < h + 10):
+                    continue
+                _click_targets.append((X, Y, 'celestial', obj['key']))
+                if kind == 'star':
+                    # Dot comes from the starfield; the entry above makes the
+                    # named stars click-selectable here too. Ring if selected.
+                    if obj['key'] == sel:
+                        pygame.draw.circle(surface, (255, 255, 0), (X, Y), 8, 1)
                     continue
                 color = obj['color'] or ((205, 130, 255) if kind == 'messier'
                                          else (90, 200, 180))
@@ -784,6 +797,8 @@ def render_mount3d_on_surface(surface, config_state, tracking_vis_state,
                                        obj['radius'] + 7, 1)
         except Exception as e:
             print(f"Mount3D celestial error: {e}")
+
+    m3d.sky_click_targets = _click_targets
 
     if tvs is not None:
 
@@ -1027,9 +1042,11 @@ def _slider_value(m3d, name, local_x):
         m3d.manual_alt = round(-90.0 + frac * 360.0, 1)
 
 
-def handle_mount3d_mouse_down(pos, button, display, m3d, config_state):
-    """HUD buttons / sliders first, else start a view drag. Returns True if
-    the event was consumed."""
+def handle_mount3d_mouse_down(pos, button, display, m3d, config_state,
+                              tracking_vis_state=None):
+    """HUD buttons / sliders first, then sky-object selection (satellites,
+    aircraft, celestial -- same semantics as the sky plots), else start a
+    view drag. Returns True if the event was consumed."""
     if button not in (1,):
         return False
     lp = _local(display, pos)
@@ -1067,6 +1084,43 @@ def handle_mount3d_mouse_down(pos, button, display, m3d, config_state):
             m3d.dragging_slider = name
             _slider_value(m3d, name, lp[0])
             return True
+
+    # Sky-object selection: nearest marker within 12 px of the click, with
+    # the same toggle/mutual-exclusivity semantics as the 2D sky plots. A
+    # launch override active means plot clicks must not select anything.
+    tvs = tracking_vis_state
+    launch_active = bool(tvs is not None
+                         and getattr(tvs, 'selected_launch', None)
+                         and getattr(tvs, 'launch_launched', False))
+    if tvs is not None and not launch_active:
+        best = None
+        for X, Y, kind, key in getattr(m3d, 'sky_click_targets', ()) or ():
+            d2 = (lp[0] - X) ** 2 + (lp[1] - Y) ** 2
+            if d2 <= 144 and (best is None or d2 < best[0]):
+                best = (d2, kind, key)
+        if best is not None:
+            _d2, kind, key = best
+            if kind == 'satellite':
+                if tvs.selected_satellite == key:
+                    tvs.selected_satellite = None
+                else:
+                    tvs.selected_satellite = key
+                    tvs.selected_aircraft = None
+                    tvs.selected_celestial = None
+                    print(f"Mount3D: selected satellite {getattr(key, 'name', key)}")
+            elif kind == 'aircraft':
+                if tvs.selected_aircraft == key:
+                    tvs.selected_aircraft = None
+                else:
+                    tvs.selected_aircraft = key
+                    tvs.selected_satellite = None
+                    tvs.selected_celestial = None
+                    print(f"Mount3D: selected aircraft {key}")
+            else:
+                from celestial import select_celestial
+                select_celestial(tvs, config_state, key)
+            return True
+
     m3d.dragging_view = True
     return True
 

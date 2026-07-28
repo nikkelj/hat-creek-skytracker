@@ -616,7 +616,8 @@ while running:
 
             elif current_mode == "mount3d":
                 handle_mount3d_mouse_down(pos, event.button, display,
-                                          mount3d_state, config_state)
+                                          mount3d_state, config_state,
+                                          tracking_vis_state)
 
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":

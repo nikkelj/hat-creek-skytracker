@@ -12,6 +12,11 @@ capture.
 Pass predictions are cross-validated against heavens-above.com to the
 seconds level across orbit classes — see [`VALIDATION.md`](VALIDATION.md).
 
+New to all this? Every screen has **explanatory hover tooltips** — hover any
+pane, button, or toggle for a plain-English description of what it does
+(visible in the Joystick Loop screenshot below). The **Tips** chip in the
+bottom-right corner turns them off once you know your way around.
+
 ![Main menu](doc/screenshots/main_menu.png)
 
 ## Current Capabilities
@@ -102,7 +107,9 @@ column on the left panel switches each object type on/off — satellites, their
 labels, aircraft, stars, Messier, NGC — with the sun/moon/planets and named
 stars deliberately always-on. Every object — plus every satellite and
 aircraft — is click-selectable, and PROGRAM mode will slew to and track it.
-Shown here with the moon selected (yellow ring):
+Shown here with the live satellite catalogue (green = LEO, orange hexagon =
+MEO, purple triangle = GEO) and a **rocket launch trajectory** climbing out
+from the southwest horizon (cyan marker = the rocket now):
 
 ![Tracking Vis](doc/screenshots/tracking_vis.png)
 
@@ -126,7 +133,8 @@ RATE_CONTROL ceiling (green = base range, orange = boost gears earned by
 pinning the stick). The skyplot quadrant carries the same celestial layer and
 click-selection as the full-screen plot, with **M** and **NGC** catalogue
 toggles in the Targets strip. Shown here in simulation with the mount and
-both cameras connected.
+both cameras connected — note the hover tooltip explaining the PID Gains
+pane, one of the explanations available on every control.
 
 ![Joystick Loop](doc/screenshots/joystick_loop.png)
 
@@ -197,9 +205,9 @@ off, real-hardware behavior is unchanged):
   dot in the wide cam and a rough **Starlink V2 Mini** in the narrow cam, over a
   **star field that streaks** with mount motion.
 
-| Wide / guide cam (satellite dot among streaking stars) | Narrow cam (Starlink V2 Mini) |
-| --- | --- |
-| ![wide cam](doc/screenshots/sim_wide_satellite.png) | ![narrow cam](doc/screenshots/sim_narrow_v2mini.png) |
+| Wide / guide cam (satellite dot among streaking stars) | Narrow cam (Starlink V2 Mini) | Launch plume |
+| --- | --- | --- |
+| ![wide cam](doc/screenshots/sim_wide_satellite.png) | ![narrow cam](doc/screenshots/sim_narrow_v2mini.png) | ![launch plume](doc/screenshots/sim_launch_plume.png) |
 
 The simulator closes the loop entirely in software: sim mount pointing → sim
 camera render → hot-spot detection → PID → rate command → sim mount moves. This

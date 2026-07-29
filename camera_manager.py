@@ -844,6 +844,21 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
     text_rect = text_surface.get_rect(center=save_button_rect.center)
     menu_screen.blit(text_surface, text_rect)
 
+def _rotation_zero_rect(slider_x, slider_y, slider_width):
+    """Rect of the '0' recenter button that sits right of a rotation slider.
+    Shared by the render and click handlers so their geometry cannot drift."""
+    return pygame.Rect(slider_x + slider_width + 12, slider_y - 7, 24, 18)
+
+
+def _draw_rotation_zero_button(menu_screen, tiny_font, slider_x, slider_y, slider_width, mouse_pos):
+    rect = _rotation_zero_rect(slider_x, slider_y, slider_width)
+    hover = rect.collidepoint(mouse_pos)
+    pygame.draw.rect(menu_screen, (90, 90, 140) if hover else (60, 60, 100), rect)
+    pygame.draw.rect(menu_screen, (170, 170, 200), rect, 1)
+    z = tiny_font.render("0°", True, (255, 255, 255))
+    menu_screen.blit(z, z.get_rect(center=rect.center))
+
+
 def render_alignment_rotation_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_height):
     """Render alignment rotation sliders for both cameras - positioned at bottom-center of each image"""
     tiny_font = pygame.font.Font(None, 12)
@@ -857,7 +872,7 @@ def render_alignment_rotation_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_
     camera2 = camera_manager.get_camera(1)
 
     # Define rotation slider ranges
-    ROTATION_RANGE = 90.0  # -90° to +90° degrees
+    ROTATION_RANGE = 180.0  # -90° to +90° degrees
     SLIDER_WIDTH = 160  # Wider slider for better precision
 
     if camera1.connected:
@@ -884,6 +899,10 @@ def render_alignment_rotation_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_
         center_x = slider_x + int(0.5 * SLIDER_WIDTH)
         pygame.draw.line(menu_screen, (255, 255, 255), (center_x, slider_y - 3), (center_x, slider_y + 8), 2)
 
+        # Zero-reset button right of the slider (full ±180° range makes the
+        # handle touchy - one click recenters exactly to 0°).
+        _draw_rotation_zero_button(menu_screen, tiny_font, slider_x, slider_y, SLIDER_WIDTH, mouse_pos)
+
     if camera2.connected:
         # Camera 2 Alignment Rotation Slider - positioned at bottom-center of camera 2 display
         # Keep same position in both combined and separate view modes for consistency
@@ -909,6 +928,8 @@ def render_alignment_rotation_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_
         # Center marker at 0° position
         center_x = slider_x + int(0.5 * SLIDER_WIDTH)
         pygame.draw.line(menu_screen, (255, 255, 255), (center_x, slider_y - 3), (center_x, slider_y + 8), 2)
+
+        _draw_rotation_zero_button(menu_screen, tiny_font, slider_x, slider_y, SLIDER_WIDTH, mouse_pos)
 
 def render_camera_sliders(menu_screen, tiny_font, sub_x, sub_y, sub_width, sub_height):
     """Render gain and exposure sliders - positioned within camera display area"""
@@ -1305,18 +1326,24 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
         # Camera 1/2 Alignment Rotation Slider track detection - bottom-center of camera display
         cam_display_height = display.sub_height - 30
         ROTATION_SLIDER_WIDTH = 160
-        ROTATION_RANGE = 90.0  # -90° to +90° degrees
+        ROTATION_RANGE = 180.0  # -90° to +90° degrees
 
         if camera1.connected:
-            camera1_rotation_track_rect = pygame.Rect(display.sub_x + 10 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2 - 5, display.sub_y + cam_display_height - 10 - 5, ROTATION_SLIDER_WIDTH + 10, 15)
+            _c1_slider_x = display.sub_x + 10 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2
+            _c1_slider_y = display.sub_y + cam_display_height - 10
+            if _rotation_zero_rect(_c1_slider_x, _c1_slider_y, ROTATION_SLIDER_WIDTH).collidepoint(pos):
+                camera_manager.cameras[0].alignment_rotation = 0.0
+            camera1_rotation_track_rect = pygame.Rect(_c1_slider_x - 5, _c1_slider_y - 5, ROTATION_SLIDER_WIDTH + 10, 15)
             if camera1_rotation_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera0_alignment_rotation_slider"]["dragging"] = True
 
         if camera2.connected:
             # Calculate Camera2 slider position - same as in render function (bottom-center of camera 2 area)
             camera2_rotation_slider_x = display.sub_x + cam_display_width + 20 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2
-
-            camera2_rotation_track_rect = pygame.Rect(camera2_rotation_slider_x - 5, display.sub_y + cam_display_height - 10 - 5, ROTATION_SLIDER_WIDTH + 10, 15)
+            _c2_slider_y = display.sub_y + cam_display_height - 10
+            if _rotation_zero_rect(camera2_rotation_slider_x, _c2_slider_y, ROTATION_SLIDER_WIDTH).collidepoint(pos):
+                camera_manager.cameras[1].alignment_rotation = 0.0
+            camera2_rotation_track_rect = pygame.Rect(camera2_rotation_slider_x - 5, _c2_slider_y - 5, ROTATION_SLIDER_WIDTH + 10, 15)
             if camera2_rotation_track_rect.collidepoint(pos):
                 camera_manager.button_states["camera1_alignment_rotation_slider"]["dragging"] = True
 
@@ -1601,7 +1628,7 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             # Handle Camera 1 Alignment Rotation Slider dragging
             if camera1.connected:
                 ROTATION_SLIDER_WIDTH = 160
-                ROTATION_RANGE = 90.0  # -90° to +90° degrees
+                ROTATION_RANGE = 180.0  # -90° to +90° degrees
                 camera1_rotation_track_rect = pygame.Rect(display.sub_x + 10 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2 - 5, display.sub_y + cam_display_height - 10 - 5, ROTATION_SLIDER_WIDTH + 10, 15)
                 if camera1_rotation_track_rect.collidepoint(current_pos):
                     slider_x = display.sub_x + 10 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2
@@ -1614,7 +1641,7 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
             # Handle Camera 2 Alignment Rotation Slider dragging
             if camera2.connected:
                 ROTATION_SLIDER_WIDTH = 160
-                ROTATION_RANGE = 90.0  # -90° to +90° degrees
+                ROTATION_RANGE = 180.0  # -90° to +90° degrees
 
                 # Calculate Camera2 slider position - same as in render function (bottom-center of camera 2 area)
                 camera2_slider_x = display.sub_x + cam_display_width + 20 + (cam_display_width - ROTATION_SLIDER_WIDTH) // 2

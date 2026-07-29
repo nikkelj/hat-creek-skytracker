@@ -447,6 +447,81 @@ def is_default_params(gamma, brightness, contrast):
 
 
 # ---------------------------------------------------------------------------
+# Zoom / crop view rects (normalized full-frame coords, x0 < x1, y0 < y1)
+# ---------------------------------------------------------------------------
+FULL_VIEW = (0.0, 0.0, 1.0, 1.0)
+_MIN_VIEW_FRAC = 0.02   # deepest zoom: 2% of the frame per axis (50x)
+
+
+def clamp_view(view):
+    """Sanitize a normalized (x0, y0, x1, y1) view rect.
+
+    Orders the corners, clamps into [0, 1], and enforces a minimum span of
+    ``_MIN_VIEW_FRAC`` per axis (expanded about the rect centre) so a stray
+    micro-drag can't zoom into a sub-pixel sliver.
+    """
+    x0, x1 = sorted((float(view[0]), float(view[2])))
+    y0, y1 = sorted((float(view[1]), float(view[3])))
+    out = []
+    for lo, hi in ((x0, x1), (y0, y1)):
+        lo, hi = max(0.0, lo), min(1.0, hi)
+        if hi - lo < _MIN_VIEW_FRAC:
+            c = (lo + hi) / 2.0
+            lo, hi = c - _MIN_VIEW_FRAC / 2.0, c + _MIN_VIEW_FRAC / 2.0
+            if lo < 0.0:
+                lo, hi = 0.0, _MIN_VIEW_FRAC
+            elif hi > 1.0:
+                lo, hi = 1.0 - _MIN_VIEW_FRAC, 1.0
+        out.append((lo, hi))
+    return (out[0][0], out[1][0], out[0][1], out[1][1])
+
+
+def view_crop_px(view, w, h, even=False):
+    """Pixel crop bounds (x0, y0, x1, y1) of normalized ``view`` on a w x h frame.
+
+    Always at least 1 px per axis; with ``even=True`` the crop WIDTH and HEIGHT
+    are rounded down to even numbers (>= 2), which keeps MP4 encoders happy.
+    """
+    x0 = max(0, min(w - 1, int(view[0] * w)))
+    y0 = max(0, min(h - 1, int(view[1] * h)))
+    x1 = max(x0 + 1, min(w, int(round(view[2] * w))))
+    y1 = max(y0 + 1, min(h, int(round(view[3] * h))))
+    if even:
+        if (x1 - x0) % 2 and (x1 - x0) > 2:
+            x1 -= 1
+        elif (x1 - x0) % 2:
+            x1 = min(w, x0 + 2)
+        if (y1 - y0) % 2 and (y1 - y0) > 2:
+            y1 -= 1
+        elif (y1 - y0) % 2:
+            y1 = min(h, y0 + 2)
+    return x0, y0, x1, y1
+
+
+def remap_annotations(annotations, view):
+    """Re-express full-frame-normalized annotations in ``view``-local coords.
+
+    Annotations are stored normalized to the FULL frame; when the visible image
+    is a zoom/crop of that frame, draw_overlays needs coords relative to the
+    crop. Identity (the same list object) for the full view. Shapes that fall
+    outside the crop are passed through -- cv2 clips them harmlessly.
+    """
+    if tuple(view) == FULL_VIEW or not annotations:
+        return annotations
+    dx = max(1e-9, view[2] - view[0])
+    dy = max(1e-9, view[3] - view[1])
+    out = []
+    for ann in annotations:
+        a = dict(ann)
+        for kx, ky in (("x", "y"), ("x0", "y0"), ("x1", "y1")):
+            if kx in a:
+                a[kx] = (a[kx] - view[0]) / dx
+                a[ky] = (a[ky] - view[1]) / dy
+        out.append(a)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Overlays (drawn with cv2 onto the final-size RGB frame -> DRY for display+export)
 # ---------------------------------------------------------------------------
 _COL_INTRACK = (80, 220, 90)     # green
@@ -606,6 +681,7 @@ class _CamState:
         self.stabilizer = None
         self.stab_reduce = None       # reduce factor the reference was built at
         self.reduce = 1               # current decode reduction for display
+        self.view = FULL_VIEW         # normalized zoom rect (x0, y0, x1, y1)
         # worker bookkeeping
         self.target_idx = 0
         self.rendered_key = None
@@ -682,13 +758,42 @@ class ReplayEngine:
         if not cs or w <= 0 or h <= 0 or cs.pane_size == (w, h):
             return
         cs.pane_size = (int(w), int(h))
-        shape = self.run.frame_shape(cam_index)
-        new_reduce = reduce_for(shape[0], w) if shape else 1
+        self._update_reduce(cs)
+        self._params_version += 1
+        cs.wake.set()
+
+    def _update_reduce(self, cs):
+        """Pick the decode reduction from pane size AND zoom: a zoomed view
+        shows a fraction of the frame across the full pane width, so it needs
+        proportionally more source resolution."""
+        shape = self.run.frame_shape(cs.cam_index)
+        if not shape:
+            return
+        eff_w = int(shape[0] * (cs.view[2] - cs.view[0]))
+        new_reduce = reduce_for(eff_w, cs.pane_size[0])
         if new_reduce != cs.reduce:
             cs.reduce = new_reduce
             cs.stabilizer = None      # reference must match the new reduce factor
+
+    def set_view(self, cam_index, view):
+        """Set a camera's normalized zoom rect (clamped); FULL_VIEW = no zoom."""
+        cs = self.cams.get(cam_index)
+        if not cs:
+            return
+        view = clamp_view(view)
+        if view == cs.view:
+            return
+        cs.view = view
+        self._update_reduce(cs)
         self._params_version += 1
         cs.wake.set()
+
+    def reset_view(self, cam_index):
+        self.set_view(cam_index, FULL_VIEW)
+
+    def get_view(self, cam_index):
+        cs = self.cams.get(cam_index)
+        return cs.view if cs else FULL_VIEW
 
     def set_image_params(self, cam_index, gamma=None, brightness=None, contrast=None):
         cs = self.cams.get(cam_index)
@@ -827,9 +932,17 @@ class ReplayEngine:
             if cs.stabilizer is not None:
                 proc, _ = cs.stabilizer.stabilize(proc)
 
+        # Zoom: crop AFTER stabilization (the stabilizer needs the full field)
+        # and BEFORE pane scaling, so the crop fills the pane.
+        if cs.view != FULL_VIEW:
+            fh, fw = proc.shape[:2]
+            x0, y0, x1, y1 = view_crop_px(cs.view, fw, fh)
+            proc = proc[y0:y1, x0:x1]
+
         pw, ph = cs.pane_size
         if CV2_AVAILABLE:
-            scaled = cv2.resize(proc, (pw, ph), interpolation=cv2.INTER_AREA)
+            interp = cv2.INTER_AREA if proc.shape[1] >= pw else cv2.INTER_NEAREST
+            scaled = cv2.resize(proc, (pw, ph), interpolation=interp)
         else:  # pragma: no cover
             scaled = proc
 
@@ -839,7 +952,8 @@ class ReplayEngine:
             meta = build_meta_lines(self.run, cs.cam_index, t, idx, len(frames),
                                     cs.gamma, self.stabilize_on)
             draw_overlays(scaled, vectors=vectors, meta_lines=meta,
-                          annotations=self.run.sidecar["annotations"])
+                          annotations=remap_annotations(
+                              self.run.sidecar["annotations"], cs.view))
 
         surf = None
         if PYGAME_AVAILABLE:
@@ -889,7 +1003,8 @@ class Mp4Exporter:
 
     def __init__(self, run, cam_index, t_start, t_end, out_path,
                  gamma=1.0, brightness=0.0, contrast=1.0,
-                 stabilize=False, overlays=True, stab_method="orb", fps=None):
+                 stabilize=False, overlays=True, stab_method="orb", fps=None,
+                 crop=None):
         self.run = run
         self.cam_index = cam_index
         self.t_start = t_start
@@ -902,6 +1017,9 @@ class Mp4Exporter:
         self.overlays = overlays
         self.stab_method = stab_method
         self.fps = fps
+        # Optional normalized (x0, y0, x1, y1) view rect: export only this
+        # region (the replay zoom box), at the region's native resolution.
+        self.crop = None if (crop is None or tuple(crop) == FULL_VIEW) else clamp_view(crop)
 
         self.progress = 0.0
         self.done = False
@@ -941,6 +1059,14 @@ class Mp4Exporter:
             raise RuntimeError("Could not decode first frame")
         h, w = first.shape[:2]
 
+        # Zoom crop: even output dims keep the MP4 encoder happy.
+        crop_px = None
+        out_w, out_h = w, h
+        if self.crop is not None:
+            crop_px = view_crop_px(self.crop, w, h, even=True)
+            out_w = crop_px[2] - crop_px[0]
+            out_h = crop_px[3] - crop_px[1]
+
         # FPS: explicit, else from median capture interval (clamped to a sane range).
         # KNOWN LIMITATION: the export writes one video frame per captured frame
         # at this constant fps, so captures with dropped frames or a mid-run
@@ -962,7 +1088,7 @@ class Mp4Exporter:
         stab = Stabilizer(method=self.stab_method) if self.stabilize else None
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(self.out_path, fourcc, fps, (w, h))
+        writer = cv2.VideoWriter(self.out_path, fourcc, fps, (out_w, out_h))
         if not writer.isOpened():
             raise RuntimeError(f"Could not open VideoWriter for {self.out_path}")
 
@@ -975,14 +1101,20 @@ class Mp4Exporter:
                 proc = processor.apply(raw, self.gamma, self.brightness, self.contrast)
                 if stab is not None:
                     proc, _ = stab.stabilize(proc)
+                if crop_px is not None:
+                    # Crop after stabilization (same order as the replay view).
+                    proc = np.ascontiguousarray(
+                        proc[crop_px[1]:crop_px[3], crop_px[0]:crop_px[2]])
                 if self.overlays:
-                    vectors = compute_track_vectors(self.run.trajectory, f["t"], w, h)
+                    vectors = compute_track_vectors(self.run.trajectory, f["t"], out_w, out_h)
                     meta = build_meta_lines(self.run, self.cam_index, f["t"], i, total,
                                             self.gamma, self.stabilize)
                     draw_overlays(proc, vectors=vectors, meta_lines=meta,
-                                  annotations=self.run.sidecar["annotations"],
-                                  font_scale=max(1.0, h / 720.0),
-                                  meta_scale=max(0.5, h / 1400.0))
+                                  annotations=remap_annotations(
+                                      self.run.sidecar["annotations"],
+                                      self.crop or FULL_VIEW),
+                                  font_scale=max(1.0, out_h / 720.0),
+                                  meta_scale=max(0.5, out_h / 1400.0))
                 writer.write(cv2.cvtColor(proc, cv2.COLOR_RGB2BGR))
                 self.frames_written += 1
                 self.progress = (i + 1) / total

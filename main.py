@@ -288,7 +288,7 @@ def start_precompute_worker(center_time, duration_minutes, observer):
             tracking_vis_state.launch_trajectories = launch_trajectories
             build_satellite_pass_table(tracking_vis_state,
                                        elevation_mask_deg=float(config_state.elevation_mask_str or 10.0),
-                                       ts=ts)
+                                       ts=ts, observer=observer)
             tracking_vis_state.trajectories_ready = True
             cb("Trajectories ready")
 
@@ -605,7 +605,8 @@ while running:
             elif current_mode == "post_process":
                 if post_process_state is None:
                     post_process_state = PostProcessState()
-                handle_pp_click(pos, display, post_process_state, status_messages)
+                handle_pp_click(pos, display, post_process_state, status_messages,
+                                button=event.button)
             elif current_mode == "alignment":
                 # Camera-panel controls (right half) take precedence, but only when the
                 # camera view is shown; fall through to the alignment controls otherwise.
@@ -616,15 +617,20 @@ while running:
 
             elif current_mode == "mount3d":
                 handle_mount3d_mouse_down(pos, event.button, display,
-                                          mount3d_state, config_state)
+                                          mount3d_state, config_state,
+                                          tracking_vis_state)
 
             # Handle tracking_vis events using state-based approach
             elif current_mode == "tracking_vis":
                 try:
-                    # Object-type show/hide toggles get first crack at clicks;
-                    # a consumed click must not fall through to plot selection.
-                    if not (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
-                            and handle_object_toggle_click(tracking_vis_state, config_state, pos)):
+                    # Object-type toggles + the interactive orbit legend get
+                    # first crack at clicks; a consumed click must not fall
+                    # through to plot selection.
+                    from tracking_visuals import handle_legend_click
+                    if not (event.type == pygame.MOUSEBUTTONDOWN
+                            and ((event.button == 1
+                                  and handle_object_toggle_click(tracking_vis_state, config_state, pos))
+                                 or handle_legend_click(tracking_vis_state, config_state, pos, event.button))):
                         # Handle events using state-based handler
                         handle_tracking_vis_mouse_events_state(tracking_vis_state, event, pos, display, display.button_states)
 
@@ -860,7 +866,7 @@ while running:
 
         # Draw UI elements on top of the polar plot
         draw_filters(display, tracking_vis_state)
-        draw_legend(display)
+        draw_legend(display, tracking_vis_state, config_state)
         draw_details(display, tracking_vis_state)
         draw_camera_fov_details(display, tracking_vis_state, 290)  # Start below satellite details (20+250+20)
         draw_time_display(display)

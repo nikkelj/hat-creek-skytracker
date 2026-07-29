@@ -830,7 +830,13 @@ JL_SLIDER_W = 100          # gain / exposure / gamma slider track width
 JL_ROT_SLIDER_W = 120      # alignment-rotation slider track width
 JL_GAMMA_MIN = 0.01
 JL_GAMMA_MAX = 2.0
-JL_ROTATION_RANGE = 90.0   # -90deg .. +90deg
+JL_ROTATION_RANGE = 180.0  # -180deg .. +180deg (full flip range)
+
+
+def _jl_rotation_zero_rect(track):
+    """Rect of the '0' recenter button beside a feed rotation slider (shared
+    by render and click handling so the geometry cannot drift)."""
+    return pygame.Rect(track.right + 8, track.y - 4, 18, 16)
 
 
 def _joystick_camera_layout(display):
@@ -1376,6 +1382,13 @@ def render_joystick_camera_controls(display, joystick_state=None):
             center_marker_x = rot.x + rot.width // 2
             pygame.draw.line(screen, (255, 255, 255),
                              (center_marker_x, rot.centery - 5), (center_marker_x, rot.centery + 5), 1)
+            # Zero-reset button (±180° range makes the handle touchy).
+            zr = _jl_rotation_zero_rect(rot)
+            z_color = (90, 90, 140) if zr.collidepoint(mouse_pos) else (60, 60, 100)
+            pygame.draw.rect(screen, z_color, zr)
+            pygame.draw.rect(screen, (170, 170, 200), zr, 1)
+            z_surf = font.render("0", True, (255, 255, 255))
+            screen.blit(z_surf, z_surf.get_rect(center=zr.center))
 
             # ROI size buttons
             for i, roi_rect in enumerate(cam["roi_rects"]):
@@ -1470,9 +1483,11 @@ def _apply_jl_camera_drag(current_pos, display):
             new_gamma = JL_GAMMA_MIN + (rel / track.width) * (JL_GAMMA_MAX - JL_GAMMA_MIN)
             camera.gamma = round(max(JL_GAMMA_MIN, min(JL_GAMMA_MAX, new_gamma)), 2)
 
-        # Alignment rotation
+        # Alignment rotation (zero-reset button first: it sits off the track)
         track = cam["rotation_track"]
-        if track.collidepoint(current_pos):
+        if _jl_rotation_zero_rect(track).collidepoint(current_pos):
+            camera.alignment_rotation = 0.0
+        elif track.collidepoint(current_pos):
             rel = min(max(current_pos[0] - track.x, 0), track.width)
             new_rot = ((rel / track.width) - 0.5) * (2 * JL_ROTATION_RANGE)
             camera.alignment_rotation = max(-JL_ROTATION_RANGE, min(JL_ROTATION_RANGE, new_rot))

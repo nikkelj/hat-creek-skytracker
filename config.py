@@ -46,6 +46,8 @@ class ConfigState:
         self.messier_enabled = True            # Messier markers on the skyplot
         self.ngc_enabled = False               # NGC markers (noisy; off by default)
         self.ngc_limiting_magnitude = 10.0     # faintest NGC object shown
+        self.meo_enabled = True                # MEO satellites (legend-click toggle)
+        self.geo_enabled = True                # GEO satellites (legend-click toggle)
 
         # Plate solver (tetra3) configuration
         self.plate_solve_enabled = False       # background plate-solve worker on/off
@@ -328,6 +330,8 @@ class ConfigState:
             "messier_enabled": self.messier_enabled,
             "ngc_enabled": self.ngc_enabled,
             "ngc_limiting_magnitude": self.ngc_limiting_magnitude,
+            "meo_enabled": self.meo_enabled,
+            "geo_enabled": self.geo_enabled,
             "max_rendered_star_count": self.max_rendered_star_count,
             "star_limiting_magnitude": self.star_limiting_magnitude,
             "plate_solve_enabled": self.plate_solve_enabled,
@@ -427,6 +431,8 @@ class ConfigState:
         self.ngc_enabled = config_dict.get("ngc_enabled", self.ngc_enabled)
         self.ngc_limiting_magnitude = config_dict.get(
             "ngc_limiting_magnitude", self.ngc_limiting_magnitude)
+        self.meo_enabled = config_dict.get("meo_enabled", self.meo_enabled)
+        self.geo_enabled = config_dict.get("geo_enabled", self.geo_enabled)
         self.max_rendered_star_count = config_dict.get("max_rendered_star_count", self.max_rendered_star_count)
         self.star_limiting_magnitude = config_dict.get("star_limiting_magnitude", self.star_limiting_magnitude)
         self.plate_solve_enabled = config_dict.get("plate_solve_enabled", self.plate_solve_enabled)
@@ -952,7 +958,9 @@ def draw_config_options(display, config_state):
             ('lon', "Longitude:", config_state.lon_str),
             ('alt', "Altitude (m):", config_state.alt_str),
             ('elevation_mask', "Elevation Mask (deg):", config_state.elevation_mask_str),
-            ('alignment_azimuth', "Azimuth Alignment (deg):", config_state.alignment_azimuth_str),
+            # TRUE north, not magnetic: a compass-aligned mount misses passes
+            # by the local declination (~12 deg here) -- see the tooltip.
+            ('alignment_azimuth', "Azimuth Align (deg, TRUE N):", config_state.alignment_azimuth_str),
             ('alignment_elevation', "Elevation Align (deg, Eq):", config_state.alignment_elevation_str),
         ]),
         ('mount', "Mount & Limits", [

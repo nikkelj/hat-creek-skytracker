@@ -101,6 +101,7 @@ class DisplaySetup:
         self.font = pygame.font.Font(None, self.NORMAL_FONT_SIZE)
         self.large_font = pygame.font.Font(None, self.LARGE_FONT_SIZE)
         self.small_font = pygame.font.Font(None, self.SMALL_FONT_SIZE)
+        self.table_font = pygame.font.Font(None, 13)  # Pass table cells/headers: one notch smaller to fit 7 columns
         self.tiny_font = pygame.font.Font(None, 12)  # Smaller font for compact camera buttons
         self.status_font = pygame.font.Font(None, self.SMALL_FONT_SIZE)
 

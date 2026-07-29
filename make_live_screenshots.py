@@ -80,7 +80,16 @@ def main():
         tvs.t1 = ts.utc(now + timedelta(minutes=30))
         precompute_trajectories(tvs, observer, ts, display, cb, now, 60)
         update_satellite_positions(tvs, ts.now().tt, elevation_mask_deg=float(cfg.elevation_mask_str or 0))
-        print(f"catalog: tle_loaded={tvs.tle_loaded} visible={len(getattr(tvs,'satellite_positions',{}) or {})}")
+        # Pass table (with apogee + estimated-magnitude columns) for the
+        # tracking-vis shot; needs observer for the brightness geometry. Sort
+        # by magnitude (brightest first) so sunlit passes with numeric mags top
+        # the table -- at local midnight an elevation sort shows only 'ecl' rows.
+        from trajectory import build_satellite_pass_table
+        tvs.table_sort_order = [(6, False)]
+        build_satellite_pass_table(tvs, elevation_mask_deg=float(cfg.elevation_mask_str or 10.0),
+                                   ts=ts, observer=observer)
+        print(f"catalog: tle_loaded={tvs.tle_loaded} visible={len(getattr(tvs,'satellite_positions',{}) or {})} "
+              f"pass_rows={len(tvs.satellite_pass_table or [])}")
     except Exception as e:
         import traceback; traceback.print_exc()
 
@@ -208,7 +217,7 @@ def main():
         from tracking_visuals import draw_object_toggles
         for fn in (lambda: draw_filters(display, tvs),
                    lambda: draw_object_toggles(display, tvs, cfg),
-                   lambda: draw_legend(display),
+                   lambda: draw_legend(display, tvs, cfg),
                    lambda: draw_details(display, tvs),
                    lambda: draw_camera_fov_details(display, tvs, 290),
                    lambda: draw_time_display(display),
@@ -300,6 +309,36 @@ def main():
         except Exception:
             import traceback; traceback.print_exc()
         save(display.menu_screen, "joystick_loop.png")
+    except Exception:
+        import traceback; traceback.print_exc()
+
+    # ============ Post Processing (replay + box zoom) ============
+    # Uses a real saved run from data/ (skipped when none exist). Zoom a pane
+    # and arm crop-to-zoom so the indicator + crop-size readout are visible.
+    try:
+        from post_process_ui import PostProcessState, draw_post_process
+        pps = PostProcessState("data")
+        runs = pps.library.runs
+        if runs:
+            run = max(runs, key=lambda r: (r.start_dt or datetime.min))
+            pps.load_run(run)
+            eng = pps.engine
+            cams = run.camera_indices[:2]
+            eng.set_view(cams[0], (0.3, 0.3, 0.7, 0.7))  # 2.5x centre zoom
+            eng.set_image_params(cams[0], gamma=1.8)     # lift the faint target
+            pps.crop_to_zoom = True
+            deadline = time.time() + 20.0
+            display.menu_screen.fill((20, 20, 24))
+            while time.time() < deadline:
+                draw_post_process(display, pps)  # advances engine, polls surfaces
+                if all(eng.get_surface(c) is not None for c in cams):
+                    break
+                time.sleep(0.2)
+            draw_post_process(display, pps)
+            save(display.menu_screen, "post_process.png")
+            pps.shutdown()
+        else:
+            print("skip post_process.png (no runs in data/)")
     except Exception:
         import traceback; traceback.print_exc()
 

@@ -32,6 +32,15 @@ FUTURE_PASS_WINDOW_SECONDS = FUTURE_PASS_WINDOW_HOURS * 3600  # Convert to secon
 PASS_TABLE_MAX_ROWS_DEFAULT = 20  # Maximum rows to display in pass table
 SATELLITE_NAME_MAX_LENGTH_TABLE = 20  # Max satellite name length in table display
 
+# Pass-table brightness estimate. TLEs carry no per-satellite intrinsic
+# magnitude, so every satellite gets the same standard magnitude (apparent mag
+# at 1000 km range, 50% illuminated -- the McCants convention); the sortable
+# column is therefore dominated by range and phase geometry. 6.0 is a
+# reasonable middle for the active catalog (Starlink ~5.5-6.5; ISS is much
+# brighter, cubesats dimmer).
+PASS_MAG_DEFAULT_STDMAG = 6.0
+R_EARTH_SHADOW_KM = 6378.137  # equatorial radius for the cylindrical shadow test
+
 # Progress Reporting
 VISIBILITY_FILTER_BATCH_SIZE = 500  # Batch size for visibility filter progress reporting
 TRAJECTORY_COMPUTE_BATCH_SIZE = 100  # Batch size for trajectory computation progress reporting
@@ -877,6 +886,35 @@ def update_satellite_positions(state, current_tt, elevation_mask_deg=10.0):
     # Atomic publish: readers see either the complete old dict or this new one.
     state.satellite_positions = new_positions
 
+def _estimate_pass_magnitude(sat, t, observer, r_sun_km):
+    """Estimated apparent visual magnitude of `sat` at time `t` for `observer`.
+
+    Returns None when the satellite sits in Earth's shadow (eclipsed -> not
+    visible regardless of geometry) or the computation fails. Uses the
+    standard-magnitude formula (PASS_MAG_DEFAULT_STDMAG at 1000 km / 50%
+    illuminated) with a Lambertian phase term; the eclipse test is a simple
+    cylindrical Earth-shadow model. `r_sun_km` is the geocentric sun position
+    vector, computed once per table build (sun direction moves ~0.06 deg over
+    a 90 min window -- negligible against a shared default intrinsic mag).
+    """
+    try:
+        r_sat = sat.at(t).position.km
+        r_obs = observer.at(t).position.km
+        u_sun = r_sun_km / np.linalg.norm(r_sun_km)
+        # Cylindrical shadow: behind the terminator plane AND within one Earth
+        # radius of the anti-sun axis -> eclipsed.
+        along = float(np.dot(r_sat, u_sun))
+        if along < 0.0 and np.linalg.norm(r_sat - along * u_sun) < R_EARTH_SHADOW_KM:
+            return None
+        v_obs = r_obs - r_sat            # satellite -> observer
+        v_sun = r_sun_km - r_sat         # satellite -> sun
+        range_km = float(np.linalg.norm(v_obs))
+        cos_phase = float(np.dot(v_obs, v_sun)) / (range_km * float(np.linalg.norm(v_sun)))
+        frac_illum = max(0.5 * (1.0 + cos_phase), 1e-3)
+        return PASS_MAG_DEFAULT_STDMAG - 15.75 + 2.5 * math.log10(range_km * range_km / frac_illum)
+    except Exception:
+        return None
+
 def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labels, elevation_mask_deg=10.0, ts=None):
     """
     Extract pass information from a single satellite's trajectory.
@@ -934,6 +972,9 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
         'norad_id': norad_id,
         'max_elevation': max_elevation,
         'azimuth_at_max': azimuth_at_max,
+        # Raw TT time of the max-elevation sample -- the brightness estimate
+        # is evaluated at this instant (culmination) in build_satellite_pass_table.
+        'max_el_time_tt': float(trajectory_array[max_alt_idx, 0]),
         'closest_approach_time': closest_approach_time,
         # Raw TT Julian date of the closest approach: time math must use
         # this, never re-parse the local "HH:MM" display string (that
@@ -943,13 +984,28 @@ def extract_pass_data_from_trajectory(trajectory_data, satellite, satellite_labe
         'is_visible': np.any(visible_points)
     }
 
-def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=None):
+def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=None, observer=None):
     """
     Build pass table data from all satellite trajectories.
     Only includes satellites that are currently in view OR will be in view soon (future closest approach).
     Modifies state object directly with sorted satellite pass table.
+
+    When `observer` is given (and the state carries the DE421 ephemeris), each
+    entry also gets an estimated visual magnitude at culmination; apogee
+    altitude comes from the precomputed state.satellite_apogee metadata.
     """
     pass_entries = []
+
+    # Geocentric sun vector, computed once for the whole table (see
+    # _estimate_pass_magnitude for why once is enough).
+    eph = getattr(state, 'ephemeris', None)
+    r_sun_km = None
+    if observer is not None and eph is not None and ts is not None:
+        try:
+            r_sun_km = eph['earth'].at(ts.now()).observe(eph['sun']).position.km
+        except Exception:
+            r_sun_km = None
+    apogee_map = getattr(state, 'satellite_apogee', None) or {}
 
     # Get current time in local timezone for comparison
     current_datetime = datetime.now(timezone.utc)
@@ -982,6 +1038,15 @@ def build_satellite_pass_table(state, elevation_mask_deg=10.0, max_rows=20, ts=N
                             pass
 
                 if include_in_table:
+                    pass_data['apogee_km'] = apogee_map.get(sat)
+                    # Magnitude key only set when the geometry inputs exist:
+                    # a present-but-None value means "eclipsed at culmination"
+                    # (drawn as 'ecl'), a missing key means "not computed" ('--').
+                    if r_sun_km is not None:
+                        t_max = pass_data.get('max_el_time_tt')
+                        if t_max is not None:
+                            pass_data['magnitude'] = _estimate_pass_magnitude(
+                                sat, ts.tt_jd(t_max), observer, r_sun_km)
                     pass_entries.append(pass_data)
 
     # Store the full candidate set; name/altitude filtering and multi-column
@@ -1045,7 +1110,9 @@ def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
         1: 'norad_id',
         2: 'azimuth_at_max',
         3: 'max_elevation',
-        4: 'closest_approach_time'
+        4: 'closest_approach_time',
+        5: 'apogee_km',
+        6: 'magnitude'
     }
 
     sort_key = column_mapping.get(active_column, 'max_elevation')
@@ -1067,6 +1134,11 @@ def sort_pass_table(pass_table, sort_keys=None, reverse_flags=None):
                 return '23:59'  # Put unknown times at the end
             return time_str
         return sorted(pass_table, key=time_sort_key, reverse=reverse)
+    elif sort_key == 'apogee_km':
+        return sorted(pass_table, key=lambda x: x.get('apogee_km') if x.get('apogee_km') is not None else -1.0, reverse=reverse)
+    elif sort_key == 'magnitude':
+        # None (eclipsed/unknown) sorts as very dim
+        return sorted(pass_table, key=lambda x: x.get('magnitude') if x.get('magnitude') is not None else 99.0, reverse=reverse)
     else:
         return pass_table
 

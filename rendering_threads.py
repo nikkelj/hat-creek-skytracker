@@ -752,6 +752,35 @@ def draw_camera_fov_details_on_surface(surface, state, display_bounds, y_offset,
         current_y += panel_height + 0  # Panel height + spacing
 
 
+def _draw_celestial_details_on_surface(surface, state, mode):
+    """Details panel for a selected celestial object (same slot the satellite
+    panel uses). No-op when nothing celestial is selected."""
+    if not getattr(state, 'selected_celestial', None):
+        return
+    try:
+        from celestial import selected_object_info_lines
+        info = selected_object_info_lines(state)
+    except Exception:
+        info = None
+    if not info:
+        return
+    surface_width, surface_height = surface.get_size()
+    if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+        panel_x, panel_width = _quadrant_info_panel_geometry(surface_width, surface_height)
+    else:
+        panel_x, panel_width = surface_width - 190, 170
+    pygame.font.init()
+    font = pygame.font.Font(None, 16)
+    line_h = 15
+    panel_y = 20
+    panel_h = len(info) * line_h + 14
+    pygame.draw.rect(surface, (50, 50, 50), (panel_x, panel_y, panel_width, panel_h))
+    pygame.draw.rect(surface, (0, 0, 0), (panel_x, panel_y, panel_width, panel_h), 2)
+    for i, (label, value) in enumerate(info):
+        s = font.render(f"{label}: {value}", True, (255, 255, 255))
+        surface.blit(s, (panel_x + 6, panel_y + 7 + i * line_h))
+
+
 def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.FULL_SCREEN, config_state=None):
     """
     Draw satellite details panel on a specified surface with given bounds.
@@ -760,6 +789,9 @@ def draw_details_on_surface(surface, state, display_bounds, mode=PolarPlotMode.F
     global SATELLITE_LABEL_FONT
 
     if not (state.hovered_satellite or state.selected_satellite):
+        # The info box serves ANY selected object: a celestial selection
+        # (star/Messier/NGC/planet/sun/moon) reuses the same panel.
+        _draw_celestial_details_on_surface(surface, state, mode)
         return
 
     # Get the satellite to display details for
@@ -1003,7 +1035,18 @@ def draw_satellites_on_surface(surface, state, cx, cy, display_bounds, mode=Pola
     # is the focus and the dense label cloud is just visual noise (the dots stay).
     hide_labels = bool(getattr(state, 'launch_launched', False) and getattr(state, 'selected_launch', None))
 
+    meo_on = config_state is None or getattr(config_state, 'meo_enabled', True)
+    geo_on = config_state is None or getattr(config_state, 'geo_enabled', True)
+
     for sat, (px, py, alt, _) in satellites_to_draw.items():
+        # Orbit-class visibility (legend-click toggles). Class tests mirror
+        # the marker-shape branches below exactly.
+        _ma = state.satellite_mean_altitudes.get(sat, 0.0)
+        _is_meo = 2000 < _ma <= 35786
+        _is_geo = (not _is_meo) and abs(_ma - 35786) <= 1000
+        if (_is_meo and not meo_on) or (_is_geo and not geo_on):
+            continue
+
         # Satellite positions are absolute screen coordinates
         # Convert to surface coordinates based on mode
 
@@ -1223,6 +1266,8 @@ def draw_celestial_on_surface(surface, config_state, ts, state, display_bounds,
                 surface.blit(surf, (dxi + obj['radius'] + 3, dyi - 5))
 
     state.celestial_positions = positions
+    # Per-frame object lookup for the details box (celestial.selected_object_info_lines).
+    state.celestial_plot_objects = {o['key']: o for o in objs}
 
 
 def draw_aircraft_on_surface(surface, state, display_bounds, current_tt, mode=PolarPlotMode.FULL_SCREEN, config_state=None):

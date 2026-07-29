@@ -25,7 +25,7 @@ import pygame
 from utils import draw_button
 from post_process import (
     RunLibrary, ReplayEngine, Mp4Exporter, StackExporter, fmt_utc,
-    compute_track_vectors,
+    compute_track_vectors, FULL_VIEW,
 )
 
 # Colors
@@ -81,6 +81,11 @@ class PostProcessState:
         self.annot_mode = None
         self.annot_draft = None       # dict with cam + normalized coords
         self.annot_pending_pos = None # (cam, nx, ny) awaiting typed text
+
+        # zoom: drag a box on a pane to zoom into it (right-click resets);
+        # crop_to_zoom makes MP4 exports crop to the active pane's zoom rect
+        self.zoom_draft = None        # {'cam', 'p0': (x,y), 'p1': (x,y)} screen px
+        self.crop_to_zoom = False
 
         # export
         self.exporter = None
@@ -323,6 +328,61 @@ def _fit_box(max_w, max_h, aspect):
     return max(1, w), max(1, h)
 
 
+def _pane_to_frame(view, pane, pos):
+    """Screen pos on a pane -> full-frame normalized coords, through the pane's
+    current zoom ``view`` (so interactions nest correctly while zoomed)."""
+    nx = (pos[0] - pane.x) / max(1, pane.width)
+    ny = (pos[1] - pane.y) / max(1, pane.height)
+    return (view[0] + nx * (view[2] - view[0]),
+            view[1] + ny * (view[3] - view[1]))
+
+
+def _frame_to_pane(view, pane, fx, fy):
+    """Full-frame normalized coords -> screen pos on the pane (inverse of above)."""
+    dx = max(1e-9, view[2] - view[0])
+    dy = max(1e-9, view[3] - view[1])
+    return (pane.x + int((fx - view[0]) / dx * pane.width),
+            pane.y + int((fy - view[1]) / dy * pane.height))
+
+
+_ZOOM_MIN_DRAG_PX = 8   # smaller drags are treated as a plain click
+
+
+def _apply_zoom_box(state, cam, pane):
+    """Turn a completed zoom-box drag into a new engine view for ``cam``.
+
+    The dragged box is expanded (never shrunk) on its short axis to the pane's
+    aspect -- in frame-normalized coords equal x/y spans ARE pane aspect, since
+    the pane already preserves the frame's aspect -- then shifted back inside
+    the frame. Mapping goes through the current view, so zooming while zoomed
+    drills in. Returns True if a zoom was applied.
+    """
+    d = state.zoom_draft
+    (x0, y0), (x1, y1) = d["p0"], d["p1"]
+    if abs(x1 - x0) < _ZOOM_MIN_DRAG_PX or abs(y1 - y0) < _ZOOM_MIN_DRAG_PX:
+        return False
+    view = state.engine.get_view(cam)
+    fx0, fy0 = _pane_to_frame(view, pane, (min(x0, x1), min(y0, y1)))
+    fx1, fy1 = _pane_to_frame(view, pane, (max(x0, x1), max(y0, y1)))
+    bw, bh = fx1 - fx0, fy1 - fy0
+    if bw > bh:
+        c = (fy0 + fy1) / 2.0
+        fy0, fy1 = c - bw / 2.0, c + bw / 2.0
+    else:
+        c = (fx0 + fx1) / 2.0
+        fx0, fx1 = c - bh / 2.0, c + bh / 2.0
+    if fx0 < 0.0:
+        fx1 -= fx0; fx0 = 0.0
+    if fx1 > 1.0:
+        fx0 -= fx1 - 1.0; fx1 = 1.0
+    if fy0 < 0.0:
+        fy1 -= fy0; fy0 = 0.0
+    if fy1 > 1.0:
+        fy0 -= fy1 - 1.0; fy1 = 1.0
+    state.engine.set_view(cam, (fx0, fy0, fx1, fy1))
+    return True
+
+
 def _draw_replay(display, state):
     sx, sy = display.sub_x, display.sub_y
     sw, sh = display.sub_width, display.sub_height
@@ -366,7 +426,21 @@ def _draw_replay(display, state):
         col = _ACCENT if cam == state.active_cam else (80, 80, 90)
         pygame.draw.rect(screen, col, pane, 2)
         _text(display, f"Cam{cam + 1}", pane.x + 6, pane.bottom - 22, display.small_font, _GOLD)
+        view = eng.get_view(cam)
+        if tuple(view) != FULL_VIEW:
+            zf = 1.0 / max(1e-9, view[2] - view[0])
+            zt = display.small_font.render(f"Zoom {zf:.1f}x  (right-click resets)",
+                                           True, _ACCENT)
+            screen.blit(zt, (pane.right - zt.get_width() - 6, pane.y + 4))
         state.pane_rects[cam] = pane
+
+    # In-progress zoom-box drag
+    if state.zoom_draft:
+        d = state.zoom_draft
+        zr = pygame.Rect(min(d["p0"][0], d["p1"][0]), min(d["p0"][1], d["p1"][1]),
+                         abs(d["p1"][0] - d["p0"][0]), abs(d["p1"][1] - d["p0"][1]))
+        if zr.width > 2 and zr.height > 2:
+            pygame.draw.rect(screen, _ACCENT, zr, 1)
 
     _draw_annotation_preview(display, state)
 
@@ -385,17 +459,20 @@ def _draw_annotation_preview(display, state):
     if not pane:
         return
     screen = display.menu_screen
+    # Draft coords are full-frame normalized; map through the pane's zoom view
+    # (and clip to the pane) so the preview lines up while zoomed.
+    view = state.engine.get_view(draft["cam"]) if state.engine else FULL_VIEW
+    p0 = _frame_to_pane(view, pane, draft["x0"], draft["y0"])
+    p1 = _frame_to_pane(view, pane, draft["x1"], draft["y1"])
+    prev_clip = screen.get_clip()
+    screen.set_clip(pane)
     if draft["type"] == "box":
-        r = pygame.Rect(
-            pane.x + int(min(draft["x0"], draft["x1"]) * pane.width),
-            pane.y + int(min(draft["y0"], draft["y1"]) * pane.height),
-            int(abs(draft["x1"] - draft["x0"]) * pane.width),
-            int(abs(draft["y1"] - draft["y0"]) * pane.height))
+        r = pygame.Rect(min(p0[0], p1[0]), min(p0[1], p1[1]),
+                        abs(p1[0] - p0[0]), abs(p1[1] - p0[1]))
         pygame.draw.rect(screen, _RED, r, 2)
     elif draft["type"] == "arrow":
-        p0 = (pane.x + int(draft["x0"] * pane.width), pane.y + int(draft["y0"] * pane.height))
-        p1 = (pane.x + int(draft["x1"] * pane.width), pane.y + int(draft["y1"] * pane.height))
         pygame.draw.line(screen, _RED, p0, p1, 2)
+    screen.set_clip(prev_clip)
 
 
 def _draw_transport(display, state, sx, sy, sw, sh, y):
@@ -487,6 +564,28 @@ def _draw_controls(display, state, x, y, w):
     _button(display, ref, "Set stab reference = here"); state.rects["set_ref"] = ref
     cy += 38
 
+    # Zoom / crop
+    pygame.draw.line(screen, (80, 80, 90), (cx, cy), (x + w - 12, cy)); cy += 8
+    _text(display, "Zoom: drag a box on a pane (right-click resets)", cx, cy,
+          display.small_font, _MUTED); cy += 22
+    zr = pygame.Rect(cx, cy, (w - 32) // 2, 26)
+    _button(display, zr, "Reset zoom"); state.rects["zoom_reset"] = zr
+    ct = pygame.Rect(zr.right + 8, cy, w - 24 - zr.width - 8, 26)
+    _button(display, ct, f"Crop exp: {'ON' if state.crop_to_zoom else 'off'}",
+            active=state.crop_to_zoom)
+    state.rects["crop_toggle"] = ct
+    cy += 30
+    view = eng.get_view(state.active_cam)
+    if state.crop_to_zoom and tuple(view) != FULL_VIEW:
+        shape = state.run.frame_shape(state.active_cam)
+        if shape:
+            cw = int(shape[0] * (view[2] - view[0]))
+            ch = int(shape[1] * (view[3] - view[1]))
+            _text(display, f"MP4 exports crop to {cw}x{ch} px", cx, cy,
+                  display.small_font, _GOLD)
+        cy += 18
+    cy += 6
+
     # Annotation tools
     pygame.draw.line(screen, (80, 80, 90), (cx, cy), (x + w - 12, cy)); cy += 8
     _text(display, "Annotate (active pane):", cx, cy, display.small_font, _MUTED); cy += 22
@@ -566,10 +665,19 @@ def draw_post_process(display, state):
         _draw_library(display, state)
 
 
-def handle_pp_click(pos, display, state, status_messages):
+def handle_pp_click(pos, display, state, status_messages, button=1):
+    if button not in (1, 3):
+        return  # ignore legacy wheel buttons (4/5); MOUSEWHEEL handles scrolling
     if state.view == "replay":
+        if button == 3:
+            # Right-click on a pane resets that pane's zoom; elsewhere ignored.
+            for cam, pane in state.pane_rects.items():
+                if pane.collidepoint(pos) and state.engine is not None:
+                    state.engine.reset_view(cam)
+                    return
+            return
         _click_replay(pos, display, state, status_messages)
-    else:
+    elif button == 1:
         _click_library(pos, display, state, status_messages)
 
 
@@ -657,13 +765,16 @@ def _click_replay(pos, display, state, status_messages):
         i = (_SPEEDS.index(eng.speed) + 1) % len(_SPEEDS) if eng.speed in _SPEEDS else 2
         eng.speed = _SPEEDS[i]; return
 
-    # Pane select
+    # Pane: annotation placement, or select + start a zoom-box drag. A drag
+    # below _ZOOM_MIN_DRAG_PX collapses to a plain pane-select click on mouseup.
     for cam, pane in state.pane_rects.items():
         if pane.collidepoint(pos):
             if state.annot_mode:
                 _start_annotation(state, cam, pos, pane)
             else:
                 state.active_cam = cam
+                state.zoom_draft = {"cam": cam, "p0": pos, "p1": pos}
+                state.dragging = ("zoom", cam)
             return
 
     # Active-cam selector + adjust reset
@@ -680,6 +791,12 @@ def _click_replay(pos, display, state, status_messages):
     if _hit(R, "set_ref", pos):
         eng.set_reference_here(state.active_cam)
         status_messages.append("Post: stabilization reference set"); return
+
+    # Zoom / crop controls
+    if _hit(R, "zoom_reset", pos):
+        eng.reset_view(state.active_cam); return
+    if _hit(R, "crop_toggle", pos):
+        state.crop_to_zoom = not state.crop_to_zoom; return
 
     # Annotation mode buttons
     for key in ("text", "arrow", "box"):
@@ -737,8 +854,9 @@ def _apply_timeline(state, mx, tl):
 
 
 def _start_annotation(state, cam, pos, pane):
-    nx = (pos[0] - pane.x) / pane.width
-    ny = (pos[1] - pane.y) / pane.height
+    # Store annotations in FULL-frame normalized coords (mapped through any
+    # active zoom) so they stay attached to image features at every zoom level.
+    nx, ny = _pane_to_frame(state.engine.get_view(cam), pane, pos)
     if state.annot_mode == "text":
         state.annot_pending_pos = (cam, nx, ny)
         state.focus = "annot"
@@ -756,12 +874,17 @@ def _start_export(state, status_messages, t_start, t_end, stabilize, tag):
     cam = state.active_cam
     cs = state.engine.cams.get(cam)
     safe = state.run.folder.replace(os.sep, "_")
+    # Crop-to-zoom: bake the active pane's zoom rect into the export.
+    view = state.engine.get_view(cam)
+    crop = view if (state.crop_to_zoom and tuple(view) != FULL_VIEW) else None
+    if crop is not None:
+        tag = tag + "_crop"
     out = os.path.join(_EXPORT_DIR, f"{safe}_cam{cam + 1}_{tag}.mp4")
     state.exporter = Mp4Exporter(
         state.run, cam, t_start, t_end, out,
         gamma=cs.gamma, brightness=cs.brightness, contrast=cs.contrast,
         stabilize=stabilize, overlays=state.engine.overlays_on,
-        stab_method=state.engine.stab_method)
+        stab_method=state.engine.stab_method, crop=crop)
     state.exporter.start()
     state.export_msg = ""
     status_messages.append(f"Post: exporting {os.path.basename(out)}")
@@ -804,9 +927,16 @@ def handle_pp_motion(pos, display, state, buttons):
     elif isinstance(state.dragging, tuple) and state.dragging[0] == "annot":
         cam = state.dragging[1]
         pane = state.pane_rects.get(cam)
-        if pane and state.annot_draft:
-            state.annot_draft["x1"] = (pos[0] - pane.x) / pane.width
-            state.annot_draft["y1"] = (pos[1] - pane.y) / pane.height
+        if pane and state.annot_draft and state.engine is not None:
+            fx, fy = _pane_to_frame(state.engine.get_view(cam), pane, pos)
+            state.annot_draft["x1"] = fx
+            state.annot_draft["y1"] = fy
+    elif isinstance(state.dragging, tuple) and state.dragging[0] == "zoom":
+        cam = state.dragging[1]
+        pane = state.pane_rects.get(cam)
+        if pane and state.zoom_draft:
+            state.zoom_draft["p1"] = (max(pane.x, min(pos[0], pane.right)),
+                                      max(pane.y, min(pos[1], pane.bottom)))
 
 
 def handle_pp_mouseup(pos, display, state):
@@ -817,6 +947,12 @@ def handle_pp_mouseup(pos, display, state):
             state.annot_draft = None
             if state.engine:
                 state.engine._bump()
+    elif isinstance(state.dragging, tuple) and state.dragging[0] == "zoom":
+        cam = state.dragging[1]
+        pane = state.pane_rects.get(cam)
+        if pane and state.zoom_draft and state.engine is not None:
+            _apply_zoom_box(state, cam, pane)  # micro-drag = plain pane select
+        state.zoom_draft = None
     state.dragging = None
 
 

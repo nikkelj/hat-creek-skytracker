@@ -93,6 +93,64 @@ class TestHoverPick(unittest.TestCase):
                          "no tooltip may render while disabled")
 
 
+class TestLegendInteractivity(unittest.TestCase):
+    """The clickable orbit legend: gradient sets altitude filters (left =
+    above, right = below), MEO/GEO rows toggle their orbit classes."""
+
+    def setUp(self):
+        from tracking_visuals import LEGEND_GRADIENT_MAX_KM
+        self.max_km = LEGEND_GRADIENT_MAX_KM
+        self.state = SimpleNamespace(
+            filter_above_alt_text="", filter_below_alt_text="",
+            legend_rects={
+                'gradient': pygame.Rect(1000, 800, 150, 40),
+                'meo': pygame.Rect(1005, 842, 140, 20),
+                'geo': pygame.Rect(1005, 862, 140, 20),
+            })
+        self.cfg = SimpleNamespace(meo_enabled=True, geo_enabled=True)
+
+    def test_gradient_left_sets_above_filter(self):
+        from tracking_visuals import handle_legend_click
+        # Click mid-gradient -> ~500 km above-filter.
+        grad = self.state.legend_rects['gradient']
+        self.assertTrue(handle_legend_click(
+            self.state, self.cfg, (grad.x + grad.width // 2, grad.centery), 1))
+        self.assertAlmostEqual(float(self.state.filter_above_alt_text),
+                               self.max_km / 2, delta=20)
+        self.assertEqual(self.state.filter_below_alt_text, "")
+
+    def test_gradient_right_sets_below_filter(self):
+        from tracking_visuals import handle_legend_click
+        grad = self.state.legend_rects['gradient']
+        self.assertTrue(handle_legend_click(
+            self.state, self.cfg, (grad.right - 1, grad.centery), 3))
+        self.assertAlmostEqual(float(self.state.filter_below_alt_text),
+                               self.max_km, delta=20)
+
+    def test_meo_geo_rows_toggle(self):
+        from tracking_visuals import handle_legend_click
+        self.assertTrue(handle_legend_click(
+            self.state, self.cfg, self.state.legend_rects['meo'].center, 1))
+        self.assertFalse(self.cfg.meo_enabled)
+        self.assertTrue(handle_legend_click(
+            self.state, self.cfg, self.state.legend_rects['geo'].center, 1))
+        self.assertFalse(self.cfg.geo_enabled)
+        # Right-click on a row is NOT a toggle; miss consumes nothing.
+        self.assertFalse(handle_legend_click(
+            self.state, self.cfg, self.state.legend_rects['meo'].center, 3))
+        self.assertFalse(handle_legend_click(self.state, self.cfg, (0, 0), 1))
+
+    def test_meo_geo_config_round_trip(self):
+        from config import ConfigState
+        cfg = ConfigState()
+        self.assertTrue(cfg.meo_enabled and cfg.geo_enabled)
+        cfg.meo_enabled = False
+        cfg2 = ConfigState()
+        cfg2.load_from_dict(cfg.get_config_dict())
+        self.assertFalse(cfg2.meo_enabled)
+        self.assertTrue(cfg2.geo_enabled)
+
+
 class TestWrap(unittest.TestCase):
     def test_wrap_bounds(self):
         lines = tooltips._wrap("word " * 40)

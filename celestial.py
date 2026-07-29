@@ -280,7 +280,8 @@ class CelestialCatalog:
                     lat, lon, elev, ts, t_tt):
                 kind = "sun" if key == "sun" else ("moon" if key == "moon" else "planet")
                 objs.append({"key": key, "kind": kind, "name": name, "az": az,
-                             "el": el, "color": color, "radius": rad, "mag": 0.0})
+                             "el": el, "color": color, "radius": rad, "mag": 0.0,
+                             "dist_km": float(dist_km)})
 
             def add_dso(cat, kind, mag_limit=None):
                 if not cat["key"]:
@@ -294,7 +295,9 @@ class CelestialCatalog:
                     objs.append({"key": cat["key"][i], "kind": kind,
                                  "name": cat["name"][i], "az": float(az[i]),
                                  "el": float(el[i]), "color": None, "radius": 3,
-                                 "mag": float(cat["mag"][i])})
+                                 "mag": float(cat["mag"][i]),
+                                 "ra_deg": float(cat["ra_deg"][i]),
+                                 "dec_deg": float(cat["dec_deg"][i])})
 
             # Always-selectable named-star anchors (drawn by the starfield;
             # these entries exist for hit-testing and PROGRAM targeting).
@@ -351,6 +354,57 @@ class CelestialCatalog:
         rows = np.column_stack([time_vals, alt_deg, az_deg, dist_km,
                                 zeros, zeros, az_rates, el_rates]).tolist()
         return rows, time_vals.copy()
+
+
+KIND_LABELS = {"sun": "Sun", "moon": "Moon", "planet": "Planet",
+               "star": "Bright star", "messier": "Messier object",
+               "ngc": "NGC object"}
+
+
+def selected_object_info_lines(tvs):
+    """(label, value) lines describing the selected celestial object, for the
+    details box the sky screens used to reserve for satellites. None when no
+    celestial object is selected. Reads state.celestial_plot_objects (the
+    render thread's per-frame lookup) so it costs nothing to build."""
+    key = getattr(tvs, "selected_celestial", None)
+    if not key:
+        return None
+    try:
+        cat = get_celestial(getattr(tvs, "ephemeris", None))
+        name = cat.display_name(key)
+    except Exception:
+        name = key
+    lines = [("Target", name)]
+    obj = (getattr(tvs, "celestial_plot_objects", {}) or {}).get(key)
+    if obj is None:
+        lines.append(("Status", "below horizon / hidden"))
+        return lines
+    lines.append(("Type", KIND_LABELS.get(obj["kind"], obj["kind"])))
+    lines.append(("Azimuth", f"{obj['az']:.2f} deg"))
+    lines.append(("Elevation", f"{obj['el']:.2f} deg"))
+    if obj.get("ra_deg") is not None:
+        ra_h = obj["ra_deg"] / 15.0
+        lines.append(("RA", f"{int(ra_h):02d}h {(ra_h % 1) * 60:04.1f}m"))
+        lines.append(("Dec", f"{obj['dec_deg']:+.2f} deg"))
+    if obj["kind"] in ("star", "messier", "ngc"):
+        lines.append(("V mag", f"{obj['mag']:.1f}"))
+    if obj.get("dist_km"):
+        d = obj["dist_km"]
+        lines.append(("Distance", f"{d:,.0f} km" if d < 5.0e7
+                      else f"{d / 1.496e8:.2f} AU"))
+    # Sky rates from the live tracking trajectory when one is built.
+    traj = (getattr(tvs, "celestial_trajectories", {}) or {}).get(key)
+    cur_tt = getattr(tvs, "current_tt", None)
+    if traj and cur_tt:
+        try:
+            from trajectory import interpolate_position_data_and_rates
+            r = interpolate_position_data_and_rates(traj, cur_tt)
+            if r[0] is not None:
+                lines.append(("Az rate", f"{r[5] * 3600.0:+.1f} arcsec/s"))
+                lines.append(("El rate", f"{r[6] * 3600.0:+.1f} arcsec/s"))
+        except Exception:
+            pass
+    return lines
 
 
 # ---- selected-target trajectory maintenance ----------------------------------

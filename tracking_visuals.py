@@ -98,8 +98,8 @@ class TrackingVisState:
         # primary key first. Default: sort by max elevation, descending.
         self.table_sort_order = [(3, True)]
         # Legacy single-sort fields kept for serialization back-compat (derived from order)
-        self.table_sort_keys = [False, False, False, True, False]
-        self.table_sort_reverse = [True, True, True, True, True]
+        self.table_sort_keys = [False, False, False, True, False, False, False]
+        self.table_sort_reverse = [True, True, True, True, True, True, True]
         self.pass_table_clickable_areas = []
         self.pass_table_scroll_offset = 0     # first visible row index (scrollback)
         self.pass_table_max_scroll = 0        # set during draw; clamps wheel scrolling
@@ -440,32 +440,89 @@ def draw_filters(display, state, rects=None):
                             (filter_below_alt_rect.x + 5 + start_width, filter_below_alt_rect.y + 5,
                              end_width - start_width, 20), 2)
 
-def draw_legend(display):
-    """
-    State-direct mutation function for drawing orbit legend.
-    Takes display object directly instead of individual parameters.
-    """
-    pygame.draw.rect(display.menu_screen, (50, 50, 50), (display.legend_x, display.legend_y, 150, 140))  # Larger legend
-    pygame.draw.line(display.menu_screen, (255, 255, 255), (display.legend_x, display.legend_y + 20), (display.legend_x + 150, display.legend_y + 20), 1)  # Title line
+LEGEND_GRADIENT_MAX_KM = 1000.0
+
+
+def draw_legend(display, state=None, config_state=None):
+    """Orbit legend -- now interactive: left/right click on the altitude
+    gradient sets the above/below altitude filters, and clicking the MEO/GEO
+    rows toggles those orbit classes on the plot (config meo/geo_enabled;
+    rows grey out when hidden). Publishes state.legend_rects for the click
+    handler and the hover tooltips."""
+    lx, ly = display.legend_x, display.legend_y
+    pygame.draw.rect(display.menu_screen, (50, 50, 50), (lx, ly, 150, 140))  # Larger legend
+    pygame.draw.line(display.menu_screen, (255, 255, 255), (lx, ly + 20), (lx + 150, ly + 20), 1)  # Title line
     legend_title = display.small_font.render("Orbit Legend", True, (255, 255, 255))
-    display.menu_screen.blit(legend_title, (display.legend_x + 5, display.legend_y + 5))
+    display.menu_screen.blit(legend_title, (lx + 5, ly + 5))
     # LEO heatmap
     for i in range(150):
-        alt = i / 150 * 1000  # Scale from 0 to 1000 km
+        alt = i / 150 * LEGEND_GRADIENT_MAX_KM
         color = get_altitude_color(alt) or (0, 255, 0)  # Fallback to green if out of range
-        pygame.draw.line(display.menu_screen, color, (display.legend_x + i, display.legend_y + 40), (display.legend_x + i, display.legend_y + 60))
+        pygame.draw.line(display.menu_screen, color, (lx + i, ly + 40), (lx + i, ly + 60))
+    # Filter markers on the gradient when altitude filters are set.
+    if state is not None:
+        for text, col in ((getattr(state, 'filter_above_alt_text', ''), (255, 255, 255)),
+                          (getattr(state, 'filter_below_alt_text', ''), (30, 30, 30))):
+            try:
+                frac = min(1.0, max(0.0, float(text) / LEGEND_GRADIENT_MAX_KM))
+                pygame.draw.line(display.menu_screen, col,
+                                 (lx + int(frac * 149), ly + 38),
+                                 (lx + int(frac * 149), ly + 62), 2)
+            except ValueError:
+                pass
     low_alt = display.small_font.render("0 km", True, (255, 255, 255))
     high_alt = display.small_font.render("1000 km", True, (255, 255, 255))
-    display.menu_screen.blit(low_alt, (display.legend_x, display.legend_y + 70))
-    display.menu_screen.blit(high_alt, (display.legend_x + 140, display.legend_y + 70))
-    # MEO hexagon
-    draw_hexagon(display.menu_screen, display.legend_x + 20, display.legend_y + 90, (255, 165, 0))  # Orange
-    meo_label = display.small_font.render("MEO (Orange)", True, (255, 255, 255))
-    display.menu_screen.blit(meo_label, (display.legend_x + 40, display.legend_y + 85))
-    # GEO triangle with line break
-    draw_triangle(display.menu_screen, display.legend_x + 20, display.legend_y + 110, (128, 0, 128))  # Purple
-    geo_label = display.small_font.render("GEO (Purple)", True, (255, 255, 255))
-    display.menu_screen.blit(geo_label, (display.legend_x + 40, display.legend_y + 105))
+    display.menu_screen.blit(low_alt, (lx, ly + 70))
+    display.menu_screen.blit(high_alt, (lx + 140, ly + 70))
+    # MEO / GEO rows, greyed when toggled off.
+    meo_on = config_state is None or getattr(config_state, 'meo_enabled', True)
+    geo_on = config_state is None or getattr(config_state, 'geo_enabled', True)
+    draw_hexagon(display.menu_screen, lx + 20, ly + 90,
+                 (255, 165, 0) if meo_on else (95, 75, 45))
+    meo_label = display.small_font.render(
+        "MEO (Orange)" if meo_on else "MEO (off)", True,
+        (255, 255, 255) if meo_on else (120, 120, 120))
+    display.menu_screen.blit(meo_label, (lx + 40, ly + 85))
+    draw_triangle(display.menu_screen, lx + 20, ly + 110,
+                  (128, 0, 128) if geo_on else (65, 45, 65))
+    geo_label = display.small_font.render(
+        "GEO (Purple)" if geo_on else "GEO (off)", True,
+        (255, 255, 255) if geo_on else (120, 120, 120))
+    display.menu_screen.blit(geo_label, (lx + 40, ly + 105))
+
+    if state is not None:
+        state.legend_rects = {
+            'gradient': pygame.Rect(lx, ly + 36, 150, 40),
+            'meo': pygame.Rect(lx + 5, ly + 82, 140, 20),
+            'geo': pygame.Rect(lx + 5, ly + 102, 140, 20),
+        }
+
+
+def handle_legend_click(state, config_state, pos, button):
+    """Legend interactivity: LEFT click on the gradient sets the 'above'
+    altitude filter, RIGHT click sets the 'below' filter (click again at the
+    same spot... just edit the filter boxes to clear); clicking MEO/GEO
+    toggles those classes. Returns True if the click was consumed."""
+    rects = getattr(state, 'legend_rects', None) or {}
+    grad = rects.get('gradient')
+    if grad and grad.collidepoint(pos) and button in (1, 3):
+        frac = min(1.0, max(0.0, (pos[0] - grad.x) / max(1, grad.width - 1)))
+        alt_km = round(frac * LEGEND_GRADIENT_MAX_KM / 10.0) * 10  # 10 km steps
+        if button == 1:
+            state.filter_above_alt_text = str(int(alt_km))
+        else:
+            state.filter_below_alt_text = str(int(alt_km))
+        return True
+    if button == 1 and config_state is not None:
+        meo = rects.get('meo')
+        if meo and meo.collidepoint(pos):
+            config_state.meo_enabled = not getattr(config_state, 'meo_enabled', True)
+            return True
+        geo = rects.get('geo')
+        if geo and geo.collidepoint(pos):
+            config_state.geo_enabled = not getattr(config_state, 'geo_enabled', True)
+            return True
+    return False
 
 
 def draw_camera_fov_details(display, state, y_offset, mode=PolarPlotMode.FULL_SCREEN):
@@ -584,6 +641,29 @@ def draw_details(display, state, mode=PolarPlotMode.FULL_SCREEN):
             text_surface = font_to_use.render(line, True, (255, 255, 255))
             display.menu_screen.blit(text_surface, (details_rect.x + padding, details_rect.y + padding + i * line_height))
 
+    elif getattr(state, 'selected_celestial', None):
+        # The info box serves ANY selected object: stars, Messier/NGC DSOs,
+        # planets, the sun and moon reuse the satellite details panel.
+        try:
+            from celestial import selected_object_info_lines
+            info = selected_object_info_lines(state)
+        except Exception:
+            info = None
+        if not info:
+            return
+        if mode == PolarPlotMode.UPPER_RIGHT_QUADRANT:
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 90, display.sub_y + 20, 85, 125)
+            font_to_use, line_height, padding = display.tiny_font, 12, 3
+        else:
+            details_rect = pygame.Rect(display.sub_x + display.sub_width - 190, display.sub_y + 20, 170, 250)
+            font_to_use, line_height, padding = display.small_font, 15, 5
+        pygame.draw.rect(display.menu_screen, (50, 50, 50), details_rect)
+        pygame.draw.rect(display.menu_screen, (0, 0, 0), details_rect, 2)
+        for i, (label, value) in enumerate(info):
+            text_surface = font_to_use.render(f"{label}: {value}", True, (255, 255, 255))
+            display.menu_screen.blit(text_surface, (details_rect.x + padding, details_rect.y + padding + i * line_height))
+
+
 def draw_time_display(display):
     """
     State-direct mutation function for drawing time display.
@@ -624,11 +704,12 @@ OBJECT_TOGGLES = (
 
 
 def draw_object_toggles(display, state, config_state):
-    """Column of object-type show/hide buttons on the tracking-vis left panel
-    (below the satellite count). Publishes state.object_toggle_rects for
-    handle_object_toggle_click."""
-    x = display.sub_x + 10
-    y = display.sub_y + 270
+    """Column of object-type show/hide buttons in the LOWER-RIGHT corner,
+    stacked directly above the orbit legend (the old left-panel spot sat
+    underneath the pass-selection table). Publishes state.object_toggle_rects
+    for handle_object_toggle_click."""
+    x = display.legend_x
+    y = display.legend_y - 10 - (22 + len(OBJECT_TOGGLES) * 26)
     label = display.small_font.render("Show objects:", True, (255, 255, 255))
     display.menu_screen.blit(label, (x, y))
     y += 22
@@ -636,7 +717,7 @@ def draw_object_toggles(display, state, config_state):
     rects = {}
     for attr, name, default in OBJECT_TOGGLES:
         on = bool(getattr(config_state, attr, default))
-        rect = pygame.Rect(x, y, 110, 22)
+        rect = pygame.Rect(x, y, 150, 22)
         base = (70, 110, 70) if on else (90, 70, 70)
         col = tuple(min(255, c + 25) for c in base) if rect.collidepoint(mouse_pos) else base
         pygame.draw.rect(display.menu_screen, col, rect)
@@ -693,7 +774,12 @@ def draw_scroll_time_display(display, current_tt, ts):
 
 PASS_TABLE_WIDTH = 354
 PASS_TABLE_ROW_HEIGHT = 18
-PASS_TABLE_COL_WIDTHS = [120, 55, 42, 57, 80]  # Name, NORAD, Az, Max El, Closest
+# Seven columns squeezed into the same 354 px footprint (the table sits ~6 px
+# clear of the skyplot circle on a 1080p screen, so the box must not widen).
+# Widths validated against display.table_font (size 13) renderings: longest
+# realistic cells are 'STARLINK-32551' 64px, '378000' 26px, header+sort-tag
+# 'NORADv1' 39px.
+PASS_TABLE_COL_WIDTHS = [100, 48, 34, 36, 42, 48, 34]  # Name, NORAD, Az, El, Time, Apog, Mag
 
 
 def _pass_table_col_x(table_x):
@@ -757,6 +843,10 @@ def draw_satellite_pass_table(display, state, box=None):
     info_surface = display.small_font.render(f"Sort: {summary}", True, (180, 180, 180))
     display.menu_screen.blit(info_surface, (table_x + table_width - info_surface.get_width() - 5, table_y + 5))
 
+    # Cells and headers use the dedicated (slightly smaller) table font so all
+    # seven columns fit without widening the box into the skyplot.
+    table_font = getattr(display, 'table_font', display.small_font)
+
     # Column headers (clickable) with sort priority + direction indicators
     header_y = table_y + title_h
     for i, header in enumerate(PASS_TABLE_COLUMN_NAMES):
@@ -767,8 +857,8 @@ def draw_satellite_pass_table(display, state, box=None):
         label = header
         if in_sort:
             label = f"{header}{'v' if rev[i] else '^'}{rank[i]}" if len(order) > 1 else f"{header}{'v' if rev[i] else '^'}"
-        display.menu_screen.blit(display.small_font.render(label, True, (255, 255, 255)),
-                                 (col_x_positions[i], header_y + 3))
+        display.menu_screen.blit(table_font.render(label, True, (255, 255, 255)),
+                                 (col_x_positions[i], header_y + 4))
         pygame.draw.rect(display.menu_screen, (150, 150, 150), header_rect, 1)
         state.pass_table_clickable_areas.append(('header', i, header_rect))
 
@@ -798,16 +888,25 @@ def draw_satellite_pass_table(display, state, box=None):
             row_bg_color = (80, 100, 120)  # Blue highlight for selected
         pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
 
+        apog = entry.get('apogee_km')
+        # Magnitude semantics: missing key = not computed ('--'), key present
+        # but None = eclipsed at culmination ('ecl'), else the estimate.
+        if 'magnitude' in entry:
+            mag_text = f"{entry['magnitude']:.1f}" if entry['magnitude'] is not None else 'ecl'
+        else:
+            mag_text = '--'
         cell_values = [
-            str(entry['name'])[:20],
+            str(entry['name'])[:16],
             entry['norad_id'],
             f"{entry['azimuth_at_max']:.0f}°",
             f"{entry['max_elevation']:.1f}°",
             entry.get('closest_approach_time', '--:--'),
+            f"{apog:.0f}" if apog is not None else '--',
+            mag_text,
         ]
         for col_idx, value in enumerate(cell_values):
-            display.menu_screen.blit(display.small_font.render(str(value), True, (255, 255, 255)),
-                                     (col_x_positions[col_idx], row_y + 2))
+            display.menu_screen.blit(table_font.render(str(value), True, (255, 255, 255)),
+                                     (col_x_positions[col_idx], row_y + 3))
 
         row_rect = pygame.Rect(table_x + 3, row_y, table_width - 6, row_height)
         pygame.draw.rect(display.menu_screen, (100, 100, 100), row_rect, 1)
@@ -849,7 +948,7 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
             row_bg_color = (100, 80, 120)
         pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, launch_row_y, table_width - 6, row_height))
 
-        launch_name_clean = (launch_name.rstrip('.csv') if launch_name.endswith('.csv') else launch_name)[:20]
+        launch_name_clean = (launch_name.rstrip('.csv') if launch_name.endswith('.csv') else launch_name)[:16]
         if launch_name in state.launch_trajectories:
             trajectory_data, times_array = state.launch_trajectories[launch_name]
             if times_array.size > 0:
@@ -861,10 +960,11 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
             duration, max_alt = 0, 0
 
         cell_values = [launch_name_clean, "LAUNCH", f"{max_alt:.0f}°", f"{duration:.0f}s", "--:--"]
+        launch_font = getattr(display, 'table_font', display.small_font)
         for col_idx, value in enumerate(cell_values):
             color = (255, 255, 220) if col_idx == 0 else (255, 255, 255)
-            display.menu_screen.blit(display.small_font.render(value, True, color),
-                                     (col_x_positions[col_idx], launch_row_y + 2))
+            display.menu_screen.blit(launch_font.render(value, True, color),
+                                     (col_x_positions[col_idx], launch_row_y + 3))
 
         launch_row_rect = pygame.Rect(table_x + 3, launch_row_y, table_width - 6, row_height)
         pygame.draw.rect(display.menu_screen, (100, 100, 100), launch_row_rect, 1)
@@ -872,12 +972,13 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
         launch_row_y += row_height
 
 # Default sort direction (reverse == descending) applied when a column first
-# becomes a sort key. Elevation/azimuth default to descending (most prominent
-# passes on top); name/NORAD/time default to ascending.
-PASS_TABLE_DEFAULT_DESC = {0: False, 1: False, 2: True, 3: True, 4: False}
+# becomes a sort key. Elevation/azimuth/apogee default to descending (most
+# prominent passes / highest orbits on top); name/NORAD/time/magnitude default
+# to ascending (a LOWER magnitude is BRIGHTER, so ascending = brightest first).
+PASS_TABLE_DEFAULT_DESC = {0: False, 1: False, 2: True, 3: True, 4: False, 5: True, 6: False}
 
 # Column display names, used for header labels and the sort summary line.
-PASS_TABLE_COLUMN_NAMES = ['Name', 'NORAD', 'Az', 'Max El', 'Closest']
+PASS_TABLE_COLUMN_NAMES = ['Name', 'NORAD', 'Az', 'El', 'Time', 'Apog', 'Mag']
 
 
 def _pass_table_sort_key(column):
@@ -893,6 +994,12 @@ def _pass_table_sort_key(column):
         return lambda e: e.get('max_elevation', 0.0)
     if column == 4:
         return lambda e: e.get('closest_approach_time') if e.get('closest_approach_time') not in (None, '--:--') else '99:99'
+    if column == 5:
+        return lambda e: e.get('apogee_km') if e.get('apogee_km') is not None else -1.0
+    if column == 6:
+        # Eclipsed/unknown entries sort as very dim (99) so ascending shows
+        # the brightest passes first and 'ecl'/'--' rows sink to the bottom.
+        return lambda e: e.get('magnitude') if e.get('magnitude') is not None else 99.0
     return None
 
 

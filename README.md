@@ -95,7 +95,13 @@ physical hardware present.
 ## Screens
 
 **Tracking Vis** — annotated polar sky plot with the selected object's orbit,
-orbital elements, camera FOV footprints, and a scrollable pass table.
+orbital elements, camera FOV footprints, and a scrollable pass table sortable
+on every column (click a header; shift-click stacks multi-column sorts) —
+including **apogee altitude** and an **estimated visual magnitude** computed
+from range + solar phase geometry, with `ecl` marking passes that sit in
+Earth's shadow at culmination. In the shot below the table is sorted by
+magnitude: the high-LEO OneWeb/Globalstar constellations are correctly the
+only satellites still sunlit near local midnight.
 
 The plot carries a full **celestial layer**: the sun, moon and planets are
 always drawn (dimmed on the horizon rim when below it, so you can see where
@@ -142,6 +148,25 @@ pane, one of the explanations available on every control.
 alignment-rotation / ROI controls for co-boresighting the guide and main cameras.
 
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
+
+**Post Processing** — review and turn saved capture runs into products. A run
+**library** (grouped by target, with favorites / tags / notes / rename /
+delete) feeds a synced **side-by-side replay** of both cameras: scrub +
+transport with in/out clip markers, per-pane gamma / brightness / contrast,
+ASTAP-style **stabilization** against a chosen reference frame, in/cross-track
+overlay vectors, and text / arrow / box **annotations** saved with the run.
+**Drag a box on a pane to zoom** — zooms nest, deeper zooms re-decode at
+higher resolution, and a right-click (or Reset zoom) restores the full frame.
+Arming **Crop exp** makes every MP4 export crop to the zoomed region at native
+resolution (the exact output pixel size is shown before you commit). Export
+buttons write clips, stabilized movies, or the whole run to MP4; the
+**lucky-imaging stack** buttons grade frames by sharpness, keep the best
+25/50%, align them (optionally with alignment-point local warping or
+PIPP-style target centring) and average them into a 16-bit linear master plus
+a sharpened, share-ready final PNG. Shown here with Cam1 zoomed 2.5× on the
+target and export-crop armed:
+
+![Post Processing](doc/screenshots/post_process.png)
 
 **Mount 3D** — a software-3D view of the mount for building alignment
 intuition: the articulated single-fork-arm model (tripod → AZ-axis tube →
@@ -254,10 +279,11 @@ than alt-tabbing between many GUI programs.
   acquisition, tracked-object handoff, click-in-image selection, and labeled
   capture (UTC, mount az/el, rate, centroid per frame).
 - **Post-processing** — quick-look and product generation to get a good shot
-  posted fast. A PIPP-style prep stage (sharpness grading, "lucky" frame
-  culling, target centring/cropping) feeds an AutoStakkert-style stacker that
-  aligns and averages the best frames — optionally with alignment-point local
-  warping — into one high-SNR master ready for wavelet sharpening.
+  posted fast (largely implemented — see the Post Processing screen above). A
+  PIPP-style prep stage (sharpness grading, "lucky" frame culling, target
+  centring/cropping) feeds an AutoStakkert-style stacker that aligns and
+  averages the best frames — optionally with alignment-point local warping —
+  into one high-SNR master ready for wavelet sharpening.
 
 We deliberately don't try to re-create everything existing tools (Heavens-Above,
 SkyTrack, KStars, etc.) already do well — the focus is the niche capabilities

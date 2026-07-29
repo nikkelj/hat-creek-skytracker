@@ -98,8 +98,8 @@ class TrackingVisState:
         # primary key first. Default: sort by max elevation, descending.
         self.table_sort_order = [(3, True)]
         # Legacy single-sort fields kept for serialization back-compat (derived from order)
-        self.table_sort_keys = [False, False, False, True, False]
-        self.table_sort_reverse = [True, True, True, True, True]
+        self.table_sort_keys = [False, False, False, True, False, False, False]
+        self.table_sort_reverse = [True, True, True, True, True, True, True]
         self.pass_table_clickable_areas = []
         self.pass_table_scroll_offset = 0     # first visible row index (scrollback)
         self.pass_table_max_scroll = 0        # set during draw; clamps wheel scrolling
@@ -774,7 +774,12 @@ def draw_scroll_time_display(display, current_tt, ts):
 
 PASS_TABLE_WIDTH = 354
 PASS_TABLE_ROW_HEIGHT = 18
-PASS_TABLE_COL_WIDTHS = [120, 55, 42, 57, 80]  # Name, NORAD, Az, Max El, Closest
+# Seven columns squeezed into the same 354 px footprint (the table sits ~6 px
+# clear of the skyplot circle on a 1080p screen, so the box must not widen).
+# Widths validated against display.table_font (size 13) renderings: longest
+# realistic cells are 'STARLINK-32551' 64px, '378000' 26px, header+sort-tag
+# 'NORADv1' 39px.
+PASS_TABLE_COL_WIDTHS = [100, 48, 34, 36, 42, 48, 34]  # Name, NORAD, Az, El, Time, Apog, Mag
 
 
 def _pass_table_col_x(table_x):
@@ -838,6 +843,10 @@ def draw_satellite_pass_table(display, state, box=None):
     info_surface = display.small_font.render(f"Sort: {summary}", True, (180, 180, 180))
     display.menu_screen.blit(info_surface, (table_x + table_width - info_surface.get_width() - 5, table_y + 5))
 
+    # Cells and headers use the dedicated (slightly smaller) table font so all
+    # seven columns fit without widening the box into the skyplot.
+    table_font = getattr(display, 'table_font', display.small_font)
+
     # Column headers (clickable) with sort priority + direction indicators
     header_y = table_y + title_h
     for i, header in enumerate(PASS_TABLE_COLUMN_NAMES):
@@ -848,8 +857,8 @@ def draw_satellite_pass_table(display, state, box=None):
         label = header
         if in_sort:
             label = f"{header}{'v' if rev[i] else '^'}{rank[i]}" if len(order) > 1 else f"{header}{'v' if rev[i] else '^'}"
-        display.menu_screen.blit(display.small_font.render(label, True, (255, 255, 255)),
-                                 (col_x_positions[i], header_y + 3))
+        display.menu_screen.blit(table_font.render(label, True, (255, 255, 255)),
+                                 (col_x_positions[i], header_y + 4))
         pygame.draw.rect(display.menu_screen, (150, 150, 150), header_rect, 1)
         state.pass_table_clickable_areas.append(('header', i, header_rect))
 
@@ -879,16 +888,25 @@ def draw_satellite_pass_table(display, state, box=None):
             row_bg_color = (80, 100, 120)  # Blue highlight for selected
         pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, row_y, table_width - 6, row_height))
 
+        apog = entry.get('apogee_km')
+        # Magnitude semantics: missing key = not computed ('--'), key present
+        # but None = eclipsed at culmination ('ecl'), else the estimate.
+        if 'magnitude' in entry:
+            mag_text = f"{entry['magnitude']:.1f}" if entry['magnitude'] is not None else 'ecl'
+        else:
+            mag_text = '--'
         cell_values = [
-            str(entry['name'])[:20],
+            str(entry['name'])[:16],
             entry['norad_id'],
             f"{entry['azimuth_at_max']:.0f}°",
             f"{entry['max_elevation']:.1f}°",
             entry.get('closest_approach_time', '--:--'),
+            f"{apog:.0f}" if apog is not None else '--',
+            mag_text,
         ]
         for col_idx, value in enumerate(cell_values):
-            display.menu_screen.blit(display.small_font.render(str(value), True, (255, 255, 255)),
-                                     (col_x_positions[col_idx], row_y + 2))
+            display.menu_screen.blit(table_font.render(str(value), True, (255, 255, 255)),
+                                     (col_x_positions[col_idx], row_y + 3))
 
         row_rect = pygame.Rect(table_x + 3, row_y, table_width - 6, row_height)
         pygame.draw.rect(display.menu_screen, (100, 100, 100), row_rect, 1)
@@ -930,7 +948,7 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
             row_bg_color = (100, 80, 120)
         pygame.draw.rect(display.menu_screen, row_bg_color, (table_x + 3, launch_row_y, table_width - 6, row_height))
 
-        launch_name_clean = (launch_name.rstrip('.csv') if launch_name.endswith('.csv') else launch_name)[:20]
+        launch_name_clean = (launch_name.rstrip('.csv') if launch_name.endswith('.csv') else launch_name)[:16]
         if launch_name in state.launch_trajectories:
             trajectory_data, times_array = state.launch_trajectories[launch_name]
             if times_array.size > 0:
@@ -942,10 +960,11 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
             duration, max_alt = 0, 0
 
         cell_values = [launch_name_clean, "LAUNCH", f"{max_alt:.0f}°", f"{duration:.0f}s", "--:--"]
+        launch_font = getattr(display, 'table_font', display.small_font)
         for col_idx, value in enumerate(cell_values):
             color = (255, 255, 220) if col_idx == 0 else (255, 255, 255)
-            display.menu_screen.blit(display.small_font.render(value, True, color),
-                                     (col_x_positions[col_idx], launch_row_y + 2))
+            display.menu_screen.blit(launch_font.render(value, True, color),
+                                     (col_x_positions[col_idx], launch_row_y + 3))
 
         launch_row_rect = pygame.Rect(table_x + 3, launch_row_y, table_width - 6, row_height)
         pygame.draw.rect(display.menu_screen, (100, 100, 100), launch_row_rect, 1)
@@ -953,12 +972,13 @@ def _draw_launch_trajectory_box(display, state, table_x, table_y, table_width, c
         launch_row_y += row_height
 
 # Default sort direction (reverse == descending) applied when a column first
-# becomes a sort key. Elevation/azimuth default to descending (most prominent
-# passes on top); name/NORAD/time default to ascending.
-PASS_TABLE_DEFAULT_DESC = {0: False, 1: False, 2: True, 3: True, 4: False}
+# becomes a sort key. Elevation/azimuth/apogee default to descending (most
+# prominent passes / highest orbits on top); name/NORAD/time/magnitude default
+# to ascending (a LOWER magnitude is BRIGHTER, so ascending = brightest first).
+PASS_TABLE_DEFAULT_DESC = {0: False, 1: False, 2: True, 3: True, 4: False, 5: True, 6: False}
 
 # Column display names, used for header labels and the sort summary line.
-PASS_TABLE_COLUMN_NAMES = ['Name', 'NORAD', 'Az', 'Max El', 'Closest']
+PASS_TABLE_COLUMN_NAMES = ['Name', 'NORAD', 'Az', 'El', 'Time', 'Apog', 'Mag']
 
 
 def _pass_table_sort_key(column):
@@ -974,6 +994,12 @@ def _pass_table_sort_key(column):
         return lambda e: e.get('max_elevation', 0.0)
     if column == 4:
         return lambda e: e.get('closest_approach_time') if e.get('closest_approach_time') not in (None, '--:--') else '99:99'
+    if column == 5:
+        return lambda e: e.get('apogee_km') if e.get('apogee_km') is not None else -1.0
+    if column == 6:
+        # Eclipsed/unknown entries sort as very dim (99) so ascending shows
+        # the brightest passes first and 'ecl'/'--' rows sink to the bottom.
+        return lambda e: e.get('magnitude') if e.get('magnitude') is not None else 99.0
     return None
 
 

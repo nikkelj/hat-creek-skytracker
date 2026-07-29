@@ -99,6 +99,16 @@ CONFIG_TIPS = {
     'alt_limit_max': "Mount safety limit: maximum ALT-axis angle.",
 }
 
+# Pass-table column headers, indexed by column. Every header sorts on click
+# (shift-click adds a secondary key); only the non-obvious columns get a tip.
+PASS_TABLE_HEADER_TIPS = {
+    4: "Time of closest approach (local). Click to sort; shift-click adds a secondary sort key.",
+    5: "Apogee altitude (km) - the orbit's highest point. Click to sort; shift-click adds a secondary sort key.",
+    6: "ESTIMATED visual magnitude at culmination (lower = brighter; 'ecl' = in Earth's shadow at max elevation). "
+       "TLEs carry no brightness data, so every satellite is assumed equally reflective - "
+       "compare rows, don't trust absolute values. Click to sort.",
+}
+
 MISC_TIPS = {
     'capture': "Record camera frames to disk while tracking - stop to save the labeled dataset.",
     'clear_filters': "Clear all satellite name/altitude filters.",
@@ -136,6 +146,16 @@ def _collect(display, config_state, mode, tvs, jms, m3d):
             if t and rect:
                 out.append((rect, t))
 
+    def add_pass_table_headers():
+        # Column-header tips from the table's clickable-area registry (both the
+        # full tracking-vis table and the joystick Targets overlay publish it).
+        for area in (getattr(tvs, 'pass_table_clickable_areas', None) or []):
+            kind, idx, rect = area
+            if kind == 'header':
+                t = PASS_TABLE_HEADER_TIPS.get(idx)
+                if t and rect:
+                    out.append((rect, t))
+
     if mode == "config_options":
         for field, rect in (getattr(display, 'input_rects', {}) or {}).items():
             t = CONFIG_TIPS.get(field)
@@ -147,6 +167,7 @@ def _collect(display, config_state, mode, tvs, jms, m3d):
     elif mode == "tracking_vis" and tvs is not None:
         add_map(getattr(tvs, 'legend_rects', None), LEGEND_TIPS)
         add_map(getattr(tvs, 'object_toggle_rects', None), OBJECT_TOGGLE_TIPS)
+        add_pass_table_headers()
         for key, tip in FILTER_TIPS.items():
             rect = getattr(display, {'filter': 'filter_rect',
                                      'filter_above_alt': 'filter_above_alt_rect',
@@ -162,6 +183,8 @@ def _collect(display, config_state, mode, tvs, jms, m3d):
 
     elif mode == "joystick" and jms is not None:
         add_map(getattr(jms, 'jl_target_btn_rects', None), JL_STRIP_TIPS)
+        if tvs is not None and getattr(jms, 'targets_panel_open', False):
+            add_pass_table_headers()
         add_map(getattr(jms, 'adsb_button_rects', None), ADSB_TIPS)
         add_map(getattr(jms, 'jl_filter_rects', None), FILTER_TIPS)
         cap = getattr(jms, 'capture_button_rect', None)

@@ -5,6 +5,37 @@ references. Newest entries first.
 
 ---
 
+## 2026-07-28 — Pass-table visual magnitude: model basis and validity bounds
+
+**What it is.** The pass table's **Mag** column is an *estimate* of apparent
+visual magnitude at culmination: the McCants standard-magnitude formula
+`m = stdmag − 15.75 + 2.5·log10(range_km² / frac_illum)` with a Lambertian
+phase term `frac_illum = (1 + cos φ)/2` (φ = sun–satellite–observer angle),
+plus a cylindrical Earth-shadow test — eclipsed passes show `ecl` instead of
+a number. Implemented in `trajectory._estimate_pass_magnitude`.
+
+**What was validated.**
+
+- The eclipse (shadow-cylinder) test was checked against Skyfield's
+  `is_sunlit` at 31 samples over a full ISS orbit: agreement at every sample.
+- Sanity of the formula: at the 1000 km / 50%-illuminated reference geometry
+  the output equals `stdmag` exactly (the convention's definition).
+- Physical plausibility in the live table: near local midnight only high-LEO
+  constellations (OneWeb ~1200 km, Globalstar ~1400 km) carry numeric
+  magnitudes (~6.0–6.5) while lower Starlink shells read `ecl` — matching the
+  expected shadow geometry.
+
+**Known limitation (by design).** TLEs carry no per-satellite brightness, so
+every satellite uses one default intrinsic magnitude (`stdmag = 6.0`, roughly
+Starlink-class). Relative rankings (which pass is brighter, sorting) are
+driven by range/phase/shadow and are meaningful; absolute values are not
+calibrated per satellite — the real ISS (stdmag ≈ −0.5 to −1.8) is several
+magnitudes brighter than this estimate reports. Do not compare the column's
+absolute numbers against heavens-above brightness predictions, which use
+per-satellite intrinsic magnitudes.
+
+---
+
 ## 2026-07-27 — Pass predictions vs heavens-above.com (4 satellites, 4 orbit classes)
 
 **Question.** Do the app's TLE → SGP4 → topocentric pass predictions agree with

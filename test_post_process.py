@@ -24,6 +24,7 @@ import cv2
 from post_process import (
     RunLibrary, Run, FrameProcessor, TrajectorySeries, decode_frame,
     compute_track_vectors, Mp4Exporter, _parse_frame_time, _parse_iso_time,
+    FULL_VIEW, clamp_view, view_crop_px, remap_annotations,
 )
 from stabilizer import Stabilizer
 
@@ -269,6 +270,70 @@ def test_mp4_export():
         cap.release()
         assert n >= 1, n
     print(f"ok  mp4 export ({exp.frames_written} frames)")
+
+
+def test_view_helpers():
+    # clamp_view: orders corners, clamps to [0,1], enforces the minimum span
+    assert clamp_view((0.8, 0.9, 0.2, 0.1)) == (0.2, 0.1, 0.8, 0.9)
+    v = clamp_view((-0.5, 0.3, 0.5, 2.0))
+    assert v[0] == 0.0 and v[3] == 1.0
+    v = clamp_view((0.5, 0.5, 0.5001, 0.5001))  # micro-box -> min span, centred
+    assert v[2] - v[0] >= 0.019 and v[3] - v[1] >= 0.019
+    v = clamp_view((0.999, 0.999, 1.0, 1.0))    # min span at the border stays inside
+    assert v[2] <= 1.0 and v[3] <= 1.0 and v[0] >= 0.0
+
+    # view_crop_px: at least 1px; even=True yields even w/h for the encoder
+    assert view_crop_px(FULL_VIEW, 100, 60) == (0, 0, 100, 60)
+    x0, y0, x1, y1 = view_crop_px((0.1, 0.2, 0.5, 0.7), 101, 61, even=True)
+    assert (x1 - x0) % 2 == 0 and (y1 - y0) % 2 == 0
+    assert x1 > x0 and y1 > y0 and x1 <= 101 and y1 <= 61
+    x0, y0, x1, y1 = view_crop_px((0.5, 0.5, 0.5005, 0.5005), 100, 60)
+    assert x1 - x0 >= 1 and y1 - y0 >= 1
+
+    # remap_annotations: identity for the full view, exact mapping for a crop
+    anns = [{"type": "text", "cam": 0, "x": 0.5, "y": 0.5, "text": "t"},
+            {"type": "box", "cam": 0, "x0": 0.25, "y0": 0.25, "x1": 0.5, "y1": 0.5}]
+    assert remap_annotations(anns, FULL_VIEW) is anns
+    out = remap_annotations(anns, (0.25, 0.25, 0.75, 0.75))
+    assert abs(out[0]["x"] - 0.5) < 1e-9 and abs(out[0]["y"] - 0.5) < 1e-9
+    assert abs(out[1]["x0"] - 0.0) < 1e-9 and abs(out[1]["x1"] - 0.5) < 1e-9
+    assert anns[1]["x0"] == 0.25, "input list must not be mutated"
+    print("ok  view helpers (clamp/crop/remap)")
+
+
+def test_mp4_export_cropped():
+    lib = RunLibrary(DATA_DIR)
+    lib.scan()
+    run = _first_real_run(lib)
+    cam = run.camera_indices[0]
+    frames = run.frames(cam)
+    t_end = frames[min(4, len(frames) - 1)]["t"]
+    w, h = run.frame_shape(cam)
+    crop = (0.25, 0.25, 0.75, 0.75)
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "clip_crop.mp4")
+        exp = Mp4Exporter(run, cam, run.t0, t_end, out, overlays=True, crop=crop)
+        exp.start()
+        import time
+        for _ in range(300):
+            if exp.done:
+                break
+            time.sleep(0.05)
+        assert exp.done and exp.error is None, exp.error
+        assert os.path.exists(out) and os.path.getsize(out) > 0
+        cap = cv2.VideoCapture(out)
+        vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        assert n >= 1, n
+        # Output is the crop region (half the frame), even-rounded
+        assert vw == (view_crop_px(crop, w, h, even=True)[2]
+                      - view_crop_px(crop, w, h, even=True)[0])
+        assert vh == (view_crop_px(crop, w, h, even=True)[3]
+                      - view_crop_px(crop, w, h, even=True)[1])
+        assert vw <= w // 2 + 2 and vh <= h // 2 + 2
+    print(f"ok  mp4 export cropped ({vw}x{vh})")
 
 
 if __name__ == "__main__":

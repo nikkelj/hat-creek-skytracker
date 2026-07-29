@@ -288,7 +288,7 @@ def start_precompute_worker(center_time, duration_minutes, observer):
             tracking_vis_state.launch_trajectories = launch_trajectories
             build_satellite_pass_table(tracking_vis_state,
                                        elevation_mask_deg=float(config_state.elevation_mask_str or 10.0),
-                                       ts=ts)
+                                       ts=ts, observer=observer)
             tracking_vis_state.trajectories_ready = True
             cb("Trajectories ready")
 
@@ -605,7 +605,8 @@ while running:
             elif current_mode == "post_process":
                 if post_process_state is None:
                     post_process_state = PostProcessState()
-                handle_pp_click(pos, display, post_process_state, status_messages)
+                handle_pp_click(pos, display, post_process_state, status_messages,
+                                button=event.button)
             elif current_mode == "alignment":
                 # Camera-panel controls (right half) take precedence, but only when the
                 # camera view is shown; fall through to the alignment controls otherwise.

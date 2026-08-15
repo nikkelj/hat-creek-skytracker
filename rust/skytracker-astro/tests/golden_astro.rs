@@ -161,7 +161,7 @@ fn satellite_rates_match_golden_scheme() {
     let mut npz = Npz::open("astro_sats.npz");
     let tt = npz.f64s("time_tt_jd");
     let site = npz.f64s("site_lat_lon_alt");
-    let (shape, az_rate_g) = npz.f64s_2d("az_rate_dps");
+    let (_shape, az_rate_g) = npz.f64s_2d("az_rate_dps");
     let (_, el_rate_g) = npz.f64s_2d("el_rate_dps");
 
     let tles = load_tles();

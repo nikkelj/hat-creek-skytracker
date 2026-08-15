@@ -26,6 +26,7 @@
     "astro_stars.npz",
     "astro_time.npz",
     "cv2_ops.npz",
+    "spk_states.npz",
     "tetra3_centroids.npz",
     "tetra3_hashes.npz"
   ]

@@ -340,6 +340,40 @@ def record_tetra3():
     )
 
 
+def record_spk_states():
+    """Raw barycentric/relative states from every de421.bsp segment, for
+    validating the Rust SPK (DAF type-2 Chebyshev) reader in isolation."""
+    from jplephem.spk import SPK
+
+    ts = _timescale()
+    times = _wide_times(ts)[::2]  # 25 epochs
+    # jplephem takes TDB Julian dates; skyfield's tdb = tt + tdb_minus_tt.
+    jd_tdb = times.tdb
+
+    spk = SPK.open(os.path.join(REPO, "de421.bsp"))
+    pairs = [(s.center, s.target) for s in spk.segments]
+    centers, targets = [], []
+    pos = np.zeros((len(pairs), len(jd_tdb), 3))
+    vel = np.zeros_like(pos)
+    for i, (c, t) in enumerate(pairs):
+        p, v = spk[c, t].compute_and_differentiate(jd_tdb)
+        pos[i] = p.T
+        vel[i] = (v / 86400.0).T  # km/day -> km/s
+        centers.append(c)
+        targets.append(t)
+    spk.close()
+
+    np.savez_compressed(
+        os.path.join(GOLDEN_DIR, "spk_states.npz"),
+        center=np.array(centers, dtype=np.int32),
+        target=np.array(targets, dtype=np.int32),
+        jd_tdb=jd_tdb,
+        position_km=pos,
+        velocity_km_s=vel,
+    )
+    print(f"spk_states.npz: {len(pairs)} segments x {len(jd_tdb)} epochs")
+
+
 def record_cv2_ops():
     import cv2
 
@@ -459,6 +493,7 @@ def main():
     record_astro_bodies()
     record_astro_stars()
     record_astro_time()
+    record_spk_states()
     record_tetra3()
     record_cv2_ops()
     write_manifest()

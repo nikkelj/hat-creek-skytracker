@@ -5,6 +5,27 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-15 — Rust astro engine: bodies, stars, and a pure-Rust SPK reader
+
+**What it is.** Completion of the Phase 1 engine math: `skytracker-astro`
+now covers solar-system bodies (sun/moon/planets from `de421.bsp`) and
+Hipparcos star apparent places, replacing skyfield's observe/apparent chain.
+
+- **SPK reader** (`spk.rs`): minimal pure-Rust DAF/Type-2 Chebyshev reader
+  (~250 LOC, no external deps) instead of a heavy ephemeris crate.
+  Validated against jplephem on all 15 de421 segments × 25 epochs:
+  worst position diff **1 cm**, velocity 1e-11 km/s.
+- **Bodies** (`ephemeris.rs` + `apparent.rs`): light-time iteration +
+  NOVAS aberration (ported from skyfield.relativity) + IAU2000A frame
+  chain. Worst alt/az and RA/Dec separation vs skyfield: **0.79 arcsec**
+  (gate 60"); the omitted relativistic light deflection is the residual.
+- **Stars** (`stars.rs`): hip_main.dat parser (117,955 rows) + the
+  starlib position/proper-motion/parallax model. Worst separation
+  **0.17 arcsec** across 50 stars (incl. high-proper-motion set) × 10
+  epochs over 2024–2027.
+
+---
+
 ## 2026-08-15 — Rust astro engine: satellite/time parity vs skyfield
 
 **What it is.** Phase 1 of the Rust port: `rust/skytracker-astro` replaces

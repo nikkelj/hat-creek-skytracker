@@ -11,7 +11,11 @@
 //! bodies/stars within 60 arcsec, GAST within 5 ms. The app closes the
 //! remaining error optically (pointing model + closed-loop tracking).
 
+pub mod apparent;
+pub mod ephemeris;
 pub mod frames;
 mod generated_tables;
 pub mod sgp4_pass;
+pub mod spk;
+pub mod stars;
 pub mod time;

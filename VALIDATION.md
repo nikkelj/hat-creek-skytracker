@@ -5,6 +5,27 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-15 — Rust astro engine: satellite/time parity vs skyfield
+
+**What it is.** Phase 1 of the Rust port: `rust/skytracker-astro` replaces
+the skyfield satellite pipeline. Validated against the Phase 0 golden
+vectors (pure-Rust `cargo test -p skytracker-astro`):
+
+- **Satellite topocentric alt/az/range**: worst sky separation
+  **0.03 arcsec** over 6 TLEs (ISS→polar→Molniya-class) × 200 epochs;
+  relative range error ≤ 1.1e-7 (gate: 20 arcsec).
+- **GAST/GMST/ΔT**: worst 1.9 ms of time (gate: 5 ms), using the full
+  IAU2000A nutation series generated verbatim from skyfield's tables.
+- **Az/el rates**: worst sky-projected difference 8.5e-8 deg/s against the
+  golden finite-difference scheme.
+
+Two convention traps found and documented in LEARNINGS.md: the Rust sgp4
+crate defaults to WGS84 (skyfield uses WGS72 — use the AFSPC-compat
+constructor), and skyfield runs SGP4 on UTC while rotating TEME→PEF with
+UT1.
+
+---
+
 ## 2026-08-15 — Rust port Phase 0: golden vectors + closed-loop baseline
 
 **What it is.** The full-Rust port (branch `rust-port`) validates every

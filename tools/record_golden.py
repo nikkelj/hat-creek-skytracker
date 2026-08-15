@@ -136,6 +136,12 @@ def record_astro_sats():
         l1s.append(l1)
         l2s.append(l2)
 
+    # Plain-text TLE copy for the Rust tests (numpy unicode arrays are
+    # awkward to read via npyz).
+    with open(os.path.join(GOLDEN_DIR, "sat_tles.txt"), "w", newline="\n") as f:
+        for name, l1, l2 in zip(names, l1s, l2s):
+            f.write(f"{name}\n{l1}\n{l2}\n")
+
     np.savez_compressed(
         os.path.join(GOLDEN_DIR, "astro_sats.npz"),
         tle_name=np.array(names),

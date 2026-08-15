@@ -6,6 +6,31 @@ Newest entries first.
 
 ---
 
+## 2026-08-15 — Satellite parity: two conventions that cost 20″ each
+
+Porting the skyfield satellite pipeline to `skytracker-astro` (Rust port
+Phase 1) hit two silent convention mismatches, each worth ~20 arcsec —
+found only because the golden gate is 20″:
+
+* **The Rust `sgp4` crate's `Constants::from_elements` uses WGS84 gravity;
+  python-sgp4/skyfield use WGS72.** Positions diverge ~0.5 km over a
+  two-week propagation. Use `from_elements_afspc_compatibility_mode`
+  (that's the WGS72 path) for parity.
+* **Skyfield runs SGP4 on the UTC timescale, not UT1** (`sgp4lib._at`:
+  "we assume the TLE epoch to be a UTC date"), while the TEME→PEF
+  rotation uses UT1 and GAST uses TT. Feeding UT1 minutes into SGP4 costs
+  ~0.2 s of along-track motion (≈1.5 km for the ISS).
+
+Also worth keeping: the full skyfield satellite alt/az chain
+(TEME→GCRS→observer-relative→ENU) **algebraically collapses** to
+`ENU(rot_z(−θ_GMST1982(UT1))·r_TEME(UTC) − r_obs_ECEF)` because the
+precession-nutation matrix and GAST cancel in the observer-relative
+projection — verified to 0.03″ against golden vectors. And the IAU2000A
+nutation/EE tables were code-generated verbatim from skyfield's own
+bundled arrays (tools/gen_astro_tables.py) rather than typed from papers.
+
+---
+
 ## 2026-08-15 — PyO3 #[pymodule] shadows an extern crate of the same name
 
 Splitting the bindings out of `skytracker_core` into the new

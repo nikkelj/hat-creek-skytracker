@@ -13,7 +13,7 @@ PROGRAM control-cycle comparison. Honest about where the win is:
     and NO GIL, so the per-call overhead disappears.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python bench_rust_vs_python.py
 """
 

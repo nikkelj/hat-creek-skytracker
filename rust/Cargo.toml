@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "skytracker-core",
+    "skytracker-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Shared version pins for all skytracker crates. Engine crates must stay
+# pure Rust (no pyo3): only skytracker-ffi may depend on pyo3/numpy.
+ndarray = "0.16"
+pyo3 = "0.22"
+numpy = "0.22"
+serialport = "4.5"
+
+# Internal crates
+skytracker-core = { path = "skytracker-core" }
+
+[profile.release]
+# Parity/perf tests run against release builds; keep debug info for profiling.
+debug = true

@@ -9,7 +9,7 @@ Uses a small Python fake mount with the same Targets-enum interface as
 simulator.SimMount, so no hardware and no full app are needed.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_core_loop_bridge.py
 """
 

@@ -170,8 +170,8 @@ class RustCoreLoopAdapter:
                 msg = ("RustCoreLoopAdapter: installed skytracker_core wheel "
                        "predates the liveness API - loop-stall watchdog "
                        "disabled. Rebuild it: maturin build --release -m "
-                       "rust/skytracker_core/Cargo.toml && pip install "
-                       "--force-reinstall rust/skytracker_core/target/wheels/"
+                       "rust/skytracker-ffi/Cargo.toml && pip install "
+                       "--force-reinstall rust/target/wheels/"
                        "skytracker_core-*.whl")
                 print(msg)
                 if self.state.update_status_callback:

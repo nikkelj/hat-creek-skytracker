@@ -29,9 +29,14 @@ jobs:
         run: pytest
 
   rust-core:
-    name: Rust core (cargo + wheel + parity)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Rust workspace (cargo + wheel + parity, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest is the actual target platform for the app.
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -41,25 +46,27 @@ jobs:
           cache: pip
 
       - name: Install system deps (serialport crate needs libudev)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/skytracker_core
+          workspaces: rust
 
-      - name: Pure-Rust tests
-        run: cargo test --release --manifest-path rust/skytracker_core/Cargo.toml
+      - name: Pure-Rust tests (workspace)
+        run: cargo test --workspace --release --manifest-path rust/Cargo.toml
 
-      - name: Build + install the PyO3 wheel
+      - name: Build + install the PyO3 wheel (skytracker-ffi)
+        shell: bash
         run: |
           pip install -r requirements.txt maturin
-          maturin build --release -m rust/skytracker_core/Cargo.toml
-          pip install rust/skytracker_core/target/wheels/skytracker_core-*.whl
+          maturin build --release -m rust/skytracker-ffi/Cargo.toml
+          pip install rust/target/wheels/skytracker_core-*.whl
 
       - name: Cross-language parity + perf suite
         # With the wheel installed, conftest.py collects the test_rust_*
         # suites (byte parity, PID/hotspot/transform parity, threaded loop,
-        # bridge, adapter, perf-regression guard).
-        run: pytest test_rust_pid_parity.py test_rust_hotspot_parity.py test_rust_mount_parity.py test_rust_transforms_parity.py test_rust_core_loop.py test_rust_core_loop_bridge.py test_rust_loop_adapter.py test_rust_perf.py
+        # bridge, adapter, perf-regression guard, closed-loop A/B).
+        run: pytest test_rust_pid_parity.py test_rust_hotspot_parity.py test_rust_mount_parity.py test_rust_transforms_parity.py test_rust_core_loop.py test_rust_core_loop_bridge.py test_rust_loop_adapter.py test_rust_perf.py test_loop_ab_parity.py

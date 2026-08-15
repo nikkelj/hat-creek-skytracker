@@ -1,0 +1,32 @@
+{
+  "recorded_utc": null,
+  "site": {
+    "lat": 34.8740289,
+    "lon": -120.4461237,
+    "alt_m": 100.0
+  },
+  "versions": {
+    "python": "3.11.5",
+    "numpy": "1.25.2",
+    "skyfield": "1.46",
+    "opencv": "4.8.0"
+  },
+  "tolerances": {
+    "sat_altaz_arcsec": 20,
+    "body_star_altaz_arcsec": 60,
+    "gast_seconds": 0.005,
+    "tetra3_hash": "bit-exact",
+    "centroid_px": 0.3,
+    "phasecorr_px": 0.05,
+    "affine_similarity": "0.1 px translation / 0.05 deg rotation"
+  },
+  "files": [
+    "astro_bodies.npz",
+    "astro_sats.npz",
+    "astro_stars.npz",
+    "astro_time.npz",
+    "cv2_ops.npz",
+    "tetra3_centroids.npz",
+    "tetra3_hashes.npz"
+  ]
+}

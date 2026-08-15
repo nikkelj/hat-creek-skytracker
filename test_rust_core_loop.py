@@ -7,7 +7,7 @@ snapshot) end to end against the in-memory byte-level mount sim — the same loo
 that runs on a background thread on hardware, exercised deterministically here.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_core_loop.py
 """
 

@@ -7,7 +7,7 @@ read-back into app state) without the pygame UI, a real mount, or skyfield.
 Uses a fake mount (SimMount-like Targets interface), fake joystick, and a
 SimpleNamespace config/state.
 
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_loop_adapter.py
 """
 

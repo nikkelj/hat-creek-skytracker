@@ -1,4 +1,5 @@
-//! PyO3 bindings (compiled only with the `extension-module` feature).
+//! PyO3 bindings over the pure-Rust engine crates (compiled only with the
+//! `extension-module` feature; the Python module name stays `skytracker_core`).
 //!
 //! Exposes the request encoders (for the byte-diff parity test) and a `SimMount`
 //! class that wraps `Mount<LoopbackTransport>` and matches the method-level API
@@ -15,14 +16,14 @@ use pyo3::exceptions::PyIOError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-use crate::controller::{Frame, HotspotParams, Inputs, LoopState, Mode, Setpoint};
-use crate::core_loop::{run_cycle, Command, CoreLoop as ThreadedLoop, Shared};
-use crate::hotspot as core_hotspot;
-use crate::pid::PidController as CorePid;
-use crate::protocol;
-use crate::serial::SerialTransport;
-use crate::sim::{LoopbackTransport, Mount, MountError, SimResponder, Transport};
-use crate::transforms::{self as core_tf, MountMode};
+use skytracker_core::controller::{Frame, HotspotParams, Inputs, LoopState, Mode, Setpoint};
+use skytracker_core::core_loop::{run_cycle, Command, CoreLoop as ThreadedLoop, Shared};
+use skytracker_core::hotspot as core_hotspot;
+use skytracker_core::pid::PidController as CorePid;
+use skytracker_core::protocol;
+use skytracker_core::serial::SerialTransport;
+use skytracker_core::sim::{LoopbackTransport, Mount, MountError, SimResponder, Transport};
+use skytracker_core::transforms::{self as core_tf, MountMode};
 
 fn parse_mode(s: &str) -> PyResult<Mode> {
     match s.to_ascii_lowercase().as_str() {
@@ -522,7 +523,7 @@ impl SimCoreLoop {
         star_filter: bool,
         rate_gate_dps: f64,
     ) {
-        self.shared.inputs.lock().unwrap().hotspot = crate::controller::HotspotParams {
+        self.shared.inputs.lock().unwrap().hotspot = skytracker_core::controller::HotspotParams {
             snr_threshold,
             gate_radius,
             coast_time_s,
@@ -1015,8 +1016,12 @@ impl CoreLoop {
     }
 }
 
-#[pymodule]
-fn skytracker_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+// The fn is named `ffi_module` (not `skytracker_core`) because the #[pymodule]
+// macro generates a module of the same name, which would shadow the extern
+// engine crate `skytracker_core` and make every `skytracker_core::` path
+// ambiguous. The Python-visible name is pinned via the name attribute.
+#[pymodule(name = "skytracker_core")]
+fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
     m.add_function(wrap_pyfunction!(encode_get_version, m)?)?;
     m.add_function(wrap_pyfunction!(encode_slew_fixed, m)?)?;

@@ -5,6 +5,40 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-15 — Rust port Phase 0: golden vectors + closed-loop baseline
+
+**What it is.** The full-Rust port (branch `rust-port`) validates every
+future phase against frozen reference outputs of the *current* Python
+implementations, recorded before any port work touches them.
+
+**What was recorded** (`tools/record_golden.py` → `tests/golden/`, committed):
+
+- **skyfield**: 6 TLEs spanning inclinations (ISS 51.6° → polar) × 200
+  epochs → topocentric alt/az/range/rates; sun/moon/5 planets and 50
+  Hipparcos stars (40 brightest + 10 highest-PM) at 2024–2027 epochs;
+  GAST/GMST/ΔT series. Tolerances for the Rust astro engine: sats 20″,
+  bodies/stars 60″, GAST 5 ms.
+- **tetra3**: 1,000 pattern-hash keys → `_key_to_index` outputs against the
+  live `db_cam1_tyc` geometry (bins=50, catalog=2,351,182) plus an alternate
+  geometry — the Rust solver must match **bit-exact** or the existing
+  database is unusable. Centroids on 5 synthetic star fields (0.3 px gate).
+- **OpenCV**: phase-correlate on known sub-pixel shifts, Gaussian/Laplacian/
+  Sobel kernels, RANSAC similarity estimation with planted outliers, and
+  pyramidal LK on a known shift — the numeric contract for the Phase 3
+  imaging port.
+- **Closed-loop baseline** (`tools/record_loop_baseline.py` →
+  `tests/golden/loop_baseline.json`): full-wiring sim rig
+  (test_tracking_quality.py). PROGRAM rms ≈ 67–73″, HOTSPOT hold
+  rms ≈ 138″, HANDOFF latency ≈ 1.0 s, zero false rejects/losses.
+  Phases 1/4/6/7 must not regress these.
+
+**Structural change validated:** `rust/` is now a Cargo workspace —
+`skytracker-core` (pure Rust) + `skytracker-ffi` (the only pyo3 crate;
+Python module name unchanged). All 49 cross-language parity tests pass
+against the relocated wheel; `cargo test --workspace` links no libpython.
+
+---
+
 ## 2026-07-28 — Pass-table visual magnitude: model basis and validity bounds
 
 **What it is.** The pass table's **Mag** column is an *estimate* of apparent

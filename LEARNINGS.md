@@ -6,6 +6,28 @@ Newest entries first.
 
 ---
 
+## 2026-08-15 — PyO3 #[pymodule] shadows an extern crate of the same name
+
+Splitting the bindings out of `skytracker_core` into the new
+`skytracker-ffi` workspace crate (Rust-port Phase 0) hit a wall of
+`E0659: skytracker_core is ambiguous` plus bogus "no `hotspot` in ..."
+errors. Cause: `#[pymodule] fn skytracker_core(...)` expands to a *module*
+named `skytracker_core` inside the bindings file, which shadows the extern
+engine crate of the same name — every `skytracker_core::` path then resolves
+into the macro-generated module. Fix: name the function something else and
+pin the Python-visible name via the attribute:
+`#[pymodule(name = "skytracker_core")] fn ffi_module(...)`. The wheel import
+name is unchanged, so `rust_loop_adapter.py` and all parity tests run as-is.
+
+Two adjacent gotchas from the same split: `tle_cache.tle` has `\r\r\n` line
+endings, so Python's universal newlines yields an empty line after every
+real one (filter blanks before pairing TLE lines); and a bare
+`cargo build -p skytracker-ffi --features extension-module` fails in
+`pyo3-build-config` unless `PYO3_PYTHON` points at the conda `track`
+interpreter (conda isn't on PATH; maturin sets this up itself).
+
+---
+
 ## 2026-07-27 — Perf scrub: the "memory leak" was the camera ring; the FPS was the GIL
 
 Field report: ~4 FPS on cam1, ~9 on cam2, and memory growing until the app

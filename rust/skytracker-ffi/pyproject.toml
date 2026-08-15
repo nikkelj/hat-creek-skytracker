@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "skytracker_core"
-description = "Rust core for the Hat Creek Skytracker (experiment)"
+description = "Rust core for the Hat Creek Skytracker (built from the skytracker-ffi workspace crate)"
 requires-python = ">=3.11"
 dynamic = ["version"]
 

@@ -6,7 +6,7 @@
 //! command starts on a clean stream. One owner per port (the loop thread), so
 //! no locking is needed here.
 //!
-//! Compiled only with the `extension-module` feature (it depends on the
+//! Compiled only with the `serial` feature (it depends on the
 //! `serialport` crate); cannot be unit-tested without a physical port.
 
 use std::time::Duration;

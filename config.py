@@ -252,6 +252,8 @@ class ConfigState:
         # Phase 1 of the Rust port: route trajectory/celestial math through
         # the skytracker-astro engine (skyfield stays as the fallback).
         self.use_rust_astro = False
+        # Phase 2: plate-solve with skytracker-platesolve (tetra3 fallback).
+        self.use_rust_platesolve = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"

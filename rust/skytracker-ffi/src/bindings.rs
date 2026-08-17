@@ -1058,5 +1058,7 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Phase 1 astro engine (AstroEngine + ASTRO_ENGINE_AVAILABLE).
     crate::astro_bindings::register(m)?;
+    // Phase 2 plate solver (PlateSolver + PLATESOLVE_AVAILABLE).
+    crate::platesolve_bindings::register(m)?;
     Ok(())
 }

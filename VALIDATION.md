@@ -5,6 +5,34 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-16 — Rust plate solver: numerically identical to tetra3
+
+**What it is.** Phase 2a of the Rust port: `skytracker-platesolve` is a
+pure-Rust line-by-line port of ESA tetra3's lost-in-space solver
+(centroider + edge-ratio pattern hash + Kabsch verify), reading the app's
+existing `.npz` pattern databases unchanged. Wired into
+`plate_solver.PlateSolver` behind `use_rust_platesolve` /
+`SKYTRACKER_RUST_PLATESOLVE=1` with tetra3 as the automatic fallback.
+
+**Validation:**
+
+- **Pattern hash**: 1,000 golden keys **bit-exact** on the live
+  db_cam1_tyc geometry (bins=50, catalog=2,351,182) and an alternate
+  geometry — the existing databases work as-is (numpy uint64 wraparound
+  reproduced with Rust wrapping arithmetic).
+- **Centroids**: within **0.0000 px** of Python tetra3 on golden frames
+  and freshly rendered fields (gate 0.3 px).
+- **End-to-end** (test_rust_platesolve_parity.py, in CI): 12/12 synthetic
+  star fields (stars projected from the DB's own catalog at random
+  pointings) solved by both solvers with **0.00 arcsec** centre
+  difference, **0.0000°** roll difference, and identical match counts —
+  the same accepted pattern, the same refined rotation, to f64 precision.
+- Wrapper flag-on path verified (identical SolveResult); solve speed
+  comparable (~260 ms first-call, dominated by DB load on both sides).
+- Existing test_plate_solve.py / test_alignment.py suites green.
+
+---
+
 ## 2026-08-16 — Rust astro engine wired into the app (flag-gated) at 76×
 
 **What it is.** Phase 1 integration: the `AstroEngine` PyO3 class exposes

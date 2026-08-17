@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "skytracker-core",
     "skytracker-astro",
+    "skytracker-platesolve",
     "skytracker-ffi",
 ]
 

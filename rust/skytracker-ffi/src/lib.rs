@@ -10,3 +10,5 @@
 mod astro_bindings;
 #[cfg(feature = "extension-module")]
 mod bindings;
+#[cfg(feature = "extension-module")]
+mod platesolve_bindings;

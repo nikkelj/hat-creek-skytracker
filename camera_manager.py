@@ -18,6 +18,10 @@ class CameraState:
         self.cap = None
         self.prop = None
         self.index = index
+        # Hardware (ASI/USB) enumeration index backing this logical slot.
+        # Normally equal to the logical index, but swap_cameras exchanges it
+        # when USB enumeration order flips between sessions.
+        self.asi_index = index
         self.width_res = 1920  # Default resolution
         self.height_res = 1280
 
@@ -146,6 +150,7 @@ class CameraManager:
         for i in range(count):
             camera = CameraState()
             camera.index = i
+            camera.asi_index = i
             camera.name = f"Camera {i+1}"
             self.cameras.append(camera)
 
@@ -172,7 +177,7 @@ class CameraManager:
         # CameraThread pipeline renders synthetic frames.
         if self.simulator is not None and self.simulator.sim_enabled():
             from simulator import SimCap
-            camera.cap = SimCap(camera.index, self.simulator)
+            camera.cap = SimCap(camera.asi_index, self.simulator)
             camera.prop = camera.cap.get_camera_property()
             camera.cap.set_image_type(asi.ASI_IMG_RAW8)
             camera.connected = True
@@ -184,7 +189,7 @@ class CameraManager:
             return True
 
         try:
-            camera.cap = asi.Camera(camera.index)
+            camera.cap = asi.Camera(camera.asi_index)
             camera.prop = camera.cap.get_camera_property()
 
             if camera.cap:
@@ -236,6 +241,36 @@ class CameraManager:
         camera.roi_y = 0.5
         if update_status_callback:
             update_status_callback(f"Camera {camera_index+1} disconnected")
+
+    def swap_cameras(self, update_status_callback=None):
+        """Swap which physical camera backs logical Camera 1 vs Camera 2.
+
+        Exchanges the hardware (asi_index) mapping between the first two
+        logical slots -- for when USB enumeration order flips between
+        sessions. Per-slot settings (gain, exposure, alignment_rotation, ...)
+        stay with the logical slot. Slots that were connected are
+        disconnected and reconnected against their new hardware index;
+        slots that were disconnected stay disconnected.
+        """
+        if len(self.cameras) < 2:
+            return False
+        c0, c1 = self.cameras[0], self.cameras[1]
+        was_connected = [c0.connected, c1.connected]
+
+        for i, connected in enumerate(was_connected):
+            if connected:
+                self.disconnect_camera(i, update_status_callback)
+
+        c0.asi_index, c1.asi_index = c1.asi_index, c0.asi_index
+
+        success = True
+        for i, connected in enumerate(was_connected):
+            if connected:
+                success = self.connect_camera(i, update_status_callback) and success
+
+        if update_status_callback:
+            update_status_callback(f"Cameras swapped: slot 1 -> hw {c0.asi_index}, slot 2 -> hw {c1.asi_index}")
+        return success
 
     def _start_camera_thread(self, camera, config_state=None):
         """Start capture thread for camera with configurable circular buffer"""

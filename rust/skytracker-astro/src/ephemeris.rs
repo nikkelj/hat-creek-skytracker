@@ -13,9 +13,13 @@ pub struct Ephemeris {
     spk: Spk,
 }
 
-/// NAIF id for a body name as celestial.py uses them.
+/// NAIF id for a body name as celestial.py uses them. Accepts both bare
+/// names ("moon", "jupiter barycenter") and celestial.py's selection keys
+/// ("planet:Jupiter").
 pub fn body_id(name: &str) -> Option<i32> {
-    Some(match name.to_ascii_lowercase().as_str() {
+    let lower = name.to_ascii_lowercase();
+    let name = lower.strip_prefix("planet:").unwrap_or(&lower);
+    Some(match name {
         "sun" => 10,
         "moon" => 301,
         "mercury" => 199,
@@ -29,6 +33,22 @@ pub fn body_id(name: &str) -> Option<i32> {
         "pluto" | "pluto barycenter" => 9,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_id;
+
+    #[test]
+    fn celestial_selection_keys_resolve() {
+        for key in [
+            "sun", "moon", "planet:Mercury", "planet:Venus", "planet:Mars",
+            "planet:Jupiter", "planet:Saturn", "planet:Uranus",
+            "planet:Neptune", "planet:Pluto",
+        ] {
+            assert!(body_id(key).is_some(), "unresolved key {key}");
+        }
+    }
 }
 
 pub struct ApparentPlace {

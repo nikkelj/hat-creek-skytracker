@@ -1055,5 +1055,8 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("AZM", protocol::targets::AZM)?;
     m.add("ALT", protocol::targets::ALT)?;
     m.add("FOCUS", protocol::targets::FOCUS)?;
+
+    // Phase 1 astro engine (AstroEngine + ASTRO_ENGINE_AVAILABLE).
+    crate::astro_bindings::register(m)?;
     Ok(())
 }

@@ -249,6 +249,9 @@ class ConfigState:
         # the Hardware Simulator screen. Takes effect on restart.
         self.use_rust_core_loop = False
         self.rust_core_loop_hz = 15
+        # Phase 1 of the Rust port: route trajectory/celestial math through
+        # the skytracker-astro engine (skyfield stays as the fallback).
+        self.use_rust_astro = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
@@ -395,6 +398,7 @@ class ConfigState:
             "altaz_side_flip": self.altaz_side_flip,
             "use_rust_core_loop": self.use_rust_core_loop,
             "rust_core_loop_hz": self.rust_core_loop_hz,
+            "use_rust_astro": self.use_rust_astro,
             "continuous_rate_tracking": self.continuous_rate_tracking,
             "guide_rate_max_dps": self.guide_rate_max_dps
         }
@@ -519,6 +523,7 @@ class ConfigState:
         # Load experimental Rust core loop toggle
         self.use_rust_core_loop = config_dict.get("use_rust_core_loop", self.use_rust_core_loop)
         self.rust_core_loop_hz = config_dict.get("rust_core_loop_hz", self.rust_core_loop_hz)
+        self.use_rust_astro = config_dict.get("use_rust_astro", self.use_rust_astro)
 
         # Continuous variable-rate tracking
         self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)

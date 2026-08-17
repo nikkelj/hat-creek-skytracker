@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 skytracker-core = { workspace = true }
+skytracker-astro = { path = "../skytracker-astro" }
 # bindings.rs builds ArrayView2 over incoming numpy frames.
 ndarray = { workspace = true }
 # pyo3 + numpy + the serial transport are OPTIONAL and only pulled in for the

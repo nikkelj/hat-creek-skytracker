@@ -215,14 +215,18 @@ a regression test).
 
 The project is being ported to Rust in phases — engines first, an egui+wgpu
 UI last — with the pygame app staying fully functional after every phase.
-`rust/` is a Cargo workspace: `skytracker-core` (pure-Rust engine) and
+`rust/` is a Cargo workspace: `skytracker-core` (control loop and friends),
+`skytracker-astro` (the skyfield replacement: SGP4 passes, DE421 bodies,
+star apparent places — sub-arcsec parity, bulk precompute 76× faster), and
 `skytracker-ffi` (the only PyO3 crate; the Python module name stays
-`skytracker_core`). Every phase is gated on golden-vector parity tests
-recorded from the current Python implementations (`tools/record_golden.py`
-→ `tests/golden/`, committed), the full pytest suite, and a closed-loop
-sim-tracking baseline (`tests/golden/loop_baseline.json`). See
-`rust/README.md` for crate layout and `VALIDATION.md` (2026-08-15 entry)
-for what was frozen as reference.
+`skytracker_core`). The astro engine is flag-gated via `use_rust_astro`
+(or `SKYTRACKER_RUST_ASTRO=1`), with skyfield as the automatic fallback.
+Every phase is gated on golden-vector parity tests recorded from the
+current Python implementations (`tools/record_golden.py` →
+`tests/golden/`, committed), live A/B suites (`test_rust_astro_parity.py`),
+the full pytest suite, and a closed-loop sim-tracking baseline
+(`tests/golden/loop_baseline.json`). See `rust/README.md` for crate layout
+and `VALIDATION.md` for the parity record.
 
 ## Hardware Simulator
 

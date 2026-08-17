@@ -5,6 +5,33 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-16 — Rust astro engine wired into the app (flag-gated) at 76×
+
+**What it is.** Phase 1 integration: the `AstroEngine` PyO3 class exposes
+the Rust astro engine, and `trajectory.py` / `celestial.py` route through
+it behind `use_rust_astro` (or env `SKYTRACKER_RUST_ASTRO=1`), skyfield
+remaining the automatic fallback on any error.
+
+**Live A/B parity** (test_rust_astro_parity.py, real tle_cache + app entry
+points, both implementations side by side):
+
+- `_compute_one_trajectory` rows: 40 sats × 31 samples, worst **0.041″**
+  (gate 20″); px/py sub-pixel; rates within 2e-3 °/s.
+- Visibility gate: 250 sats, **zero** disagreements (boundary cases
+  verified within 0.2° of the threshold when they occur).
+- `solar_system_altaz` + `build_trajectory` (moon, planet:Jupiter, star
+  anchor): worst **0.03″** — with an explicit guard that the Rust path
+  actually engaged (see LEARNINGS: silent fallback made an early version
+  of this test compare skyfield to itself).
+
+**Measured speedup** (bench_rust_vs_python.py, 16,085-sat catalog,
+31 samples): visibility gate 176.6 → 57.3 ms (**3.1×**); bulk trajectory
+rows for the 970 visible satellites 285.7 → **3.8 ms (75.9×)** — one FFI
+call, rayon-parallel, GIL released. TLE catalog parse: 16,085 sats in
+40 ms.
+
+---
+
 ## 2026-08-15 — Rust astro engine: bodies, stars, and a pure-Rust SPK reader
 
 **What it is.** Completion of the Phase 1 engine math: `skytracker-astro`

@@ -6,6 +6,22 @@ Newest entries first.
 
 ---
 
+## 2026-08-15 — Adapter fallbacks make A/B parity tests lie
+
+The Rust-astro adapter returns None on any failure so callers fall back
+to skyfield — safe for the app, treacherous for tests: the celestial A/B
+parity test initially "passed" at 0.00″ because the engine couldn't
+resolve celestial.py's `planet:Jupiter` selection keys, the adapter fell
+back, and the test compared **skyfield to skyfield**. The tell was a
+missing per-key print, not a failure.
+
+Rule now baked into test_rust_astro_parity.py: before any A/B assert,
+prove the fast path actually engages (probe the adapter directly and
+assert non-None). Any strangler-pattern port with graceful fallback needs
+this guard, or green parity means nothing.
+
+---
+
 ## 2026-08-15 — Satellite parity: two conventions that cost 20″ each
 
 Porting the skyfield satellite pipeline to `skytracker-astro` (Rust port

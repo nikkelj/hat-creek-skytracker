@@ -12,6 +12,7 @@
 //! remaining error optically (pointing model + closed-loop tracking).
 
 pub mod apparent;
+pub mod engine;
 pub mod ephemeris;
 pub mod frames;
 mod generated_tables;
@@ -19,3 +20,4 @@ pub mod sgp4_pass;
 pub mod spk;
 pub mod stars;
 pub mod time;
+pub mod tle;

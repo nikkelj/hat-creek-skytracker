@@ -202,6 +202,15 @@ global mount_control_thread
 # RustCoreLoopAdapter, behind a flag (default off). Enable with
 # config_state.use_rust_core_loop = True or env SKYTRACKER_RUST_LOOP=1.
 import os as _os
+
+# Phase 1 of the Rust port: route trajectory/celestial math through the
+# skytracker-astro engine when flagged (config use_rust_astro or env
+# SKYTRACKER_RUST_ASTRO=1). The adapter falls back to skyfield on any error.
+import rust_astro_adapter
+rust_astro_adapter.configure(config_state)
+if rust_astro_adapter.enabled():
+    print("Using RUST astro engine for trajectories/celestial (skyfield fallback).")
+
 _use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
     _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")
 )

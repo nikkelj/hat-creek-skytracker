@@ -5,6 +5,31 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-17 — Rust imaging primitives vs cv2 goldens (Phase 3a)
+
+**What it is.** `skytracker-imaging`: the OpenCV numeric cluster the
+stacking/stabilization pipeline composes — filters (Gaussian/Laplacian/
+Sobel, reflect-101 borders), warpAffine/remap (incl. cv2's 1/32-px
+fixed-point coordinate quantization), rustfft phase correlation with
+OpenCV's fftShift/minMaxLoc/weighted-centroid subpixel chain, Shi-Tomasi
+corners + pyramidal Lucas-Kanade (win 21, 3 levels, Scharr gradients),
+and RANSAC similarity with exact-LSQ refine.
+
+**Validation** (cargo test -p skytracker-imaging vs regenerated
+cv2_ops.npz): filters ≤ 9e-5; warp 4.6e-5; LK 0.0055 px; RANSAC
+**identical** to cv2 (rotation/translation/scale 0.000, same 54 inliers);
+phase correlation 0.01 px with a mirror-tolerant gate at exact
+half-pixel shifts (cv2's f32 pipeline and our f64 pipeline break the
+two-row peak tie oppositely; the test also asserts we are never less
+accurate than cv2 against truth).
+
+**Golden integrity bug found and fixed**: cv2.phaseCorrelate mutates its
+inputs in place; the original cv2_ops.npz was internally inconsistent
+(see LEARNINGS 2026-08-17). Recorder fixed, goldens regenerated, and a
+defensive copy added to stacking.py's live phase-correlate call.
+
+---
+
 ## 2026-08-16 — Rust pointing-model fits at machine precision
 
 **What it is.** Phase 2b: `skytracker-pointing` ports the 7-term TPOINT

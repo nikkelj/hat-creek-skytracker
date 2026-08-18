@@ -488,8 +488,13 @@ def measure_local_shifts(ref_gray, frame_gray, points, patch=48, min_response=0.
         # node still contributes to the displacement field).
         x0 = int(np.clip(round(px) - half, 0, w - side))
         y0 = int(np.clip(round(py) - half, 0, h - side))
-        a = ref[y0:y0 + 2 * half, x0:x0 + 2 * half]
-        b = cur[y0:y0 + 2 * half, x0:x0 + 2 * half]
+        # .copy() is load-bearing: cv2.phaseCorrelate MUTATES its inputs in
+        # place (OpenCV 4.8 applies the window into the caller's buffers).
+        # These slices are only safe today because non-contiguous views get
+        # copied by the numpy bridge -- a full-width window would pass a
+        # contiguous view and corrupt the frame. See LEARNINGS 2026-08-17.
+        a = ref[y0:y0 + 2 * half, x0:x0 + 2 * half].copy()
+        b = cur[y0:y0 + 2 * half, x0:x0 + 2 * half].copy()
         (dx, dy), response = cv2.phaseCorrelate(a, b, win)
         if response < min_response:
             continue

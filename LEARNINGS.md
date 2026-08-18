@@ -6,6 +6,32 @@ Newest entries first.
 
 ---
 
+## 2026-08-17 — cv2.phaseCorrelate mutates its input arrays
+
+Discovered porting the imaging primitives (Rust port Phase 3a): OpenCV
+4.8's `cv2.phaseCorrelate(a, b, window)` **multiplies the window into the
+caller's arrays in place** when they arrive as contiguous float numpy
+buffers. In tools/record_golden.py this silently corrupted `base` a
+little more on each loop iteration, producing a golden file whose
+`shifted` images came from progressively-windowed bases — caught only
+because the Rust warp port refused to match at 100 intensity units. The
+filters *did* match, because they were computed after the corruption and
+stored alongside the corrupted base: an internally-inconsistent golden
+that partially validates. Fix: pass `.copy()`s.
+
+stacking.py survived by accident: its phase-correlate windows are
+non-contiguous slices, which the numpy bridge copies before OpenCV sees
+them — but a full-width window would be contiguous and corrupt the live
+frame. Defensive copies added there too.
+
+Bonus findings from the same port: cv2.warpAffine quantizes source
+coordinates to 1/32 px (INTER_TAB_SIZE) even for float images — a 0.3 px
+shift silently becomes 0.3125; and at exact half-pixel shifts,
+phaseCorrelate's weighted-centroid estimate carries a ±0.32 px bias whose
+sign depends on which of the two tied peak rows float dust selects.
+
+---
+
 ## 2026-08-15 — Adapter fallbacks make A/B parity tests lie
 
 The Rust-astro adapter returns None on any failure so callers fall back

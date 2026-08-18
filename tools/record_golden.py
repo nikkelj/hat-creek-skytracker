@@ -394,7 +394,11 @@ def record_cv2_ops():
         sh = cv2.warpAffine(
             base, m, (256, 256), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
         )
-        (mx, my), resp = cv2.phaseCorrelate(base, sh, hann)
+        # cv2.phaseCorrelate MUTATES its inputs in place (OpenCV 4.8 applies
+        # the window into the caller's buffers) -- pass copies or every
+        # later array in this recorder is silently computed from a
+        # corrupted base. See LEARNINGS.md 2026-08-17.
+        (mx, my), resp = cv2.phaseCorrelate(base.copy(), sh.copy(), hann)
         pc_measured.append([mx, my, resp])
         shifted_imgs.append(sh)
 

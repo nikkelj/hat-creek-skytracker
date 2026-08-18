@@ -1,0 +1,19 @@
+[package]
+name = "skytracker-imaging"
+description = "Imaging engine for the Hat Creek Skytracker (Phase 3 of the Rust port): the OpenCV numeric cluster — filters, warps, phase correlation, Shi-Tomasi + pyramidal LK, RANSAC similarity — validated against cv2 golden vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_imaging"
+crate-type = ["rlib"]
+
+[dependencies]
+# FFT-based phase correlation (stacking global alignment).
+rustfft = "6"
+# Deterministic RANSAC sampling.
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+
+[dev-dependencies]
+npyz = { version = "0.8", features = ["npz"] }

@@ -17,7 +17,8 @@ Crates:
 | `skytracker-ffi` | The ONLY pyo3 crate; builds the Python module `skytracker_core` (strangler seam, deleted at the end). Exposes the core-loop classes + `AstroEngine` |
 | `skytracker-platesolve` | Phase 2 tetra3 port: pattern hash bit-exact vs the existing .npz databases, centroids 0.0 px, solutions numerically identical to Python tetra3 (12/12 A/B fields) |
 | `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg) |
-| *(planned)* `skytracker-imaging`, `-camera`, `-adsb`, `-app` | Phase 3–7 engines and the final eframe binary |
+| `skytracker-imaging` | Phase 3a imaging primitives (filters/warps/phase-correlate/Shi-Tomasi/LK/RANSAC) at cv2 parity: filters ≤9e-5, LK 0.006 px, RANSAC identical. Phase 3b composes them into the stacking/stabilizer/sharpen pipelines |
+| *(planned)* `skytracker-camera`, `-adsb`, `-app` | Phase 4–7 engines and the final eframe binary |
 
 ## Ported so far
 

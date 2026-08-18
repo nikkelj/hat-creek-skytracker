@@ -13,6 +13,8 @@ mod astro_bindings;
 #[cfg(feature = "extension-module")]
 mod bindings;
 #[cfg(feature = "extension-module")]
+mod camera_bindings;
+#[cfg(feature = "extension-module")]
 mod platesolve_bindings;
 #[cfg(feature = "extension-module")]
 mod imaging_bindings;

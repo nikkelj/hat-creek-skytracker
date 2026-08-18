@@ -5,6 +5,36 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-18 — Rust camera pipeline sustains camera-native rates (Phase 4a)
+
+**What it is.** `skytracker-camera`: the capture pipeline rebuilt in
+Rust — frame pump thread, ring buffer with exposure-midpoint stamping
+(camera_buffer semantics), armed-capture retention + rayon-parallel BMP
+dump, and the ZWO ASI SDK binding (ASICamera2.dll via libloading,
+rig-ready but timing-truth pending hardware). Python touches frames only
+on display pull. Motivation: the Python capture path (CameraThread +
+pygame conversion + CircularBuffer, all under the GIL) capped at
+**4-10 FPS** against cameras capable of 50-100.
+
+**Validation** (test_rust_camera_pipeline.py, in CI; frames rendered by
+the real HardwareSimulator per the sim-first directive, replayed
+metered):
+
+- **100.2 FPS sustained** at the 100 FPS target and **50.3** at 50, zero
+  dropped frames, while a concurrent 30 Hz display consumer pulls.
+- Unthrottled pipeline headroom **2,244 FPS** (VGA mono) vs 992 FPS for
+  the isolated Python per-frame path (2.3×) — and the Rust path holds
+  under load since no stage touches the GIL, where the Python 992
+  degrades to the observed 4-10 in the live app.
+- Armed capture: 40 sim frames dumped as byte-correct BMPs with
+  monotonic stamps; midpoint backdating measured at exactly 250 ms for
+  a 0.5 s exposure (parity with exposure_midpoint_utc).
+
+Remaining Phase 4: camera_manager wiring behind use_rust_camera, and
+rig-session timing truth (ASI SDK buffering vs midpoint stamps).
+
+---
+
 ## 2026-08-18 — Rust ADS-B decode identical to pyModeS (Phase 5)
 
 **What it is.** `skytracker-adsb` ports the Mode-S DF17/18 decode subset

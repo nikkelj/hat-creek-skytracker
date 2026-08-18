@@ -16,6 +16,7 @@ skytracker-platesolve = { path = "../skytracker-platesolve" }
 skytracker-pointing = { path = "../skytracker-pointing" }
 skytracker-imaging = { path = "../skytracker-imaging" }
 skytracker-adsb = { path = "../skytracker-adsb" }
+skytracker-camera = { path = "../skytracker-camera" }
 # bindings.rs builds ArrayView2 over incoming numpy frames.
 ndarray = { workspace = true }
 # pyo3 + numpy + the serial transport are OPTIONAL and only pulled in for the

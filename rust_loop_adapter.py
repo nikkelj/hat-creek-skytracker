@@ -488,9 +488,24 @@ class RustCoreLoopAdapter:
         px, py, target_alt, dist, target_az, az_rate, el_rate = (
             interpolate_position_data_and_rates(target_traj, live_tt())
         )
-        if px is None or target_az is None or target_alt is None or target_alt <= 0:
+        if px is None or target_az is None or target_alt is None:
             self.loop.clear_setpoint()
             return
+        # Below the horizon: pre-position at the mask-exit point (the target's
+        # azimuth at the elevation mask) instead of clearing the setpoint --
+        # mirrors joystick_controller.program_track's mask-exit drive and the
+        # launch path's mask hold, and closes the documented Rust-loop gap
+        # (FINDINGS: "adapter commands a safe stop instead").
+        below = float(target_alt) <= 0.0
+        if below:
+            try:
+                mask = float(getattr(self.config_state, "elevation_mask_str", None)
+                             or getattr(self.config_state, "elevation_mask", 10.0) or 10.0)
+            except (TypeError, ValueError):
+                mask = 10.0
+            target_alt = mask
+            az_rate = 0.0
+            el_rate = 0.0
         self.loop.set_ff_enabled(
             bool(st.feed_forward_azm_enabled), bool(st.feed_forward_alt_enabled)
         )

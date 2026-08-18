@@ -12,6 +12,7 @@ pub mod core_loop;
 pub mod hotspot;
 pub mod pid;
 pub mod protocol;
+pub mod rate;
 #[cfg(feature = "serial")]
 pub mod serial;
 pub mod sim;

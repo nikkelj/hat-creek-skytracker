@@ -5,6 +5,28 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-18 — Rust-loop gaps closed: mask-exit + rate gearbox (Phase 6a)
+
+**Mask-exit pre-positioning**: the flag-on Rust loop's documented gap
+(below-horizon satellite → safe stop) is closed: the adapter now holds
+the setpoint at the mask-exit point (target azimuth at the elevation
+mask, zero rates), mirroring the Python program_track drive and the
+launch path's mask hold. Loop/adapter/A-B suites green (32 tests).
+
+**Adaptive rate gearbox**: `axis_to_rate` + `AdaptiveRateMapper` ported
+to skytracker-core (rate.rs) with the exact constants and absolute-
+deadline semantics; exposed as RustAdaptiveRateMapper.
+test_rust_rate_parity.py (in CI): 16,004 axis samples identical, and 20
+random deterministic stick timelines (pins, releases, reversals, stale
+gaps at 15 Hz service) match the Python gearbox on EVERY step and
+ceiling. One porting catch: a guessed JOY_RELEASE_DEFLECTION (0.5 vs
+the real 0.70) was flushed out immediately by the timeline A/B.
+
+MTI remains a stub on both sides by design; alignment-run sequencing +
+autotune port in Phase 6b; Rust-loop promotion to default awaits the rig.
+
+---
+
 ## 2026-08-18 — Rust camera pipeline sustains camera-native rates (Phase 4a)
 
 **What it is.** `skytracker-camera`: the capture pipeline rebuilt in

@@ -1020,6 +1020,48 @@ impl CoreLoop {
 // macro generates a module of the same name, which would shadow the extern
 // engine crate `skytracker_core` and make every `skytracker_core::` path
 // ambiguous. The Python-visible name is pinned via the name attribute.
+/// Adaptive RATE_CONTROL gearbox (port of joystick_controller's
+/// AdaptiveRateMapper; deterministic via caller-supplied monotonic `now`).
+#[pyclass]
+struct RustAdaptiveRateMapper {
+    inner: skytracker_core::rate::AdaptiveRateMapper,
+}
+
+#[pymethods]
+impl RustAdaptiveRateMapper {
+    #[new]
+    #[pyo3(signature = (base_ceiling = 5, max_ceiling = 9, engage_delay_s = 0.8))]
+    fn new(base_ceiling: i32, max_ceiling: i32, engage_delay_s: f64) -> Self {
+        RustAdaptiveRateMapper {
+            inner: skytracker_core::rate::AdaptiveRateMapper::new(
+                base_ceiling,
+                max_ceiling,
+                engage_delay_s,
+            ),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn update(&mut self, az_axis: f64, alt_axis: f64, now: f64) -> (i32, i32) {
+        self.inner.update(az_axis, alt_axis, now)
+    }
+
+    #[getter]
+    fn ceiling(&self) -> i32 {
+        self.inner.ceiling
+    }
+}
+
+/// joystick_controller.axis_to_rate (single source of truth check).
+#[pyfunction]
+#[pyo3(signature = (axis_value, ceiling = 9))]
+fn rust_axis_to_rate(axis_value: f64, ceiling: i32) -> i32 {
+    skytracker_core::rate::axis_to_rate(axis_value, ceiling)
+}
+
 #[pymodule(name = "skytracker_core")]
 fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_get_position, m)?)?;
@@ -1044,6 +1086,8 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(local_elev_az_to_telescope, m)?)?;
     m.add_function(wrap_pyfunction!(altaz_local_to_radec, m)?)?;
     m.add_class::<SimMount>()?;
+    m.add_class::<RustAdaptiveRateMapper>()?;
+    m.add_function(wrap_pyfunction!(rust_axis_to_rate, m)?)?;
     m.add_class::<PidController>()?;
     m.add_class::<Detection>()?;
     m.add_class::<SimCoreLoop>()?;

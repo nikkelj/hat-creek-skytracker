@@ -17,4 +17,6 @@ pub mod metrics;
 pub mod phasecorr;
 pub mod ransac;
 pub mod stabilize;
+#[cfg(feature = "mp4-export")]
+pub mod video;
 pub mod warp;

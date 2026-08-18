@@ -26,7 +26,13 @@ stabilizer transforms 0.0055 px / 0.0012°; grid-warp 51.1 dB, shift-field
 estimators' shared noise floor (median 0.37 px) — the clean-signal
 phase-correlation case is golden-gated at 0.01 px in cargo.
 
-Remaining Phase 3 item: MP4 export via openh264+mp4 (3c).
+**Phase 3c (MP4 export)**: post_process's Mp4Exporter can now write
+H.264 via openh264 + a pure-Rust MP4 muxer behind the same flag
+(cv2.VideoWriter mp4v fallback; odd dimensions fall back). Round-trip
+gate is comparative: the H.264 output must decode no worse than the
+mp4v writer it replaces — measured **37.2 dB vs mp4v's 35.1 dB** on the
+noisy synthetic burst, all frames cv2-decodable. (Two traps documented
+in LEARNINGS: limited-range YUV, and openh264's per-GOP QP startup.)
 
 ---
 

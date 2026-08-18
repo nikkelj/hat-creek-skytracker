@@ -169,6 +169,57 @@ class ImagingParity(unittest.TestCase):
         print(f"[parity] end-to-end stack: PSNR {psnr:.1f} dB "
               f"(flag-off vs flag-on masters)")
 
+    def test_mp4_export_roundtrip(self):
+        """Rust H.264 writer: cv2-decodable file, right frame count, decent
+        content fidelity (H.264 is lossy; gate well above garbage)."""
+        import tempfile
+
+        import rust_imaging_adapter
+
+        _flag(True)
+        out = os.path.join(tempfile.gettempdir(), "skytracker_test_export.mp4")
+        writer = rust_imaging_adapter.make_video_writer(out, 320, 240, 15.0)
+        self.assertIsNotNone(writer, "Rust mp4 writer unavailable")
+        self.assertTrue(writer.isOpened())
+        src = [f[..., ::-1].copy() for f in self.frames]  # BGR like cv2 path
+        for f in src:
+            writer.write(f)
+        writer.release()
+
+        def read_back(path):
+            cap = cv2.VideoCapture(path)
+            n = 0
+            worst = float("inf")
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                worst = min(worst, _psnr(fr, src[n]))
+                n += 1
+            cap.release()
+            return n, worst
+
+        count, worst = read_back(out)
+        os.remove(out)
+
+        # Comparative gate: the frames are mostly sensor noise (PSNR here
+        # measures bitrate, not correctness), so require the H.264 output
+        # to be no worse than the cv2 mp4v writer it replaces.
+        ref_path = os.path.join(tempfile.gettempdir(), "skytracker_test_ref.mp4")
+        vw = cv2.VideoWriter(ref_path, cv2.VideoWriter_fourcc(*"mp4v"), 15.0, (320, 240))
+        for f in src:
+            vw.write(f)
+        vw.release()
+        ref_count, ref_worst = read_back(ref_path)
+        os.remove(ref_path)
+
+        self.assertEqual(count, len(src), "frame count")
+        self.assertEqual(ref_count, len(src), "cv2 reference frame count")
+        self.assertGreater(worst, ref_worst - 1.0,
+                           f"H.264 {worst:.1f} dB vs mp4v {ref_worst:.1f} dB")
+        print(f"[parity] mp4 export: {count} frames, decoded PSNR {worst:.1f} dB "
+              f"(cv2 mp4v reference {ref_worst:.1f} dB)")
+
     def test_finish_mono(self):
         from sharpen import finish
 

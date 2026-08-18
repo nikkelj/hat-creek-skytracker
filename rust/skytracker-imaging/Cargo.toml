@@ -14,6 +14,15 @@ crate-type = ["rlib"]
 rustfft = "6"
 # Deterministic RANSAC sampling.
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# MP4 export (the sanctioned FFI exception: Cisco's openh264, compiled
+# from bundled source) + pure-Rust MP4 muxing. Optional so plain
+# `cargo test --workspace` stays free of C++ compilation.
+openh264 = { version = "0.6", optional = true }
+mp4 = { version = "0.14", optional = true }
+
+[features]
+default = []
+mp4-export = ["dep:openh264", "dep:mp4"]
 
 [dev-dependencies]
 npyz = { version = "0.8", features = ["npz"] }

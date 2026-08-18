@@ -6,6 +6,24 @@ Newest entries first.
 
 ---
 
+## 2026-08-17 — Unflagged H.264 is decoded as limited-range YUV
+
+The Rust MP4 exporter (Phase 3c) hit a hard ~24 dB round-trip PSNR
+ceiling that no bitrate or rate-control setting moved — because the
+problem wasn't compression at all: the RGB→YUV conversion used
+full-range BT.601, but decoders assume **limited range (Y 16–235)** for
+unflagged H.264 streams, producing a systematic contrast error. The
+tell: PSNR identical to three decimals across wildly different encoder
+settings (a systematic error is bitrate-independent). Studio-swing
+conversion fixed it instantly: 37.2 dB, beating the cv2 mp4v writer it
+replaces (35.1 dB) on the same frames.
+
+Also: openh264's bitrate controller holds its startup QP for a whole
+GOP, so short clips see no effect from the bitrate target at all —
+another way "changing the knob does nothing" pointed at the real bug.
+
+---
+
 ## 2026-08-17 — cv2.phaseCorrelate mutates its input arrays
 
 Discovered porting the imaging primitives (Rust port Phase 3a): OpenCV

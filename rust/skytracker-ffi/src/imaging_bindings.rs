@@ -174,7 +174,48 @@ fn imaging_finish_gray<'py>(
     Ok(to_pyarray(py, &out))
 }
 
+/// MP4 (H.264) writer with a cv2.VideoWriter-like surface: construct,
+/// write RGB frames, finish. Replaces post_process.Mp4Exporter's encoder.
+#[pyclass]
+pub struct Mp4Encoder {
+    inner: Option<skytracker_imaging::video::Mp4Encoder>,
+}
+
+#[pymethods]
+impl Mp4Encoder {
+    #[new]
+    fn new(path: String, width: usize, height: usize, fps: f64) -> PyResult<Self> {
+        let inner =
+            skytracker_imaging::video::Mp4Encoder::create(std::path::Path::new(&path), width, height, fps)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Mp4Encoder { inner: Some(inner) })
+    }
+
+    /// Write one (h, w, 3) RGB uint8 frame.
+    fn write(&mut self, py: Python<'_>, frame: numpy::PyReadonlyArray3<'_, u8>) -> PyResult<()> {
+        let arr = frame.as_array();
+        let data: Vec<u8> = arr.iter().copied().collect();
+        let enc = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("encoder finished"))?;
+        py.allow_threads(|| enc.write_rgb(&data))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Finalize the file; returns the number of frames written.
+    fn finish(&mut self, py: Python<'_>) -> PyResult<u64> {
+        let mut enc = self
+            .inner
+            .take()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("already finished"))?;
+        py.allow_threads(move || enc.finish())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Mp4Encoder>()?;
     m.add_function(wrap_pyfunction!(imaging_sharpness, m)?)?;
     m.add_function(wrap_pyfunction!(imaging_resize_area, m)?)?;
     m.add_function(wrap_pyfunction!(imaging_brightness_centroid, m)?)?;

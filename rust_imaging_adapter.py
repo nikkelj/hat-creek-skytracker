@@ -160,6 +160,44 @@ def estimate_flow(ref_gray, ref_points, cur_gray, min_inliers, min_inlier_ratio,
         return None
 
 
+class _RustVideoWriter:
+    """cv2.VideoWriter-compatible surface over the Rust H.264 encoder.
+
+    write() takes BGR frames (like cv2.VideoWriter) and flips to RGB."""
+
+    def __init__(self, encoder):
+        self._enc = encoder
+        self._open = True
+
+    def isOpened(self):
+        return self._open
+
+    def write(self, bgr):
+        frame = np.ascontiguousarray(np.asarray(bgr)[:, :, ::-1])
+        self._enc.write(frame)
+
+    def release(self):
+        if self._open:
+            self._open = False
+            try:
+                self._enc.finish()
+            except Exception as e:
+                print(f"Rust mp4 finish failed: {e}")
+
+
+def make_video_writer(out_path, width, height, fps):
+    """A cv2.VideoWriter-like H.264 writer, or None (caller falls back)."""
+    sc = _core()
+    if sc is None:
+        return None
+    try:
+        return _RustVideoWriter(
+            sc.Mp4Encoder(str(out_path), int(width), int(height), float(fps)))
+    except Exception as e:
+        print(f"Rust mp4 encoder unavailable ({e}); using cv2.VideoWriter.")
+        return None
+
+
 def finish_gray(img01, layers, stretch, black_pct, white_pct, target_median):
     sc = _core()
     g = _gray32(img01)

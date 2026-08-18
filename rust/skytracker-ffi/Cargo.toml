@@ -30,4 +30,7 @@ extension-module = [
     "dep:numpy",
     "pyo3/extension-module",
     "skytracker-core/serial",
+    # MP4 export (openh264 C++ build) rides only with the extension build,
+    # keeping plain `cargo test --workspace` C-free.
+    "skytracker-imaging/mp4-export",
 ]

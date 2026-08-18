@@ -210,6 +210,11 @@ import rust_astro_adapter
 rust_astro_adapter.configure(config_state)
 if rust_astro_adapter.enabled():
     print("Using RUST astro engine for trajectories/celestial (skyfield fallback).")
+# Phase 2b: pointing-model fits (use_rust_pointing / SKYTRACKER_RUST_POINTING=1).
+import rust_pointing_adapter
+rust_pointing_adapter.configure(config_state)
+if rust_pointing_adapter.enabled():
+    print("Using RUST pointing-model fits (numpy fallback).")
 
 _use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
     _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")

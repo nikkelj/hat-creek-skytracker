@@ -4,6 +4,7 @@ members = [
     "skytracker-core",
     "skytracker-astro",
     "skytracker-platesolve",
+    "skytracker-pointing",
     "skytracker-ffi",
 ]
 

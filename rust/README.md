@@ -16,7 +16,8 @@ Crates:
 | `skytracker-astro` | Phase 1 astro engine replacing skyfield: timescales/GAST (IAU2000A tables generated from skyfield), SGP4 passes, pure-Rust SPK reader for de421.bsp, body/star apparent places, TLE catalog. Parity: sats 0.03″, GAST 1.9 ms, bodies 0.79″, stars 0.17″; bulk precompute 76× |
 | `skytracker-ffi` | The ONLY pyo3 crate; builds the Python module `skytracker_core` (strangler seam, deleted at the end). Exposes the core-loop classes + `AstroEngine` |
 | `skytracker-platesolve` | Phase 2 tetra3 port: pattern hash bit-exact vs the existing .npz databases, centroids 0.0 px, solutions numerically identical to Python tetra3 (12/12 A/B fields) |
-| *(planned)* `skytracker-pointing`, `-imaging`, `-camera`, `-adsb`, `-app` | Phase 2b–7 engines and the final eframe binary |
+| `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg) |
+| *(planned)* `skytracker-imaging`, `-camera`, `-adsb`, `-app` | Phase 3–7 engines and the final eframe binary |
 
 ## Ported so far
 

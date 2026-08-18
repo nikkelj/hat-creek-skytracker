@@ -1060,5 +1060,7 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::astro_bindings::register(m)?;
     // Phase 2 plate solver (PlateSolver + PLATESOLVE_AVAILABLE).
     crate::platesolve_bindings::register(m)?;
+    // Phase 2b pointing-model fits (POINTING_AVAILABLE).
+    crate::pointing_bindings::register(m)?;
     Ok(())
 }

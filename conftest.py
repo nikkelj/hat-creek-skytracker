@@ -63,6 +63,7 @@ if not _HAVE_RUST:
         "test_rust_perf.py",
         "test_rust_astro_parity.py",
         "test_rust_platesolve_parity.py",
+        "test_rust_pointing_parity.py",
         "test_loop_ab_parity.py",
         # Live-fidelity tracking-quality metrics harness: drives the Rust
         # loop through the real adapter (imports skytracker_core at module

@@ -5,6 +5,25 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-16 — Rust pointing-model fits at machine precision
+
+**What it is.** Phase 2b: `skytracker-pointing` ports the 7-term TPOINT
+fits (alt-az IA/IE/AN/AW/NPAE/CA/TF and equatorial IH/ID/NP/CH/ME/MA/TF
+with parallactic-angle flexure), including the partial (seeded) nightly
+refit, MAD-robust outlier rejection, Bennett refraction stripping, and
+the polar-axis SVD plane fit. Least squares uses numpy's
+`lstsq(rcond=None)` semantics (SVD minimum-norm with the same cutoff).
+Fit classmethods route via `use_rust_pointing` / SKYTRACKER_RUST_POINTING
+with the numpy implementations as fallback.
+
+**Validation** (test_rust_pointing_parity.py, in CI; synthesized truth
+models + noisy samples + planted outliers through the real classmethod
+entry points): worst coefficient difference **4.4e-16 deg** (gate 1e-6),
+identical robust rejection counts (3/3), identical n_samples/design_cond/
+RMS stats, polar-axis fit exact to 2.8e-14 deg.
+
+---
+
 ## 2026-08-16 — Rust plate solver: numerically identical to tetra3
 
 **What it is.** Phase 2a of the Rust port: `skytracker-platesolve` is a

@@ -1064,5 +1064,7 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::pointing_bindings::register(m)?;
     // Phase 3b imaging kernels (IMAGING_AVAILABLE).
     crate::imaging_bindings::register(m)?;
+    // Phase 5 ADS-B decode (ADSB_AVAILABLE).
+    crate::adsb_bindings::register(m)?;
     Ok(())
 }

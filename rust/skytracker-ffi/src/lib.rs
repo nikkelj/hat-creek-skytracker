@@ -7,6 +7,8 @@
 //! glue only, and is deleted at the end of the Rust port.
 
 #[cfg(feature = "extension-module")]
+mod adsb_bindings;
+#[cfg(feature = "extension-module")]
 mod astro_bindings;
 #[cfg(feature = "extension-module")]
 mod bindings;

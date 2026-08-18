@@ -1,0 +1,12 @@
+[package]
+name = "skytracker-adsb"
+description = "ADS-B decode + geometry for the Hat Creek Skytracker (Phase 5 of the Rust port): Mode-S DF17/18 extended squitter (replaces the pyModeS subset the app uses) and WGS84 topocentric geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_adsb"
+crate-type = ["rlib"]
+
+[dependencies]

@@ -69,4 +69,4 @@ jobs:
         # With the wheel installed, conftest.py collects the test_rust_*
         # suites (byte parity, PID/hotspot/transform parity, threaded loop,
         # bridge, adapter, perf-regression guard, closed-loop A/B).
-        run: pytest test_rust_pid_parity.py test_rust_hotspot_parity.py test_rust_mount_parity.py test_rust_transforms_parity.py test_rust_core_loop.py test_rust_core_loop_bridge.py test_rust_loop_adapter.py test_rust_perf.py test_rust_astro_parity.py test_rust_platesolve_parity.py test_rust_pointing_parity.py test_rust_imaging_parity.py test_loop_ab_parity.py
+        run: pytest test_rust_pid_parity.py test_rust_hotspot_parity.py test_rust_mount_parity.py test_rust_transforms_parity.py test_rust_core_loop.py test_rust_core_loop_bridge.py test_rust_loop_adapter.py test_rust_perf.py test_rust_astro_parity.py test_rust_platesolve_parity.py test_rust_pointing_parity.py test_rust_imaging_parity.py test_rust_adsb_parity.py test_loop_ab_parity.py

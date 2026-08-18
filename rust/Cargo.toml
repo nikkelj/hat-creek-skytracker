@@ -6,6 +6,7 @@ members = [
     "skytracker-platesolve",
     "skytracker-pointing",
     "skytracker-imaging",
+    "skytracker-adsb",
     "skytracker-ffi",
 ]
 

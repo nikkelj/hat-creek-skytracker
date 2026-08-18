@@ -220,6 +220,11 @@ import rust_imaging_adapter
 rust_imaging_adapter.configure(config_state)
 if rust_imaging_adapter.enabled():
     print("Using RUST imaging kernels for stacking/stabilize/sharpen (cv2 fallback).")
+# Phase 5: ADS-B decode (use_rust_adsb / SKYTRACKER_RUST_ADSB=1).
+import adsb_receiver as _adsb
+_adsb.configure_rust_adsb(config_state)
+if _adsb.rust_adsb_enabled():
+    print("Using RUST ADS-B Mode-S decode (pyModeS fallback).")
 
 _use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
     _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")

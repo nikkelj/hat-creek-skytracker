@@ -5,6 +5,27 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-18 — Rust ADS-B decode identical to pyModeS (Phase 5)
+
+**What it is.** `skytracker-adsb` ports the Mode-S DF17/18 decode subset
+the app uses (CRC-24, ICAO, typecode, TC 1-4 callsign, TC 9-18/20-22
+CPR position-with-reference + altitude, TC 19 velocity — faithful to
+pyModeS's algorithms including its integer-truncation quirks) plus the
+WGS84 geodetic→ECEF→ENU→az/el chain. `decode_adsb_message` routes
+through it behind `use_rust_adsb` / SKYTRACKER_RUST_ADSB=1 with pyModeS
+as fallback. Deliberate divergence: Gillham (Q=0) altitudes above
+50,187 ft decode to None. SBS source + tracker orchestration stay
+Python; native RTL demod arrives with the Phase 7 app.
+
+**Validation** (test_rust_adsb_parity.py, in CI): a generated corpus of
+242 CRC-valid DF17 frames (random ident/position/velocity payloads,
+CRCs from pyModeS's own encoder) decodes **identically** in every field
+(ident 81, position 81, velocity 80); geometry matches numpy to 7e-15;
+the classic pyModeS reference messages decode to the documented values
+in pure-Rust unit tests. Existing test_adsb.py suite green.
+
+---
+
 ## 2026-08-17 — Rust imaging kernels live in the pipelines (Phase 3b)
 
 **What it is.** The stacking/stabilizer/sharpen numeric kernels now route

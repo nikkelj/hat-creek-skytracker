@@ -18,7 +18,8 @@ Crates:
 | `skytracker-platesolve` | Phase 2 tetra3 port: pattern hash bit-exact vs the existing .npz databases, centroids 0.0 px, solutions numerically identical to Python tetra3 (12/12 A/B fields) |
 | `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg) |
 | `skytracker-imaging` | Phase 3a imaging primitives (filters/warps/phase-correlate/Shi-Tomasi/LK/RANSAC) at cv2 parity: filters ≤9e-5, LK 0.006 px, RANSAC identical. Phase 3b composes them into the stacking/stabilizer/sharpen pipelines |
-| *(planned)* `skytracker-camera`, `-adsb`, `-app` | Phase 4–7 engines and the final eframe binary |
+| `skytracker-adsb` | Phase 5 Mode-S DF17/18 decode (pyModeS subset, 242-frame corpus decodes identically) + WGS84 topocentric geometry |
+| *(planned)* `skytracker-camera`, `-app` | Phase 4 camera stack (needs rig time) and the Phase 7 eframe binary |
 
 ## Ported so far
 

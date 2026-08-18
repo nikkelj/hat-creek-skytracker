@@ -258,6 +258,8 @@ class ConfigState:
         self.use_rust_pointing = False
         # Phase 3b: stacking/stabilizer/sharpen kernels via skytracker-imaging.
         self.use_rust_imaging = False
+        # Phase 5: ADS-B Mode-S decode via skytracker-adsb (pyModeS fallback).
+        self.use_rust_adsb = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
@@ -408,6 +410,7 @@ class ConfigState:
             "use_rust_platesolve": self.use_rust_platesolve,
             "use_rust_pointing": self.use_rust_pointing,
             "use_rust_imaging": self.use_rust_imaging,
+            "use_rust_adsb": self.use_rust_adsb,
             "continuous_rate_tracking": self.continuous_rate_tracking,
             "guide_rate_max_dps": self.guide_rate_max_dps
         }
@@ -536,6 +539,7 @@ class ConfigState:
         self.use_rust_platesolve = config_dict.get("use_rust_platesolve", self.use_rust_platesolve)
         self.use_rust_pointing = config_dict.get("use_rust_pointing", self.use_rust_pointing)
         self.use_rust_imaging = config_dict.get("use_rust_imaging", self.use_rust_imaging)
+        self.use_rust_adsb = config_dict.get("use_rust_adsb", self.use_rust_adsb)
 
         # Continuous variable-rate tracking
         self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)

@@ -8,9 +8,13 @@
 //! pipelines gate on end-to-end quality (PSNR/transform accuracy), not
 //! bit parity.
 
+pub mod enhance;
 pub mod features;
 pub mod filters;
+pub mod gridshift;
 pub mod image;
+pub mod metrics;
 pub mod phasecorr;
 pub mod ransac;
+pub mod stabilize;
 pub mod warp;

@@ -256,6 +256,8 @@ class ConfigState:
         self.use_rust_platesolve = False
         # Phase 2b: pointing-model fits via skytracker-pointing (numpy fallback).
         self.use_rust_pointing = False
+        # Phase 3b: stacking/stabilizer/sharpen kernels via skytracker-imaging.
+        self.use_rust_imaging = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
@@ -405,6 +407,7 @@ class ConfigState:
             "use_rust_astro": self.use_rust_astro,
             "use_rust_platesolve": self.use_rust_platesolve,
             "use_rust_pointing": self.use_rust_pointing,
+            "use_rust_imaging": self.use_rust_imaging,
             "continuous_rate_tracking": self.continuous_rate_tracking,
             "guide_rate_max_dps": self.guide_rate_max_dps
         }
@@ -532,6 +535,7 @@ class ConfigState:
         self.use_rust_astro = config_dict.get("use_rust_astro", self.use_rust_astro)
         self.use_rust_platesolve = config_dict.get("use_rust_platesolve", self.use_rust_platesolve)
         self.use_rust_pointing = config_dict.get("use_rust_pointing", self.use_rust_pointing)
+        self.use_rust_imaging = config_dict.get("use_rust_imaging", self.use_rust_imaging)
 
         # Continuous variable-rate tracking
         self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)

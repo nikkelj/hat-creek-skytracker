@@ -127,6 +127,14 @@ def sharpness(frame, method="laplacian", roi=None, scale=1.0):
     if roi is not None:
         x, y, w, h = _clamp_roi(gray.shape, roi)
         gray = gray[y:y + h, x:x + w]
+    # Rust fast path (Phase 3b): laplacian/tenengrad kernels incl. the
+    # INTER_AREA downscale; cv2 fallback on any failure.
+    if method in ("laplacian", "tenengrad"):
+        import rust_imaging_adapter
+        if rust_imaging_adapter.enabled():
+            s = rust_imaging_adapter.sharpness(gray, method, scale)
+            if s is not None:
+                return s
     if scale != 1.0 and gray.size:
         gh, gw = gray.shape
         nw, nh = max(1, int(gw * scale)), max(1, int(gh * scale))
@@ -316,6 +324,15 @@ def brightness_centroid(frame, threshold=None, roi=None):
     if roi is not None:
         x0, y0, rw, rh = _clamp_roi(gray.shape, roi)
         gray = gray[y0:y0 + rh, x0:x0 + rw]
+    # Rust fast path (Phase 3b); result wrapped so a legit "no target" None
+    # is distinguishable from adapter failure.
+    import rust_imaging_adapter
+    if rust_imaging_adapter.enabled():
+        wrapped = rust_imaging_adapter.brightness_centroid(gray, threshold)
+        if wrapped is not None:
+            res = wrapped[0]
+            return None if res is None else (res[0] + x0, res[1] + y0)
+
     weights, _ = _foreground(gray, threshold)
     total = float(weights.sum())
     if total <= 0.0:
@@ -473,6 +490,13 @@ def measure_local_shifts(ref_gray, frame_gray, points, patch=48, min_response=0.
     cur = frame_gray if frame_gray.ndim == 2 else _to_gray(frame_gray)
     ref = ref.astype(np.float32)
     cur = cur.astype(np.float32)
+    # Rust fast path (Phase 3b): patchwise phase correlation off the GIL.
+    import rust_imaging_adapter
+    if rust_imaging_adapter.enabled():
+        s = rust_imaging_adapter.measure_local_shifts(
+            ref, cur, points, patch, min_response, max_shift)
+        if s is not None:
+            return s
     h, w = ref.shape
     half = int(patch) // 2
     win = cv2.createHanningWindow((2 * half, 2 * half), cv2.CV_32F)
@@ -514,6 +538,14 @@ def warp_by_grid(frame, grid, shifts, border=None):
     before it is added to the stack.
     """
     _require_cv2()
+    # Rust fast path (Phase 3b), default (reflect) border only.
+    if border is None:
+        import rust_imaging_adapter
+        if rust_imaging_adapter.enabled():
+            out = rust_imaging_adapter.warp_by_grid(
+                frame, grid.rows, grid.cols, shifts)
+            if out is not None:
+                return out
     if border is None:
         border = cv2.BORDER_REFLECT
     h, w = frame.shape[:2]

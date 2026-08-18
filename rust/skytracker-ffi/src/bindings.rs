@@ -1062,5 +1062,7 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::platesolve_bindings::register(m)?;
     // Phase 2b pointing-model fits (POINTING_AVAILABLE).
     crate::pointing_bindings::register(m)?;
+    // Phase 3b imaging kernels (IMAGING_AVAILABLE).
+    crate::imaging_bindings::register(m)?;
     Ok(())
 }

@@ -5,6 +5,31 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-17 — Rust imaging kernels live in the pipelines (Phase 3b)
+
+**What it is.** The stacking/stabilizer/sharpen numeric kernels now route
+through `skytracker-imaging` behind `use_rust_imaging` /
+SKYTRACKER_RUST_IMAGING=1 (cv2/numpy fallback): sharpness grading
+(laplacian/tenengrad incl. INTER_AREA downscale with uint8 rounding
+semantics), brightness centroid, patchwise local shifts + dense grid
+warp, the flow-method stabilizer estimate (detect + LK + RANSAC +
+plausibility bounds in one Rust call), and the mono finish()
+(multi-scale unsharp + auto-stretch). Orchestration and color paths stay
+Python.
+
+**Validation** (test_rust_imaging_parity.py, in CI, real entry points on
+a synthetic jittered burst): end-to-end LuckyStacker master (flow align
++ local grid + accumulate) **51.2 dB PSNR** flag-off vs flag-on (gate
+40); finish() **identical**; sharpness <1e-3 rel; centroid exact;
+stabilizer transforms 0.0055 px / 0.0012°; grid-warp 51.1 dB, shift-field
+42.2 dB. Per-node local shifts on noisy rotated patches differ at the
+estimators' shared noise floor (median 0.37 px) — the clean-signal
+phase-correlation case is golden-gated at 0.01 px in cargo.
+
+Remaining Phase 3 item: MP4 export via openh264+mp4 (3c).
+
+---
+
 ## 2026-08-17 — Rust imaging primitives vs cv2 goldens (Phase 3a)
 
 **What it is.** `skytracker-imaging`: the OpenCV numeric cluster the

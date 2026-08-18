@@ -13,4 +13,6 @@ mod bindings;
 #[cfg(feature = "extension-module")]
 mod platesolve_bindings;
 #[cfg(feature = "extension-module")]
+mod imaging_bindings;
+#[cfg(feature = "extension-module")]
 mod pointing_bindings;

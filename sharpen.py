@@ -110,6 +110,17 @@ def auto_stretch(img, black_pct=0.25, white_pct=99.9, target_median=0.25,
 def finish(master, layers=DEFAULT_LAYERS, stretch=True, black_pct=0.25,
            white_pct=99.9, target_median=0.25):
     """Sharpen + stretch a linear master into a share-ready uint8 RGB image."""
+    # Rust fast path (Phase 3b), mono masters only; cv2 fallback.
+    arr = np.asarray(master)
+    if arr.ndim == 2:
+        import rust_imaging_adapter
+        if rust_imaging_adapter.enabled():
+            out01 = rust_imaging_adapter.finish_gray(
+                _to_float01(arr), layers, stretch, black_pct, white_pct,
+                target_median)
+            if out01 is not None:
+                return _to_uint8(out01)
+
     out = unsharp_layers(master, layers=layers)
     if stretch:
         out = auto_stretch(out, black_pct=black_pct, white_pct=white_pct,

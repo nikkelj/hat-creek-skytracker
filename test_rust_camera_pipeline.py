@@ -182,6 +182,66 @@ class CameraPipelineRates(unittest.TestCase):
         print(f"[capture] 40 frames dumped, stamps monotonic, "
               f"span {stamps[-1] - stamps[0]:.2f}s")
 
+    def test_camera_manager_wiring_sim(self):
+        """Full camera_manager wiring: sim-connect with the flag on must run
+        the RustCameraThread, flow frames for display + detection, and
+        round-trip an armed capture with the standard frame dicts."""
+        import pygame
+        pygame.init()
+        from config import ConfigState
+        from simulator import HardwareSimulator
+
+        os.environ["SKYTRACKER_RUST_CAMERA"] = "1"
+        try:
+            from camera_manager import camera_manager as cm
+            from rust_camera_adapter import RustCameraThread
+
+            cfg = ConfigState()
+            cfg.load_from_dict(json.load(open("config.example.json")))
+            cfg.sim_config["enabled"] = True
+            cfg.sim_config["sim_use_real_stars"] = False
+            sim = HardwareSimulator(cfg, None, None)
+            cm.simulator = sim
+            self.assertTrue(cm.connect_camera(0), "sim camera must connect")
+            try:
+                cam = cm.get_camera(0)
+                self.assertIsInstance(cam.thread, RustCameraThread,
+                                      "flag on but Python thread selected")
+                deadline = time.time() + 5.0
+                while cam.thread.frame_count < 10 and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertGreaterEqual(cam.thread.frame_count, 10, "no frames flowing")
+
+                raw, seq, mono = cam.thread.get_latest_raw_with_meta()
+                self.assertIsNotNone(raw)
+                self.assertGreater(seq, 0)
+                disp = cam.thread.get_latest_frame()
+                self.assertIsNotNone(disp)
+                self.assertIn('frame', disp)
+                self.assertIsInstance(disp['frame'], pygame.Surface)
+
+                # Armed capture round-trip through the standard interface.
+                cam.thread.start_capture()
+                n0 = cam.thread.frame_count
+                while cam.thread.frame_count < n0 + 8 and time.time() < deadline + 5:
+                    time.sleep(0.05)
+                info, buffer = cam.thread.stop_capture()
+                self.assertGreaterEqual(len(buffer), 8, "captured frames missing")
+                fd = buffer[-1]
+                for key in ('frame', 'datetime_utc_microseconds',
+                            'sequence_in_capture', 'camera_index'):
+                    self.assertIn(key, fd)
+                self.assertGreater(fd['sequence_in_capture'], 0)
+                print(f"\n[wiring] camera_manager sim connect: "
+                      f"{cam.thread.frame_count} frames, capture {len(buffer)} dicts, "
+                      f"fps {cam.thread.actual_fps:.1f}")
+            finally:
+                cm.disconnect_camera(0)
+        finally:
+            os.environ.pop("SKYTRACKER_RUST_CAMERA", None)
+            from camera_manager import camera_manager as cm2
+            cm2.simulator = None
+
     def test_midpoint_backdating_semantics(self):
         """Parity with camera_buffer.exposure_midpoint_utc: stamp = now - t/2."""
         pipe = skytracker_core.CameraPipeline.push_source(ring_capacity=10)

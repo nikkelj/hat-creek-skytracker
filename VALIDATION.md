@@ -30,8 +30,18 @@ metered):
   monotonic stamps; midpoint backdating measured at exactly 250 ms for
   a 0.5 s exposure (parity with exposure_midpoint_utc).
 
-Remaining Phase 4: camera_manager wiring behind use_rust_camera, and
-rig-session timing truth (ASI SDK buffering vs midpoint stamps).
+**Phase 4b (wiring)**: `RustCameraThread` (rust_camera_adapter.py)
+subclasses CameraThread and reroutes the per-frame path: raw frames go to
+the Rust ring, the display Surface is built lazily at UI-pull rate
+instead of per frame, and armed capture keeps the exact frame-dict
+contract capture_manager consumes. Selected in
+camera_manager._start_camera_thread behind `use_rust_camera` /
+SKYTRACKER_RUST_CAMERA=1 (Python CameraThread on any failure). Verified:
+camera_manager sim connect runs the Rust thread at the paced sim target
+(15.4 FPS actual vs 15 target), display + detection + capture round-trip
+correct, and the full-wiring closed-loop tracking gate holds on the Rust
+camera (**PROGRAM rms 74.4″** vs the 67-73″ Python baseline band).
+Remaining: rig-session timing truth + native open_asi promotion.
 
 ---
 

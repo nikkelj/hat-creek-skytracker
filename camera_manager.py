@@ -288,8 +288,22 @@ class CameraManager:
         # and control threads. Real cameras keep the full 30 FPS target
         # (their exposure/readout waits release the GIL inside the SDK).
         is_sim = getattr(camera.cap, 'simulator', None) is not None
-        camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size,
-                                     target_fps=15 if is_sim else 30)
+        # Rust fast path (Phase 4b): per-frame ring/stamping in Rust, lazy
+        # display conversion -- lifts the GIL-bound 4-10 FPS ceiling toward
+        # the camera's native rate. Python CameraThread on any failure.
+        camera.thread = None
+        import rust_camera_adapter
+        if rust_camera_adapter.enabled():
+            try:
+                camera.thread = rust_camera_adapter.RustCameraThread(
+                    camera.index, camera.cap, buffer_size=buffer_size,
+                    target_fps=15 if is_sim else 30)
+                print(f"Camera {camera.index}: RUST capture pipeline.")
+            except Exception as e:
+                print(f"Rust camera pipeline unavailable ({e}); Python thread.")
+        if camera.thread is None:
+            camera.thread = CameraThread(camera.index, camera.cap, buffer_size=buffer_size,
+                                         target_fps=15 if is_sim else 30)
         camera.thread.start()
 
         if config_state:

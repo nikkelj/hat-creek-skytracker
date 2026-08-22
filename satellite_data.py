@@ -17,7 +17,7 @@ def download_tle_data(cache_file, tle_url, update_status_callback=None):
     try:
         if update_status_callback:
             update_status_callback("Downloading TLEs from Celestrak...")
-        response = requests.get(tle_url)
+        response = requests.get(tle_url, timeout=30)
         response.raise_for_status()
         tle_text = response.text
         with open(cache_file, 'w') as f:
@@ -63,7 +63,19 @@ def load_satellite_data(state, update_status_callback=None):
     """
     try:
         if is_cache_expired(state.cache_file, state.cache_age_limit):
-            download_tle_data(state.cache_file, 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle', update_status_callback)
+            try:
+                download_tle_data(state.cache_file, 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle', update_status_callback)
+            except Exception as e:
+                # Celestrak can refuse us (403 rate-limit, 404, outage) or the
+                # network can be down entirely. A stale cache beats no
+                # satellites at all -- fall back to it and let the epoch-age
+                # warning below convey how degraded the data actually is.
+                if not os.path.exists(state.cache_file):
+                    raise
+                if update_status_callback:
+                    update_status_callback(
+                        f"Download failed ({str(e)}) - falling back to cached TLEs")
+                load_tle_from_cache(state.cache_file, update_status_callback)
         else:
             load_tle_from_cache(state.cache_file, update_status_callback)
 

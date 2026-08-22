@@ -232,6 +232,21 @@ the full pytest suite, and a closed-loop sim-tracking baseline
 (`tests/golden/loop_baseline.json`). See `rust/README.md` for crate layout
 and `VALIDATION.md` for the parity record.
 
+#### Native app (Phase 7, first light)
+
+![Native Rust app](doc/screenshots/rust_app_phase7.png)
+
+`rust/skytracker-app` is the egui+wgpu application over the Rust engines:
+polar skyplot (stars, satellites, planets, mask), live camera view from the
+Rust capture pipeline (a Rust star-field simulator until the ASI source is
+flipped on at the rig), the core-loop mount panel with gamepad RATE control
+and satellite PROGRAM tracking, and a live satellite table — all rendered
+from worker snapshots at a 120 Hz repaint target. Run from the repo root:
+
+```
+cd rust && cargo run --release -p skytracker-app
+```
+
 ## Hardware Simulator
 
 To hone the user experience and develop the control/acquisition algorithms

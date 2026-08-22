@@ -1,0 +1,25 @@
+[package]
+name = "skytracker-app"
+description = "Hat Creek Skytracker — the native egui+wgpu application (Phase 7 of the Rust port): 120 Hz display over the Rust engines"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "skytracker"
+path = "src/main.rs"
+
+[dependencies]
+skytracker-core = { workspace = true }
+skytracker-astro = { path = "../skytracker-astro" }
+skytracker-camera = { path = "../skytracker-camera" }
+skytracker-imaging = { path = "../skytracker-imaging" }
+
+eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
+egui = "0.29"
+egui_extras = { version = "0.29", default-features = false }
+arc-swap = "1"
+crossbeam-channel = "0.5"
+gilrs = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

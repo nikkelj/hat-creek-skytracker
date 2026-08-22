@@ -58,6 +58,8 @@ impl Observer {
 /// A parsed TLE ready for propagation.
 pub struct Satellite {
     pub name: String,
+    /// NORAD catalog field (line-1 cols 3-7), alpha-5 safe.
+    pub satnum: String,
     pub epoch_jd_utc: f64,
     constants: sgp4::Constants,
 }
@@ -114,6 +116,7 @@ impl Satellite {
             .map_err(|e| SatError::Tle(e.to_string()))?;
         Ok(Satellite {
             name: name.to_string(),
+            satnum: line1.get(2..7).unwrap_or("").trim().to_string(),
             epoch_jd_utc,
             constants,
         })

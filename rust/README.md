@@ -20,7 +20,7 @@ Crates:
 | `skytracker-imaging` | Phase 3a imaging primitives (filters/warps/phase-correlate/Shi-Tomasi/LK/RANSAC) at cv2 parity: filters ≤9e-5, LK 0.006 px, RANSAC identical. Phase 3b composes them into the stacking/stabilizer/sharpen pipelines |
 | `skytracker-adsb` | Phase 5 Mode-S DF17/18 decode (pyModeS subset, 242-frame corpus decodes identically) + WGS84 topocentric geometry |
 | `skytracker-camera` | Phase 4a capture pipeline: pump/ring/exposure-midpoint stamps/armed BMP dump + ASI DLL binding (libloading, rig-ready). Sim-proven 100 FPS sustained, 2,244 FPS headroom vs Python's GIL-bound 4-10 |
-| *(planned)* `skytracker-app` | Phase 7 eframe binary |
+| `skytracker-app` | Phase 7 native app (eframe/egui on wgpu, 120 Hz repaint target): ArcSwap snapshot bus + command channel, sky/mount/camera workers over the engines; first light 2026-08-22 — `cargo run --release -p skytracker-app` from the repo root |
 
 ## Ported so far
 

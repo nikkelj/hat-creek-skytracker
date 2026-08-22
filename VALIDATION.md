@@ -5,6 +5,36 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-22 — Native egui+wgpu app: first light (Phase 7a)
+
+**What it is.** `rust/skytracker-app` — the native application over the
+Rust engines, the plan's Phase 7 architecture realized: three
+single-owner worker threads (sky: astro engine + TLE catalog + DE421 +
+Hipparcos; mount: the core loop over the byte-level wall-clock sim mount
+with gamepad → adaptive rate gearbox → RATE, or live satellite setpoints
+→ PROGRAM; camera: a Rust star-field simulator — catalog stars projected
+through camera 1's pinhole at the mount's live pointing — pumped through
+the real skytracker-camera pipeline at ~100 FPS) publish immutable
+`ArcSwap` snapshots; the UI renders snapshots and sends `MountCmd`s over
+a channel, never mutating shared state. eframe on wgpu, requesting
+repaint at 120 Hz (display-refresh bound: 60 Hz on this desktop).
+
+**First light** (doc/screenshots/rust_app_phase7.png, launched from the
+repo root on the live catalog): polar skyplot with 1,025 stars and 763
+visible satellites from 16,080 TLEs (GEO belt, planets, mask ring), sky
+compute 3.4 ms/s on the worker; camera panel at **97 FPS**; mount panel
+with the sim loop at 15.0 Hz and STANDBY/RATE/PROGRAM/STOP; elevation-
+sorted live satellite table with click-to-select driving PROGRAM
+setpoints; hover tooltips; 9 s soak clean. Run:
+`cargo run --release -p skytracker-app` from the repo root.
+
+Remaining Phase 7: pass table + trajectory arcs, HANDOFF/HOTSPOT UI over
+the in-process camera→hotspot path, alignment/plate-solve screens, post-
+process replay, mount3d, config editing, native open_asi/serial
+transports, AlignmentRunner, then pygame deletion.
+
+---
+
 ## 2026-08-18 — Rust PID auto-tuner identical to Python (Phase 6b)
 
 **What it is.** `autotune.rs` in skytracker-core ports PIDAutoTuner: the

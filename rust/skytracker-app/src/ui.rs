@@ -138,28 +138,33 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, &b.name, FontId::proportional(11.0), col);
     }
 
-    // Satellites + hit-testing.
+    // Satellites + hit-testing. The worker publishes at ~2 Hz; dead-reckon
+    // each mark forward with its az/el rate so motion is smooth at the
+    // display rate rather than stepping once per snapshot.
     let pointer = resp.hover_pos();
     let mut best: Option<(f32, String, String)> = None;
+    let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
     if st.show_sats {
         for s in &sky.sats {
-            if s.el < 0.0 {
+            let el = s.el + s.el_rate * age_s;
+            if el < 0.0 {
                 continue;
             }
-            let p = polar(center, radius, s.az, s.el);
+            let az = s.az + s.az_rate * age_s;
+            let p = polar(center, radius, az, el);
             let selected = st.selected.as_deref() == Some(s.satnum.as_str());
             let col = alt_color(s.range_km);
             if selected {
                 painter.circle_stroke(p, 9.0, Stroke::new(2.0, ACCENT));
             }
             painter.rect_filled(Rect::from_center_size(p, Vec2::splat(5.0)), 1.0, col);
-            if st.show_labels && (selected || s.el > 40.0) {
+            if st.show_labels && (selected || el > 40.0) {
                 painter.text(p + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, &s.name, FontId::proportional(10.0), col.linear_multiply(0.9));
             }
             if let Some(ptr) = pointer {
                 let d = ptr.distance(p);
                 if d < 10.0 && best.as_ref().map_or(true, |b| d < b.0) {
-                    best = Some((d, s.satnum.clone(), format!("{}  az {:.1}° el {:.1}°  {:.0} km  {:+.2}°/s", s.name, s.az, s.el, s.range_km, s.az_rate)));
+                    best = Some((d, s.satnum.clone(), format!("{}  az {:.1}° el {:.1}°  {:.0} km  {:+.2}°/s", s.name, az, el, s.range_km, s.az_rate)));
                 }
             }
         }

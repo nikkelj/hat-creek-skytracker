@@ -1,6 +1,6 @@
 //! Sky worker: owns the astro engine (TLE catalog, DE421, Hipparcos) and
-//! publishes SkySnapshot — satellites + bodies every second, stars every
-//! five — entirely off the UI thread.
+//! publishes SkySnapshot — satellites + bodies at 2 Hz (the UI dead-reckons
+//! between snapshots), stars every five seconds — entirely off the UI thread.
 
 use crate::state::{BodyMark, SatMark, Shared, SkySnapshot, StarMark};
 use skytracker_astro::engine::Engine;
@@ -204,7 +204,8 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             },
         }));
 
-        let sleep = Duration::from_secs(1).saturating_sub(t0.elapsed());
+        // 2 Hz: the UI dead-reckons marks between snapshots with their rates.
+        let sleep = Duration::from_millis(500).saturating_sub(t0.elapsed());
         std::thread::sleep(sleep);
     }
 }

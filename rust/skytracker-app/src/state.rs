@@ -25,6 +25,7 @@ pub struct Config {
     pub cam1_focal_mm: f64,
     pub star_limit_mag: f64,
     pub max_stars: usize,
+    pub ui_vsync: bool,
 }
 
 impl Config {
@@ -57,6 +58,7 @@ impl Config {
             cam1_focal_mm: camf("focal_length", 162.0),
             star_limit_mag: f("star_limiting_magnitude", 6.5),
             max_stars: f("max_rendered_star_count", 2000.0) as usize,
+            ui_vsync: v["ui_vsync"].as_bool().unwrap_or(true),
         }
     }
 

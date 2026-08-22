@@ -56,8 +56,6 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new("HAT CREEK SKYTRACKER").color(ui::ACCENT).strong());
-                ui.separator();
                 let m = self.shared.mount.load();
                 ui.label(egui::RichText::new(format!("MODE {}", m.mode)).color(ui::AMBER).monospace());
                 ui.separator();
@@ -119,6 +117,10 @@ fn main() -> eframe::Result<()> {
     let root = find_repo_root();
     eprintln!("skytracker: repo root = {}", root.display());
     let config = state::Config::load(&root.join("config.json"));
+    let vsync = match std::env::var("SKYTRACKER_VSYNC") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => config.ui_vsync,
+    };
     let shared = Shared::new(config);
     let (tx, rx) = crossbeam_channel::unbounded::<MountCmd>();
 
@@ -132,7 +134,9 @@ fn main() -> eframe::Result<()> {
             .with_title("Hat Creek Skytracker")
             .with_inner_size([1700.0, 1050.0])
             .with_min_inner_size([1100.0, 700.0]),
-        vsync: true,
+        // vsync caps the UI at the display refresh (60 Hz on a 60 Hz panel).
+        // config "ui_vsync": false or SKYTRACKER_VSYNC=0 lets it run free.
+        vsync: vsync,
         ..Default::default()
     };
     let tx2 = tx.clone();

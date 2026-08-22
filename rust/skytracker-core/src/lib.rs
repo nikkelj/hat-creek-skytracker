@@ -7,6 +7,7 @@
 //! PyO3 bindings live in the sibling `skytracker-ffi` crate, which is the
 //! strangler seam and is deleted once the Rust app fully replaces Python.
 
+pub mod autotune;
 pub mod controller;
 pub mod core_loop;
 pub mod hotspot;

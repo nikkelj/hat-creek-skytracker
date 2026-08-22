@@ -262,6 +262,8 @@ class ConfigState:
         self.use_rust_adsb = False
         # Phase 4b: camera capture via skytracker-camera (CameraThread fallback).
         self.use_rust_camera = False
+        # Phase 6b: PID auto-tuner via skytracker-core (Python tuner fallback).
+        self.use_rust_autotune = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
@@ -414,6 +416,7 @@ class ConfigState:
             "use_rust_imaging": self.use_rust_imaging,
             "use_rust_adsb": self.use_rust_adsb,
             "use_rust_camera": self.use_rust_camera,
+            "use_rust_autotune": self.use_rust_autotune,
             "continuous_rate_tracking": self.continuous_rate_tracking,
             "guide_rate_max_dps": self.guide_rate_max_dps
         }
@@ -544,6 +547,7 @@ class ConfigState:
         self.use_rust_imaging = config_dict.get("use_rust_imaging", self.use_rust_imaging)
         self.use_rust_adsb = config_dict.get("use_rust_adsb", self.use_rust_adsb)
         self.use_rust_camera = config_dict.get("use_rust_camera", self.use_rust_camera)
+        self.use_rust_autotune = config_dict.get("use_rust_autotune", self.use_rust_autotune)
 
         # Continuous variable-rate tracking
         self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)

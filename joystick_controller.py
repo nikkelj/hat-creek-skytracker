@@ -827,7 +827,8 @@ class JoystickModeState:
                 self.update_status_callback(
                     "Auto-tune: start PROGRAM or HOTSPOT tracking first")
             return
-        self.autotuner = PIDAutoTuner(self.config_state, mode=self.tracking_mode)
+        from autotune import make_autotuner
+        self.autotuner = make_autotuner(self.config_state, mode=self.tracking_mode)
         # Remember what we're tuning ON (captured at arm time; the profile of
         # this mode gets stamped with it when the tune finishes).
         self.autotuner.target_label = self._current_target_label()

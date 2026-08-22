@@ -1055,6 +1055,82 @@ impl RustAdaptiveRateMapper {
     }
 }
 
+/// Online PID auto-tuner (port of autotune.PIDAutoTuner). The caller
+/// mirrors `applied_gains()` into its live config after every call.
+#[pyclass]
+struct RustPIDAutoTuner {
+    inner: skytracker_core::autotune::PidAutoTuner,
+}
+
+#[pymethods]
+impl RustPIDAutoTuner {
+    /// Initial gains as (p, d, i) per axis.
+    #[new]
+    fn new(azm_initial: [f64; 3], alt_initial: [f64; 3]) -> Self {
+        RustPIDAutoTuner {
+            inner: skytracker_core::autotune::PidAutoTuner::new(azm_initial, alt_initial),
+        }
+    }
+
+    fn start(&mut self, now: f64) {
+        self.inner.start(now);
+    }
+
+    #[pyo3(signature = (revert = false))]
+    fn stop(&mut self, revert: bool) {
+        self.inner.stop(revert);
+    }
+
+    fn update(&mut self, now: f64, tracking_active: bool, azm_err: f64, alt_err: f64) {
+        self.inner.update(now, tracking_active, azm_err, alt_err);
+    }
+
+    fn take_messages(&mut self) -> Vec<String> {
+        self.inner.take_messages()
+    }
+
+    /// ((azm_p, azm_d, azm_i), (alt_p, alt_d, alt_i)) currently applied.
+    fn applied_gains(&self) -> ([f64; 3], [f64; 3]) {
+        let g = self.inner.applied_gains();
+        (g[0], g[1])
+    }
+
+    fn best_gains(&self) -> ([f64; 3], [f64; 3]) {
+        (self.inner.axes[0].best, self.inner.axes[1].best)
+    }
+
+    fn best_costs(&self) -> (Option<f64>, Option<f64>) {
+        (self.inner.axes[0].best_cost, self.inner.axes[1].best_cost)
+    }
+
+    fn summary(&self) -> String {
+        self.inner.summary()
+    }
+
+    fn status_text(&self, now: f64) -> String {
+        self.inner.status_text(now)
+    }
+
+    fn stage_label(&self) -> String {
+        self.inner.stage_label()
+    }
+
+    #[getter]
+    fn active(&self) -> bool {
+        self.inner.active
+    }
+
+    #[getter]
+    fn phase(&self) -> &'static str {
+        self.inner.phase.as_str()
+    }
+
+    #[getter]
+    fn sweep(&self) -> u32 {
+        self.inner.sweep
+    }
+}
+
 /// joystick_controller.axis_to_rate (single source of truth check).
 #[pyfunction]
 #[pyo3(signature = (axis_value, ceiling = 9))]
@@ -1087,6 +1163,7 @@ fn ffi_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(altaz_local_to_radec, m)?)?;
     m.add_class::<SimMount>()?;
     m.add_class::<RustAdaptiveRateMapper>()?;
+    m.add_class::<RustPIDAutoTuner>()?;
     m.add_function(wrap_pyfunction!(rust_axis_to_rate, m)?)?;
     m.add_class::<PidController>()?;
     m.add_class::<Detection>()?;

@@ -5,6 +5,31 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-18 — Rust PID auto-tuner identical to Python (Phase 6b)
+
+**What it is.** `autotune.rs` in skytracker-core ports PIDAutoTuner: the
+shared-schedule P/D/I twiddle in log-gain space (settle/eval windows,
+>3% acceptance margin, step expand/shrink, live divergence gate,
+pause/resume on tracking loss, sweep convergence). Exposed as
+RustPIDAutoTuner; the PIDAutoTuner-compatible Python wrapper mirrors the
+applied gains into the live config fields both loops read, so
+joystick_controller / joystick_panels are untouched. Selected by
+`make_autotuner` behind `use_rust_autotune` / SKYTRACKER_RUST_AUTOTUNE=1.
+
+**Validation** (test_rust_autotune_parity.py, in CI): both tuners drive
+identical synthetic plants (error depends on the gains each applied, so
+decision divergence cascades) at 15 Hz — **5,230 cycles identical**
+through full convergence (9 sweeps; phase, stage, every applied gain to
+1e-9, every status message); 3,600 cycles identical through a 6 s
+tracking dropout + divergence spike; stop(revert=True) identical and
+restores initial gains.
+
+Alignment-run sequencing (AlignmentRunner) is thread/hardware-coupled
+and moves with the Phase 7 app's state redesign; its pure math
+(Fibonacci grid, fits) is already ported.
+
+---
+
 ## 2026-08-18 — Rust-loop gaps closed: mask-exit + rate gearbox (Phase 6a)
 
 **Mask-exit pre-positioning**: the flag-on Rust loop's documented gap

@@ -230,6 +230,11 @@ import rust_camera_adapter
 rust_camera_adapter.configure(config_state)
 if rust_camera_adapter.enabled():
     print("Using RUST camera capture pipeline (CameraThread fallback).")
+# Phase 6b: PID auto-tuner (use_rust_autotune / SKYTRACKER_RUST_AUTOTUNE=1).
+import autotune as _autotune
+_autotune.configure_rust_autotune(config_state)
+if _autotune.rust_autotune_enabled():
+    print("Using RUST PID auto-tuner (Python tuner fallback).")
 
 _use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
     _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")

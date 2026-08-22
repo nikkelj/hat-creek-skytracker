@@ -106,6 +106,12 @@ fn find_repo_root() -> std::path::PathBuf {
             None => break,
         }
     }
+    // Launched from a build directory (double-clicked exe): fall back to the
+    // checkout this binary was compiled from.
+    let compiled_from = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if compiled_from.join("tle_cache.tle").exists() || compiled_from.join("config.json").exists() {
+        return compiled_from.canonicalize().unwrap_or(compiled_from);
+    }
     cwd
 }
 

@@ -146,6 +146,10 @@ pane, one of the explanations available on every control.
 
 **Sensor Calibration** — both camera feeds side by side with gain / exposure /
 alignment-rotation / ROI controls for co-boresighting the guide and main cameras.
+The **Swap Cams 1&lt;-&gt;2** button (lower left) exchanges which physical camera
+backs each pane — USB enumeration order can flip between boots, so when the
+feeds come up swapped, one click reconnects them the right way around while
+per-slot settings (gain / exposure / gamma / rotation) stay put.
 
 ![Sensor Calibration](doc/screenshots/sensor_calib.png)
 

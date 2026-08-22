@@ -109,6 +109,7 @@ class CameraManager:
         self.button_states.update({
             "reset_config": {"hover": False, "clicked": False},
             "save_config": {"hover": False, "clicked": False},
+            "swap_cameras": {"hover": False, "clicked": False},
         })
 
         # Combined view settings
@@ -117,6 +118,7 @@ class CameraManager:
 
         # UI control rects
         self.COMBINED_VIEW_BUTTON_RECT = None
+        self.SWAP_CAMERAS_BUTTON_RECT = None  # set each frame by render_combined_view_controls
         self.CAMERA_OPACITY_SLIDER_RECT = None
         self.CAMERA_OPACITY_SLIDER_HANDLE_RECT = None
 
@@ -564,6 +566,12 @@ def render_sensor_calibration(menu_screen, sub_x, sub_y, sub_width, sub_height, 
     camera1 = camera_manager.get_camera(0)
     camera2 = camera_manager.get_camera(1)
     button_states = camera_manager.button_states
+
+    # The names arrive indexed by hardware enumeration order; follow each
+    # slot's asi_index so labels stay truthful after a swap.
+    hw_names = {0: camera1_name, 1: camera2_name}
+    camera1_name = hw_names.get(camera1.asi_index, camera1_name)
+    camera2_name = hw_names.get(camera2.asi_index, camera2_name)
 
     menu_screen.fill((0, 0, 0), (sub_x, sub_y, sub_width, sub_height))
 
@@ -1280,6 +1288,21 @@ def render_combined_view_controls(menu_screen, sub_x, sub_y, sub_width, sub_heig
         text_rect = combined_text.get_rect(center=button_rect.center)
         menu_screen.blit(combined_text, text_rect)
 
+    # Swap button: exchanges which physical camera backs slot 1 vs slot 2, for
+    # when USB enumeration order flips between boots. Anchored at the bottom-left
+    # corner of the camera 1 pane, clear of the rotation sliders and the
+    # combined-view cluster at any window width. Rect is stored so the click
+    # handler shares this exact geometry.
+    swap_rect = pygame.Rect(sub_x + 10, sub_y + sub_height - 55, 110, 20)
+    camera_manager.SWAP_CAMERAS_BUTTON_RECT = swap_rect
+    camera_manager.button_states["swap_cameras"]["hover"] = swap_rect.collidepoint(mouse_pos)
+    button_color = (100, 100, 150) if camera_manager.button_states["swap_cameras"]["hover"] else (70, 70, 100)
+    pygame.draw.rect(menu_screen, button_color, swap_rect)
+    pygame.draw.rect(menu_screen, (150, 150, 150), swap_rect, 1)
+    swap_text = tiny_font.render("Swap Cams 1<->2", True, (255, 255, 255))
+    text_rect = swap_text.get_rect(center=swap_rect.center)
+    menu_screen.blit(swap_text, text_rect)
+
     # Camera opacity slider (only show when both cameras are connected or in combined view)
     if camera_manager.CAMERA_OPACITY_SLIDER_RECT and camera1.connected and camera2.connected:
         slider_rect = camera_manager.CAMERA_OPACITY_SLIDER_RECT
@@ -1401,6 +1424,12 @@ def handle_sensor_calib_events(event, pos, display, camera_manager, update_statu
         if camera_manager.COMBINED_VIEW_BUTTON_RECT and camera_manager.COMBINED_VIEW_BUTTON_RECT.collidepoint(pos):
             is_combined_view_controls_click = True
             camera_manager.combined_view_toggle = not camera_manager.combined_view_toggle
+
+        # Swap cameras button click (flag it so the click doesn't also land as
+        # an ROI-origin click on a camera image underneath)
+        if camera_manager.SWAP_CAMERAS_BUTTON_RECT and camera_manager.SWAP_CAMERAS_BUTTON_RECT.collidepoint(pos):
+            is_combined_view_controls_click = True
+            camera_manager.swap_cameras(update_status_callback)
 
         # Camera opacity slider click (if both cameras connected)
         if camera1.connected and camera2.connected:

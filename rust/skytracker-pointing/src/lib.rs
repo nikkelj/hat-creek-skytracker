@@ -4,6 +4,7 @@
 //! pointing_model.py / eq_pointing_model.py / polar_align.py math with
 //! coefficient parity at 1e-6 (see test_rust_pointing_parity.py).
 
+pub mod alignment;
 pub mod altaz;
 pub mod eq;
 pub mod fit;

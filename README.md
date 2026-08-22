@@ -232,20 +232,52 @@ the full pytest suite, and a closed-loop sim-tracking baseline
 (`tests/golden/loop_baseline.json`). See `rust/README.md` for crate layout
 and `VALIDATION.md` for the parity record.
 
-#### Native app (Phase 7, first light)
+#### Native app (Phase 7b — all screens)
 
-![Native Rust app](doc/screenshots/rust_app_phase7.png)
+`rust/skytracker-app` is the egui+wgpu application over the Rust engines —
+seven screens rendered from worker snapshots at a 120 Hz repaint target
+(display-refresh bound), every interaction a command on a channel:
 
-`rust/skytracker-app` is the egui+wgpu application over the Rust engines:
-polar skyplot (stars, satellites, planets, mask), live camera view from the
-Rust capture pipeline (a Rust star-field simulator until the ASI source is
-flipped on at the rig), the core-loop mount panel with gamepad RATE control
-and satellite PROGRAM tracking, and a live satellite table — all rendered
-from worker snapshots at a 120 Hz repaint target. Run from the repo root:
+| Screen | What it does |
+|---|---|
+| **Track** | Polar skyplot (Hipparcos stars, the gated satellite set dead-reckoned between 2 Hz snapshots, planets, mask ring, the selected satellite's ±10 min track with minute ticks, mount boresight + camera FOV + PROGRAM setpoint vector, hover cards, de-conflicted labels), live camera with tracking overlay (reticle, HOTSPOT gate/centroid/SNR, REC tag), the mount instrument panel (STANDBY/RATE/PROGRAM/HANDOFF/HOTSPOT/STOP, az/el readouts, errors, gains, autotune, log), capture arm/save, and the sortable visible-now table |
+| **Passes** | Upcoming passes over the next 6 h from the Rust pass predictor (AOS/TCA/LOS, peak el @ az, duration, peak rate, range, apogee, estimated magnitude / `ecl`), sortable on every column, LEO/GEO filters, name/NORAD filter, click-to-select |
+| **Align** | Live camera with centroid/match overlay, one-click tetra3 plate solve (RA/Dec/roll/FOV/rmse → true az/el and pointing error vs the mount), 0.05° paddles, and the pointing-model alignment run (Fibonacci grid + holdout, spiral grid search, supervised confirm, 7-term fit with residuals) |
+| **Replay** | Run library over `data/` (Python and native captures alike), synchronized two-camera replay with scrubber/speed, gamma / brightness / contrast, flow stabilization, sharpening, stack-N, in-track/cross-track overlays, annotations, H.264 MP4 export — all on worker threads |
+| **Mount 3D** | Orbit-camera 3D view of the mount (AltAz / AltAz-Side / Passthrough / Eq kinematics), boresight ray, target ray + great-circle arc when tracking, FOV cone, soft-limit arcs |
+| **Sim** | Live hardware-simulator controls: injected misalignment / periodic error, camera background / noise / target brightness / Tycho star limit |
+| **Config** | Editor for the native app's config.json surface (site, mount + transport + serial port, control gains, hotspot/handoff, both cameras, sources & paths) — round-trips unknown keys, applies gains + hotspot signs live |
+
+![Track](doc/screenshots/rust_app_track.png)
+
+![Passes](doc/screenshots/rust_app_passes.png)
+
+![Align](doc/screenshots/rust_app_align.png)
+
+![Replay](doc/screenshots/rust_app_replay.png)
+
+![Mount 3D](doc/screenshots/rust_app_mount3d.png)
+
+The camera source is the Rust hardware simulator by default (Tycho-2 stars
+to mag 10 + the live satellites projected through camera 1's pinhole at the
+mount's *true* pointing, Gaussian PSFs + read noise, through the real
+capture pump at ~100 FPS) or a ZWO ASI camera (`"camera_source": "asi"`);
+the mount is the byte-level simulated NexStar responder or a serial port
+(`"mount_transport": "serial"`, `"mount_serial_port": "COM3"`). In
+HANDOFF/HOTSPOT the camera worker pushes frames straight into the core
+loop's frame slot — the in-process optical feed. Run from anywhere (the
+repo root is found from the cwd, `SKYTRACKER_ROOT`, or the build
+checkout):
 
 ```
 cargo run --release --manifest-path rust/Cargo.toml -p skytracker-app
 ```
+
+Headless checks: `SKYTRACKER_AUTOTEST=<seconds>` injects a sim misalignment,
+selects a LEO target, arms HANDOFF, captures a short run, plate-solves and
+runs an 8-point alignment while logging the loop once a second;
+`SKYTRACKER_SCREENSHOT_DIR=<dir>` tours every screen and saves PNGs.
+`SKYTRACKER_VSYNC=0` / `"ui_vsync": false` unlocks the frame rate.
 
 ## Hardware Simulator
 

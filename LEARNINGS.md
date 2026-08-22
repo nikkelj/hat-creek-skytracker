@@ -6,6 +6,45 @@ Newest entries first.
 
 ---
 
+## 2026-08-22 — HOTSPOT geometry was alt-az only; AltAz-Side needs the axis rotation
+
+Running the native app's headless closed-loop check (`SKYTRACKER_AUTOTEST`)
+on the configured **AltAz-Side** mount: HANDOFF promoted to HOTSPOT, locked
+for one frame, then coasted out and fell back to PROGRAM. Root cause was
+not the detector — it was five `if mount_mode == AltAz { 90 - alt } else
+{ alt }` shortcuts in the core controller (boresight sky position, `el_sky`
+for the cos(el) azimuth compression, the elevation-error sign, the
+HOTSPOT feed-forward sign, the gate prediction). They are exact for AltAz
+and *meaningless* for AltAz-Side / Eq, whose axes are pole-referenced: the
+optical correction measured on the sky (cross-el, el) has to be rotated
+into (axis-1, axis-2) — and near the pole the old code scaled the azimuth
+term by 1/cos(ALT) with ALT ≈ 100°, i.e. flipped its sign.
+
+Fix: two tiny helpers, `sky_delta_to_axis` = `sky_to_mount(boresight + d)
+- (azm, alt)` and its inverse, used everywhere the controller crosses the
+sky/axis boundary (errors, feed-forward in both HOTSPOT and PROGRAM, gate
+prediction, star-filter boresight). For AltAz they reduce to the historical
+`(d_az, -d_el)` exactly, so the Python A/B loop parity suite (30 tests) is
+unchanged; for AltAz-Side the sim now locks and holds for the whole run.
+Lesson: anything that says "ALT" when it means "sky elevation" is a latent
+bug on every mount geometry except the one it was written on — push the
+frame conversion through the one transform that already knows the mode.
+
+Second trap from the same session: `transformations.py`'s `AzAlt2AzEl_AltAz`
+(forward) drops `alignment_elevation` while its inverse keeps it, so the
+pair is not a round trip when the alignment elevation is non-zero (-0.6° in
+config). The native app's `mount_to_sky` is the exact inverse of
+`sky_to_mount` (unit-tested round-trip in all four modes); the Python
+forward form is kept only where parity with the Python display matters.
+
+Third: a hot-spot tracker keys on the *brightest* compact object. A sim
+that renders catalogue stars brighter than the target teaches you nothing
+about the tracker — the star filter correctly rejects them all and HANDOFF
+never promotes. The Rust sim caps star peaks at 55% of the target; the
+real-world equivalent is "track bright passes or gate the search".
+
+---
+
 ## 2026-08-17 — Unflagged H.264 is decoded as limited-range YUV
 
 The Rust MP4 exporter (Phase 3c) hit a hard ~24 dB round-trip PSNR

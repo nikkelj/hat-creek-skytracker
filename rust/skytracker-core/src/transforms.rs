@@ -342,6 +342,48 @@ pub enum MountMode {
     Eq,
 }
 
+/// Mount (azm, alt) -> sky (az, el) for the given mount mode: the inverse of
+/// `sky_to_mount` (same alignment / lat / flip conventions).
+pub fn mount_to_sky(
+    mode: MountMode,
+    azm: f64,
+    alt: f64,
+    alignment_azimuth: f64,
+    alignment_elevation: f64,
+    altaz_side_flip: bool,
+) -> (f64, f64) {
+    match mode {
+        // Exact inverse of az_el_to_az_alt_altaz (which sky_to_mount uses):
+        // alt = 90 - el - alignment_elevation. (transformations.py's forward
+        // AzAlt2AzEl_AltAz drops the alignment elevation; its inverse keeps
+        // it, so the pair is not a round trip when alignment_elevation != 0.)
+        MountMode::AltAz => ((azm + alignment_azimuth).rem_euclid(360.0), 90.0 - alt - alignment_elevation),
+        MountMode::AltAzSide => az_alt_to_az_el_altaz_side(azm, alt, alignment_azimuth, altaz_side_flip),
+        MountMode::Passthrough => az_alt_to_az_el_passthrough(azm, alt),
+        MountMode::Eq => {
+            let (el, az) = telescope_to_local_elev_az(alt, azm, alignment_elevation);
+            (az, el)
+        }
+    }
+}
+
+#[cfg(test)]
+mod mount_sky_roundtrip {
+    use super::*;
+
+    #[test]
+    fn mount_to_sky_inverts_sky_to_mount_in_every_mode() {
+        for mode in [MountMode::AltAz, MountMode::AltAzSide, MountMode::Passthrough, MountMode::Eq] {
+            for &(az, el) in &[(10.0, 20.0), (123.4, 45.6), (250.0, 70.0), (359.0, 15.0), (180.0, 5.0)] {
+                let (azm, alt) = sky_to_mount(mode, az, el, 274.8, -0.6, false);
+                let (az2, el2) = mount_to_sky(mode, azm, alt, 274.8, -0.6, false);
+                let daz = ((az2 - az + 540.0).rem_euclid(360.0) - 180.0).abs();
+                assert!(daz < 1e-6 && (el2 - el).abs() < 1e-6, "{mode:?}: ({az},{el}) -> ({azm},{alt}) -> ({az2},{el2})");
+            }
+        }
+    }
+}
+
 /// Sky (az, el) -> mount (azm, alt) for the given mount mode. This is the
 /// transform the PROGRAM control path uses each cycle. For Eq mode, `lat_deg`
 /// is the configured alignment elevation (matching control.py's call site).

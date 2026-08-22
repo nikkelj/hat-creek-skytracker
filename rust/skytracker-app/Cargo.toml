@@ -9,11 +9,22 @@ license.workspace = true
 name = "skytracker"
 path = "src/main.rs"
 
+[features]
+default = ["serial", "mp4-export"]
+serial = ["skytracker-core/serial"]
+# H.264 MP4 export for the replay screen (openh264 compiled from bundled
+# C++ source via skytracker-imaging). Disable with --no-default-features
+# if the C++ toolchain is unavailable; the Export MP4 button then reports
+# "not compiled in".
+mp4-export = ["skytracker-imaging/mp4-export"]
+
 [dependencies]
 skytracker-core = { workspace = true }
 skytracker-astro = { path = "../skytracker-astro" }
 skytracker-camera = { path = "../skytracker-camera" }
 skytracker-imaging = { path = "../skytracker-imaging" }
+skytracker-platesolve = { path = "../skytracker-platesolve" }
+skytracker-pointing = { path = "../skytracker-pointing" }
 
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.29"
@@ -23,3 +34,4 @@ crossbeam-channel = "0.5"
 gilrs = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }

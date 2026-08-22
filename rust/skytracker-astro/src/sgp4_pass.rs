@@ -61,6 +61,11 @@ pub struct Satellite {
     /// NORAD catalog field (line-1 cols 3-7), alpha-5 safe.
     pub satnum: String,
     pub epoch_jd_utc: f64,
+    /// TLE mean motion, revolutions per day (line-2 cols 53-63). python-sgp4's
+    /// `no_kozai` (rad/min) is `mean_motion_rev_per_day * TAU / 1440`.
+    pub mean_motion_rev_per_day: f64,
+    /// TLE eccentricity (python-sgp4 `ecco`).
+    pub eccentricity: f64,
     constants: sgp4::Constants,
 }
 
@@ -118,6 +123,8 @@ impl Satellite {
             name: name.to_string(),
             satnum: line1.get(2..7).unwrap_or("").trim().to_string(),
             epoch_jd_utc,
+            mean_motion_rev_per_day: elements.mean_motion,
+            eccentricity: elements.eccentricity,
             constants,
         })
     }

@@ -1,8 +1,10 @@
-//! UI: skyplot (egui Painter), camera view (wgpu texture), live sky table,
-//! mount panel, HUD — dark modern theme, rendered from snapshots only.
+//! Track screen widgets: skyplot (egui Painter), camera view (texture +
+//! tracking overlay), mount instrument panel, live sky table. Rendered from
+//! snapshots only; every interaction is a command on a channel.
 
-use crate::state::{MountCmd, Shared};
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use crate::state::{CamCmd, MountCmd, Shared};
+use crate::theme::{self, ACCENT, AMBER, BG, DIM, GREEN, HAIRLINE, RED, TEXT, TEXT_2, VIOLET};
+use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use std::sync::Arc;
 
 pub struct UiState {
@@ -11,10 +13,14 @@ pub struct UiState {
     pub show_stars: bool,
     pub show_sats: bool,
     pub show_labels: bool,
+    pub show_below_mask: bool,
     pub cam_tex: Option<egui::TextureHandle>,
     pub cam_seq: u64,
     pub frame_times: std::collections::VecDeque<f64>,
     pub last_frame: std::time::Instant,
+    pub capture_name: String,
+    pub gains_edit: Option<[[f64; 3]; 2]>,
+    pub table_sort: (usize, bool),
 }
 
 impl Default for UiState {
@@ -25,167 +31,280 @@ impl Default for UiState {
             show_stars: true,
             show_sats: true,
             show_labels: true,
+            show_below_mask: true,
             cam_tex: None,
             cam_seq: u64::MAX,
             frame_times: std::collections::VecDeque::with_capacity(240),
             last_frame: std::time::Instant::now(),
+            capture_name: "manual".into(),
+            gains_edit: None,
+            table_sort: (2, false),
         }
     }
 }
 
-pub const ACCENT: Color32 = Color32::from_rgb(56, 189, 248);
-pub const AMBER: Color32 = Color32::from_rgb(251, 191, 36);
-pub const DIM: Color32 = Color32::from_rgb(110, 120, 135);
-pub const PANEL: Color32 = Color32::from_rgb(17, 20, 26);
-pub const SKY: Color32 = Color32::from_rgb(8, 10, 14);
-
-pub fn apply_theme(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = PANEL;
-    v.window_fill = PANEL;
-    v.extreme_bg_color = SKY;
-    v.widgets.noninteractive.bg_fill = PANEL;
-    v.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    v.hyperlink_color = ACCENT;
-    ctx.set_visuals(v);
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-    style.spacing.button_padding = Vec2::new(10.0, 5.0);
-    ctx.set_style(style);
-}
-
-fn alt_color(range_km: f64) -> Color32 {
-    // Legend: 0..1000 km blue->green->red like the orbit legend; beyond 1000 km
-    // MEO orange, GEO purple.
-    if range_km > 20000.0 {
-        Color32::from_rgb(190, 80, 220)
-    } else if range_km > 3000.0 {
-        Color32::from_rgb(255, 160, 40)
-    } else {
-        let t = (range_km / 1000.0).clamp(0.0, 1.0) as f32;
-        let (r, g, b) = if t < 0.5 {
-            (0.0, t * 2.0, 1.0 - t * 2.0)
-        } else {
-            ((t - 0.5) * 2.0, 1.0 - (t - 0.5) * 2.0, 0.0)
-        };
-        Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-    }
-}
-
 /// Polar projection: az clockwise from north (up), el 90 at centre.
-fn polar(center: Pos2, radius: f32, az: f64, el: f64) -> Pos2 {
+pub fn polar(center: Pos2, radius: f32, az: f64, el: f64) -> Pos2 {
     let r = radius * ((90.0 - el.clamp(-10.0, 90.0)) / 90.0) as f32;
     let a = az.to_radians() as f32;
     Pos2::new(center.x + r * a.sin(), center.y - r * a.cos())
 }
 
+/// Simple label de-confliction: a coarse occupancy grid over the plot.
+struct LabelGrid {
+    cell: f32,
+    cols: usize,
+    used: Vec<bool>,
+    origin: Pos2,
+}
+
+impl LabelGrid {
+    fn new(rect: Rect, cell: f32) -> Self {
+        let cols = (rect.width() / cell).ceil() as usize + 1;
+        let rows = (rect.height() / cell).ceil() as usize + 1;
+        LabelGrid { cell, cols, used: vec![false; cols * rows], origin: rect.min }
+    }
+    /// Claim the cells a label of `w`x`h` at `p` would cover; false if any is taken.
+    fn claim(&mut self, p: Pos2, w: f32, h: f32) -> bool {
+        let c0 = ((p.x - self.origin.x) / self.cell).floor().max(0.0) as usize;
+        let c1 = ((p.x + w - self.origin.x) / self.cell).floor().max(0.0) as usize;
+        let r0 = ((p.y - h / 2.0 - self.origin.y) / self.cell).floor().max(0.0) as usize;
+        let r1 = ((p.y + h / 2.0 - self.origin.y) / self.cell).floor().max(0.0) as usize;
+        let rows = self.used.len() / self.cols;
+        for r in r0..=r1.min(rows.saturating_sub(1)) {
+            for c in c0..=c1.min(self.cols - 1) {
+                if self.used[r * self.cols + c] {
+                    return false;
+                }
+            }
+        }
+        for r in r0..=r1.min(rows.saturating_sub(1)) {
+            for c in c0..=c1.min(self.cols - 1) {
+                self.used[r * self.cols + c] = true;
+            }
+        }
+        true
+    }
+}
+
 pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &crossbeam_channel::Sender<MountCmd>) {
     let sky = shared.sky.load();
     let mount = shared.mount.load();
+    let passes = shared.passes.load();
     let cfg = &shared.config;
     let avail = ui.available_size();
     let (resp, painter) = ui.allocate_painter(avail, Sense::click());
     let rect = resp.rect;
-    painter.rect_filled(rect, 0.0, SKY);
-    let radius = (rect.width().min(rect.height()) / 2.0 - 28.0).max(50.0);
+    painter.rect_filled(rect, 0.0, BG);
+    let radius = (rect.width().min(rect.height()) / 2.0 - 30.0).max(60.0);
     let center = rect.center();
+    let mask = cfg.elevation_mask_deg;
 
-    // Elevation rings + mask.
+    // Dome shading: a few concentric fills, lighter toward the zenith.
+    for (i, el) in [0.0, 15.0, 30.0, 45.0, 60.0, 75.0].iter().enumerate() {
+        let r = radius * ((90.0 - el) / 90.0) as f32;
+        let shade = 12 + i as u8 * 2;
+        painter.circle_filled(center, r, Color32::from_rgb(shade, shade + 2, shade + 6));
+    }
+    // Rings + spokes.
     for el in [0.0, 30.0, 60.0] {
         let r = radius * ((90.0 - el) / 90.0) as f32;
-        painter.circle_stroke(center, r, Stroke::new(1.0, Color32::from_gray(55)));
+        painter.circle_stroke(center, r, Stroke::new(1.0, HAIRLINE));
+        if el > 0.0 {
+            painter.text(
+                Pos2::new(center.x + 3.0, center.y - r + 2.0),
+                Align2::LEFT_TOP,
+                format!("{el:.0}°"),
+                theme::mono(9.5),
+                DIM,
+            );
+        }
     }
-    let mask_r = radius * ((90.0 - cfg.elevation_mask_deg) / 90.0) as f32;
-    painter.circle_stroke(center, mask_r, Stroke::new(1.2, Color32::from_rgb(160, 40, 40)));
-    // Azimuth spokes + labels.
+    let mask_r = radius * ((90.0 - mask) / 90.0) as f32;
+    painter.circle_stroke(center, mask_r, Stroke::new(1.0, theme::with_alpha(RED, 110)));
     for az in (0..360).step_by(30) {
         let p = polar(center, radius, az as f64, 0.0);
-        painter.line_segment([center, p], Stroke::new(0.6, Color32::from_gray(45)));
-        let lp = polar(center, radius + 14.0, az as f64, 0.0);
-        let label = match az {
-            0 => "N".to_string(),
-            90 => "E".to_string(),
-            180 => "S".to_string(),
-            270 => "W".to_string(),
-            a => a.to_string(),
+        painter.line_segment([center, p], Stroke::new(0.6, theme::with_alpha(HAIRLINE, 160)));
+        let lp = polar(center, radius + 15.0, az as f64, 0.0);
+        let (label, col, font) = match az {
+            0 => ("N".to_string(), TEXT, theme::sans(13.0)),
+            90 => ("E".to_string(), TEXT_2, theme::sans(13.0)),
+            180 => ("S".to_string(), TEXT_2, theme::sans(13.0)),
+            270 => ("W".to_string(), TEXT_2, theme::sans(13.0)),
+            a => (a.to_string(), DIM, theme::mono(10.0)),
         };
-        painter.text(lp, Align2::CENTER_CENTER, label, FontId::proportional(12.0), DIM);
+        painter.text(lp, Align2::CENTER_CENTER, label, font, col);
     }
 
-    // Stars (magnitude-sized).
+    // Stars (magnitude-sized, quiet).
     if st.show_stars {
         for s in &sky.stars {
             if s.el < 0.0 {
                 continue;
             }
             let p = polar(center, radius, s.az, s.el);
-            let size = (3.2 - s.mag * 0.45).clamp(0.6, 3.2) as f32;
-            painter.circle_filled(p, size, Color32::from_gray((200.0 - s.mag * 18.0).clamp(90.0, 230.0) as u8));
+            let size = (2.6 - s.mag * 0.38).clamp(0.5, 2.6) as f32;
+            let g = (190.0 - s.mag * 16.0).clamp(80.0, 215.0) as u8;
+            painter.circle_filled(p, size, Color32::from_rgb(g, g, (g as u16 + 12).min(255) as u8));
         }
     }
     // Bodies.
+    let mut grid = LabelGrid::new(rect, 12.0);
     for b in &sky.bodies {
         if b.el < -2.0 {
             continue;
         }
         let p = polar(center, radius, b.az, b.el);
         let (col, r) = match b.name.as_str() {
-            "sun" => (Color32::from_rgb(255, 230, 120), 7.0),
-            "moon" => (Color32::from_rgb(220, 220, 230), 6.0),
-            _ => (Color32::from_rgb(240, 200, 120), 4.0),
+            "sun" => (Color32::from_rgb(255, 225, 130), 6.5),
+            "moon" => (Color32::from_rgb(215, 218, 228), 5.5),
+            _ => (Color32::from_rgb(235, 205, 140), 3.2),
         };
         painter.circle_filled(p, r, col);
-        painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, &b.name, FontId::proportional(11.0), col);
+        if grid.claim(p + Vec2::new(8.0, -6.0), 44.0, 12.0) {
+            painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, &b.name, theme::sans(11.0), theme::with_alpha(col, 220));
+        }
     }
 
-    // Satellites + hit-testing. The worker publishes at ~2 Hz; dead-reckon
-    // each mark forward with its az/el rate so motion is smooth at the
-    // display rate rather than stepping once per snapshot.
+    // Selected satellite's track: past dim, future bright, minute ticks.
+    if let (Some(sn), false) = (passes.arc_satnum.as_ref(), passes.arc.is_empty()) {
+        if st.selected.as_deref() == Some(sn.as_str()) {
+            let mut prev: Option<(Pos2, f64)> = None;
+            for a in &passes.arc {
+                if a.el < -1.0 {
+                    prev = None;
+                    continue;
+                }
+                let p = polar(center, radius, a.az, a.el);
+                if let Some((pp, _)) = prev {
+                    let (col, w) = if a.t_rel_s <= 0.0 {
+                        (theme::with_alpha(ACCENT, 70), 1.2)
+                    } else {
+                        (theme::with_alpha(ACCENT, 200), 1.6)
+                    };
+                    painter.line_segment([pp, p], Stroke::new(w, col));
+                }
+                if (a.t_rel_s % 60.0).abs() < 1e-6 && a.t_rel_s != 0.0 {
+                    painter.circle_filled(p, 1.8, theme::with_alpha(ACCENT, if a.t_rel_s > 0.0 { 230 } else { 110 }));
+                    if (a.t_rel_s % 300.0).abs() < 1e-6 {
+                        painter.text(
+                            p + Vec2::new(5.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            format!("{:+.0}m", a.t_rel_s / 60.0),
+                            theme::mono(9.5),
+                            theme::with_alpha(ACCENT, 200),
+                        );
+                    }
+                }
+                prev = Some((p, a.t_rel_s));
+            }
+        }
+    }
+
+    // Satellites + hit-testing. Marks are dead-reckoned forward with their
+    // rates so motion is smooth at the display rate.
     let pointer = resp.hover_pos();
-    let mut best: Option<(f32, String, String)> = None;
+    let mut best: Option<(f32, String, String, Pos2)> = None;
     let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
+    let mut n_labels = 0;
     if st.show_sats {
-        for s in &sky.sats {
-            let el = s.el + s.el_rate * age_s;
-            if el < 0.0 {
-                continue;
-            }
-            let az = s.az + s.az_rate * age_s;
-            let p = polar(center, radius, az, el);
-            let selected = st.selected.as_deref() == Some(s.satnum.as_str());
-            let col = alt_color(s.range_km);
-            if selected {
-                painter.circle_stroke(p, 9.0, Stroke::new(2.0, ACCENT));
-            }
-            painter.rect_filled(Rect::from_center_size(p, Vec2::splat(5.0)), 1.0, col);
-            if st.show_labels && (selected || el > 40.0) {
-                painter.text(p + Vec2::new(6.0, 0.0), Align2::LEFT_CENTER, &s.name, FontId::proportional(10.0), col.linear_multiply(0.9));
-            }
-            if let Some(ptr) = pointer {
-                let d = ptr.distance(p);
-                if d < 10.0 && best.as_ref().map_or(true, |b| d < b.0) {
-                    best = Some((d, s.satnum.clone(), format!("{}  az {:.1}° el {:.1}°  {:.0} km  {:+.2}°/s", s.name, az, el, s.range_km, s.az_rate)));
+        // Draw in two passes so the trackable set sits on top of the chaff.
+        for pass in 0..2 {
+            for s in &sky.sats {
+                let el = s.el + s.el_rate * age_s;
+                if el < 0.0 {
+                    continue;
+                }
+                let above = el >= mask;
+                if (pass == 0) == above {
+                    continue;
+                }
+                if !above && !st.show_below_mask {
+                    continue;
+                }
+                let az = s.az + s.az_rate * age_s;
+                let p = polar(center, radius, az, el);
+                let selected = st.selected.as_deref() == Some(s.satnum.as_str());
+                let hovered = st.hover.as_deref() == Some(s.satnum.as_str());
+                let col = theme::sat_color(s.range_km);
+                if above {
+                    let r = if s.range_km > 20_000.0 { 2.2 } else { 2.6 };
+                    painter.circle_filled(p, r, col);
+                } else {
+                    painter.circle_filled(p, 1.4, theme::with_alpha(col, 70));
+                }
+                if selected {
+                    painter.circle_stroke(p, 8.0, Stroke::new(1.6, ACCENT));
+                    painter.circle_stroke(p, 12.0, Stroke::new(0.8, theme::with_alpha(ACCENT, 90)));
+                } else if hovered {
+                    painter.circle_stroke(p, 7.0, Stroke::new(1.0, theme::with_alpha(TEXT, 180)));
+                }
+                let want_label = st.show_labels && (selected || hovered || (above && el > 35.0 && s.range_km < 20_000.0 && n_labels < 36));
+                if want_label {
+                    let lp = p + Vec2::new(7.0, 0.0);
+                    let w = 6.0 * s.name.len() as f32;
+                    if selected || hovered || grid.claim(lp, w, 12.0) {
+                        let lc = if selected { TEXT } else { theme::with_alpha(col, 200) };
+                        painter.text(lp, Align2::LEFT_CENTER, &s.name, theme::sans(10.5), lc);
+                        n_labels += 1;
+                    }
+                }
+                if let Some(ptr) = pointer {
+                    let d = ptr.distance(p);
+                    if d < 9.0 && best.as_ref().map_or(true, |b| d < b.0) {
+                        let cls = if s.range_km > 20_000.0 {
+                            "GEO"
+                        } else if s.range_km > 3_000.0 {
+                            "MEO"
+                        } else {
+                            "LEO"
+                        };
+                        best = Some((
+                            d,
+                            s.satnum.clone(),
+                            format!(
+                                "{}\n{} · {}   az {:.1}°  el {:.1}°\nrange {:.0} km   rate {:+.3}°/s",
+                                s.name, s.satnum, cls, az, el, s.range_km, s.az_rate
+                            ),
+                            p,
+                        ));
+                    }
                 }
             }
         }
     }
 
-    // Mount boresight + camera FOV footprint.
+    // Mount boresight + camera FOV footprint + setpoint vector.
     let mp = polar(center, radius, mount.az, mount.el);
-    painter.circle_stroke(mp, 7.0, Stroke::new(1.5, AMBER));
-    painter.line_segment([mp + Vec2::new(-11.0, 0.0), mp + Vec2::new(11.0, 0.0)], Stroke::new(1.0, AMBER));
-    painter.line_segment([mp + Vec2::new(0.0, -11.0), mp + Vec2::new(0.0, 11.0)], Stroke::new(1.0, AMBER));
+    if let Some((saz, sel)) = mount.setpoint {
+        let sp = polar(center, radius, saz, sel);
+        painter.line_segment([mp, sp], Stroke::new(1.0, theme::with_alpha(GREEN, 150)));
+        painter.line_segment([sp + Vec2::new(-4.0, -4.0), sp + Vec2::new(4.0, 4.0)], Stroke::new(1.0, GREEN));
+        painter.line_segment([sp + Vec2::new(-4.0, 4.0), sp + Vec2::new(4.0, -4.0)], Stroke::new(1.0, GREEN));
+    }
+    painter.circle_stroke(mp, 7.0, Stroke::new(1.4, AMBER));
+    painter.line_segment([mp + Vec2::new(-12.0, 0.0), mp + Vec2::new(-4.0, 0.0)], Stroke::new(1.0, AMBER));
+    painter.line_segment([mp + Vec2::new(4.0, 0.0), mp + Vec2::new(12.0, 0.0)], Stroke::new(1.0, AMBER));
+    painter.line_segment([mp + Vec2::new(0.0, -12.0), mp + Vec2::new(0.0, -4.0)], Stroke::new(1.0, AMBER));
+    painter.line_segment([mp + Vec2::new(0.0, 4.0), mp + Vec2::new(0.0, 12.0)], Stroke::new(1.0, AMBER));
     if let Some(cam) = shared.cam.load().as_ref() {
         let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
-        painter.circle_stroke(mp, fov_r.max(3.0), Stroke::new(1.0, AMBER.linear_multiply(0.6)));
+        painter.circle_stroke(mp, fov_r.max(3.0), Stroke::new(1.0, theme::with_alpha(AMBER, 120)));
     }
 
-    // Hover tooltip + click select.
+    // Hover card + click select.
     st.hover = None;
-    if let Some((_, satnum, text)) = best {
-        if let Some(ptr) = pointer {
-            painter.text(ptr + Vec2::new(12.0, -14.0), Align2::LEFT_CENTER, text, FontId::proportional(12.0), Color32::WHITE);
+    if let Some((_, satnum, text, p)) = best {
+        let galley = painter.layout_no_wrap(text, theme::mono(11.0), TEXT);
+        let size = galley.size() + Vec2::new(16.0, 10.0);
+        let mut at = p + Vec2::new(14.0, -size.y / 2.0);
+        if at.x + size.x > rect.right() - 4.0 {
+            at.x = p.x - 14.0 - size.x;
         }
+        at.y = at.y.clamp(rect.top() + 4.0, rect.bottom() - size.y - 4.0);
+        let card = Rect::from_min_size(at, size);
+        painter.rect(card, 4.0, theme::with_alpha(theme::RAISED, 235), Stroke::new(1.0, HAIRLINE));
+        painter.galley(card.min + Vec2::new(8.0, 5.0), galley, TEXT);
         st.hover = Some(satnum.clone());
         if resp.clicked() {
             st.selected = Some(satnum.clone());
@@ -197,15 +316,45 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     }
 
     // Corner readouts.
-    painter.text(rect.left_top() + Vec2::new(8.0, 8.0), Align2::LEFT_TOP,
-        format!("{}\n{} visible · compute {:.1} ms · {}", sky.utc_iso, sky.n_visible, sky.compute_ms, sky.status),
-        FontId::monospace(11.0), DIM);
+    painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &sky.utc_iso, theme::mono(12.5), TEXT);
+    let err = sky.status.contains("failed") || sky.status.contains("not found");
+    painter.text(
+        rect.left_top() + Vec2::new(10.0, 26.0),
+        Align2::LEFT_TOP,
+        format!("{} visible · {}", sky.n_visible, sky.status),
+        theme::mono(10.5),
+        if err { RED } else { DIM },
+    );
+    painter.text(
+        rect.left_top() + Vec2::new(10.0, 40.0),
+        Align2::LEFT_TOP,
+        format!("sky {:.1} ms · passes {:.0} ms", sky.compute_ms, passes.compute_ms),
+        theme::mono(10.0),
+        DIM,
+    );
+    // Legend.
+    let mut ly = rect.bottom() - 14.0;
+    for (name, col) in [("GEO", VIOLET), ("MEO", Color32::from_rgb(232, 150, 72)), ("LEO far", theme::sat_color(2400.0)), ("LEO near", theme::sat_color(400.0))] {
+        painter.circle_filled(Pos2::new(rect.left() + 14.0, ly), 2.6, col);
+        painter.text(Pos2::new(rect.left() + 22.0, ly), Align2::LEFT_CENTER, name, theme::sans(10.0), DIM);
+        ly -= 14.0;
+    }
+    // Right-corner: mount pointing.
+    painter.text(
+        rect.right_top() + Vec2::new(-10.0, 8.0),
+        Align2::RIGHT_TOP,
+        format!("boresight {:7.3}° / {:6.3}°", mount.az, mount.el),
+        theme::mono(11.0),
+        AMBER,
+    );
 }
 
-pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState) {
+pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx_cam: &crossbeam_channel::Sender<CamCmd>, show_solve: bool) {
     let cam = shared.cam.load();
+    let mount = shared.mount.load();
     let Some(cam) = cam.as_ref() else {
-        ui.label("camera: waiting for frames…");
+        theme::section(ui, "camera 1");
+        ui.label(egui::RichText::new("waiting for frames…").color(DIM));
         return;
     };
     if cam.seq != st.cam_seq {
@@ -216,85 +365,272 @@ pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState) {
         }
         st.cam_seq = cam.seq;
     }
+    ui.horizontal(|ui| {
+        theme::section(ui, "camera 1");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(format!("{:.0} fps", cam.fps)).font(theme::mono(10.5)).color(TEXT_2));
+            ui.label(egui::RichText::new(&cam.source).font(theme::mono(10.5)).color(DIM));
+        });
+    });
     if let Some(tex) = &st.cam_tex {
         let avail = ui.available_width();
         let h = avail * cam.height as f32 / cam.width as f32;
         let (r, p) = ui.allocate_painter(Vec2::new(avail, h), Sense::hover());
         p.image(tex.id(), r.rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        let sx = r.rect.width() / cam.width as f32;
+        let sy = r.rect.height() / cam.height as f32;
+        let to_screen = |x: f64, y: f64| Pos2::new(r.rect.left() + x as f32 * sx, r.rect.top() + y as f32 * sy);
         // Reticle.
         let c = r.rect.center();
-        p.line_segment([c + Vec2::new(-14.0, 0.0), c + Vec2::new(14.0, 0.0)], Stroke::new(1.0, AMBER));
-        p.line_segment([c + Vec2::new(0.0, -14.0), c + Vec2::new(0.0, 14.0)], Stroke::new(1.0, AMBER));
-        p.text(r.rect.left_top() + Vec2::new(6.0, 6.0), Align2::LEFT_TOP,
-            format!("CAM1 sim · {:.0} FPS · FOV {:.2}° · seq {}", cam.fps, cam.fov_deg, cam.seq),
-            FontId::monospace(11.0), AMBER);
+        let reticle = theme::with_alpha(AMBER, 200);
+        p.line_segment([c + Vec2::new(-16.0, 0.0), c + Vec2::new(-5.0, 0.0)], Stroke::new(1.0, reticle));
+        p.line_segment([c + Vec2::new(5.0, 0.0), c + Vec2::new(16.0, 0.0)], Stroke::new(1.0, reticle));
+        p.line_segment([c + Vec2::new(0.0, -16.0), c + Vec2::new(0.0, -5.0)], Stroke::new(1.0, reticle));
+        p.line_segment([c + Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 16.0)], Stroke::new(1.0, reticle));
+        // Hotspot overlay.
+        if mount.mode == "HOTSPOT" || mount.mode == "HANDOFF" {
+            let gate = shared.config.hotspot_gate_radius as f32 * sx;
+            p.circle_stroke(c, gate, Stroke::new(1.0, theme::with_alpha(GREEN, 60)));
+            if let Some((cx, cy)) = mount.hotspot_centroid {
+                let hp = to_screen(cx, cy);
+                let col = if mount.hotspot_acquired { GREEN } else { theme::with_alpha(GREEN, 120) };
+                p.circle_stroke(hp, 9.0, Stroke::new(1.4, col));
+                p.line_segment([c, hp], Stroke::new(1.0, theme::with_alpha(col, 120)));
+                p.text(hp + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER, format!("snr {:.1}", mount.hotspot_snr), theme::mono(10.5), col);
+            }
+            p.text(
+                r.rect.left_bottom() + Vec2::new(6.0, -6.0),
+                Align2::LEFT_BOTTOM,
+                format!("{}  {}", mount.mode, mount.hotspot_status),
+                theme::mono(10.5),
+                if mount.hotspot_acquired { GREEN } else { AMBER },
+            );
+        }
+        // Plate-solve overlay.
+        if show_solve {
+            let sv = shared.solve.load();
+            if sv.frame_seq != 0 {
+                for cpt in &sv.centroids {
+                    p.circle_stroke(to_screen(cpt[1], cpt[0]), 5.0, Stroke::new(0.8, theme::with_alpha(ACCENT, 140)));
+                }
+                for m in &sv.matched {
+                    p.circle_stroke(to_screen(m[1], m[0]), 7.0, Stroke::new(1.2, GREEN));
+                }
+            }
+        }
+        // Capture tag.
+        if cam.armed {
+            p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, RED);
+            p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, format!("REC {}", cam.armed_frames), theme::mono(10.5), RED);
+        }
+        p.text(
+            r.rect.left_top() + Vec2::new(6.0, 6.0),
+            Align2::LEFT_TOP,
+            format!("FOV {:.2}°  {}×{}  #{}", cam.fov_deg, cam.width, cam.height, cam.seq),
+            theme::mono(10.0),
+            theme::with_alpha(TEXT_2, 200),
+        );
+        if cam.deep_stars > 0 {
+            p.text(r.rect.right_bottom() + Vec2::new(-6.0, -6.0), Align2::RIGHT_BOTTOM, format!("{} Tycho stars", cam.deep_stars), theme::mono(9.5), DIM);
+        }
+    }
+    ui.horizontal(|ui| {
+        if theme::mode_button(ui, if cam.armed { "ARMED" } else { "ARM" }, cam.armed, RED) {
+            let _ = tx_cam.send(if cam.armed { CamCmd::Disarm } else { CamCmd::Arm });
+        }
+        ui.add(egui::TextEdit::singleline(&mut st.capture_name).desired_width(110.0).hint_text("run name"));
+        if ui.add_enabled(cam.armed, egui::Button::new("save run")).clicked() {
+            let _ = tx_cam.send(CamCmd::Dump { name: st.capture_name.clone() });
+        }
+    });
+    if let Some(d) = &cam.last_dump {
+        ui.label(egui::RichText::new(d).font(theme::mono(10.0)).color(DIM));
+    }
+}
+
+fn mode_color(mode: &str) -> Color32 {
+    match mode {
+        "RATE" => AMBER,
+        "PROGRAM" | "HANDOFF" => ACCENT,
+        "HOTSPOT" => GREEN,
+        _ => TEXT_2,
     }
 }
 
 pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &crossbeam_channel::Sender<MountCmd>) {
     let m = shared.mount.load();
-    ui.heading("Mount");
     ui.horizontal(|ui| {
-        for mode in ["STANDBY", "RATE", "PROGRAM"] {
-            let on = m.mode == mode;
-            if ui.selectable_label(on, mode).clicked() {
+        theme::section(ui, "mount");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            theme::tag(ui, &m.mode, mode_color(&m.mode));
+            ui.label(
+                egui::RichText::new(format!("{} · {:.1} Hz", m.transport, m.actual_hz))
+                    .font(theme::mono(10.5))
+                    .color(if m.loop_dead { RED } else { DIM }),
+            );
+        });
+    });
+    ui.horizontal(|ui| {
+        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT"] {
+            if theme::mode_button(ui, mode, m.mode == mode, mode_color(mode)) {
                 let _ = tx.send(MountCmd::SetMode(mode.to_string()));
             }
         }
-        if ui.button("STOP").clicked() {
+        if theme::mode_button(ui, "STOP", false, RED) {
             let _ = tx.send(MountCmd::Stop);
         }
     });
     ui.add_space(4.0);
-    egui::Grid::new("mount_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-        ui.label("AZ"); ui.monospace(format!("{:8.3}°", m.az)); ui.end_row();
-        ui.label("EL"); ui.monospace(format!("{:8.3}°", m.el)); ui.end_row();
-        ui.label("err"); ui.monospace(format!("{:+.3} / {:+.3}", m.az_error, m.el_error)); ui.end_row();
-        ui.label("rate cmd"); ui.monospace(format!("{:+} / {:+}  (gear {})", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling)); ui.end_row();
-        ui.label("loop"); ui.monospace(format!("{:.1} Hz", m.actual_hz)); ui.end_row();
-        ui.label("joystick"); ui.monospace(m.joystick.clone().unwrap_or_else(|| "none".into())); ui.end_row();
-        ui.label("stick"); ui.monospace(format!("{:+.2} / {:+.2}", m.stick.0, m.stick.1)); ui.end_row();
-        ui.label("target"); ui.monospace(st.selected.clone().unwrap_or_else(|| "—".into())); ui.end_row();
+    ui.horizontal(|ui| {
+        theme::readout(ui, "azimuth", &format!("{:8.3}", m.az), "°", TEXT);
+        ui.add_space(14.0);
+        theme::readout(ui, "elevation", &format!("{:7.3}", m.el), "°", TEXT);
+        ui.add_space(14.0);
+        let ec = if m.az_error.abs() + m.el_error.abs() < 0.01 { GREEN } else { AMBER };
+        theme::readout(ui, "error az / el", &format!("{:+.3} / {:+.3}", m.az_error, m.el_error), "°", ec);
     });
-    ui.add_space(6.0);
-    for s in &m.status {
-        ui.small(s);
+    ui.add_space(4.0);
+    egui::Grid::new("mount_grid").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
+        theme::kv(ui, "rate cmd", format!("{:+} / {:+}   gear {}", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling));
+        theme::kv(ui, "joystick", format!("{}   {:+.2} / {:+.2}", m.joystick.clone().unwrap_or_else(|| "none".into()), m.stick.0, m.stick.1));
+        theme::kv_colored(ui, "target", m.target.clone().unwrap_or_else(|| "—".into()), if m.target.is_some() { ACCENT } else { DIM });
+        if let Some((a, e)) = m.setpoint {
+            theme::kv(ui, "setpoint", format!("{a:8.3}° / {e:7.3}°"));
+        }
+        if m.mode == "HANDOFF" {
+            theme::kv_colored(ui, "handoff", format!("{} / {} detections", m.handoff_count, shared.config.handoff_min_frames), AMBER);
+        }
+        if m.mode == "HOTSPOT" {
+            theme::kv_colored(ui, "hotspot", format!("{}  snr {:.1}", m.hotspot_status, m.hotspot_snr), if m.hotspot_acquired { GREEN } else { AMBER });
+        }
+        theme::kv(
+            ui,
+            "gains az",
+            format!("{:.5} {:.5} {:.5}", m.gains[0][0], m.gains[0][1], m.gains[0][2]),
+        );
+        theme::kv(
+            ui,
+            "gains el",
+            format!("{:.5} {:.5} {:.5}", m.gains[1][0], m.gains[1][1], m.gains[1][2]),
+        );
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let tuning = m.autotune.is_some();
+        if theme::mode_button(ui, if tuning { "autotune running" } else { "autotune" }, tuning, ACCENT) {
+            let _ = tx.send(if tuning { MountCmd::AutotuneStop { revert: false } } else { MountCmd::AutotuneStart });
+        }
+        if tuning && ui.small_button("revert").clicked() {
+            let _ = tx.send(MountCmd::AutotuneStop { revert: true });
+        }
+        if ui.small_button("gains…").clicked() {
+            st.gains_edit = Some(if st.gains_edit.is_some() { st.gains_edit.unwrap() } else { m.gains });
+            if st.gains_edit.is_some() && ui.input(|i| i.modifiers.shift) {
+                st.gains_edit = None;
+            }
+        }
+    });
+    if let Some(t) = &m.autotune {
+        ui.label(egui::RichText::new(t).font(theme::mono(10.5)).color(ACCENT));
+    }
+    if let Some(mut g) = st.gains_edit {
+        let mut close = false;
+        theme::card(ui, |ui| {
+            egui::Grid::new("gains_grid").num_columns(4).spacing([8.0, 3.0]).show(ui, |ui| {
+                ui.label(egui::RichText::new("").small());
+                for h in ["P", "I", "D"] {
+                    ui.label(egui::RichText::new(h).color(DIM));
+                }
+                ui.end_row();
+                for (i, name) in ["az", "el"].iter().enumerate() {
+                    ui.label(egui::RichText::new(*name).color(TEXT_2));
+                    for j in 0..3 {
+                        ui.add(egui::DragValue::new(&mut g[i][j]).speed(0.00001).max_decimals(6));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("apply").clicked() {
+                    let _ = tx.send(MountCmd::SetGains { azm: (g[0][0], g[0][1], g[0][2]), alt: (g[1][0], g[1][1], g[1][2]) });
+                }
+                if ui.button("close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        st.gains_edit = if close { None } else { Some(g) };
+    }
+    ui.add_space(4.0);
+    theme::section(ui, "log");
+    for s in m.status.iter().rev().take(6) {
+        ui.label(egui::RichText::new(s).font(theme::mono(10.5)).color(TEXT_2));
     }
 }
 
 pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &crossbeam_channel::Sender<MountCmd>) {
     use egui_extras::{Column, TableBuilder};
     let sky = shared.sky.load();
-    ui.heading(format!("Visible satellites ({})", sky.n_visible));
+    let mask = shared.config.elevation_mask_deg;
+    ui.horizontal(|ui| {
+        theme::section(ui, &format!("visible now · {}", sky.n_visible));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.checkbox(&mut st.show_below_mask, "below mask");
+        });
+    });
+    let mut rows: Vec<_> = sky.sats.iter().filter(|s| s.el > 0.0 && (st.show_below_mask || s.el >= mask)).collect();
+    let (col, asc) = st.table_sort;
+    rows.sort_by(|a, b| {
+        let o = match col {
+            0 => a.name.cmp(&b.name),
+            1 => a.satnum.cmp(&b.satnum),
+            2 => a.el.partial_cmp(&b.el).unwrap(),
+            3 => a.az.partial_cmp(&b.az).unwrap(),
+            4 => a.range_km.partial_cmp(&b.range_km).unwrap(),
+            _ => a.az_rate.abs().partial_cmp(&b.az_rate.abs()).unwrap(),
+        };
+        if asc { o } else { o.reverse() }
+    });
+    let headers = ["Name", "NORAD", "El °", "Az °", "Range km", "Az rate °/s"];
     TableBuilder::new(ui)
         .striped(true)
-        .column(Column::initial(170.0).at_least(120.0))
-        .column(Column::initial(70.0))
+        .sense(Sense::click())
+        .column(Column::initial(190.0).at_least(120.0))
+        .column(Column::initial(64.0))
         .column(Column::initial(60.0))
         .column(Column::initial(60.0))
         .column(Column::initial(80.0))
-        .column(Column::initial(80.0))
-        .header(18.0, |mut h| {
-            for t in ["Name", "NORAD", "Az", "El", "Range km", "Az rate °/s"] {
-                h.col(|ui| { ui.strong(t); });
+        .column(Column::remainder())
+        .header(20.0, |mut h| {
+            for (i, t) in headers.iter().enumerate() {
+                h.col(|ui| {
+                    let active = st.table_sort.0 == i;
+                    let label = if active { format!("{t} {}", if st.table_sort.1 { "▲" } else { "▼" }) } else { t.to_string() };
+                    if ui.add(egui::Label::new(egui::RichText::new(label).color(if active { TEXT } else { TEXT_2 }).font(theme::sans(11.5))).sense(Sense::click())).clicked() {
+                        st.table_sort = if active { (i, !st.table_sort.1) } else { (i, i == 0 || i == 1) };
+                    }
+                });
             }
         })
         .body(|body| {
-            let rows: Vec<_> = sky.sats.iter().filter(|s| s.el > 0.0).collect();
-            body.rows(16.0, rows.len(), |mut row| {
+            body.rows(18.0, rows.len(), |mut row| {
                 let s = rows[row.index()];
                 let sel = st.selected.as_deref() == Some(s.satnum.as_str());
+                row.set_selected(sel);
+                let dim = s.el < mask;
+                let c = if dim { DIM } else { TEXT };
                 row.col(|ui| {
-                    if ui.selectable_label(sel, &s.name).clicked() {
-                        st.selected = Some(s.satnum.clone());
-                        let _ = tx.send(MountCmd::SelectTarget(Some(s.satnum.clone())));
-                    }
+                    ui.label(egui::RichText::new(&s.name).color(if sel { ACCENT } else { c }));
                 });
-                row.col(|ui| { ui.monospace(&s.satnum); });
-                row.col(|ui| { ui.monospace(format!("{:.1}", s.az)); });
-                row.col(|ui| { ui.monospace(format!("{:.1}", s.el)); });
-                row.col(|ui| { ui.monospace(format!("{:.0}", s.range_km)); });
-                row.col(|ui| { ui.monospace(format!("{:+.3}", s.az_rate)); });
+                row.col(|ui| { ui.label(egui::RichText::new(&s.satnum).font(theme::mono(11.0)).color(c)); });
+                row.col(|ui| { ui.label(egui::RichText::new(format!("{:.1}", s.el)).font(theme::mono(11.0)).color(c)); });
+                row.col(|ui| { ui.label(egui::RichText::new(format!("{:.1}", s.az)).font(theme::mono(11.0)).color(c)); });
+                row.col(|ui| { ui.label(egui::RichText::new(format!("{:.0}", s.range_km)).font(theme::mono(11.0)).color(c)); });
+                row.col(|ui| { ui.label(egui::RichText::new(format!("{:+.3}", s.az_rate)).font(theme::mono(11.0)).color(c)); });
+                if row.response().clicked() {
+                    st.selected = Some(s.satnum.clone());
+                    let _ = tx.send(MountCmd::SelectTarget(Some(s.satnum.clone())));
+                }
             });
         });
 }

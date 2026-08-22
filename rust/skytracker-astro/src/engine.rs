@@ -3,6 +3,7 @@
 //! natively in Phase 7. Owns the TLE catalog and the DE421 ephemeris.
 
 use crate::ephemeris::{body_id, Ephemeris};
+use crate::passes::{self, Pass, PassParams};
 use crate::sgp4_pass::{self, Observer, Satellite};
 use crate::spk::SpkError;
 use crate::stars;
@@ -144,6 +145,41 @@ impl Engine {
             })
             .cloned()
             .collect())
+    }
+
+    /// Geocentric sun position (km) on the true equator and equinox of
+    /// date — within the equation of the equinoxes (~20") of TEME, the
+    /// frame the pass magnitude/eclipse test works in. Light-time and
+    /// aberration corrected (the ~20" aberration is irrelevant there).
+    pub fn sun_tod_km(&self, jd_tt: f64) -> Option<[f64; 3]> {
+        let eph = self.eph.as_ref()?;
+        let ctx = crate::apparent::FrameContext::new(jd_tt);
+        let place = eph.apparent(10, &ctx, None).ok()?;
+        let p_km = [
+            place.position_au[0] * crate::apparent::AU_KM,
+            place.position_au[1] * crate::apparent::AU_KM,
+            place.position_au[2] * crate::apparent::AU_KM,
+        ];
+        Some(crate::frames::mat_vec(&ctx.m, &p_km))
+    }
+
+    /// Pass prediction for `satnums` (unknown keys skipped), sorted by AOS.
+    /// The sun vector for the brightness/eclipse estimate comes from the
+    /// loaded DE421 ephemeris; without one every `est_mag` is `None`
+    /// (`eclipsed_at_tca` false = "not computed").
+    pub fn predict_passes(
+        &self,
+        satnums: &[String],
+        observer: &Observer,
+        jd_tt_start: f64,
+        params: &PassParams,
+    ) -> Vec<Pass> {
+        let Some(tles) = self.tles.as_ref() else {
+            return Vec::new();
+        };
+        let sats: Vec<&Satellite> = satnums.iter().filter_map(|sn| tles.get(sn)).collect();
+        let sun = |jd_tt: f64| self.sun_tod_km(jd_tt);
+        passes::predict_passes(&sats, observer, jd_tt_start, params, &sun)
     }
 
     /// Apparent topocentric (alt, az, dist_km) of a solar-system body at

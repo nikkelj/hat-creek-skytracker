@@ -13,14 +13,14 @@ Crates:
 | Crate | Role |
 |-------|------|
 | `skytracker-core` | Pure-Rust engine: protocol, sim, PID, hotspot, transforms, controller, core loop (no pyo3) |
-| `skytracker-astro` | Phase 1 astro engine replacing skyfield: timescales/GAST (IAU2000A tables generated from skyfield), SGP4 passes, pure-Rust SPK reader for de421.bsp, body/star apparent places, TLE catalog. Parity: sats 0.03″, GAST 1.9 ms, bodies 0.79″, stars 0.17″; bulk precompute 76× |
+| `skytracker-astro` | Phase 1 astro engine replacing skyfield: timescales/GAST (IAU2000A tables generated from skyfield), SGP4 passes, pure-Rust SPK reader for de421.bsp, body/star apparent places, TLE catalog, pass prediction (`passes.rs`: AOS/TCA/LOS, peak rate, est. magnitude + cylindrical shadow, apogee — 0.00 s / 0.012 s / 0.0003 mag vs skyfield). Parity: sats 0.03″, GAST 1.9 ms, bodies 0.79″, stars 0.17″; bulk precompute 76× |
 | `skytracker-ffi` | The ONLY pyo3 crate; builds the Python module `skytracker_core` (strangler seam, deleted at the end). Exposes the core-loop classes + `AstroEngine` |
 | `skytracker-platesolve` | Phase 2 tetra3 port: pattern hash bit-exact vs the existing .npz databases, centroids 0.0 px, solutions numerically identical to Python tetra3 (12/12 A/B fields) |
-| `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg) |
+| `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg); `alignment.rs` = the alignment runner (Fibonacci grid + holdout, spiral grid search, running fit/early stop, backtest, supervised) as a pure state machine, 23 tests incl. Python-golden grid parity |
 | `skytracker-imaging` | Phase 3a imaging primitives (filters/warps/phase-correlate/Shi-Tomasi/LK/RANSAC) at cv2 parity: filters ≤9e-5, LK 0.006 px, RANSAC identical. Phase 3b composes them into the stacking/stabilizer/sharpen pipelines |
 | `skytracker-adsb` | Phase 5 Mode-S DF17/18 decode (pyModeS subset, 242-frame corpus decodes identically) + WGS84 topocentric geometry |
 | `skytracker-camera` | Phase 4a capture pipeline: pump/ring/exposure-midpoint stamps/armed BMP dump + ASI DLL binding (libloading, rig-ready). Sim-proven 100 FPS sustained, 2,244 FPS headroom vs Python's GIL-bound 4-10 |
-| `skytracker-app` | Phase 7 native app (eframe/egui on wgpu, 120 Hz repaint target): ArcSwap snapshot bus + command channel, sky/mount/camera workers over the engines; first light 2026-08-22 — `cargo run --release -p skytracker-app` from the repo root |
+| `skytracker-app` | Phase 7 native app (eframe/egui on wgpu, 120 Hz repaint target): ArcSwap snapshot bus + command channels; workers sky (astro engine, passes, arcs) / mount (core loop over sim or serial, gamepad, autotune) / camera (Tycho star-field sim or ASI, in-process HANDOFF/HOTSPOT frame feed, capture) / align (tetra3 plate solve + alignment runner). Screens: Track, Passes, Align, Replay, Mount 3D, Sim, Config. `cargo run --release -p skytracker-app` (finds the repo root from cwd, SKYTRACKER_ROOT, or the build checkout); `SKYTRACKER_AUTOTEST=<s>` headless closed-loop check, `SKYTRACKER_SCREENSHOT_DIR=<dir>` screenshot tour |
 
 ## Ported so far
 

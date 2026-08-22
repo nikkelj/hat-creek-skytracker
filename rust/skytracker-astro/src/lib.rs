@@ -16,6 +16,7 @@ pub mod engine;
 pub mod ephemeris;
 pub mod frames;
 mod generated_tables;
+pub mod passes;
 pub mod sgp4_pass;
 pub mod spk;
 pub mod stars;

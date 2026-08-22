@@ -1,8 +1,10 @@
 //! Sky worker: owns the astro engine (TLE catalog, DE421, Hipparcos) and
 //! publishes SkySnapshot — satellites + bodies at 2 Hz (the UI dead-reckons
-//! between snapshots), stars every five seconds — entirely off the UI thread.
+//! between snapshots), stars every five seconds — plus PassesSnapshot (the
+//! upcoming-pass table every minute and the selected satellite's track
+//! every 2 s), entirely off the UI thread.
 
-use crate::state::{BodyMark, SatMark, Shared, SkySnapshot, StarMark};
+use crate::state::{ArcPoint, BodyMark, PassRow, PassesSnapshot, SatMark, Shared, SkySnapshot, StarMark};
 use skytracker_astro::engine::Engine;
 use skytracker_astro::sgp4_pass::{self, Observer};
 use skytracker_astro::stars;
@@ -10,21 +12,26 @@ use skytracker_astro::time;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub fn now_jd_tt() -> f64 {
-    let unix = std::time::SystemTime::now()
+pub fn now_unix() -> f64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs_f64();
-    time::utc_to_tt(2440587.5 + unix / 86400.0)
+        .as_secs_f64()
 }
 
-fn utc_iso(jd_tt: f64) -> String {
-    let jd_utc = time::tt_to_utc(jd_tt);
-    let unix = (jd_utc - 2440587.5) * 86400.0;
+pub fn now_jd_tt() -> f64 {
+    time::utc_to_tt(2440587.5 + now_unix() / 86400.0)
+}
+
+pub fn jd_tt_to_unix(jd_tt: f64) -> f64 {
+    (time::tt_to_utc(jd_tt) - 2440587.5) * 86400.0
+}
+
+/// Civil (y, m, d, h, min, s) from unix seconds (Howard Hinnant's algorithm).
+pub fn civil_from_unix(unix: f64) -> (i64, i64, i64, i64, i64, i64) {
     let secs = unix.floor() as i64;
     let days = secs.div_euclid(86400);
     let sod = secs.rem_euclid(86400);
-    // Civil date from days since epoch (Howard Hinnant's algorithm).
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;
@@ -35,15 +42,27 @@ fn utc_iso(jd_tt: f64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
-        y,
-        m,
-        d,
-        sod / 3600,
-        (sod % 3600) / 60,
-        sod % 60
-    )
+    (y, m, d, sod / 3600, (sod % 3600) / 60, sod % 60)
+}
+
+pub fn utc_iso_from_unix(unix: f64) -> String {
+    let (y, m, d, hh, mm, ss) = civil_from_unix(unix);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+pub fn hms_from_unix(unix: f64) -> String {
+    let (_, _, _, hh, mm, ss) = civil_from_unix(unix);
+    format!("{hh:02}:{mm:02}:{ss:02}")
+}
+
+/// `YYYY_MM_DD_HH_MM_SS` like the Python capture directories.
+pub fn utc_stamp_compact() -> String {
+    let (y, m, d, hh, mm, ss) = civil_from_unix(now_unix());
+    format!("{y:04}_{m:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}")
+}
+
+fn utc_iso(jd_tt: f64) -> String {
+    utc_iso_from_unix(jd_tt_to_unix(jd_tt))
 }
 
 pub fn spawn(shared: Arc<Shared>, repo_root: std::path::PathBuf) {
@@ -107,7 +126,11 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     let mut visible: Vec<String> = Vec::new();
     let mut last_gate = Instant::now() - Duration::from_secs(3600);
     let mut last_stars = Instant::now() - Duration::from_secs(3600);
+    let mut last_passes = Instant::now() - Duration::from_secs(3600);
     let mut star_marks: Vec<StarMark> = Vec::new();
+    let mut pass_rows: Vec<PassRow> = Vec::new();
+    let mut pass_ms = 0.0;
+    let mut pass_computed = 0.0;
 
     loop {
         let t0 = Instant::now();
@@ -204,10 +227,51 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             },
         }));
 
+        // Pass table every 60 s over the gated set (+ everything that will
+        // rise in the horizon: the gate window is short, so use the whole
+        // catalog through the engine's coarse prediction).
+        if last_passes.elapsed() > Duration::from_secs(60) && !all_satnums.is_empty() {
+            let tp = Instant::now();
+            pass_rows = compute_passes(&engine, &all_satnums, &observer, jd_tt, cfg.elevation_mask_deg);
+            pass_ms = tp.elapsed().as_secs_f64() * 1000.0;
+            pass_computed = now_unix();
+            last_passes = Instant::now();
+        }
+
+        // Selected satellite's track, -10..+10 min at 5 s steps.
+        let selected = shared.selected.load();
+        let mut arc = Vec::new();
+        if let (Some(sn), Some(cat)) = (selected.as_ref().as_ref(), engine.tles.as_ref()) {
+            if let Some(sat) = cat.get(sn) {
+                let mut t = -600.0;
+                while t <= 600.0 {
+                    if let Ok((alt, az, _)) = sgp4_pass::satellite_altaz(sat, jd_tt + t / 86400.0, &geom) {
+                        if alt > -3.0 {
+                            arc.push(ArcPoint { t_rel_s: t, az, el: alt });
+                        }
+                    }
+                    t += 5.0;
+                }
+            }
+        }
+        shared.passes.store(Arc::new(PassesSnapshot {
+            computed_unix: pass_computed,
+            horizon_h: 6.0,
+            rows: pass_rows.clone(),
+            compute_ms: pass_ms,
+            arc,
+            arc_satnum: selected.as_ref().clone(),
+        }));
+
         // 2 Hz: the UI dead-reckons marks between snapshots with their rates.
         let sleep = Duration::from_millis(500).saturating_sub(t0.elapsed());
         std::thread::sleep(sleep);
     }
+}
+
+/// Upcoming passes over the next 6 h (skytracker-astro `passes`).
+fn compute_passes(engine: &Engine, satnums: &[String], observer: &Observer, jd_tt: f64, mask_deg: f64) -> Vec<PassRow> {
+    crate::passes_bridge::compute(engine, satnums, observer, jd_tt, mask_deg)
 }
 
 fn publish_status(shared: &Shared, msg: String) {

@@ -1,38 +1,177 @@
 //! Hat Creek Skytracker — native app (Phase 7 of the Rust port).
 //!
 //! eframe + egui on wgpu at a 120 Hz display target; workers publish
-//! snapshots (sky, mount, camera), the UI renders them and sends commands.
-//! Run from the repo root (it reads config.json, tle_cache.tle, de421.bsp,
-//! hip_main.dat from the working directory):
+//! snapshots (sky, passes, mount, camera, solve, alignment), the UI renders
+//! them and sends commands. Reads config.json, tle_cache.tle, de421.bsp,
+//! hip_main.dat, tyc_main.dat from the repo root (found from SKYTRACKER_ROOT,
+//! the working directory, or the checkout the binary was built from):
 //!
 //!   cargo run --release -p skytracker-app
+//!
+//! SKYTRACKER_SCREENSHOT_DIR=<dir> cycles every screen and saves PNGs.
 
+mod align;
+mod align_runner;
 mod camera;
+mod deepsky;
 mod mount;
+mod mount3d;
+mod passes_bridge;
+mod replay;
+mod screens;
 mod sky;
 mod state;
+mod theme;
 mod ui;
 
-use state::{MountCmd, Shared};
+use state::{AlignCmd, CamCmd, MountCmd, Shared};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use theme::{ACCENT, DIM, GREEN, RED, TEXT_2};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Screen {
+    Track,
+    Passes,
+    Align,
+    Replay,
+    Mount3d,
+    Sim,
+    Config,
+}
+
+impl Screen {
+    const ALL: [Screen; 7] = [Screen::Track, Screen::Passes, Screen::Align, Screen::Replay, Screen::Mount3d, Screen::Sim, Screen::Config];
+    fn label(self) -> &'static str {
+        match self {
+            Screen::Track => "Track",
+            Screen::Passes => "Passes",
+            Screen::Align => "Align",
+            Screen::Replay => "Replay",
+            Screen::Mount3d => "Mount 3D",
+            Screen::Sim => "Sim",
+            Screen::Config => "Config",
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            Screen::Track => "track",
+            Screen::Passes => "passes",
+            Screen::Align => "align",
+            Screen::Replay => "replay",
+            Screen::Mount3d => "mount3d",
+            Screen::Sim => "sim",
+            Screen::Config => "config",
+        }
+    }
+}
+
+struct Screenshots {
+    dir: std::path::PathBuf,
+    idx: usize,
+    switched_at: Instant,
+    requested: bool,
+    solve_sent: bool,
+}
 
 struct App {
     shared: Arc<Shared>,
     tx: crossbeam_channel::Sender<MountCmd>,
+    tx_cam: crossbeam_channel::Sender<CamCmd>,
+    tx_align: crossbeam_channel::Sender<AlignCmd>,
     ui: ui::UiState,
+    passes: screens::PassesState,
+    align: screens::AlignState,
+    config: screens::ConfigState,
+    mount3d: mount3d::Mount3dView,
+    replay: replay::ReplayState,
+    screen: Screen,
     started: Instant,
+    shots: Option<Screenshots>,
+    autotest: Option<Autotest>,
+}
+
+struct Autotest {
+    duration: f64,
+    armed: bool,
+    captured: bool,
+    dumped: bool,
+    solved: bool,
+    aligned: bool,
+    last_log: f64,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, shared: Arc<Shared>, tx: crossbeam_channel::Sender<MountCmd>) -> Self {
-        ui::apply_theme(&cc.egui_ctx);
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        shared: Arc<Shared>,
+        tx: crossbeam_channel::Sender<MountCmd>,
+        tx_cam: crossbeam_channel::Sender<CamCmd>,
+        tx_align: crossbeam_channel::Sender<AlignCmd>,
+    ) -> Self {
+        theme::install(&cc.egui_ctx);
+        let shots = std::env::var("SKYTRACKER_SCREENSHOT_DIR").ok().map(|d| Screenshots {
+            dir: std::path::PathBuf::from(d),
+            idx: 0,
+            switched_at: Instant::now(),
+            requested: false,
+            solve_sent: false,
+        });
         App {
             shared,
             tx,
+            tx_cam,
+            tx_align,
             ui: ui::UiState::default(),
+            passes: screens::PassesState::default(),
+            align: screens::AlignState::default(),
+            config: screens::ConfigState::default(),
+            mount3d: mount3d::Mount3dView::default(),
+            replay: replay::ReplayState::default(),
+            screen: Screen::Track,
             started: Instant::now(),
+            shots,
+            autotest: std::env::var("SKYTRACKER_AUTOTEST").ok().and_then(|v| v.parse::<f64>().ok()).map(|d| Autotest { duration: d, armed: false, captured: false, dumped: false, solved: false, aligned: false, last_log: 0.0 }),
         }
+    }
+
+    fn top_bar(&mut self, ctx: &egui::Context, ui_fps: f64) {
+        egui::TopBottomPanel::top("top").exact_height(34.0).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Skytracker").font(theme::sans(13.0)).color(TEXT_2));
+                ui.add_space(10.0);
+                for s in Screen::ALL {
+                    let active = self.screen == s;
+                    let text = egui::RichText::new(s.label()).font(theme::sans(12.5)).color(if active { theme::TEXT } else { TEXT_2 });
+                    let b = egui::Button::new(text)
+                        .fill(if active { theme::with_alpha(ACCENT, 40) } else { egui::Color32::TRANSPARENT })
+                        .stroke(egui::Stroke::NONE)
+                        .rounding(egui::Rounding::same(4.0));
+                    if ui.add(b).clicked() {
+                        self.screen = s;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(format!("{ui_fps:5.1} Hz")).font(theme::mono(10.5)).color(DIM));
+                    ui.label(egui::RichText::new(format!("up {:.0} s", self.started.elapsed().as_secs_f64())).font(theme::mono(10.5)).color(DIM));
+                    let m = self.shared.mount.load();
+                    let col = match m.mode.as_str() {
+                        "RATE" => theme::AMBER,
+                        "PROGRAM" | "HANDOFF" => ACCENT,
+                        "HOTSPOT" => GREEN,
+                        _ => TEXT_2,
+                    };
+                    theme::tag(ui, &m.mode, col);
+                    if m.loop_dead {
+                        theme::tag(ui, "LOOP DEAD", RED);
+                    }
+                    let sky = self.shared.sky.load();
+                    ui.label(egui::RichText::new(&sky.utc_iso).font(theme::mono(11.5)).color(theme::TEXT));
+                });
+            });
+        });
     }
 }
 
@@ -50,45 +189,217 @@ impl eframe::App for App {
         let avg = self.ui.frame_times.iter().sum::<f64>() / self.ui.frame_times.len().max(1) as f64;
         let ui_fps = if avg > 0.0 { 1.0 / avg } else { 0.0 };
         ctx.request_repaint_after(Duration::from_micros(8_300));
-        // Pin the dark theme: egui follows the OS theme by default and would
-        // flip the panels light on a light Windows desktop.
+        // Pin the dark theme: egui follows the OS theme by default.
         ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+        // Screenshot tour.
+        if let Some(shots) = self.shots.as_mut() {
+            for ev in ctx.input(|i| i.raw.events.clone()) {
+                if let egui::Event::Screenshot { image, .. } = ev {
+                    let path = shots.dir.join(format!("rust_app_{}.png", self.screen.slug()));
+                    let _ = std::fs::create_dir_all(&shots.dir);
+                    let w = image.width() as u32;
+                    let h = image.height() as u32;
+                    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+                    for p in &image.pixels {
+                        rgba.extend_from_slice(&[p.r(), p.g(), p.b(), 255]);
+                    }
+                    if let Err(e) = image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
+                        eprintln!("screenshot failed: {e}");
+                    } else {
+                        eprintln!("screenshot -> {}", path.display());
+                    }
+                    shots.idx += 1;
+                    shots.requested = false;
+                    shots.switched_at = Instant::now();
+                    if shots.idx >= Screen::ALL.len() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.screen = Screen::ALL[shots.idx];
+                    }
+                }
+            }
+            if shots.idx < Screen::ALL.len() {
+                self.screen = Screen::ALL[shots.idx];
+                let dwell = match shots.idx { 0 => 12.0, 2 => 8.0, _ => 4.0 };
+                if shots.idx == 0 && self.ui.selected.is_none() && shots.switched_at.elapsed().as_secs_f64() > 3.0 {
+                    // Select something for the track screen so arcs + labels show.
+                    if let Some(s) = pick_demo_target(&self.shared) {
+                        self.ui.selected = Some(s.clone());
+                        let _ = self.tx.send(MountCmd::SelectTarget(Some(s)));
+                        let _ = self.tx.send(MountCmd::SetMode("PROGRAM".into()));
+                    }
+                }
+                if Screen::ALL[shots.idx] == Screen::Align && shots.switched_at.elapsed().as_secs_f64() > 0.5 {
+                    // Keep solving once a second until one sticks (sparse sim fields).
+                    let sv = self.shared.solve.load();
+                    if !sv.last_ok && !sv.busy && (!shots.solve_sent || shots.switched_at.elapsed().as_secs_f64() % 1.0 < 0.03) {
+                        let _ = self.tx_align.send(AlignCmd::SolveNow);
+                        shots.solve_sent = true;
+                    }
+                }
+                if !shots.requested && shots.switched_at.elapsed().as_secs_f64() > dwell {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                    shots.requested = true;
+                }
+            }
+        }
+
+        // Headless closed-loop check: SKYTRACKER_AUTOTEST=<seconds> injects a
+        // sim misalignment, selects a LEO target, arms HANDOFF and logs the
+        // loop once a second, then exits.
+        if let Some(at) = self.autotest.as_mut() {
+            let t = self.started.elapsed().as_secs_f64();
+            if !at.armed && t > 4.0 {
+                if let Some(s) = pick_demo_target(&self.shared) {
+                    let mut sim = (**self.shared.sim.load()).clone();
+                    sim.misalign_az_deg = 0.04;
+                    sim.misalign_el_deg = -0.03;
+                    self.shared.sim.store(Arc::new(sim));
+                    self.ui.selected = Some(s.clone());
+                    let _ = self.tx.send(MountCmd::SelectTarget(Some(s.clone())));
+                    let _ = self.tx.send(MountCmd::SetMode("HANDOFF".into()));
+                    eprintln!("autotest: target {s}, misalignment +0.040/-0.030 deg, HANDOFF armed at t={t:.1}s");
+                    at.armed = true;
+                }
+            }
+            if at.armed && !at.captured && t > 9.0 {
+                let _ = self.tx_cam.send(CamCmd::Arm);
+                at.captured = true;
+            }
+            if at.captured && !at.dumped && t > 11.0 {
+                let _ = self.tx_cam.send(CamCmd::Dump { name: "autotest".into() });
+                at.dumped = true;
+            }
+            if at.armed && !at.solved && t > 20.0 {
+                let _ = self.tx_align.send(AlignCmd::SolveNow);
+                at.solved = true;
+            }
+            if at.armed && !at.aligned && t > 26.0 {
+                let _ = self.tx.send(MountCmd::SetMode("STANDBY".into()));
+                let _ = self.tx_align.send(AlignCmd::Start { n_points: 8, supervised: false });
+                at.aligned = true;
+            }
+            if t - at.last_log >= 1.0 {
+                at.last_log = t;
+                if at.solved {
+                    let sv = self.shared.solve.load();
+                    let al = self.shared.align.load();
+                    eprintln!("autotest   solve: {} | align: {} ({}/{}) rms={:?}", sv.message, al.status, al.point, al.n_points, al.rms_arcsec.map(|r| (r * 10.0).round() / 10.0));
+                    for l in al.log.iter().rev().take(1) {
+                        eprintln!("autotest   align-log: {l}");
+                    }
+                }
                 let m = self.shared.mount.load();
-                ui.label(egui::RichText::new(format!("MODE {}", m.mode)).color(ui::AMBER).monospace());
-                ui.separator();
-                ui.checkbox(&mut self.ui.show_stars, "stars");
-                ui.checkbox(&mut self.ui.show_sats, "satellites");
-                ui.checkbox(&mut self.ui.show_labels, "labels");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(format!("UI {ui_fps:5.1} Hz")).monospace().color(ui::DIM));
-                    ui.separator();
-                    ui.label(egui::RichText::new(format!("up {:.0}s", self.started.elapsed().as_secs_f64())).monospace().color(ui::DIM));
+                let c = self.shared.cam.load();
+                eprintln!(
+                    "autotest t={t:5.1}s mode={:<8} az={:8.3} el={:7.3} err={:+.4}/{:+.4} rate={:+}/{:+} hs={} snr={:.1} cen={:?} handoff={} loop={:.1}Hz cam={:.0}fps",
+                    m.mode, m.az, m.el, m.az_error, m.el_error, m.rate_cmd.0, m.rate_cmd.1, m.hotspot_status, m.hotspot_snr,
+                    m.hotspot_centroid.map(|(x, y)| ((x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0)), m.handoff_count, m.actual_hz,
+                    c.as_ref().as_ref().map(|c| c.fps).unwrap_or(0.0)
+                );
+                if let Some(s) = m.status.last() {
+                    eprintln!("autotest   last: {s}");
+                }
+            }
+            if t > at.duration {
+                eprintln!("autotest: done");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        self.top_bar(ctx, ui_fps);
+
+        match self.screen {
+            Screen::Track => {
+                egui::SidePanel::right("right").default_width(430.0).min_width(360.0).show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui::camera_panel(ui, &self.shared, &mut self.ui, &self.tx_cam, false);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
+                    });
                 });
-            });
-        });
-
-        egui::SidePanel::right("right").default_width(420.0).show(ctx, |ui| {
-            ui::camera_panel(ui, &self.shared, &mut self.ui);
-            ui.separator();
-            ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
-        });
-
-        egui::TopBottomPanel::bottom("bottom").default_height(220.0).resizable(true).show(ctx, |ui| {
-            ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
-        });
+                egui::TopBottomPanel::bottom("bottom").default_height(230.0).resizable(true).show(ctx, |ui| {
+                    ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
+                });
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.ui.show_stars, "stars");
+                        ui.checkbox(&mut self.ui.show_sats, "satellites");
+                        ui.checkbox(&mut self.ui.show_labels, "labels");
+                        ui.checkbox(&mut self.ui.show_below_mask, "below mask");
+                    });
+                    ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
+                });
+            }
+            Screen::Passes => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    screens::passes_screen(ui, &self.shared, &mut self.ui, &mut self.passes, &self.tx);
+                });
+            }
+            Screen::Align => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    screens::align_screen(ui, &self.shared, &mut self.ui, &mut self.align, &self.tx_align, &self.tx, &self.tx_cam);
+                });
+            }
+            Screen::Replay => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let dir = self.shared.config.repo_root().join(&self.shared.config.captures_dir);
+                    replay::screen(ui, &mut self.replay, &dir);
+                });
+            }
+            Screen::Mount3d => {
+                egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                    let m = self.shared.mount.load();
+                    let cfg = &self.shared.config;
+                    let cam_fov = self.shared.cam.load().as_ref().as_ref().map(|c| c.fov_deg).unwrap_or(1.0);
+                    let pose = mount3d::MountPose {
+                        az_deg: m.azm,
+                        el_deg: m.alt,
+                        mount_mode: &cfg.mount_mode,
+                        lat_deg: cfg.lat_deg,
+                        target: m.setpoint,
+                        tracking: matches!(m.mode.as_str(), "PROGRAM" | "HANDOFF" | "HOTSPOT"),
+                        fov_deg: cam_fov,
+                        az_limits: Some(cfg.azm_limit),
+                        el_limits: Some(cfg.alt_limit),
+                    };
+                    let size = ui.available_size();
+                    self.mount3d.ui(ui, size, &pose);
+                });
+            }
+            Screen::Sim => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    screens::sim_screen(ui, &self.shared);
+                });
+            }
+            Screen::Config => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    screens::config_screen(ui, &self.shared, &mut self.config, &self.tx);
+                });
+            }
+        }
     }
 }
 
+/// A good demo/track target: a LEO satellite well above the mask that
+/// stays up for a while (highest elevation among range < 2500 km).
+fn pick_demo_target(shared: &Shared) -> Option<String> {
+    let sky = shared.sky.load();
+    let mask = shared.config.elevation_mask_deg;
+    sky.sats
+        .iter()
+        .filter(|s| s.range_km < 2500.0 && s.el > mask + 15.0 && s.el < 60.0 && s.az_rate.abs() < 0.6 && s.el_rate > -0.05)
+        .max_by(|a, b| a.el.partial_cmp(&b.el).unwrap())
+        .map(|s| s.satnum.clone())
+}
+
 /// Locate the repo root (config.json + tle_cache.tle) from SKYTRACKER_ROOT,
-/// the working directory, or any parent of it -- so `cargo run` from rust/
-/// and launching the exe from anywhere both work.
+/// the working directory or any parent of it, or the checkout this binary
+/// was compiled from -- so `cargo run` from rust/ and a double-clicked exe
+/// both work.
 fn find_repo_root() -> std::path::PathBuf {
     if let Ok(r) = std::env::var("SKYTRACKER_ROOT") {
         return std::path::PathBuf::from(r);
@@ -104,8 +415,6 @@ fn find_repo_root() -> std::path::PathBuf {
             None => break,
         }
     }
-    // Launched from a build directory (double-clicked exe): fall back to the
-    // checkout this binary was compiled from.
     let compiled_from = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     if compiled_from.join("tle_cache.tle").exists() || compiled_from.join("config.json").exists() {
         return compiled_from.canonicalize().unwrap_or(compiled_from);
@@ -121,28 +430,30 @@ fn main() -> eframe::Result<()> {
         Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
         Err(_) => config.ui_vsync,
     };
-    let shared = Shared::new(config);
+    let core = skytracker_core::core_loop::Shared::new(mount::make_inputs(&config));
+    let shared = Shared::new(config, core);
     let (tx, rx) = crossbeam_channel::unbounded::<MountCmd>();
+    let (tx_cam, rx_cam) = crossbeam_channel::unbounded::<CamCmd>();
+    let (tx_align, rx_align) = crossbeam_channel::unbounded::<AlignCmd>();
 
     sky::spawn(shared.clone(), root.clone());
     mount::spawn(shared.clone(), rx, root.clone());
-    camera::spawn(shared.clone());
+    camera::spawn(shared.clone(), rx_cam, root.clone());
+    align::spawn(shared.clone(), rx_align, tx.clone());
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_title("Hat Creek Skytracker")
-            .with_inner_size([1700.0, 1050.0])
+            .with_inner_size([1760.0, 1060.0])
             .with_min_inner_size([1100.0, 700.0]),
-        // vsync caps the UI at the display refresh (60 Hz on a 60 Hz panel).
-        // config "ui_vsync": false or SKYTRACKER_VSYNC=0 lets it run free.
-        vsync: vsync,
+        vsync,
         ..Default::default()
     };
-    let tx2 = tx.clone();
+    let (tx2, tx_cam2, tx_align2) = (tx.clone(), tx_cam.clone(), tx_align.clone());
     eframe::run_native(
         "Hat Creek Skytracker",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, tx2)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, tx2, tx_cam2, tx_align2)))),
     )
 }

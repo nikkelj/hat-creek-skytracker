@@ -244,7 +244,7 @@ and satellite PROGRAM tracking, and a live satellite table — all rendered
 from worker snapshots at a 120 Hz repaint target. Run from the repo root:
 
 ```
-cd rust && cargo run --release -p skytracker-app
+cargo run --release --manifest-path rust/Cargo.toml -p skytracker-app
 ```
 
 ## Hardware Simulator

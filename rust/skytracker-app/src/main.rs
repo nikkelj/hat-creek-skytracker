@@ -50,6 +50,9 @@ impl eframe::App for App {
         let avg = self.ui.frame_times.iter().sum::<f64>() / self.ui.frame_times.len().max(1) as f64;
         let ui_fps = if avg > 0.0 { 1.0 / avg } else { 0.0 };
         ctx.request_repaint_after(Duration::from_micros(8_300));
+        // Pin the dark theme: egui follows the OS theme by default and would
+        // flip the panels light on a light Windows desktop.
+        ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -85,8 +88,30 @@ impl eframe::App for App {
     }
 }
 
+/// Locate the repo root (config.json + tle_cache.tle) from SKYTRACKER_ROOT,
+/// the working directory, or any parent of it -- so `cargo run` from rust/
+/// and launching the exe from anywhere both work.
+fn find_repo_root() -> std::path::PathBuf {
+    if let Ok(r) = std::env::var("SKYTRACKER_ROOT") {
+        return std::path::PathBuf::from(r);
+    }
+    let cwd = std::env::current_dir().expect("cwd");
+    let mut dir = cwd.clone();
+    for _ in 0..5 {
+        if dir.join("tle_cache.tle").exists() || dir.join("config.json").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
+        }
+    }
+    cwd
+}
+
 fn main() -> eframe::Result<()> {
-    let root = std::env::current_dir().expect("cwd");
+    let root = find_repo_root();
+    eprintln!("skytracker: repo root = {}", root.display());
     let config = state::Config::load(&root.join("config.json"));
     let shared = Shared::new(config);
     let (tx, rx) = crossbeam_channel::unbounded::<MountCmd>();

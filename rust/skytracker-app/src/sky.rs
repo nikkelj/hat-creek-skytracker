@@ -71,13 +71,17 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
         }
     };
     let tle_path = root.join("tle_cache.tle");
+    let mut load_error = String::new();
     let n_catalog = match engine.load_tle_file(&tle_path) {
         Ok(n) => n,
         Err(e) => {
-            publish_status(&shared, format!("TLE load failed: {e}"));
+            load_error = format!("TLE load failed ({}): {e} -- run from the repo root or set SKYTRACKER_ROOT", tle_path.display());
             0
         }
     };
+    if !de421.exists() {
+        load_error = format!("{load_error} | de421.bsp not found at {}", de421.display());
+    }
     let all_satnums: Vec<String> = engine
         .tles
         .as_ref()
@@ -193,7 +197,11 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             bodies: body_marks,
             n_catalog,
             compute_ms,
-            status: format!("{n_catalog} TLEs · {} stars", star_marks.len()),
+            status: if load_error.is_empty() {
+                format!("{n_catalog} TLEs · {} stars", star_marks.len())
+            } else {
+                load_error.clone()
+            },
         }));
 
         let sleep = Duration::from_secs(1).saturating_sub(t0.elapsed());

@@ -32,23 +32,58 @@
       "pixel_size": 2.9,
       "array_size_diagonal": 9.07142,
       "focal_length": 162.0,
-      "alignment_rotation": 0.0,
+      "alignment_rotation": 180.0,
       "gain": 225,
       "exposure": 57,
       "gamma": 0.1,
       "gamma_enabled": false,
-      "tetra3_db": "db_cam1_tyc"
+      "tetra3_db": "db_cam1_tyc",
+      "name": "Guide 50 mm",
+      "role": "guide",
+      "asi_index": 0,
+      "sensor_width": 3096,
+      "sensor_height": 2080,
+      "bin": 1,
+      "projection": "pinhole",
+      "enabled": true
     },
     "camera2": {
-      "pixel_size": 2.4,
-      "array_size_diagonal": 14.1,
+      "pixel_size": 9.0,
+      "array_size_diagonal": 17.56,
       "focal_length": 2000.0,
-      "alignment_rotation": 0.0,
+      "alignment_rotation": 180.0,
       "gain": 304,
       "exposure": 170,
       "gamma": 0.1,
       "gamma_enabled": false,
-      "tetra3_db": null
+      "tetra3_db": null,
+      "name": "Main ASI432MM",
+      "role": "main",
+      "asi_index": 1,
+      "sensor_width": 1608,
+      "sensor_height": 1104,
+      "bin": 1,
+      "projection": "pinhole",
+      "enabled": true
+    },
+    "camera3": {
+      "name": "Bubble ASI462MM",
+      "role": "bubble",
+      "asi_index": 2,
+      "pixel_size": 2.9,
+      "array_size_diagonal": 6.46,
+      "focal_length": 1.55,
+      "sensor_width": 1936,
+      "sensor_height": 1096,
+      "bin": 2,
+      "projection": "fisheye",
+      "alignment_rotation": 0.0,
+      "gain": 200,
+      "exposure": 50,
+      "gamma": 0.1,
+      "gamma_enabled": false,
+      "tetra3_db": null,
+      "enabled": true
     }
   },
   "pid_azm_p_gain": 0.014,
@@ -103,5 +138,37 @@
   "rust_core_loop_hz": 15,
   "continuous_rate_tracking": true,
   "guide_rate_max_dps": 5.0,
-  "config_version": 1
+  "config_version": 1,
+  "filter_wheels": [
+    {
+      "name": "Main EFW",
+      "kind": "efw",
+      "camera": 1,
+      "efw_index": 0,
+      "slots": [
+        "L",
+        "R",
+        "G",
+        "B",
+        "Ha",
+        "OIII",
+        "SII"
+      ],
+      "position": 0
+    },
+    {
+      "name": "Guide manual wheel",
+      "kind": "manual",
+      "camera": 0,
+      "efw_index": 0,
+      "slots": [
+        "Clear",
+        "R",
+        "G",
+        "B",
+        "ND"
+      ],
+      "position": 0
+    }
+  ]
 }

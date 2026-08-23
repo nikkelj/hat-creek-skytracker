@@ -413,6 +413,8 @@ impl eframe::App for App {
                         ui.checkbox(&mut self.ui.show_ngc, "NGC");
                         ui.checkbox(&mut self.ui.show_aircraft, "aircraft");
                         ui.checkbox(&mut self.ui.show_keepout, "keepout");
+                        ui.checkbox(&mut self.ui.show_meo, "MEO");
+                        ui.checkbox(&mut self.ui.show_geo, "GEO");
                     });
                     ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                 });

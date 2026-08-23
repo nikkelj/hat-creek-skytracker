@@ -137,7 +137,23 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
                 AlignCmd::Abort => runner.abort(),
                 AlignCmd::ApplyModel => {
                     if let Some(t) = runner.terms() {
-                        align.log.push(format!("model terms: {:?}", t.map(|x| (x * 1e4).round() / 1e4)));
+                        shared.pointing.store(Arc::new((true, t)));
+                        // Persist like accept_alignment: terms by name + enabled.
+                        if let Ok(text) = std::fs::read_to_string(&cfg.path) {
+                            if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(o) = raw.as_object_mut() {
+                                    let m: serde_json::Map<String, serde_json::Value> = skytracker_pointing::altaz::TERM_NAMES.iter().zip(t.iter()).map(|(n, v)| (n.to_string(), serde_json::json!(v))).collect();
+                                    o.insert("pointing_model_terms".into(), serde_json::Value::Object(m));
+                                    o.insert("pointing_model_enabled".into(), serde_json::json!(true));
+                                    if let Ok(s) = serde_json::to_string_pretty(&raw) {
+                                        let _ = std::fs::write(&cfg.path, s);
+                                    }
+                                }
+                            }
+                        }
+                        align.log.push(format!("pointing model APPLIED + saved: {}", skytracker_pointing::altaz::TERM_NAMES.iter().zip(t.iter()).map(|(n, v)| format!("{n} {:+.2}′", v * 60.0)).collect::<Vec<_>>().join("  ")));
+                    } else {
+                        align.log.push("no fit to apply yet".into());
                     }
                 }
             }

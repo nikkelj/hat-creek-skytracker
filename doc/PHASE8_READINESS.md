@@ -10,13 +10,13 @@ sign-off. This is the inventory to walk through on the rig, written as of
 |---|---|---|
 | Tracking Vis skyplot (stars, sats, planets, named stars, Messier/NGC, keepout wash, ADS-B, launch trajectories, pass table) | Track + Passes | pass predictor validated to 0.00 s / 0.0003 mag vs skyfield |
 | PROGRAM / RATE / HANDOFF / HOTSPOT / STANDBY, STOP, park, operator bias, PID mode profiles, autotune, feed-forward toggle | Track (mount panel) + gamepad | controller geometry generalized for AltAz-Side / Eq (LEARNINGS 2026-08-22) |
-| Gamepad map (Cross capture, Circle stop, Triangle park, Share bias mode, Options mount-mode toggle, R3/pad mode cycle, L1 FF, D-pad bias) | all except **Options mount-mode toggle** and **Square tare** | tare = AUX encoder zero; decide on the rig whether it is still wanted |
+| Gamepad map (Cross capture, Circle stop, Triangle park, Share bias mode, Options mount-mode toggle, R3/pad mode cycle, L1 FF, D-pad bias) | all (Options cycles mount mode, Square tares the stick, right stick = RATE) | verify gilrs button names on the actual controller |
 | Sensor calibration (2 cameras) | Cameras (3 cameras) | gain / exposure / gamma / rotation / ROI / swap / combined view; hardware ROI via `ASISetStartPos` (untested) |
 | Filter wheels | Cameras | new: EFW via `EFW_filter.dll` (untested — DLL not on the dev PC), manual wheel assignments persisted |
-| Alignment (plate solve + runner) | Align | tetra3 port identical; runner bit-matches Python grid/holdout; Eq mode fit available, Eq alignment UI minimal |
+| Alignment (plate solve + runner + apply model) | Align | tetra3 port identical; runner bit-matches Python grid/holdout; alt-az model applied to tracking; Eq model correction still to wire (mount-axis hook) |
 | Post-process / replay / stacking / MP4 | Replay | proxies + buffering; OneDrive online-only runs detected |
 | Mount 3D | Mount 3D | + sky objects |
-| HW Sim | Sim | encoder/rate noise + backlash not injected yet (the Rust responder owns its physics) |
+| HW Sim | Sim | misalignment, periodic error, encoder/rate noise, backlash all injectable live |
 | Config editor | Config | native-app keys only; round-trips unknown keys; Python-only keys (tooltips, ngc/messier toggles live in the Track toggles now) |
 | ADS-B (RTL-SDR / dump1090 / sim) | native | **real Mode S frames received on this PC** |
 | TLE fetch (gp.php) + disk cache | native | `skytracker-astro::tle::download_to_cache` (ureq); auto-refresh by age + a button; first run downloaded 16,069 TLEs |

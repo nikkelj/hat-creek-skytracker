@@ -134,9 +134,31 @@ impl Clock {
 /// Byte-level simulated mount. Integrates the rate commands the control loop
 /// issues into a true pointing and reports an encoder position (optionally with
 /// fixed axis misalignment). Mirrors `simulator.SimMount` physics.
+/// Injectable imperfections for the simulated mount (hardware_simulator's
+/// mount_encoder_noise_deg / mount_rate_noise_dps / mount_backlash_deg):
+/// zero by default so every existing test is untouched; the app shares one
+/// `Arc<Mutex<SimNoise>>` with the responder and edits it live.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SimNoise {
+    /// 1-sigma encoder read noise (deg) added to every position reply.
+    pub encoder_deg: f64,
+    /// 1-sigma error (deg/s) added to every commanded rate while it runs.
+    pub rate_dps: f64,
+    /// Dead band on direction reversal (deg): the first `backlash_deg` of
+    /// travel after a sign change produces no true motion.
+    pub backlash_deg: f64,
+}
+
 pub struct SimResponder {
     pub az_true_deg: f64,
     pub el_true_deg: f64,
+    /// Live imperfection settings (shared with the owner).
+    pub noise: std::sync::Arc<std::sync::Mutex<SimNoise>>,
+    rng: u64,
+    // Backlash bookkeeping: last motion sign and dead-band travel left, per axis.
+    bl_sign: [f64; 2],
+    bl_left: [f64; 2],
+    rate_err: [f64; 2],
     /// Focus motor: a third rate-commanded axis on the same encoder/rate
     /// convention as az/el, integrated cleanly (no misalignment) so a focus
     /// read-back follows the focus move commands.
@@ -163,7 +185,22 @@ impl SimResponder {
             clock: Clock::Wall(std::time::Instant::now()),
             mis_az_deg: 0.0,
             mis_el_deg: 0.0,
+            noise: std::sync::Arc::new(std::sync::Mutex::new(SimNoise::default())),
+            rng: 0x9e37_79b9_7f4a_7c15,
+            bl_sign: [0.0, 0.0],
+            bl_left: [0.0, 0.0],
+            rate_err: [0.0, 0.0],
         }
+    }
+
+    /// Approximately Gaussian (sum of three uniforms), unit sigma.
+    fn gauss(&mut self) -> f64 {
+        let mut s = 0.0;
+        for _ in 0..3 {
+            self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s += (self.rng >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+        }
+        s
     }
 
     /// Manual-clock variant for deterministic tests. Advance time with
@@ -188,8 +225,39 @@ impl SimResponder {
         if dt <= 0.0 {
             return;
         }
-        self.az_true_deg = (self.az_true_deg + self.az_rate_dps * dt).rem_euclid(360.0);
-        self.el_true_deg += self.el_rate_dps * dt;
+        let noise = *self.noise.lock().unwrap();
+        // Rate noise: a slowly re-drawn error per axis while a rate is running.
+        if noise.rate_dps > 0.0 {
+            for k in 0..2 {
+                if self.gauss().abs() > 2.0 {
+                    self.rate_err[k] = self.gauss() * noise.rate_dps;
+                }
+            }
+        } else {
+            self.rate_err = [0.0, 0.0];
+        }
+        let mut step = [self.az_rate_dps * dt, self.el_rate_dps * dt];
+        for k in 0..2 {
+            let cmd = if k == 0 { self.az_rate_dps } else { self.el_rate_dps };
+            if cmd != 0.0 {
+                step[k] += self.rate_err[k] * dt;
+                // Backlash: a direction reversal first consumes the dead band.
+                let sign = cmd.signum();
+                if noise.backlash_deg > 0.0 && sign != self.bl_sign[k] {
+                    if self.bl_sign[k] != 0.0 {
+                        self.bl_left[k] = noise.backlash_deg;
+                    }
+                    self.bl_sign[k] = sign;
+                }
+                if self.bl_left[k] > 0.0 {
+                    let eat = step[k].abs().min(self.bl_left[k]);
+                    self.bl_left[k] -= eat;
+                    step[k] -= sign * eat;
+                }
+            }
+        }
+        self.az_true_deg = (self.az_true_deg + step[0]).rem_euclid(360.0);
+        self.el_true_deg += step[1];
         self.focus_true_deg = (self.focus_true_deg + self.focus_rate_dps * dt).rem_euclid(360.0);
     }
 
@@ -215,7 +283,9 @@ impl SimResponder {
             } else {
                 (self.az_true_deg, self.mis_az_deg)
             };
-            let frac = (true_deg + mis).rem_euclid(360.0) / 360.0;
+            let enc_noise = self.noise.lock().unwrap().encoder_deg;
+            let jitter = if enc_noise > 0.0 && dest != protocol::targets::FOCUS { self.gauss() * enc_noise } else { 0.0 };
+            let frac = (true_deg + mis + jitter).rem_euclid(360.0) / 360.0;
             let mut out = protocol::pack_int3(frac).to_vec();
             out.push(b'#');
             out

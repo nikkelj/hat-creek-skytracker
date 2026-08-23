@@ -5,6 +5,31 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — Parity round: pointing model applied, gamepad map complete, runtime connect, diagnostics, sim noise
+
+- **Pointing model in the loop**: PROGRAM/HANDOFF setpoints are pre-corrected
+  `command = desired − error(desired)` with the 7-term alt-az model
+  (`pointing_model_terms`, `pointing_model_enabled`, persisted; APPLY MODEL on
+  the Align screen stores + saves a fresh fit). With the existing config terms
+  the panel shows `corr +0.51′ / +1.49′` being applied live.
+- **Gamepad**: Options cycles AltAz → AltAz-Side → Eq → Passthrough (live,
+  persisted), Square tares the stick, RATE now reads the **right** stick like
+  the Python app (`joystick_rate_stick`), gearbox base step / wind-up from
+  config.
+- **Runtime connection**: serial port enumeration + connect/disconnect
+  re-spawns the core loop; ADS-B source switchable live (rtlsdr / dump1090 /
+  sim / off).
+- **Diagnostics**: az/el error + rate-command strip charts (30 s) and a
+  navball in the mount panel.
+- **Sim**: encoder read noise (1σ 0.0007°), rate noise, reversal backlash
+  (0.006°) injected into the byte-level responder (`SimNoise`), live from the
+  Sim screen; closed loop still locks and holds with them on.
+- **Capture dump made asynchronous** — see LEARNINGS (it was starving the
+  HOTSPOT camera).
+- Workspace tests 146/146.
+
+---
+
 ## 2026-08-23 — Native RTL-SDR ADS-B: real Mode S frames on the first run
 
 `skytracker-adsb::demod` ports pyModeS' RtlReader (100 µs-window noise

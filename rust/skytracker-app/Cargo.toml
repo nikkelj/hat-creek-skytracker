@@ -38,3 +38,4 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
 rayon = "1"
 libloading = "0.8"
+serialport = { workspace = true }

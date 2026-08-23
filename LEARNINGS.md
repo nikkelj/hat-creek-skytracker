@@ -6,6 +6,23 @@ Newest entries first.
 
 ---
 
+## 2026-08-23 — "HOTSPOT loses lock ~10 s after handoff" was the capture dump, not the tracker
+
+In the sim autotest the optical loop locked at t≈5 s and reliably went
+`coasting → lost → PROGRAM` around t≈12 s. Everything pointed at tracker
+tuning (gate, star filter, feed-forward) — and one real fix did come out of
+that (the worker was clearing the trajectory setpoint in HOTSPOT). But the
+1 Hz log also showed the camera at **36 fps** on the loss line: the autotest
+saves its capture at t=11 s and `CaptureRecorder::disarm_and_dump` (≈200 BMP
+writes + renames) ran *inside the camera worker*, so the HOTSPOT frame feed
+starved for ~1 s — exactly the coast time — and the loop gave up. Moved the
+dump onto its own thread (the recorder is an Arc); lock now holds straight
+through the save with encoder noise + backlash injected, error 0.003–0.02°.
+Lesson: when a control loop drops out at a repeatable time, look for what
+else the test does at that time before touching gains.
+
+---
+
 ## 2026-08-23 — "Sluggish replay" was OneDrive Files-On-Demand, not the decoder
 
 Replaying the YAOGAN-11 run in the native app: the playhead raced along,

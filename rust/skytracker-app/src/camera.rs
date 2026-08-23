@@ -354,6 +354,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
     let mut armed_frames = 0usize;
     let mut last_dump: Option<String> = None;
     let mut deep_n = 0usize;
+    let mut dump_result: Option<Arc<Mutex<Option<String>>>> = None;
     let mut last_applied = settings.clone();
     let mut connected = false;
 
@@ -375,26 +376,37 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                 CamCmd::Dump { name } => {
                     if recorder.is_armed() {
                         // One run directory per capture: name_<stamp to the second>.
+                        // The BMP writes run on their own thread so the capture
+                        // pump (and the HOTSPOT frame feed) never stalls.
                         let stamp = crate::sky::utc_stamp_compact();
                         let dir = root.join(&cfg.captures_dir).join(format!("{name}_{stamp}"));
-                        match recorder.disarm_and_dump(&dir) {
-                            Ok((n, times)) => {
-                                for (i, t) in times.iter().enumerate() {
-                                    let (y, mo, d, hh, mm, ss) = crate::sky::civil_from_unix(*t);
-                                    let frac = ((t - t.floor()) * 1e6).round() as i64;
-                                    let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.bmp", slot + 1));
-                                    let _ = std::fs::rename(dir.join(format!("frame_{i:05}.bmp")), new);
+                        let rec = recorder.clone();
+                        let (w2, h2, src2, fov2, cname, crole, cn) = (w, h, source_name.clone(), cam_cfg.fov_deg(w as f64), cam_cfg.name.clone(), cam_cfg.role.clone(), name.clone());
+                        let slot2 = slot;
+                        let done = Arc::new(Mutex::new(None::<String>));
+                        dump_result = Some(done.clone());
+                        std::thread::Builder::new().name(format!("capture-dump{}", slot + 1)).spawn(move || {
+                            let res = match rec.disarm_and_dump(&dir) {
+                                Ok((n, times)) => {
+                                    for (i, t) in times.iter().enumerate() {
+                                        let (y, mo, d, hh, mm, ss) = crate::sky::civil_from_unix(*t);
+                                        let frac = ((t - t.floor()) * 1e6).round() as i64;
+                                        let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.bmp", slot2 + 1));
+                                        let _ = std::fs::rename(dir.join(format!("frame_{i:05}.bmp")), new);
+                                    }
+                                    let meta = serde_json::json!({
+                                        "target": cn, "camera": format!("camera{}", slot2 + 1), "name": cname, "role": crole,
+                                        "source": src2, "width": w2, "height": h2, "fov_deg": fov2, "frames": n,
+                                        "start_unix": times.first().copied().unwrap_or(0.0), "end_unix": times.last().copied().unwrap_or(0.0),
+                                    });
+                                    let _ = std::fs::write(dir.join(format!("run_camera{}.json", slot2 + 1)), serde_json::to_string_pretty(&meta).unwrap());
+                                    format!("{n} frames -> {}", dir.display())
                                 }
-                                let meta = serde_json::json!({
-                                    "target": name, "camera": format!("camera{}", slot + 1), "name": cam_cfg.name, "role": cam_cfg.role,
-                                    "source": source_name, "width": w, "height": h, "fov_deg": cam_cfg.fov_deg(w as f64), "frames": n,
-                                    "start_unix": times.first().copied().unwrap_or(0.0), "end_unix": times.last().copied().unwrap_or(0.0),
-                                });
-                                let _ = std::fs::write(dir.join(format!("run_camera{}.json", slot + 1)), serde_json::to_string_pretty(&meta).unwrap());
-                                last_dump = Some(format!("{n} frames -> {}", dir.display()));
-                            }
-                            Err(e) => last_dump = Some(format!("dump failed: {e}")),
-                        }
+                                Err(e) => format!("dump failed: {e}"),
+                            };
+                            *done.lock().unwrap() = Some(res);
+                        }).ok();
+                        last_dump = Some("saving…".into());
                     }
                     armed_frames = 0;
                 }
@@ -409,6 +421,12 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                 }
                 CamCmd::Swap { .. } => {}
             }
+        }
+
+        let finished = dump_result.as_ref().and_then(|d| d.lock().unwrap().clone());
+        if let Some(r) = finished {
+            last_dump = Some(r);
+            dump_result = None;
         }
 
         // (Re)connect the source when asked.

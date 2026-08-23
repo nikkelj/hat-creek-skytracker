@@ -92,7 +92,23 @@ pub fn mount_to_sky(cfg: &Config, azm: f64, alt: f64) -> (f64, f64) {
     transforms::mount_to_sky(parse_mount_mode(&cfg.mount_mode), azm, alt, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip)
 }
 
-fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String, Vec<String>) {
+const MOUNT_MODE_CYCLE: [&str; 4] = ["AltAz", "AltAz-Side", "Eq", "Passthrough"];
+
+/// Persist one top-level config key (read-modify-write, other keys untouched).
+fn persist_config_key(path: &std::path::Path, key: &str, value: serde_json::Value) {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(o) = raw.as_object_mut() {
+                o.insert(key.to_string(), value);
+                if let Ok(s) = serde_json::to_string_pretty(&raw) {
+                    let _ = std::fs::write(path, s);
+                }
+            }
+        }
+    }
+}
+
+fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String, Vec<String>, Option<Arc<std::sync::Mutex<skytracker_core::sim::SimNoise>>>) {
     let mut notes = Vec::new();
     let hz = if cfg.loop_hz > 0.0 { cfg.loop_hz } else { 15.0 };
     if cfg.mount_transport.eq_ignore_ascii_case("serial") {
@@ -102,7 +118,7 @@ fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String,
                 Ok(port) => {
                     notes.push(format!("serial {} @ {}", cfg.serial_port, cfg.serial_baud));
                     let mount = Mount::new(port);
-                    return (CoreLoop::spawn(mount, loop_shared.clone(), hz), format!("serial {}", cfg.serial_port), notes);
+                    return (CoreLoop::spawn(mount, loop_shared.clone(), hz), format!("serial {}", cfg.serial_port), notes, None);
                 }
                 Err(e) => notes.push(format!("serial {} failed: {e} -- using sim", cfg.serial_port)),
             }
@@ -113,18 +129,24 @@ fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String,
     // Wall-clock byte-level sim mount, parked at SKY az 180 / el 45 (raw
     // encoder angles through the configured mode + offsets).
     let (azm, alt) = transforms::sky_to_mount(parse_mount_mode(&cfg.mount_mode), 180.0, 45.0, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip);
-    let mount = Mount::new(LoopbackTransport::new(SimResponder::new_wall(azm + cfg.offsets.0, alt + cfg.offsets.1)));
-    (CoreLoop::spawn(mount, loop_shared.clone(), hz), "sim".into(), notes)
+    let responder = SimResponder::new_wall(azm + cfg.offsets.0, alt + cfg.offsets.1);
+    let noise = responder.noise.clone();
+    let mount = Mount::new(LoopbackTransport::new(responder));
+    (CoreLoop::spawn(mount, loop_shared.clone(), hz), "sim".into(), notes, Some(noise))
 }
 
 fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx_cam: crossbeam_channel::Sender<crate::state::CamCmd>) {
     let cfg = shared.config.clone();
     let loop_shared = shared.core.clone();
-    let (_core, transport, notes) = spawn_loop(&cfg, &loop_shared);
+    let (mut core, mut transport, notes, mut sim_noise) = spawn_loop(&cfg, &loop_shared);
 
     // Gamepad.
     let mut gilrs = gilrs::Gilrs::new().ok();
-    let mut mapper = AdaptiveRateMapper::new(5, 9, 0.8);
+    let mut mapper = AdaptiveRateMapper::new(cfg.joy_rate_base_ceiling.clamp(1, 9), 9, cfg.joy_rate_windup_delay_s.max(0.0));
+    let mut tare = (0.0f64, 0.0f64);
+    let mut last_stick_raw = (0.0f64, 0.0f64);
+    let mut cur_mode_name = cfg.mount_mode.clone();
+    let mut cfg = cfg.clone();
     let epoch = loop_shared.epoch;
 
     // Satellite catalog for PROGRAM / HANDOFF setpoints (shares the TLE file).
@@ -161,6 +183,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut bias = (0.0f64, 0.0f64);
     let mut bias_fine = false;
     let mut parking = false;
+    let mut pm_corr_last = (0.0f64, 0.0f64);
     let apply_profile = |mode: Mode, loop_shared: &Arc<LoopShared>, status: &mut Vec<String>| {
         let key = match mode {
             Mode::Program | Mode::Handoff => "PROGRAM",
@@ -187,6 +210,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
 
         // Commands from the UI.
         while let Ok(cmd) = rx.try_recv() {
+            let cmd_copy = cmd.clone();
             match cmd {
                 MountCmd::SetMode(m) => {
                     mode = match m.as_str() {
@@ -279,6 +303,69 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     parking = true;
                     push_status(&mut status, "PARK -> configured offsets".into());
                 }
+                MountCmd::CycleMountMode | MountCmd::SetMountMode(_) => {
+                    let next = match &cmd_copy {
+                        MountCmd::SetMountMode(m) => m.clone(),
+                        _ => {
+                            let cur = MOUNT_MODE_CYCLE.iter().position(|m| parse_mount_mode(m) == parse_mount_mode(&cur_mode_name)).unwrap_or(0);
+                            MOUNT_MODE_CYCLE[(cur + 1) % MOUNT_MODE_CYCLE.len()].to_string()
+                        }
+                    };
+                    cur_mode_name = next.clone();
+                    cfg.mount_mode = next.clone();
+                    loop_shared.inputs.lock().unwrap().mount_mode = parse_mount_mode(&next);
+                    shared.mount_mode.store(Arc::new(next.clone()));
+                    persist_config_key(&cfg.path, "mount_mode", serde_json::json!(next));
+                    push_status(&mut status, format!("mount mode -> {next}"));
+                }
+                MountCmd::TareJoystick => {
+                    tare = last_stick_raw;
+                    push_status(&mut status, format!("joystick tared at {:+.2} / {:+.2}", tare.0, tare.1));
+                }
+                MountCmd::PointingModel(on) => {
+                    let (_, t) = **shared.pointing.load();
+                    shared.pointing.store(Arc::new((on, t)));
+                    persist_config_key(&cfg.path, "pointing_model_enabled", serde_json::json!(on));
+                    push_status(&mut status, format!("pointing model {}", if on { "ON" } else { "OFF" }));
+                }
+                MountCmd::ListPorts => {
+                    let ports: Vec<String> = serialport::available_ports()
+                        .map(|v| v.into_iter().map(|p| p.port_name).collect())
+                        .unwrap_or_default();
+                    shared.serial_ports.store(Arc::new(ports));
+                }
+                MountCmd::Connect { transport: tr, port, baud } => {
+                    // Stop the running loop, then spawn a new one on the requested transport.
+                    core.stop();
+                    cfg.mount_transport = tr.clone();
+                    cfg.serial_port = port.clone();
+                    cfg.serial_baud = baud;
+                    let (c2, t2, notes2, n2) = spawn_loop(&cfg, &loop_shared);
+                    core = c2;
+                    transport = t2;
+                    sim_noise = n2;
+                    for n in notes2 {
+                        push_status(&mut status, n);
+                    }
+                    push_status(&mut status, format!("connected: {transport}"));
+                    persist_config_key(&cfg.path, "mount_transport", serde_json::json!(tr));
+                    persist_config_key(&cfg.path, "mount_serial_port", serde_json::json!(port));
+                    persist_config_key(&cfg.path, "mount_serial_baud", serde_json::json!(baud));
+                    mode = Mode::Standby;
+                    loop_shared.inputs.lock().unwrap().mode = Mode::Standby;
+                }
+                MountCmd::Disconnect => {
+                    core.stop();
+                    // A stopped loop publishes loop_dead; keep a sim loop alive so the UI stays sane.
+                    cfg.mount_transport = "sim".into();
+                    let (c2, t2, _, n2) = spawn_loop(&cfg, &loop_shared);
+                    core = c2;
+                    sim_noise = n2;
+                    transport = format!("{t2} (mount disconnected)");
+                    mode = Mode::Standby;
+                    loop_shared.inputs.lock().unwrap().mode = Mode::Standby;
+                    push_status(&mut status, "mount disconnected -- sim loop".into());
+                }
                 MountCmd::ToggleFeedForward => {
                     let mut i = loop_shared.inputs.lock().unwrap();
                     let on = !(i.ff_azm_enabled && i.ff_alt_enabled);
@@ -309,6 +396,16 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             }
         }
 
+        // Live sim imperfections from the Sim screen.
+        if let Some(n) = &sim_noise {
+            let s = shared.sim.load();
+            let want = skytracker_core::sim::SimNoise { encoder_deg: s.encoder_noise_deg, rate_dps: s.rate_noise_dps, backlash_deg: s.backlash_deg };
+            let mut g = n.lock().unwrap();
+            if *g != want {
+                *g = want;
+            }
+        }
+
         // Reload the satellite catalog after a TLE refresh.
         let tv = shared.tle_version.load(std::sync::atomic::Ordering::Relaxed);
         if tv != tle_version {
@@ -319,7 +416,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
 
         // Gamepad -> gearbox -> rate command.
         let mut stick = (0.0, 0.0);
+        let mut stick_raw = (0.0, 0.0);
         let mut joystick_name = None;
+        let mut want_tare = false;
+        let mut want_cycle_mode = false;
         let mut armed_toggle = false;
         if let Some(g) = gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
@@ -372,6 +472,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                             parking = true;
                             push_status(&mut status, "PARK (gamepad)".into());
                         }
+                        Button::West => want_tare = true,
+                        Button::Start => want_cycle_mode = true,
                         Button::Select => {
                             bias_fine = !bias_fine;
                             push_status(&mut status, format!("bias step {}", if bias_fine { "fine 0.01°" } else { "coarse 0.1°" }));
@@ -394,11 +496,25 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             }
             if let Some((_id, pad)) = g.gamepads().next() {
                 joystick_name = Some(pad.name().to_string());
-                stick = (
-                    pad.value(gilrs::Axis::LeftStickX) as f64,
-                    -(pad.value(gilrs::Axis::LeftStickY) as f64),
-                );
+                let (ax, ay) = if cfg.joystick_rate_stick.eq_ignore_ascii_case("left") { (gilrs::Axis::LeftStickX, gilrs::Axis::LeftStickY) } else { (gilrs::Axis::RightStickX, gilrs::Axis::RightStickY) };
+                stick_raw = (pad.value(ax) as f64, -(pad.value(ay) as f64));
+                stick = ((stick_raw.0 - tare.0).clamp(-1.0, 1.0), (stick_raw.1 - tare.1).clamp(-1.0, 1.0));
             }
+        }
+        last_stick_raw = stick_raw;
+        if want_tare {
+            tare = stick_raw;
+            push_status(&mut status, format!("joystick tared at {:+.2} / {:+.2} (gamepad)", tare.0, tare.1));
+        }
+        if want_cycle_mode {
+            let cur = MOUNT_MODE_CYCLE.iter().position(|m| parse_mount_mode(m) == parse_mount_mode(&cur_mode_name)).unwrap_or(0);
+            let next = MOUNT_MODE_CYCLE[(cur + 1) % MOUNT_MODE_CYCLE.len()].to_string();
+            cur_mode_name = next.clone();
+            cfg.mount_mode = next.clone();
+            loop_shared.inputs.lock().unwrap().mount_mode = parse_mount_mode(&next);
+            shared.mount_mode.store(Arc::new(next.clone()));
+            persist_config_key(&cfg.path, "mount_mode", serde_json::json!(next));
+            push_status(&mut status, format!("mount mode -> {next} (gamepad)"));
         }
         if armed_toggle {
             let armed = shared.cam(shared.hotspot_slot()).map(|c| c.armed).unwrap_or(false);
@@ -462,14 +578,25 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     ff_el_dps: ff_el,
                 })
             });
+            let mut pm_corr = (0.0, 0.0);
             let sp = sp.map(|mut s| {
                 if bias != (0.0, 0.0) {
                     let cos_el = s.el_deg.to_radians().cos().max(0.087);
                     s.az_deg = (s.az_deg + bias.0 / cos_el).rem_euclid(360.0);
                     s.el_deg += bias.1;
                 }
+                // Pointing-model pre-correction (control.apply_pointing_model):
+                // command = desired - error(desired), first-order inverse.
+                let (on, terms) = **shared.pointing.load();
+                if on && parse_mount_mode(&cur_mode_name) != MountMode::Eq {
+                    let (da, de) = skytracker_pointing::altaz::error(&terms, s.az_deg, s.el_deg);
+                    pm_corr = (da, de);
+                    s.az_deg = (s.az_deg - da).rem_euclid(360.0);
+                    s.el_deg -= de;
+                }
                 s
             });
+            pm_corr_last = pm_corr;
             last_setpoint = sp.as_ref().map(|s| (s.az_deg, s.el_deg));
             if prev_target != target {
                 prev_target = target.clone();
@@ -578,6 +705,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             bias,
             bias_fine,
             parking,
+            mount_mode: cur_mode_name.clone(),
+            pointing_model_on: shared.pointing.load().0,
+            pointing_corr: pm_corr_last,
+            joystick_tare: tare,
         }));
 
         let sleep = Duration::from_millis(33).saturating_sub(t0.elapsed());

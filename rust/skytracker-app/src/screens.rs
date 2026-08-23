@@ -185,6 +185,15 @@ pub fn align_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, a
         // Right: alignment run.
         let ui = &mut cols[1];
         theme::section(ui, "pointing-model alignment");
+        {
+            let (on, t) = **shared.pointing.load();
+            ui.horizontal(|ui| {
+                if theme::mode_button(ui, if on { "MODEL ON" } else { "MODEL OFF" }, on, GREEN) {
+                    let _ = tx_mount.send(MountCmd::PointingModel(!on));
+                }
+                ui.label(RichText::new(format!("{}  (applied to PROGRAM setpoints: command = desired − error)", skytracker_pointing::altaz::TERM_NAMES.iter().zip(t.iter()).map(|(n, v)| format!("{n} {:+.1}′", v * 60.0)).collect::<Vec<_>>().join(" "))).font(theme::mono(10.0)).color(TEXT_2));
+            });
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("points").color(TEXT_2));
             ui.add(egui::DragValue::new(&mut als.n_points).range(4..=60));
@@ -241,7 +250,12 @@ pub fn align_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, a
         p.circle_stroke(mp, 5.0, egui::Stroke::new(1.2, AMBER));
         if let (Some(t), Some(rms)) = (align.terms, align.rms_arcsec) {
             theme::card(ui, |ui| {
-                ui.label(RichText::new(format!("fit rms {rms:.1}″")).color(GREEN).font(theme::mono(12.5)));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("fit rms {rms:.1}″")).color(GREEN).font(theme::mono(12.5)));
+                    if theme::mode_button(ui, "APPLY MODEL", shared.pointing.load().0, GREEN) {
+                        let _ = tx_align.send(AlignCmd::ApplyModel);
+                    }
+                });
                 let names = ["IA", "IE", "NPAE", "CA", "AN", "AW", "TF"];
                 egui::Grid::new("terms").num_columns(7).spacing([10.0, 2.0]).show(ui, |ui| {
                     for n in names {
@@ -289,6 +303,15 @@ pub fn sim_screen(ui: &mut egui::Ui, shared: &Arc<Shared>) {
             ui.label(RichText::new("misalignment el").color(TEXT_2));
             changed |= ui.add(egui::Slider::new(&mut s.misalign_el_deg, -0.5..=0.5).suffix("°").fixed_decimals(3)).changed();
             ui.end_row();
+            ui.label(RichText::new("encoder noise (1σ)").color(TEXT_2));
+            changed |= ui.add(egui::Slider::new(&mut s.encoder_noise_deg, 0.0..=0.01).suffix("°").fixed_decimals(4)).changed();
+            ui.end_row();
+            ui.label(RichText::new("rate noise (1σ)").color(TEXT_2));
+            changed |= ui.add(egui::Slider::new(&mut s.rate_noise_dps, 0.0..=0.05).suffix("°/s").fixed_decimals(4)).changed();
+            ui.end_row();
+            ui.label(RichText::new("backlash").color(TEXT_2));
+            changed |= ui.add(egui::Slider::new(&mut s.backlash_deg, 0.0..=0.05).suffix("°").fixed_decimals(4)).changed();
+            ui.end_row();
             ui.label(RichText::new("periodic error amp").color(TEXT_2));
             changed |= ui.add(egui::Slider::new(&mut s.pe_amplitude_deg, 0.0..=0.05).suffix("°").fixed_decimals(4)).changed();
             ui.end_row();
@@ -326,7 +349,7 @@ pub fn sim_screen(ui: &mut egui::Ui, shared: &Arc<Shared>) {
             "• Mount: byte-level NexStar responder with wall-clock physics (skytracker-core::sim), driven by the same core loop as hardware.",
             "• Camera: Tycho-2 stars (mag ≤ limit) + live satellites projected through camera 1's pinhole at the true boresight; Gaussian PSFs, read noise; real capture pump/ring at 100 FPS.",
             "• The projection is the exact inverse of the hotspot pixel→angle mapping, so HOTSPOT closes the loop with the configured signs (x +1, y −1) by construction. Hardware signs still need rig calibration.",
-            "• Encoder/rate noise and backlash are not yet injected (the responder owns its physics).",
+            "• Encoder read noise, rate noise and reversal backlash are injected into the byte-level responder live (skytracker-core::sim::SimNoise).",
         ] {
             ui.label(RichText::new(line).color(TEXT_2).font(theme::sans(11.5)));
         }
@@ -373,6 +396,10 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
         });
     });
     egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Hat Creek Skytracker").font(theme::sans(12.0)).color(TEXT));
+            ui.label(RichText::new("· Jonathan Nikkel — @NikkelJonathan · native Rust app (rust-port)").font(theme::sans(11.0)).color(DIM));
+        });
         ui.columns(3, |cols| {
             let ui = &mut cols[0];
             theme::section(ui, "site");
@@ -384,7 +411,13 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
             });
             theme::section(ui, "mount");
             egui::Grid::new("cfg_mount").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                combo(ui, "mode", &mut c.mount_mode, &["AltAz", "AltAzSide", "Passthrough", "Eq"]);
+                combo(ui, "mode", &mut c.mount_mode, &["AltAz", "AltAz-Side", "Passthrough", "Eq"]);
+                boolean(ui, "pointing model", &mut c.pointing_model_enabled);
+                combo(ui, "rate stick", &mut c.joystick_rate_stick, &["right", "left"]);
+                let mut bc = c.joy_rate_base_ceiling as f64;
+                num(ui, "gearbox base step", &mut bc, 1.0, 0);
+                c.joy_rate_base_ceiling = bc.clamp(1.0, 9.0) as i32;
+                num(ui, "gearbox wind-up s", &mut c.joy_rate_windup_delay_s, 0.1, 1);
                 combo(ui, "transport", &mut c.mount_transport, &["sim", "serial"]);
                 text(ui, "serial port", &mut c.serial_port);
                 let mut baud = c.serial_baud as f64;
@@ -483,6 +516,12 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
                 text(ui, "tetra3 db dir", &mut c.tetra3_db_dir);
                 boolean(ui, "vsync", &mut c.ui_vsync);
                 num(ui, "star limit mag", &mut c.star_limit_mag, 0.1, 1);
+                let mut gc = c.alignment_grid_search_cells as f64;
+                num(ui, "align grid-search cells", &mut gc, 1.0, 0);
+                c.alignment_grid_search_cells = gc.max(1.0) as usize;
+                num(ui, "align target rms ′", &mut c.alignment_target_rms_arcmin, 0.1, 1);
+                boolean(ui, "align pause on fail", &mut c.alignment_pause_on_fail);
+                num(ui, "align settle s", &mut c.alignment_settle_s, 0.1, 1);
                 let mut ms = c.max_stars as f64;
                 num(ui, "max stars", &mut ms, 100.0, 0);
                 c.max_stars = ms as usize;

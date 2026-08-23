@@ -71,11 +71,40 @@ fn run(shared: Arc<Shared>) {
         other => format!("{other}: unknown adsb_source_mode (rtlsdr | dump1090 | sim | off)"),
     };
     let mut aircraft: HashMap<String, Aircraft> = HashMap::new();
+    let mut mode = mode;
+    let mut tx = tx;
+    let mut rx = rx;
     let (ox, oy, oz) = geodetic_to_ecef(cfg.lat_deg, cfg.lon_deg, cfg.alt_m);
     let mut last_pub = Instant::now() - Duration::from_secs(10);
     let stale = Duration::from_secs_f64(cfg.adsb_stale_timeout_s.max(5.0));
     let mut n_msgs: u64 = 0;
     loop {
+        // Runtime source switch (UI): drop the old channel (source threads
+        // exit on send error) and start the requested source.
+        if let Some(req) = shared.adsb_request.swap(Arc::new(None)).as_ref().clone() {
+            let (ntx, nrx) = crossbeam_channel::unbounded::<Msg>();
+            tx = ntx;
+            rx = nrx;
+            mode = req.to_ascii_lowercase();
+            aircraft.clear();
+            status = match mode.as_str() {
+                "dump1090" | "sbs" => {
+                    let addr = format!("{}:{}", cfg.adsb_host, cfg.adsb_port);
+                    spawn_sbs_reader(addr.clone(), tx.clone());
+                    format!("dump1090 SBS {addr}")
+                }
+                "sim" => {
+                    spawn_sim_source(cfg.lat_deg, cfg.lon_deg, tx.clone());
+                    "simulated traffic".to_string()
+                }
+                "rtlsdr" => {
+                    spawn_rtlsdr_source(cfg.clone(), tx.clone());
+                    "RTL-SDR 1090 MHz".to_string()
+                }
+                _ => "off".to_string(),
+            };
+            n_msgs = 0;
+        }
         // Drain SBS lines.
         let mut got = false;
         while let Ok(m) = rx.try_recv() {
@@ -227,7 +256,9 @@ fn spawn_sbs_reader(addr: String, tx: crossbeam_channel::Sender<Msg>) {
                     let _ = tx.send(Msg::Status(format!("lost {addr}, reconnecting")));
                 }
                 Err(e) => {
-                    let _ = tx.send(Msg::Status(format!("{addr}: {e} (retrying)")));
+                    if tx.send(Msg::Status(format!("{addr}: {e} (retrying)"))).is_err() {
+                        return;
+                    }
                 }
             }
             std::thread::sleep(Duration::from_secs(3));
@@ -257,10 +288,15 @@ fn spawn_sim_source(lat0: f64, lon0: f64, tx: crossbeam_channel::Sender<Msg>) {
                     let lat = lat0 + n_km / 111.32;
                     let lon = lon0 + e_km / (111.32 * lat0.to_radians().cos());
                     let alt_ft = alt / 0.3048;
-                    let _ = tx.send(Msg::Line(format!(
-                        "MSG,3,1,1,{},1,,,,,{},{:.0},{:.0},{:.0},{:.6},{:.6},,,,,,",
-                        icao.to_uppercase(), cs, alt_ft, spd * 1.94384, hdg, lat, lon
-                    )));
+                    if tx
+                        .send(Msg::Line(format!(
+                            "MSG,3,1,1,{},1,,,,,{},{:.0},{:.0},{:.0},{:.6},{:.6},,,,,,",
+                            icao.to_uppercase(), cs, alt_ft, spd * 1.94384, hdg, lat, lon
+                        )))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(1000));
             }
@@ -417,7 +453,9 @@ fn spawn_rtlsdr_source(cfg: crate::state::Config, tx: crossbeam_channel::Sender<
                             }
                             if last_report.elapsed() > Duration::from_secs(5) {
                                 last_report = Instant::now();
-                                let _ = tx.send(Msg::Status(format!("rtlsdr: receiving 1090 MHz · {n_frames} Mode S frames · noise {:.3}", demod.noise_floor)));
+                                if tx.send(Msg::Status(format!("rtlsdr: receiving 1090 MHz · {n_frames} Mode S frames · noise {:.3}", demod.noise_floor))).is_err() {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {

@@ -28,7 +28,20 @@ pub struct UiState {
     pub show_ngc: bool,
     pub show_aircraft: bool,
     pub show_keepout: bool,
+    pub show_meo: bool,
+    pub show_geo: bool,
+    pub toggles_init: bool,
     pub keepout_tex: Option<(egui::TextureHandle, String)>,
+    pub conn_transport: String,
+    pub conn_port: String,
+    pub conn_baud: u32,
+    pub conn_init: bool,
+    pub adsb_mode: String,
+    /// Tracking history for the strip charts: (t_s, az_err, el_err, az_rate, el_rate, hz).
+    pub history: std::collections::VecDeque<(f64, f64, f64, f64, f64)>,
+    pub history_t0: std::time::Instant,
+    pub show_charts: bool,
+    pub show_navball: bool,
 }
 
 impl Default for UiState {
@@ -53,7 +66,19 @@ impl Default for UiState {
             show_ngc: false,
             show_aircraft: true,
             show_keepout: true,
+            show_meo: true,
+            show_geo: true,
+            toggles_init: false,
             keepout_tex: None,
+            conn_transport: String::new(),
+            conn_port: String::new(),
+            conn_baud: 9600,
+            conn_init: false,
+            adsb_mode: String::new(),
+            history: std::collections::VecDeque::with_capacity(2000),
+            history_t0: std::time::Instant::now(),
+            show_charts: true,
+            show_navball: true,
         }
     }
 }
@@ -114,6 +139,14 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     let radius = (rect.width().min(rect.height()) / 2.0 - 30.0).max(60.0);
     let center = rect.center();
     let mask = cfg.elevation_mask_deg;
+    if !st.toggles_init {
+        st.toggles_init = true;
+        st.show_meo = cfg.meo_enabled;
+        st.show_geo = cfg.geo_enabled;
+        st.show_labels = cfg.satellite_labels_enabled;
+        st.show_messier = cfg.messier_enabled;
+        st.show_ngc = cfg.ngc_enabled;
+    }
 
     // Dome shading: a few concentric fills, lighter toward the zenith.
     for (i, el) in [0.0, 15.0, 30.0, 45.0, 60.0, 75.0].iter().enumerate() {
@@ -428,6 +461,9 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
                 let above = el >= mask;
                 if (pass == 0) == above {
+                    continue;
+                }
+                if (!st.show_geo && s.range_km > 20_000.0) || (!st.show_meo && s.range_km > 3_000.0 && s.range_km <= 20_000.0) {
                     continue;
                 }
                 if !above && !st.show_below_mask {
@@ -845,6 +881,13 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         if m.parking {
             theme::kv_colored(ui, "park", "driving to the configured offsets".to_string(), AMBER);
         }
+        theme::kv(ui, "mount mode", format!("{}   (gamepad Options cycles)", m.mount_mode));
+        if m.pointing_model_on {
+            theme::kv_colored(ui, "pointing model", format!("ON  corr {:+.2}′ / {:+.2}′", m.pointing_corr.0 * 60.0, m.pointing_corr.1 * 60.0), GREEN);
+        }
+        if m.joystick_tare != (0.0, 0.0) {
+            theme::kv(ui, "stick tare", format!("{:+.2} / {:+.2}", m.joystick_tare.0, m.joystick_tare.1));
+        }
         theme::kv(ui, "joystick", format!("{}   {:+.2} / {:+.2}", m.joystick.clone().unwrap_or_else(|| "none".into()), m.stick.0, m.stick.1));
         let tname = {
             let sky = shared.sky.load();
@@ -883,6 +926,12 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         }
         if tuning && ui.small_button("revert").clicked() {
             let _ = tx.send(MountCmd::AutotuneStop { revert: true });
+        }
+        if ui.small_button("tare").on_hover_text("zero the rate stick at its current position (gamepad: Square)").clicked() {
+            let _ = tx.send(MountCmd::TareJoystick);
+        }
+        if ui.small_button("mode >").on_hover_text("cycle mount mode AltAz → AltAz-Side → Eq → Passthrough (gamepad: Options)").clicked() {
+            let _ = tx.send(MountCmd::CycleMountMode);
         }
         if ui.small_button("park").on_hover_text("drive both axes to the configured offsets (gamepad: Triangle)").clicked() {
             let _ = tx.send(MountCmd::Park);
@@ -937,10 +986,190 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         });
         st.gains_edit = if close { None } else { Some(g) };
     }
+    // PID diagnostics: tracking-error and rate-command strip charts + navball
+    // (render_tracking_strip_charts / render_pid_diagnostics / render_navball).
+    {
+        let t = st.history_t0.elapsed().as_secs_f64();
+        let sample = (t, m.az_error, m.el_error, m.rate_cmd.0 as f64, m.rate_cmd.1 as f64);
+        if st.history.back().map_or(true, |h| (h.0 - t).abs() > 1.0 / 30.0) {
+            st.history.push_back(sample);
+            while st.history.len() > 1800 {
+                st.history.pop_front();
+            }
+        }
+    }
+    egui::CollapsingHeader::new(egui::RichText::new("DIAGNOSTICS").font(theme::sans(10.5)).color(DIM)).id_salt("diag").default_open(true).show(ui, |ui| {
+        let tracking = matches!(m.mode.as_str(), "PROGRAM" | "HANDOFF" | "HOTSPOT");
+        strip_chart(ui, &st.history, |h| (h.1, h.2), "error az / el  (°)", tracking, true);
+        strip_chart(ui, &st.history, |h| (h.3, h.4), "rate cmd az / el  (steps)", tracking, false);
+    });
+    egui::CollapsingHeader::new(egui::RichText::new("NAVBALL").font(theme::sans(10.5)).color(DIM)).id_salt("navball").default_open(false).show(ui, |ui| {
+        navball(ui, m.az, m.el, m.connected && !m.loop_dead, m.setpoint);
+    });
+    ui.add_space(4.0);
+    // Connection controls (mirrors render_connection_controls / ADS-B controls).
+    if !st.conn_init {
+        st.conn_init = true;
+        st.conn_transport = shared.config.mount_transport.clone();
+        st.conn_port = shared.config.serial_port.clone();
+        st.conn_baud = shared.config.serial_baud;
+        st.adsb_mode = shared.config.adsb_source_mode.clone();
+        let _ = tx.send(MountCmd::ListPorts);
+    }
+    egui::CollapsingHeader::new(egui::RichText::new("CONNECTION").font(theme::sans(10.5)).color(DIM)).id_salt("conn").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("conn_tr").selected_text(st.conn_transport.clone()).width(70.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut st.conn_transport, "sim".into(), "sim");
+                ui.selectable_value(&mut st.conn_transport, "serial".into(), "serial");
+            });
+            if st.conn_transport == "serial" {
+                let ports = shared.serial_ports.load();
+                egui::ComboBox::from_id_salt("conn_port").selected_text(if st.conn_port.is_empty() { "port".to_string() } else { st.conn_port.clone() }).width(90.0).show_ui(ui, |ui| {
+                    for p in ports.iter() {
+                        ui.selectable_value(&mut st.conn_port, p.clone(), p);
+                    }
+                });
+                if ui.small_button("⟳").on_hover_text("rescan serial ports").clicked() {
+                    let _ = tx.send(MountCmd::ListPorts);
+                }
+                ui.add(egui::DragValue::new(&mut st.conn_baud).speed(100.0).range(1200..=115200));
+            }
+            let connected = !m.loop_dead && m.connected;
+            if theme::mode_button(ui, "CONNECT", connected && !m.transport.contains("disconnected"), GREEN) {
+                let _ = tx.send(MountCmd::Connect { transport: st.conn_transport.clone(), port: st.conn_port.clone(), baud: st.conn_baud });
+            }
+            if ui.small_button("disconnect").clicked() {
+                let _ = tx.send(MountCmd::Disconnect);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("ADS-B").color(TEXT_2));
+            egui::ComboBox::from_id_salt("adsb_src").selected_text(st.adsb_mode.clone()).width(90.0).show_ui(ui, |ui| {
+                for m in ["off", "rtlsdr", "dump1090", "sim"] {
+                    ui.selectable_value(&mut st.adsb_mode, m.into(), m);
+                }
+            });
+            if ui.small_button("connect").clicked() {
+                shared.adsb_request.store(Arc::new(Some(st.adsb_mode.clone())));
+            }
+            if ui.small_button("disconnect").clicked() {
+                shared.adsb_request.store(Arc::new(Some("off".into())));
+            }
+            let a = shared.adsb.load();
+            ui.label(egui::RichText::new(format!("{} · {} ac", a.status, a.n_aircraft)).font(theme::mono(10.0)).color(DIM));
+        });
+    });
     ui.add_space(4.0);
     theme::section(ui, "log");
     for s in m.status.iter().rev().take(6) {
         ui.label(egui::RichText::new(s).font(theme::mono(10.5)).color(TEXT_2));
+    }
+}
+
+/// A two-trace strip chart over the last 30 s (az amber, el accent).
+fn strip_chart(ui: &mut egui::Ui, hist: &std::collections::VecDeque<(f64, f64, f64, f64, f64)>, pick: impl Fn(&(f64, f64, f64, f64, f64)) -> (f64, f64), title: &str, live: bool, symmetric_auto: bool) {
+    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), 64.0), Sense::hover());
+    p.rect_filled(r.rect, 3.0, theme::BG);
+    p.rect_stroke(r.rect, 3.0, Stroke::new(1.0, HAIRLINE));
+    let window = 30.0;
+    let t1 = hist.back().map(|h| h.0).unwrap_or(0.0);
+    let t0 = t1 - window;
+    let pts: Vec<(f64, f64, f64)> = hist.iter().filter(|h| h.0 >= t0).map(|h| { let (a, b) = pick(h); (h.0, a, b) }).collect();
+    let mut amp = pts.iter().fold(0.0f64, |m, &(_, a, b)| m.max(a.abs()).max(b.abs()));
+    if symmetric_auto {
+        amp = if amp < 0.01 { 0.01 } else { amp * 1.15 };
+    } else {
+        amp = amp.max(1.0);
+    }
+    let inner = r.rect.shrink2(Vec2::new(4.0, 6.0));
+    let y_of = |v: f64| inner.center().y - (v / amp) as f32 * (inner.height() / 2.0);
+    let x_of = |t: f64| inner.left() + ((t - t0) / window) as f32 * inner.width();
+    p.line_segment([Pos2::new(inner.left(), y_of(0.0)), Pos2::new(inner.right(), y_of(0.0))], Stroke::new(1.0, theme::with_alpha(HAIRLINE, 200)));
+    let alpha = if live { 230 } else { 90 };
+    for (idx, col) in [(1usize, AMBER), (2usize, ACCENT)] {
+        let mut prev: Option<Pos2> = None;
+        for &(t, a, b) in &pts {
+            let v = if idx == 1 { a } else { b };
+            let q = Pos2::new(x_of(t), y_of(v).clamp(inner.top(), inner.bottom()));
+            if let Some(pp) = prev {
+                p.line_segment([pp, q], Stroke::new(1.2, theme::with_alpha(col, alpha)));
+            }
+            prev = Some(q);
+        }
+    }
+    p.text(r.rect.left_top() + Vec2::new(5.0, 3.0), Align2::LEFT_TOP, title, theme::mono(9.5), TEXT_2);
+    p.text(r.rect.right_top() + Vec2::new(-5.0, 3.0), Align2::RIGHT_TOP, format!("±{:.3}", amp), theme::mono(9.5), DIM);
+    if let Some(&(_, a, b)) = pts.last() {
+        p.text(r.rect.right_bottom() + Vec2::new(-5.0, -3.0), Align2::RIGHT_BOTTOM, format!("{a:+.3}  {b:+.3}"), theme::mono(9.5), if live { TEXT } else { DIM });
+    }
+}
+
+/// KSP-style navball: heading tape at the top, pitch ladder under a fixed
+/// boresight reticle; the ball moves, the reticle stays. Target shown as a
+/// green marker when a setpoint exists.
+fn navball(ui: &mut egui::Ui, az: f64, el: f64, connected: bool, target: Option<(f64, f64)>) {
+    let size = ui.available_width().min(220.0);
+    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), size), Sense::hover());
+    let c = r.rect.center();
+    let rad = size / 2.0 - 4.0;
+    let dim = if connected { 255 } else { 110 };
+    p.circle_filled(c, rad, Color32::from_rgb(14, 18, 26));
+    p.circle_stroke(c, rad, Stroke::new(1.0, HAIRLINE));
+    let clip = p.with_clip_rect(Rect::from_center_size(c, Vec2::splat(rad * 2.0)));
+    // Pitch ladder: 10 px per degree around the boresight elevation.
+    let px_per_deg = rad / 30.0;
+    for k in -9..=9 {
+        let ladder_el = ((el / 10.0).round() as i32 + k) * 10;
+        if !(-90..=90).contains(&ladder_el) {
+            continue;
+        }
+        let y = c.y + ((el - ladder_el as f64) * px_per_deg as f64) as f32;
+        if (y - c.y).abs() > rad {
+            continue;
+        }
+        let half = if ladder_el == 0 { rad } else { rad * 0.45 };
+        let col = if ladder_el == 0 { theme::with_alpha(TEXT, dim) } else if ladder_el > 0 { theme::with_alpha(ACCENT, dim.min(170)) } else { theme::with_alpha(Color32::from_rgb(160, 120, 80), dim.min(170)) };
+        clip.line_segment([Pos2::new(c.x - half, y), Pos2::new(c.x + half, y)], Stroke::new(if ladder_el == 0 { 1.4 } else { 1.0 }, col));
+        if ladder_el != 0 {
+            clip.text(Pos2::new(c.x + half + 4.0, y), Align2::LEFT_CENTER, format!("{ladder_el}"), theme::mono(9.5), col);
+        }
+    }
+    // Heading tape along the top: every 30 deg, 2 px per degree.
+    let tape_y = c.y - rad + 14.0;
+    let px_per_deg_h = (rad * 2.0) / 120.0;
+    for k in -6..=6 {
+        let hdg = ((az / 30.0).round() as i32 + k) * 30;
+        let x = c.x + (((hdg as f64) - az) * px_per_deg_h as f64) as f32;
+        if (x - c.x).abs() > rad - 6.0 {
+            continue;
+        }
+        let label = match hdg.rem_euclid(360) {
+            0 => "N".to_string(),
+            90 => "E".to_string(),
+            180 => "S".to_string(),
+            270 => "W".to_string(),
+            h => format!("{h}"),
+        };
+        clip.line_segment([Pos2::new(x, tape_y - 5.0), Pos2::new(x, tape_y + 5.0)], Stroke::new(1.0, theme::with_alpha(TEXT_2, dim)));
+        clip.text(Pos2::new(x, tape_y + 8.0), Align2::CENTER_TOP, label, theme::mono(9.5), theme::with_alpha(TEXT_2, dim));
+    }
+    // Target marker (green) relative to the boresight.
+    if let Some((taz, tel)) = target {
+        let daz = (taz - az + 540.0).rem_euclid(360.0) - 180.0;
+        let x = c.x + (daz * el.to_radians().cos() * px_per_deg as f64) as f32;
+        let y = c.y - ((tel - el) * px_per_deg as f64) as f32;
+        if (x - c.x).powi(2) + (y - c.y).powi(2) < rad * rad {
+            clip.circle_stroke(Pos2::new(x, y), 5.0, Stroke::new(1.2, GREEN));
+        }
+    }
+    // Fixed boresight reticle.
+    p.circle_stroke(c, 6.0, Stroke::new(1.4, AMBER));
+    p.line_segment([c + Vec2::new(-18.0, 0.0), c + Vec2::new(-6.0, 0.0)], Stroke::new(1.4, AMBER));
+    p.line_segment([c + Vec2::new(6.0, 0.0), c + Vec2::new(18.0, 0.0)], Stroke::new(1.4, AMBER));
+    p.line_segment([c + Vec2::new(0.0, -14.0), c + Vec2::new(0.0, -6.0)], Stroke::new(1.4, AMBER));
+    p.text(c + Vec2::new(0.0, rad - 4.0), Align2::CENTER_BOTTOM, format!("az {:.1}°  el {:.1}°", az, el), theme::mono(10.0), theme::with_alpha(TEXT, dim));
+    if !connected {
+        p.text(c, Align2::CENTER_CENTER, "mount offline", theme::mono(10.5), DIM);
     }
 }
 

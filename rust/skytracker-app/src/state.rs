@@ -122,6 +122,7 @@ pub struct SimSettings {
     pub misalign_el_deg: f64,
     pub encoder_noise_deg: f64,
     pub rate_noise_dps: f64,
+    pub backlash_deg: f64,
     pub pe_amplitude_deg: f64,
     pub pe_period_s: f64,
     pub background_level: f64,
@@ -139,6 +140,7 @@ impl Default for SimSettings {
             misalign_el_deg: 0.0,
             encoder_noise_deg: 0.0007,
             rate_noise_dps: 0.003,
+            backlash_deg: 0.006,
             pe_amplitude_deg: 0.003,
             pe_period_s: 600.0,
             background_level: 6.0,
@@ -203,6 +205,12 @@ pub struct Config {
     pub tetra3_db_dir: String,
     pub alignment_points: usize,
     pub alignment_settle_s: f64,
+    pub alignment_grid_search_cells: usize,
+    pub alignment_target_rms_arcmin: f64,
+    pub alignment_pause_on_fail: bool,
+    pub meo_enabled: bool,
+    pub geo_enabled: bool,
+    pub satellite_labels_enabled: bool,
     pub ngc_limit_mag: f64,
     pub messier_enabled: bool,
     pub ngc_enabled: bool,
@@ -222,6 +230,14 @@ pub struct Config {
     /// Refresh tle_cache.tle from Celestrak when older than this (hours; 0 = never).
     pub tle_max_age_h: f64,
     pub tle_url: String,
+    /// 7-term alt-az pointing model (IA IE AN AW NPAE CA TF, degrees) and whether it pre-corrects setpoints.
+    pub pointing_model_enabled: bool,
+    pub pointing_model_terms: [f64; 7],
+    /// Gearbox: base ceiling step, wind-up delay (joy_rate_base_ceiling / joy_rate_windup_delay_s).
+    pub joy_rate_base_ceiling: i32,
+    pub joy_rate_windup_delay_s: f64,
+    /// Which stick drives RATE mode ("right" like the Python app, or "left").
+    pub joystick_rate_stick: String,
     pub sim: SimSettings,
 }
 
@@ -335,6 +351,7 @@ impl Config {
             misalign_el_deg: num(&sc["mount_misalignment_el_deg"], sd.misalign_el_deg),
             encoder_noise_deg: num(&sc["mount_encoder_noise_deg"], sd.encoder_noise_deg),
             rate_noise_dps: num(&sc["mount_rate_noise_dps"], sd.rate_noise_dps),
+            backlash_deg: num(&sc["mount_backlash_deg"], sd.backlash_deg),
             pe_amplitude_deg: num(&sc["mount_pe_amplitude_deg"], sd.pe_amplitude_deg),
             pe_period_s: num(&sc["mount_pe_period_sec"], sd.pe_period_s),
             background_level: num(&sc["background_level"], sd.background_level),
@@ -392,6 +409,12 @@ impl Config {
             tetra3_db_dir: s("tetra3_db_dir", ""),
             alignment_points: f("alignment_points", 12.0) as usize,
             alignment_settle_s: f("alignment_settle_sec", 2.0),
+            alignment_grid_search_cells: f("alignment_grid_search_cells", 100.0) as usize,
+            alignment_target_rms_arcmin: f("alignment_target_rms_arcmin", 0.0),
+            alignment_pause_on_fail: b("alignment_pause_on_fail", false),
+            meo_enabled: b("meo_enabled", true),
+            geo_enabled: b("geo_enabled", true),
+            satellite_labels_enabled: b("satellite_labels_enabled", true),
             ngc_limit_mag: f("ngc_limiting_magnitude", 10.0),
             messier_enabled: b("messier_enabled", true),
             ngc_enabled: b("ngc_enabled", false),
@@ -428,6 +451,18 @@ impl Config {
             launches_dir: s("launches_dir", "launches"),
             tle_max_age_h: f("tle_cache_age_hours", 12.0),
             tle_url: s("tle_url", skytracker_astro::tle::CELESTRAK_ACTIVE_URL),
+            pointing_model_enabled: b("pointing_model_enabled", false),
+            pointing_model_terms: {
+                let t = &v["pointing_model_terms"];
+                let mut arr = [0.0; 7];
+                for (i, name) in skytracker_pointing::altaz::TERM_NAMES.iter().enumerate() {
+                    arr[i] = num(&t[*name], 0.0);
+                }
+                arr
+            },
+            joy_rate_base_ceiling: f("joy_rate_base_ceiling", 5.0) as i32,
+            joy_rate_windup_delay_s: f("joy_rate_windup_delay_s", 0.8),
+            joystick_rate_stick: s("joystick_rate_stick", "right"),
             sim,
             raw,
         }
@@ -482,6 +517,14 @@ impl Config {
         set("star_limiting_magnitude", json!(self.star_limit_mag));
         set("max_rendered_star_count", json!(self.max_stars));
         set("ui_vsync", json!(self.ui_vsync));
+        set("pointing_model_enabled", json!(self.pointing_model_enabled));
+        set(
+            "pointing_model_terms",
+            json!(skytracker_pointing::altaz::TERM_NAMES.iter().zip(self.pointing_model_terms.iter()).map(|(n, v)| (n.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>()),
+        );
+        set("joy_rate_base_ceiling", json!(self.joy_rate_base_ceiling));
+        set("joy_rate_windup_delay_s", json!(self.joy_rate_windup_delay_s));
+        set("joystick_rate_stick", json!(self.joystick_rate_stick));
         set("mount_transport", json!(self.mount_transport));
         set("mount_serial_port", json!(self.serial_port));
         set("mount_serial_baud", json!(self.serial_baud));
@@ -491,6 +534,12 @@ impl Config {
         set("tetra3_db_dir", json!(self.tetra3_db_dir));
         set("alignment_points", json!(self.alignment_points));
         set("alignment_settle_sec", json!(self.alignment_settle_s));
+        set("alignment_grid_search_cells", json!(self.alignment_grid_search_cells));
+        set("alignment_target_rms_arcmin", json!(self.alignment_target_rms_arcmin));
+        set("alignment_pause_on_fail", json!(self.alignment_pause_on_fail));
+        set("meo_enabled", json!(self.meo_enabled));
+        set("geo_enabled", json!(self.geo_enabled));
+        set("satellite_labels_enabled", json!(self.satellite_labels_enabled));
         for (i, c) in self.cam.iter().enumerate() {
             let name = format!("camera{}", i + 1);
             let entry = o
@@ -533,6 +582,7 @@ impl Config {
         sc.insert("mount_misalignment_el_deg".into(), json!(s.misalign_el_deg));
         sc.insert("mount_encoder_noise_deg".into(), json!(s.encoder_noise_deg));
         sc.insert("mount_rate_noise_dps".into(), json!(s.rate_noise_dps));
+        sc.insert("mount_backlash_deg".into(), json!(s.backlash_deg));
         sc.insert("mount_pe_amplitude_deg".into(), json!(s.pe_amplitude_deg));
         sc.insert("mount_pe_period_sec".into(), json!(s.pe_period_s));
         sc.insert("background_level".into(), json!(s.background_level));
@@ -758,6 +808,11 @@ pub struct MountSnapshot {
     pub bias: (f64, f64),
     pub bias_fine: bool,
     pub parking: bool,
+    pub mount_mode: String,
+    pub pointing_model_on: bool,
+    /// Last pointing-model correction applied to the setpoint (deg).
+    pub pointing_corr: (f64, f64),
+    pub joystick_tare: (f64, f64),
 }
 
 /// Published by the camera worker for every pumped frame.
@@ -883,6 +938,17 @@ pub enum MountCmd {
     BiasFine(bool),
     /// Park: drive the axes to the configured offsets (mount frame 0/0).
     Park,
+    /// Options button: cycle AltAz -> AltAz-Side -> Eq -> Passthrough (persisted).
+    CycleMountMode,
+    SetMountMode(String),
+    /// Square button: tare the joystick axes (current stick = zero).
+    TareJoystick,
+    /// Enable / disable the pointing-model pre-correction (persisted).
+    PointingModel(bool),
+    /// Runtime mount connection: (re)open the loop on "sim" or "serial:<port>".
+    Connect { transport: String, port: String, baud: u32 },
+    Disconnect,
+    ListPorts,
 }
 
 /// UI -> camera worker.
@@ -933,6 +999,14 @@ pub struct Shared {
     pub tle_version: std::sync::atomic::AtomicU64,
     pub tle_refresh: std::sync::atomic::AtomicBool,
     pub tle_status: ArcSwap<String>,
+    /// Live pointing model (enabled, terms) applied to PROGRAM/HANDOFF setpoints.
+    pub pointing: ArcSwap<(bool, [f64; 7])>,
+    /// Live mount mode name (Options button cycles it).
+    pub mount_mode: ArcSwap<String>,
+    /// Serial ports enumerated on request (MountCmd::ListPorts).
+    pub serial_ports: ArcSwap<Vec<String>>,
+    /// ADS-B source switch request: Some("off" | "rtlsdr" | "dump1090" | "sim").
+    pub adsb_request: ArcSwap<Option<String>>,
 }
 
 impl Shared {
@@ -951,6 +1025,8 @@ impl Shared {
 
     pub fn new(config: Config, core: Arc<LoopShared>) -> Arc<Self> {
         let sim = config.sim.clone();
+        let pointing0 = (config.pointing_model_enabled, config.pointing_model_terms);
+        let mount_mode0 = config.mount_mode.clone();
         Arc::new(Shared {
             adsb: ArcSwap::from_pointee(AdsbSnapshot::default()),
             sky: ArcSwap::from_pointee(SkySnapshot::default()),
@@ -969,6 +1045,10 @@ impl Shared {
             tle_version: std::sync::atomic::AtomicU64::new(0),
             tle_refresh: std::sync::atomic::AtomicBool::new(false),
             tle_status: ArcSwap::from_pointee(String::new()),
+            pointing: ArcSwap::from_pointee(pointing0),
+            mount_mode: ArcSwap::from_pointee(mount_mode0),
+            serial_ports: ArcSwap::from_pointee(Vec::new()),
+            adsb_request: ArcSwap::from_pointee(None),
         })
     }
 }

@@ -103,11 +103,25 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     if !de421.exists() {
         load_error = format!("{load_error} | de421.bsp not found at {}", de421.display());
     }
-    let all_satnums: Vec<String> = engine
+    let mut all_satnums: Vec<String> = engine
         .tles
         .as_ref()
         .map(|c| c.sats.iter().map(|s| s.satnum.clone()).collect())
         .unwrap_or_default();
+    let mut n_catalog = n_catalog;
+    // TLE freshness: download from Celestrak when the cache is older than
+    // tle_cache_age_hours (background thread; the catalog is reloaded when
+    // it lands) or when the UI asks.
+    let age_h = skytracker_astro::tle::cache_age_s(&tle_path).map(|s| s / 3600.0);
+    shared.tle_status.store(Arc::new(match age_h {
+        Some(a) => format!("{n_catalog} TLEs · cache {a:.1} h old"),
+        None => "no TLE cache".into(),
+    }));
+    if cfg.tle_max_age_h > 0.0 && age_h.map_or(true, |a| a > cfg.tle_max_age_h) {
+        shared.tle_refresh.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (dl_tx, dl_rx) = crossbeam_channel::unbounded::<Result<usize, String>>();
+    let mut downloading = false;
 
     // Hipparcos: brightest N within the limiting magnitude.
     let hip_path = root.join("hip_main.dat");
@@ -156,6 +170,36 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     loop {
         let t0 = Instant::now();
         let jd_tt = now_jd_tt();
+
+        // TLE download / reload.
+        if shared.tle_refresh.swap(false, std::sync::atomic::Ordering::Relaxed) && !downloading {
+            downloading = true;
+            shared.tle_status.store(Arc::new("downloading TLEs from Celestrak…".into()));
+            let (url, path, tx) = (cfg.tle_url.clone(), tle_path.clone(), dl_tx.clone());
+            std::thread::Builder::new().name("tle-download".into()).spawn(move || {
+                let _ = tx.send(skytracker_astro::tle::download_to_cache(&url, &path, 60));
+            }).ok();
+        }
+        if let Ok(res) = dl_rx.try_recv() {
+            downloading = false;
+            match res {
+                Ok(n) => {
+                    match engine.load_tle_file(&tle_path) {
+                        Ok(m) => {
+                            n_catalog = m;
+                            all_satnums = engine.tles.as_ref().map(|c| c.sats.iter().map(|s| s.satnum.clone()).collect()).unwrap_or_default();
+                            last_gate = Instant::now() - Duration::from_secs(3600);
+                            last_passes = Instant::now() - Duration::from_secs(3600);
+                            shared.tle_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            shared.tle_status.store(Arc::new(format!("{m} TLEs · refreshed just now ({n} downloaded)")));
+                            eprintln!("skytracker: TLEs refreshed from Celestrak ({m} satellites)");
+                        }
+                        Err(e) => shared.tle_status.store(Arc::new(format!("TLE reload failed: {e}"))),
+                    }
+                }
+                Err(e) => shared.tle_status.store(Arc::new(format!("TLE download failed: {e}"))),
+            }
+        }
 
         // Visibility gate over the whole catalog every 60 s (window +-15 min).
         if last_gate.elapsed() > Duration::from_secs(60) && !all_satnums.is_empty() {

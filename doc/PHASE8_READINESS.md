@@ -19,7 +19,7 @@ sign-off. This is the inventory to walk through on the rig, written as of
 | HW Sim | Sim | encoder/rate noise + backlash not injected yet (the Rust responder owns its physics) |
 | Config editor | Config | native-app keys only; round-trips unknown keys; Python-only keys (tooltips, ngc/messier toggles live in the Track toggles now) |
 | ADS-B (RTL-SDR / dump1090 / sim) | native | **real Mode S frames received on this PC** |
-| TLE fetch (gp.php) + disk cache | **Python only** | native app reads `tle_cache.tle`; port the HTTP fetch (ureq in skytracker-astro::tle) before deletion |
+| TLE fetch (gp.php) + disk cache | native | `skytracker-astro::tle::download_to_cache` (ureq); auto-refresh by age + a button; first run downloaded 16,069 TLEs |
 | Live screenshots script, tooltips, pygame tests | n/a | `SKYTRACKER_SCREENSHOT_DIR` tour replaces make_live_screenshots |
 
 ## Must be confirmed on the rig before deleting Python
@@ -35,6 +35,5 @@ sign-off. This is the inventory to walk through on the rig, written as of
 
 ## Deletion plan (after sign-off)
 
-- Port `trajectory.py` TLE fetch (Celestrak gp.php) + npz cache → `skytracker-astro::tle` (ureq already a dependency), wire a "refresh TLEs" button.
 - Move `tests/golden` parity tests to pure-Rust integration tests (npyz readers exist in platesolve/astro), drop maturin/pytest from CI, add the Windows release package (exe + ASICamera2.dll + EFW_filter.dll + rtlsdr.dll + de421.bsp + catalogs).
 - Delete `skytracker-ffi`, `*.py`, `environment.yml`, `requirements.txt`, `pyproject.toml`; keep `tools/` scripts that generated goldens as documentation.

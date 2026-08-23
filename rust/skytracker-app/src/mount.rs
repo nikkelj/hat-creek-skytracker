@@ -128,7 +128,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let epoch = loop_shared.epoch;
 
     // Satellite catalog for PROGRAM / HANDOFF setpoints (shares the TLE file).
-    let catalog = TleCatalog::load(&root.join("tle_cache.tle")).ok();
+    let mut catalog = TleCatalog::load(&root.join("tle_cache.tle")).ok();
+    let mut tle_version = shared.tle_version.load(std::sync::atomic::Ordering::Relaxed);
     let observer = Observer {
         lat_deg: cfg.lat_deg,
         lon_deg: cfg.lon_deg,
@@ -306,6 +307,14 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     push_status(&mut status, format!("autotune stopped ({})", if revert { "reverted" } else { "kept" }));
                 }
             }
+        }
+
+        // Reload the satellite catalog after a TLE refresh.
+        let tv = shared.tle_version.load(std::sync::atomic::Ordering::Relaxed);
+        if tv != tle_version {
+            tle_version = tv;
+            catalog = TleCatalog::load(&root.join("tle_cache.tle")).ok();
+            push_status(&mut status, "TLE catalog reloaded".into());
         }
 
         // Gamepad -> gearbox -> rate command.

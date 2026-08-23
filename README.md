@@ -277,6 +277,10 @@ checkout):
 cargo run --release --manifest-path rust/Cargo.toml -p skytracker-app
 ```
 
+TLEs: `tle_cache.tle` is refreshed from Celestrak (`tle_url`, default the active group)
+when older than `tle_cache_age_hours` (12) or on **refresh TLEs** in Passes; the sky and
+mount workers reload the catalog in place.
+
 Phase 8 (Python retirement) inventory + rig checklist: [doc/PHASE8_READINESS.md](doc/PHASE8_READINESS.md).
 
 Headless checks: `SKYTRACKER_AUTOTEST=<seconds>` injects a sim misalignment,

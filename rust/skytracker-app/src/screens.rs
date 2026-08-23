@@ -34,6 +34,10 @@ pub fn passes_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, 
         ui.checkbox(&mut ps.hide_geo, "hide GEO");
         ui.add(egui::TextEdit::singleline(&mut ps.filter).hint_text("filter name / NORAD").desired_width(160.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("refresh TLEs").on_hover_text("download the Celestrak active catalog into tle_cache.tle and reload").clicked() {
+                shared.tle_refresh.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ui.label(RichText::new(shared.tle_status.load().as_str()).font(theme::mono(10.5)).color(TEXT_2));
             let age = if passes.computed_unix > 0.0 { now - passes.computed_unix } else { 0.0 };
             ui.label(
                 RichText::new(format!("{} passes · computed {:.0} s ago in {:.0} ms", passes.rows.len(), age, passes.compute_ms))

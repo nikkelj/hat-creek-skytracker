@@ -14,6 +14,8 @@ crate-type = ["rlib"]
 sgp4 = "2"
 # Parallel bulk trajectory precompute.
 rayon = "1"
+# TLE download (Celestrak gp.php) -- port of satellite_data.download_tle_data.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 # NOTE: timescales are implemented in src/time.rs as a direct port of the
 # skyfield formulas (leap table + sampled delta-T + ERA/GMST/GAST) rather
 # than via hifitime — golden-vector parity requires skyfield's exact

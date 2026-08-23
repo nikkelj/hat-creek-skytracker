@@ -109,3 +109,29 @@ mod tests {
         assert_eq!(satnum_str(&triplets[0].1), "00900");
     }
 }
+
+/// Celestrak "active" group in TLE format (the URL the Python app uses).
+pub const CELESTRAK_ACTIVE_URL: &str = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle";
+
+/// Age of the cache file in seconds (None when it does not exist).
+pub fn cache_age_s(cache: &std::path::Path) -> Option<f64> {
+    let m = std::fs::metadata(cache).ok()?.modified().ok()?;
+    Some(std::time::SystemTime::now().duration_since(m).map(|d| d.as_secs_f64()).unwrap_or(0.0))
+}
+
+/// Download TLEs and overwrite the cache file (port of
+/// satellite_data.download_tle_data). Returns the number of satellites
+/// parsed from the downloaded text; the cache is only replaced when the
+/// download parses as a plausible catalog (>= 100 entries).
+pub fn download_to_cache(url: &str, cache: &std::path::Path, timeout_s: u64) -> Result<usize, String> {
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(timeout_s)).build();
+    let text = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?.into_string().map_err(|e| e.to_string())?;
+    let n = parse_tle_text(&text).len();
+    if n < 100 {
+        return Err(format!("download parsed only {n} TLEs -- cache kept"));
+    }
+    let tmp = cache.with_extension("tle.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, cache).map_err(|e| e.to_string())?;
+    Ok(n)
+}

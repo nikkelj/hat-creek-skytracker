@@ -219,6 +219,9 @@ pub struct Config {
     /// Per-mode PID gain profiles (config `pid_mode_profiles`): mode -> (azm (p,i,d), alt (p,i,d)).
     pub pid_profiles: std::collections::HashMap<String, ((f64, f64, f64), (f64, f64, f64))>,
     pub launches_dir: String,
+    /// Refresh tle_cache.tle from Celestrak when older than this (hours; 0 = never).
+    pub tle_max_age_h: f64,
+    pub tle_url: String,
     pub sim: SimSettings,
 }
 
@@ -423,6 +426,8 @@ impl Config {
                 })
                 .unwrap_or_default(),
             launches_dir: s("launches_dir", "launches"),
+            tle_max_age_h: f("tle_cache_age_hours", 12.0),
+            tle_url: s("tle_url", skytracker_astro::tle::CELESTRAK_ACTIVE_URL),
             sim,
             raw,
         }
@@ -923,6 +928,11 @@ pub struct Shared {
     pub core: Arc<LoopShared>,
     /// Selected satellite (mirrored from the mount worker for the sky worker).
     pub selected: ArcSwap<Option<String>>,
+    /// TLE catalog generation: bumped by the sky worker after a (re)load so
+    /// the mount worker reloads its own catalog; `tle_refresh` asks for a download.
+    pub tle_version: std::sync::atomic::AtomicU64,
+    pub tle_refresh: std::sync::atomic::AtomicBool,
+    pub tle_status: ArcSwap<String>,
 }
 
 impl Shared {
@@ -956,6 +966,9 @@ impl Shared {
             config,
             core,
             selected: ArcSwap::from_pointee(None),
+            tle_version: std::sync::atomic::AtomicU64::new(0),
+            tle_refresh: std::sync::atomic::AtomicBool::new(false),
+            tle_status: ArcSwap::from_pointee(String::new()),
         })
     }
 }

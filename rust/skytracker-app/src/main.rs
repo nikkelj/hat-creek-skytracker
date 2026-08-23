@@ -404,14 +404,17 @@ impl eframe::App for App {
                     "stack" => {
                         egui::SidePanel::right("right").default_width(400.0).min_width(330.0).show(ctx, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| {
+                                sats_rollup(ui, &self.shared, &mut self.ui, &self.tx, false);
+                                ui.separator();
                                 ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
                             });
                         });
                         egui::SidePanel::right("cams_col").default_width(360.0).min_width(280.0).show(ctx, |ui| {
                             let n = self.shared.cams.len().max(1);
-                            let h = (ui.available_height() - 20.0 * n as f32) / n as f32;
+                            let h = (ui.available_height() - 46.0 * n as f32) / n as f32;
                             for slot in 0..n {
                                 ui::camera_view(ui, &self.shared, &mut self.ui, slot, false, Some(h));
+                                ui::camera_quick_controls(ui, &self.shared, slot, &self.tx_cam);
                                 ui.add_space(4.0);
                             }
                         });
@@ -422,20 +425,31 @@ impl eframe::App for App {
                     }
                     // ---- quad: controls | skyplot on top, cameras across the bottom ----
                     "quad" => {
-                        egui::TopBottomPanel::bottom("quad_cams").resizable(true).default_height(470.0).height_range(240.0..=820.0).show(ctx, |ui| {
+                        // Explicit stored height + our own drag handle: egui's
+                        // bottom-panel resize memory kept sliding back.
+                        let max_h = (ctx.screen_rect().height() - 240.0).max(260.0);
+                        self.ui.quad_cam_h = self.ui.quad_cam_h.clamp(200.0, max_h);
+                        let cam_h = self.ui.quad_cam_h;
+                        egui::TopBottomPanel::bottom("quad_cams").resizable(false).exact_height(cam_h).show(ctx, |ui| {
+                            ui::vdrag_handle(ui, "quad_split", &mut self.ui.quad_cam_h, 200.0, max_h, true);
                             let k = self.ui.quad_cams.clamp(2, 3);
-                            let h = ui.available_height() - 6.0;
+                            let h = ui.available_height() - 36.0;
                             ui.columns(k, |cols| {
                                 for (slot, col) in cols.iter_mut().enumerate() {
                                     ui::camera_view(col, &self.shared, &mut self.ui, slot, false, Some(h));
+                                    ui::camera_quick_controls(col, &self.shared, slot, &self.tx_cam);
                                 }
                             });
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
                             ui.columns(2, |cols| {
-                                egui::ScrollArea::vertical().id_salt("quad_ctl").show(&mut cols[0], |ui| {
-                                    ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
-                                });
+                                {
+                                    let ui = &mut cols[0];
+                                    sats_rollup(ui, &self.shared, &mut self.ui, &self.tx, false);
+                                    egui::ScrollArea::vertical().id_salt("quad_ctl").show(ui, |ui| {
+                                        ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
+                                    });
+                                }
                                 let ui = &mut cols[1];
                                 track_toggles(ui, &mut self.ui, &self.shared);
                                 ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
@@ -444,17 +458,29 @@ impl eframe::App for App {
                     }
                     // ---- scope: guide + main dominate; skyplot + controls peripheral ----
                     "scope" => {
-                        egui::SidePanel::right("scope_side").default_width(330.0).min_width(280.0).show(ctx, |ui| {
+                        egui::SidePanel::right("scope_side").resizable(true).default_width(330.0).min_width(280.0).show(ctx, |ui| {
+                            // Widen the bar, then drag the handles: each
+                            // section's height is stored, the bubble cam
+                            // takes whatever is left.
                             let w = ui.available_width();
-                            ui.allocate_ui(egui::Vec2::new(w, w.min(330.0)), |ui| {
+                            let sky_h = self.ui.scope_sky_h;
+                            ui.allocate_ui(egui::Vec2::new(w, sky_h), |ui| {
+                                ui.set_min_size(egui::Vec2::new(w, sky_h));
                                 ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                             });
-                            ui.separator();
-                            ui::compact_mount(ui, &self.shared, &self.tx);
-                            ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui::camera_view(ui, &self.shared, &mut self.ui, 2, false, Some(180.0));
+                            ui::vdrag_handle(ui, "scope_sky", &mut self.ui.scope_sky_h, 140.0, 760.0, false);
+                            let ctl_h = self.ui.scope_ctl_h;
+                            ui.allocate_ui(egui::Vec2::new(w, ctl_h), |ui| {
+                                ui.set_min_size(egui::Vec2::new(w, ctl_h));
+                                egui::ScrollArea::vertical().id_salt("scope_ctl").max_height(ctl_h).show(ui, |ui| {
+                                    ui::compact_mount(ui, &self.shared, &self.tx);
+                                });
                             });
+                            ui::vdrag_handle(ui, "scope_ctl", &mut self.ui.scope_ctl_h, 80.0, 500.0, false);
+                            sats_rollup(ui, &self.shared, &mut self.ui, &self.tx, false);
+                            let h = (ui.available_height() - 40.0).max(120.0);
+                            ui::camera_view(ui, &self.shared, &mut self.ui, 2, false, Some(h));
+                            ui::camera_quick_controls(ui, &self.shared, 2, &self.tx_cam);
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
                             track_toggles(ui, &mut self.ui, &self.shared);
@@ -464,9 +490,12 @@ impl eframe::App for App {
                                 let w = self.ui.scope_weights;
                                 ui::weighted_overlay(ui, &self.shared, &mut self.ui, r.rect, &[(0, w[0]), (1, w[1])], true);
                             } else {
+                                let h = h - 30.0;
                                 ui.columns(2, |cols| {
                                     ui::camera_view(&mut cols[0], &self.shared, &mut self.ui, 0, false, Some(h));
+                                    ui::camera_quick_controls(&mut cols[0], &self.shared, 0, &self.tx_cam);
                                     ui::camera_view(&mut cols[1], &self.shared, &mut self.ui, 1, false, Some(h));
+                                    ui::camera_quick_controls(&mut cols[1], &self.shared, 1, &self.tx_cam);
                                 });
                             }
                         });
@@ -571,6 +600,21 @@ impl eframe::App for App {
     }
 }
 
+
+/// The visible-satellites table as a collapsible rollup (stack right bar,
+/// quad top-left, scope right bar). Height-capped so it can nest anywhere.
+fn sats_rollup(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut ui::UiState, tx: &crossbeam_channel::Sender<MountCmd>, default_open: bool) {
+    egui::CollapsingHeader::new(egui::RichText::new("VISIBLE SATELLITES").font(theme::sans(11.0)).color(theme::TEXT_2))
+        .id_salt("sats_rollup")
+        .default_open(default_open)
+        .show(ui, |ui| {
+            let h = 300.0_f32.min(ui.available_height().max(180.0));
+            ui.allocate_ui(egui::Vec2::new(ui.available_width(), h), |ui| {
+                ui.set_min_height(h);
+                ui::sky_table(ui, shared, st, tx);
+            });
+        });
+}
 
 /// The Track screen's toggle strip: skyplot layers + the layout selector.
 fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) {

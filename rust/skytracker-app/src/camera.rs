@@ -319,7 +319,7 @@ fn open_asi(cfg: &crate::state::Config, cam: &CameraConfig, hw_index: usize, set
     if frac < 0.999 {
         sdk.set_start_pos(id, sx, sy).map_err(|e| e.0)?;
     }
-    sdk.set_control(id, ASI_EXPOSURE, settings.exposure_us.max(32), false).map_err(|e| e.0)?;
+    sdk.set_control(id, ASI_EXPOSURE, settings.exposure_us.max(1), false).map_err(|e| e.0)?;
     sdk.set_control(id, ASI_GAIN, settings.gain, false).map_err(|e| e.0)?;
     sdk.start_video(id).map_err(|e| e.0)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -529,7 +529,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                 let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_GAIN, settings.gain, false);
             }
             if settings.exposure_us != last_applied.exposure_us {
-                let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_EXPOSURE, settings.exposure_us.max(32), false);
+                let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_EXPOSURE, settings.exposure_us.max(1), false);
             }
             last_applied = settings.clone();
         }

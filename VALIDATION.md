@@ -5,6 +5,38 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — UI round 4: skyplot zoom + info panes, deterministic splitters
+
+- **Skyplot zoom/pan**: mousewheel zooms about the cursor (1–60×), drag pans
+  when zoomed, and a `N.N× · reset` overlay button (bottom-right of the plot)
+  restores the whole dome. All hit-testing (hover cards, click-select) works
+  through the transform; content clips to the plot rect.
+- **Selected-object info pane** (top-right, like the old UI): satellites show
+  NORAD, intl designator, epoch, inclination, RAAN, arg perigee, mean anomaly,
+  mean motion, eccentricity, rev #, apogee/perigee, live az/el, slant range
+  and rates — the classical elements are parsed from TLE line 2 in
+  `skytracker-astro` and carried on `SatMark`. Bodies / stars / DSOs /
+  aircraft / launches get type-appropriate cards.
+- **Camera FOV cards + footprints**: per-camera color-matched cards (az/el,
+  FOV w×h, rotation, spot size ″/px) under the info pane; the skyplot draws
+  each connected camera's FOV circle in its color (fisheye bubble =
+  zenith-centred coverage circle). At 1× the pinhole FOVs are a few px —
+  zooming shows them at true scale.
+- **Deterministic splitters** (`vdrag_handle`): the egui bottom-panel resize
+  memory kept sliding back after a drag, so quad's camera row and the scope
+  right-bar sections (skyplot / controls / bubble) now use stored heights
+  with explicit drag bars. Verified across the four layout tours.
+- **Visible-satellites rollup** available in every layout: bottom panel
+  (tabs), right-bar rollup (stack, scope), top-left rollup (quad).
+- **Track-screen camera controls**: each camera view carries a `controls`
+  rollup (gain / exposure / gamma / rotation / ROI) in all layouts.
+- **Exposure floor** dropped 32 µs → **1 µs** (slider + ASI clamp; the
+  driver enforces its own hardware minimum).
+- Workspace tests green after the `Satellite` element additions; screenshot
+  tours of all four layouts inspected (tabs/stack/quad/scope).
+
+---
+
 ## 2026-08-23 — UI round 3: track layouts, µs exposure, weighted combined view
 
 - **Exposure** is now microseconds internally (`exposure_us`, config keeps the

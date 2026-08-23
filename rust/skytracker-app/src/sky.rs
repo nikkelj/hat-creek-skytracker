@@ -228,6 +228,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                 if alt < -5.0 {
                     continue;
                 }
+                let (apo, per) = skytracker_astro::passes::apogee_perigee_km(sat);
                 sats.push(SatMark {
                     satnum: sn.clone(),
                     name: sat.name.clone(),
@@ -236,6 +237,17 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                     range_km: rng,
                     az_rate: sgp4_pass::unwrap_az_diff(z_p - z_m),
                     el_rate: a_p - a_m,
+                    intl_desg: sat.intl_desg.clone(),
+                    inclination_deg: sat.inclination_deg,
+                    raan_deg: sat.raan_deg,
+                    arg_perigee_deg: sat.arg_perigee_deg,
+                    mean_anomaly_deg: sat.mean_anomaly_deg,
+                    mean_motion_rev_day: sat.mean_motion_rev_per_day,
+                    eccentricity: sat.eccentricity,
+                    rev_number: sat.rev_number,
+                    epoch_unix: (sat.epoch_jd_utc - 2440587.5) * 86400.0,
+                    apogee_km: apo,
+                    perigee_km: per,
                 });
             }
         }

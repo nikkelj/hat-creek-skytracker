@@ -637,6 +637,18 @@ pub struct SatMark {
     pub range_km: f64,
     pub az_rate: f64,
     pub el_rate: f64,
+    /// Classical elements for the info pane (from the TLE).
+    pub intl_desg: String,
+    pub inclination_deg: f64,
+    pub raan_deg: f64,
+    pub arg_perigee_deg: f64,
+    pub mean_anomaly_deg: f64,
+    pub mean_motion_rev_day: f64,
+    pub eccentricity: f64,
+    pub rev_number: u32,
+    pub epoch_unix: f64,
+    pub apogee_km: f64,
+    pub perigee_km: f64,
 }
 
 #[derive(Clone, Debug)]

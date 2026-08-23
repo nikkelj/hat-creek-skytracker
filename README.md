@@ -254,10 +254,21 @@ The Track screen has four selectable layouts (persisted as `track_layout`):
 their own column), **quad** (controls | skyplot on top, 2 or 3 cameras across
 the bottom — the classic Python arrangement), and **scope** (guide + main
 split or weighted-combined dominate the screen; skyplot, bubble cam and the
-essential mount controls go peripheral). Exposure controls are logarithmic
-from **32 µs to 2 s** (µs/ms/s formatting, typed values accepted). The
-Cameras screen's combined view blends the selected feeds with **per-camera
-dominance weights** (exact weighted mean), optionally plate-scale matched.
+essential mount controls go peripheral — with draggable splitters between
+the right-bar sections). Exposure controls are logarithmic from **1 µs to
+2 s** (µs/ms/s formatting, typed values accepted). The Cameras screen's
+combined view blends the selected feeds with **per-camera dominance
+weights** (exact weighted mean), optionally plate-scale matched.
+
+The skyplot **zooms with the mousewheel** (about the cursor, drag to pan, a
+reset button appears bottom-right), shows a **selected-object info pane**
+top-right (full TLE elements, apogee/perigee and slant range for satellites;
+type-appropriate cards for planets, stars, DSOs, aircraft and launches) with
+**camera parameter/FOV cards** beneath it, color-matched to each camera's
+FOV footprint drawn on the plot (the fisheye bubble as a zenith-centred
+coverage circle). Every layout carries the **visible-satellites table**
+(bottom panel in tabs, rollups elsewhere) and per-camera quick controls
+(gain / exposure / gamma / rotation / ROI) under each Track camera view.
 
 ![Track](doc/screenshots/rust_app_track.png)
 

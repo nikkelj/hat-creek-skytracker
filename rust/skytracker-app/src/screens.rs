@@ -725,7 +725,7 @@ fn camera_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, i: usize, tx_cam: &c
             // Logarithmic 32 µs .. 2 s: half the slider travel sits below ~8 ms,
             // so the microsecond region has real motion range.
             ui.add(
-                egui::Slider::new(&mut s.exposure_us, 32..=2_000_000)
+                egui::Slider::new(&mut s.exposure_us, 1..=2_000_000)
                     .logarithmic(true)
                     .custom_formatter(|v, _| fmt_exposure(v as i64))
                     .custom_parser(parse_exposure),

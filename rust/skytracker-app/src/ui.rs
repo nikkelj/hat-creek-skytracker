@@ -48,6 +48,14 @@ pub struct UiState {
     /// Scope layout: weighted-combined guide+main instead of a split.
     pub scope_combined: bool,
     pub scope_weights: [f32; 2],
+    /// Skyplot mousewheel zoom (1 = whole dome) and pan (px, screen frame).
+    pub sky_zoom: f32,
+    pub sky_pan: Vec2,
+    /// Deterministic layout heights (the egui panel-resize memory proved
+    /// unreliable for bottom panels, so these are ours).
+    pub quad_cam_h: f32,
+    pub scope_sky_h: f32,
+    pub scope_ctl_h: f32,
 }
 
 impl Default for UiState {
@@ -89,6 +97,11 @@ impl Default for UiState {
             quad_cams: 3,
             scope_combined: false,
             scope_weights: [1.0, 1.0],
+            sky_zoom: 1.0,
+            sky_pan: Vec2::ZERO,
+            quad_cam_h: 470.0,
+            scope_sky_h: 320.0,
+            scope_ctl_h: 150.0,
         }
     }
 }
@@ -98,6 +111,117 @@ pub fn polar(center: Pos2, radius: f32, az: f64, el: f64) -> Pos2 {
     let r = radius * ((90.0 - el.clamp(-10.0, 90.0)) / 90.0) as f32;
     let a = az.to_radians() as f32;
     Pos2::new(center.x + r * a.sin(), center.y - r * a.cos())
+}
+
+/// Per-camera accent colors: skyplot FOV footprints + the parameter cards.
+pub const CAM_COLORS: [Color32; 3] = [AMBER, Color32::from_rgb(96, 200, 235), VIOLET];
+
+/// "2026-08-23 04:10" from a unix timestamp (UTC), no chrono needed.
+fn fmt_unix(t: f64) -> String {
+    if !t.is_finite() || t <= 0.0 {
+        return "—".into();
+    }
+    let secs = t as i64;
+    let (days, sod) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", sod / 3600, (sod / 60) % 60)
+}
+
+/// A small painter-drawn key/value card (info + camera panes on the skyplot).
+/// Returns the card height.
+fn info_pane(painter: &egui::Painter, at: Pos2, w: f32, title: &str, title_col: Color32, lines: &[(String, String, Color32)]) -> f32 {
+    let lh = 13.0;
+    let h = 21.0 + lines.len() as f32 * lh + 5.0;
+    let r = Rect::from_min_size(at, Vec2::new(w, h));
+    painter.rect(r, 4.0, theme::with_alpha(theme::RAISED, 216), Stroke::new(1.0, HAIRLINE));
+    painter.text(r.min + Vec2::new(8.0, 4.0), Align2::LEFT_TOP, title, theme::sans(11.0), title_col);
+    let mut y = r.min.y + 21.0;
+    for (k, v, c) in lines {
+        painter.text(Pos2::new(r.min.x + 8.0, y), Align2::LEFT_TOP, k, theme::mono(9.5), DIM);
+        painter.text(Pos2::new(r.max.x - 8.0, y), Align2::RIGHT_TOP, v, theme::mono(9.5), *c);
+        y += lh;
+    }
+    h
+}
+
+/// A horizontal grab-bar splitter: dragging it resizes the section above
+/// (or below, with `invert`) deterministically — no panel-memory surprises.
+pub fn vdrag_handle(ui: &mut egui::Ui, id_salt: &str, val: &mut f32, min: f32, max: f32, invert: bool) {
+    let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 8.0), Sense::drag());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    let c = if resp.dragged() {
+        ACCENT
+    } else if resp.hovered() {
+        theme::with_alpha(ACCENT, 150)
+    } else {
+        HAIRLINE
+    };
+    ui.painter().line_segment([Pos2::new(r.center().x - 26.0, r.center().y), Pos2::new(r.center().x + 26.0, r.center().y)], Stroke::new(2.0, c));
+    if resp.dragged() {
+        let d = resp.drag_delta().y;
+        *val = (*val + if invert { -d } else { d }).clamp(min, max);
+    }
+    let _ = ui.interact(r, ui.id().with((id_salt, "h")), Sense::hover());
+}
+
+/// Compact per-camera gain / exposure / gamma / rotation / ROI controls for
+/// the Track-screen camera views (full controls live on the Cameras screen).
+pub fn camera_quick_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, slot: usize, tx_cam: &crossbeam_channel::Sender<CamCmd>) {
+    if slot >= shared.cam_settings.len() {
+        return;
+    }
+    let mut s = (**shared.cam_settings[slot].load()).clone();
+    let before = s.clone();
+    egui::CollapsingHeader::new(egui::RichText::new("controls").font(theme::sans(10.5)).color(TEXT_2))
+        .id_salt(("quickcam", slot))
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 150.0).clamp(70.0, 170.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("gain").font(theme::sans(10.0)).color(DIM));
+                ui.add(egui::Slider::new(&mut s.gain, 0..=600));
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("exp ").font(theme::sans(10.0)).color(DIM));
+                ui.add(
+                    egui::Slider::new(&mut s.exposure_us, 1..=2_000_000)
+                        .logarithmic(true)
+                        .custom_formatter(|v, _| crate::screens::fmt_exposure(v as i64))
+                        .custom_parser(crate::screens::parse_exposure),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.gamma_enabled, egui::RichText::new("γ").font(theme::sans(11.0)).color(DIM));
+                ui.add(egui::Slider::new(&mut s.gamma, 0.05..=2.0).logarithmic(true).fixed_decimals(2));
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("rot ").font(theme::sans(10.0)).color(DIM));
+                ui.add(egui::DragValue::new(&mut s.rotation_deg).speed(0.5).suffix("°").range(-180.0..=180.0));
+                ui.label(egui::RichText::new("ROI").font(theme::sans(10.0)).color(DIM));
+                for (f, label) in [(1.0, "1"), (0.5, "½"), (0.25, "¼"), (0.125, "⅛")] {
+                    if theme::mode_button(ui, label, (s.roi_frac - f).abs() < 1e-6, ACCENT) {
+                        s.roi_frac = f;
+                        if f >= 0.999 {
+                            s.roi_cx = 0.5;
+                            s.roi_cy = 0.5;
+                        }
+                    }
+                }
+            });
+        });
+    if s != before {
+        shared.cam_settings[slot].store(Arc::new(s));
+        let _ = tx_cam.send(CamCmd::Apply { slot });
+    }
 }
 
 /// Simple label de-confliction: a coarse occupancy grid over the plot.
@@ -143,14 +267,39 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     let passes = shared.passes.load();
     let cfg = &shared.config;
     let avail = ui.available_size();
-    let (resp, painter) = ui.allocate_painter(avail, Sense::click());
+    let (resp, painter) = ui.allocate_painter(avail, Sense::click_and_drag());
     let rect = resp.rect;
     painter.rect_filled(rect, 0.0, BG);
-    let radius = (rect.width().min(rect.height()) / 2.0 - 30.0).max(60.0);
+    let painter = painter.with_clip_rect(rect);
+    let base_radius = (rect.width().min(rect.height()) / 2.0 - 30.0).max(60.0);
     // Peripheral/mini form: drop the corner readouts, legend and automatic
     // labels so the plot itself stays readable at small sizes.
-    let compact = radius < 240.0;
-    let center = rect.center();
+    let compact = base_radius < 240.0;
+    // Mousewheel zoom about the cursor; drag pans when zoomed in.
+    if let Some(ptr) = resp.hover_pos() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            let old = st.sky_zoom;
+            let new = (old * (scroll * 0.0022).exp()).clamp(1.0, 60.0);
+            if new != old {
+                let c = rect.center() + st.sky_pan;
+                st.sky_pan = (ptr + (c - ptr) * (new / old)) - rect.center();
+                st.sky_zoom = new;
+            }
+        }
+    }
+    if resp.dragged() && st.sky_zoom > 1.001 {
+        st.sky_pan += resp.drag_delta();
+    }
+    if st.sky_zoom <= 1.001 {
+        st.sky_zoom = 1.0;
+        st.sky_pan = Vec2::ZERO;
+    } else {
+        let lim = st.sky_zoom * base_radius;
+        st.sky_pan = st.sky_pan.clamp(Vec2::splat(-lim), Vec2::splat(lim));
+    }
+    let radius = base_radius * st.sky_zoom;
+    let center = rect.center() + st.sky_pan;
     let mask = cfg.elevation_mask_deg;
     if !st.toggles_init {
         st.toggles_init = true;
@@ -552,12 +701,33 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     painter.line_segment([mp + Vec2::new(0.0, 4.0), mp + Vec2::new(0.0, 12.0)], Stroke::new(1.0, AMBER));
     for (i, c) in shared.cams.iter().enumerate() {
         if let Some(cam) = c.load().as_ref() {
-            if cam.fisheye || !cam.connected {
+            if !cam.connected {
                 continue;
             }
-            let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
-            let alpha = if i == shared.hotspot_slot() { 140 } else { 70 };
-            painter.circle_stroke(mp, fov_r.max(3.0), Stroke::new(1.0, theme::with_alpha(AMBER, alpha)));
+            let col = CAM_COLORS[i % CAM_COLORS.len()];
+            if cam.fisheye {
+                // Fixed-zenith bubble: its coverage circle is centred on the
+                // zenith, radius = half the fisheye FOV.
+                let r = (radius * (cam.fov_deg / 2.0 / 90.0) as f32).min(radius);
+                painter.circle_stroke(center, r, Stroke::new(1.0, theme::with_alpha(col, 80)));
+            } else {
+                let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
+                let alpha = if i == shared.hotspot_slot() { 170 } else { 110 };
+                painter.circle_stroke(mp, fov_r.max(2.5), Stroke::new(1.2, theme::with_alpha(col, alpha)));
+            }
+        }
+    }
+    // Reset-zoom control (bottom-right of the plot).
+    let mut zoom_btn_hovered = false;
+    if st.sky_zoom > 1.0 {
+        let br = Rect::from_min_size(rect.right_bottom() + Vec2::new(-96.0, -26.0), Vec2::new(88.0, 20.0));
+        let rb = ui.interact(br, ui.id().with("sky_zoom_reset"), Sense::click());
+        zoom_btn_hovered = rb.hovered();
+        painter.rect(br, 4.0, theme::with_alpha(theme::RAISED, 230), Stroke::new(1.0, if rb.hovered() { ACCENT } else { HAIRLINE }));
+        painter.text(br.center(), Align2::CENTER_CENTER, format!("{:.1}× · reset", st.sky_zoom), theme::mono(10.0), if rb.hovered() { TEXT } else { TEXT_2 });
+        if rb.clicked() {
+            st.sky_zoom = 1.0;
+            st.sky_pan = Vec2::ZERO;
         }
     }
 
@@ -579,7 +749,7 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             st.selected = Some(satnum.clone());
             let _ = tx.send(MountCmd::SelectTarget(Some(satnum)));
         }
-    } else if resp.clicked() && resp.hover_pos().map_or(false, |p| p.distance(center) > radius) {
+    } else if resp.clicked() && !zoom_btn_hovered && resp.hover_pos().map_or(false, |p| p.distance(center) > radius) {
         st.selected = None;
         let _ = tx.send(MountCmd::SelectTarget(None));
     }
@@ -632,6 +802,127 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         theme::mono(11.0),
         AMBER,
     );
+
+    // ---- Selected-object info pane (top-right, under the boresight line) ----
+    let pane_w = 196.0;
+    let px = rect.right() - pane_w - 8.0;
+    let mut py = rect.top() + 26.0;
+    let lb = Color32::from_rgb(150, 200, 255); // az
+    let lg = Color32::from_rgb(150, 230, 150); // el
+    let ly2 = Color32::from_rgb(235, 220, 140); // spot size
+    if let Some(sel) = &st.selected {
+        let mut title = String::new();
+        let mut lines: Vec<(String, String, Color32)> = Vec::new();
+        let mut kv = |lines: &mut Vec<(String, String, Color32)>, k: &str, v: String, c: Color32| lines.push((k.into(), v, c));
+        if let Some(s) = sky.sats.iter().find(|s| &s.satnum == sel) {
+            title = s.name.clone();
+            kv(&mut lines, "norad", s.satnum.clone(), TEXT_2);
+            kv(&mut lines, "intl desg", s.intl_desg.clone(), TEXT_2);
+            kv(&mut lines, "epoch", fmt_unix(s.epoch_unix), TEXT_2);
+            kv(&mut lines, "inclination", format!("{:.3}°", s.inclination_deg), TEXT_2);
+            kv(&mut lines, "raan", format!("{:.3}°", s.raan_deg), TEXT_2);
+            kv(&mut lines, "arg perigee", format!("{:.3}°", s.arg_perigee_deg), TEXT_2);
+            kv(&mut lines, "mean anom", format!("{:.3}°", s.mean_anomaly_deg), TEXT_2);
+            kv(&mut lines, "mean motion", format!("{:.4} rev/d", s.mean_motion_rev_day), TEXT_2);
+            kv(&mut lines, "eccentricity", format!("{:.5}", s.eccentricity), TEXT_2);
+            kv(&mut lines, "rev #", format!("{}", s.rev_number), TEXT_2);
+            kv(&mut lines, "apogee", format!("{:.0} km", s.apogee_km), TEXT_2);
+            kv(&mut lines, "perigee", format!("{:.0} km", s.perigee_km), TEXT_2);
+            kv(&mut lines, "azimuth", format!("{:.2}°", (s.az + s.az_rate * age_s).rem_euclid(360.0)), lb);
+            kv(&mut lines, "elevation", format!("{:.2}°", s.el + s.el_rate * age_s), lg);
+            kv(&mut lines, "slant range", format!("{:.0} km", s.range_km), TEXT_2);
+            kv(&mut lines, "rates", format!("{:+.3}/{:+.3}°/s", s.az_rate, s.el_rate), TEXT_2);
+        } else if let Some(name) = sel.strip_prefix("body:") {
+            if let Some(b) = sky.bodies.iter().find(|b| b.name == name) {
+                title = b.name.clone();
+                kv(&mut lines, "type", "solar system".into(), TEXT_2);
+                kv(&mut lines, "azimuth", format!("{:.2}°", b.az), lb);
+                kv(&mut lines, "elevation", format!("{:.2}°", b.el), lg);
+                kv(&mut lines, "distance", if b.dist_km > 1e6 { format!("{:.4} au", b.dist_km / 1.495_978_707e8) } else { format!("{:.0} km", b.dist_km) }, TEXT_2);
+            }
+        } else if let Some(h) = sel.strip_prefix("star:") {
+            let hip: i64 = h.parse().unwrap_or(-1);
+            if let Some(s) = sky.stars.iter().find(|s| s.hip == hip) {
+                title = sky.star_names.get(&hip).cloned().unwrap_or_else(|| format!("HIP {hip}"));
+                kv(&mut lines, "type", "star".into(), TEXT_2);
+                kv(&mut lines, "hip", format!("{hip}"), TEXT_2);
+                kv(&mut lines, "v mag", format!("{:.2}", s.mag), TEXT_2);
+                kv(&mut lines, "azimuth", format!("{:.2}°", s.az), lb);
+                kv(&mut lines, "elevation", format!("{:.2}°", s.el), lg);
+            }
+        } else if let Some(k) = sel.strip_prefix("dso:") {
+            if let Some(d) = sky.dsos.iter().find(|d| d.key == k) {
+                title = d.name.clone();
+                kv(&mut lines, "type", if d.messier { "Messier".into() } else { "NGC".into() }, TEXT_2);
+                kv(&mut lines, "v mag", format!("{:.1}", d.mag), TEXT_2);
+                kv(&mut lines, "azimuth", format!("{:.2}°", d.az), lb);
+                kv(&mut lines, "elevation", format!("{:.2}°", d.el), lg);
+            }
+        } else if let Some(icao) = sel.strip_prefix("adsb:") {
+            let adsb = shared.adsb.load();
+            if let Some(a) = adsb.aircraft.iter().find(|a| a.icao == icao) {
+                title = a.label.clone();
+                kv(&mut lines, "type", "aircraft".into(), TEXT_2);
+                kv(&mut lines, "icao", a.icao.clone(), TEXT_2);
+                kv(&mut lines, "azimuth", format!("{:.2}°", a.az), lb);
+                kv(&mut lines, "elevation", format!("{:.2}°", a.el), lg);
+                kv(&mut lines, "range", format!("{:.1} km", a.range_km), TEXT_2);
+                kv(&mut lines, "altitude", format!("{:.0} m", a.alt_m), TEXT_2);
+                if let Some(s) = a.speed_kt {
+                    kv(&mut lines, "speed", format!("{s:.0} kt"), TEXT_2);
+                }
+                if let Some(t) = a.track_deg {
+                    kv(&mut lines, "track", format!("{t:.0}°"), TEXT_2);
+                }
+                kv(&mut lines, "fix age", format!("{:.1} s", a.age_s), TEXT_2);
+            }
+        } else if let Some(k) = sel.strip_prefix("launch:") {
+            if let Some(l) = sky.launches.iter().find(|l| l.key == k) {
+                title = l.name.clone();
+                kv(&mut lines, "type", "launch traj".into(), TEXT_2);
+                kv(&mut lines, "points", format!("{}", l.rows.len()), TEXT_2);
+                if let Some(t) = &sky.target {
+                    if &t.key == sel {
+                        kv(&mut lines, "azimuth", format!("{:.2}°", t.az), lb);
+                        kv(&mut lines, "elevation", format!("{:.2}°", t.el), lg);
+                        kv(&mut lines, "rates", format!("{:+.3}/{:+.3}°/s", t.az_rate, t.el_rate), TEXT_2);
+                    }
+                }
+            }
+        }
+        if !lines.is_empty() {
+            py += info_pane(&painter, Pos2::new(px, py), pane_w, &title, ACCENT, &lines) + 6.0;
+        }
+    }
+    // ---- Camera parameter / FOV cards, color-matched to the footprints ----
+    for (i, c) in shared.cams.iter().enumerate() {
+        if let Some(cam) = c.load().as_ref() {
+            if !cam.connected {
+                continue;
+            }
+            let s = shared.cam_settings[i].load();
+            let col = CAM_COLORS[i % CAM_COLORS.len()];
+            let fov_h = cam.deg_per_px * cam.height as f64;
+            let (az_s, el_s) = if cam.fisheye {
+                ("zenith".to_string(), format!("{:.1}°", 90.0))
+            } else {
+                (format!("{:.2}°", mount.az), format!("{:.2}°", mount.el))
+            };
+            let lines = vec![
+                ("az".to_string(), az_s, lb),
+                ("el".to_string(), el_s, lg),
+                ("fov w".to_string(), format!("{:.3}°", cam.fov_deg), TEXT_2),
+                ("fov h".to_string(), format!("{:.3}°", fov_h), TEXT_2),
+                ("rotation".to_string(), format!("{:.1}°", s.rotation_deg), TEXT_2),
+                ("spot size".to_string(), format!("{:.2}″/px", cam.deg_per_px * 3600.0), ly2),
+            ];
+            let name = cam.name.split(' ').next().unwrap_or("cam");
+            py += info_pane(&painter, Pos2::new(px, py), pane_w, &format!("cam {} · {}", i + 1, name), col, &lines) + 6.0;
+            if py > rect.bottom() - 60.0 {
+                break;
+            }
+        }
+    }
 }
 
 /// Reachability lattice over the sky disc (port of rendering_threads
@@ -786,6 +1077,7 @@ pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, t
         });
     });
     camera_view(ui, shared, st, st.cam_view, show_solve, None);
+    camera_quick_controls(ui, shared, st.cam_view, tx_cam);
     let slot = st.cam_view;
     let Some(cam) = shared.cam(slot) else { return };
     ui.horizontal(|ui| {

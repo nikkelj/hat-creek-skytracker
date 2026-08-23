@@ -5,6 +5,33 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — Native app: three cameras, sensor-calibration view, filter wheels, HOTSPOT feed-forward fix
+
+- **Camera model**: logical slots with role / projection / hardware index /
+  sensor geometry / bin; one worker thread per slot (sim or ASI by hardware
+  index), live gain / exposure / gamma / rotation / ROI (hardware ROI via
+  `ASISetStartPos`, sim ROI by cropping), swap = exchange hardware indices and
+  reconnect (settings stay with the slot), captures arm every connected
+  camera into one run directory as `CameraN_` files. Sim: guide 50 mm
+  (1248×936 crop at 2.9 µm, FOV 1.28° — the tetra3 DB camera), ASI432MM main
+  (9 µm / 2000 mm, FOV 0.32°), ASI462MM bubble (equidistant fisheye fixed at
+  the zenith, whole-sky Hipparcos + satellites). All three run at 97–98 FPS.
+- **Cameras screen** (doc/screenshots/rust_app_cameras.png): three feeds +
+  per-camera controls, combined opacity overlay (optionally plate-scale
+  matched), reset / save to config, filter-wheel cards (EFW offline here —
+  no `EFW_filter.dll` on this machine; the manual wheel marks positions and
+  persists assignments to config.json).
+- **Closed loop through the multi-camera path** (`SKYTRACKER_AUTOTEST=45`,
+  AltAz-Side): HANDOFF → HOTSPOT at t=5 s, locked through the run with the
+  error converging 0.08° → 0.006° — the mount worker now keeps the
+  trajectory setpoint alive in HOTSPOT (feed-forward + star-filter rate
+  reference), which it had been clearing before. A second run lost lock at
+  t≈12 s and fell back to PROGRAM cleanly — lock robustness against bright
+  stars crossing the gate remains a tuning item for the rig.
+- App crate tests 20/20, camera crate tests 2/2.
+
+---
+
 ## 2026-08-23 — Native app 7g: replay proxies, skyplot layers, ADS-B, gamepad, celestial tracking
 
 - **Replay** (`SKYTRACKER_REPLAY_TEST`): on a local 196-frame run the

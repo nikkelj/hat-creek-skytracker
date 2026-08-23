@@ -14,8 +14,10 @@ pub struct UiState {
     pub show_sats: bool,
     pub show_labels: bool,
     pub show_below_mask: bool,
-    pub cam_tex: Option<egui::TextureHandle>,
-    pub cam_seq: u64,
+    pub cam_tex: Vec<Option<egui::TextureHandle>>,
+    pub cam_seq: Vec<u64>,
+    /// Camera slot shown in the Track panel.
+    pub cam_view: usize,
     pub frame_times: std::collections::VecDeque<f64>,
     pub last_frame: std::time::Instant,
     pub capture_name: String,
@@ -38,8 +40,9 @@ impl Default for UiState {
             show_sats: true,
             show_labels: true,
             show_below_mask: true,
-            cam_tex: None,
-            cam_seq: u64::MAX,
+            cam_tex: Vec::new(),
+            cam_seq: Vec::new(),
+            cam_view: 0,
             frame_times: std::collections::VecDeque::with_capacity(240),
             last_frame: std::time::Instant::now(),
             capture_name: "manual".into(),
@@ -455,9 +458,15 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     painter.line_segment([mp + Vec2::new(4.0, 0.0), mp + Vec2::new(12.0, 0.0)], Stroke::new(1.0, AMBER));
     painter.line_segment([mp + Vec2::new(0.0, -12.0), mp + Vec2::new(0.0, -4.0)], Stroke::new(1.0, AMBER));
     painter.line_segment([mp + Vec2::new(0.0, 4.0), mp + Vec2::new(0.0, 12.0)], Stroke::new(1.0, AMBER));
-    if let Some(cam) = shared.cam.load().as_ref() {
-        let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
-        painter.circle_stroke(mp, fov_r.max(3.0), Stroke::new(1.0, theme::with_alpha(AMBER, 120)));
+    for (i, c) in shared.cams.iter().enumerate() {
+        if let Some(cam) = c.load().as_ref() {
+            if cam.fisheye || !cam.connected {
+                continue;
+            }
+            let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
+            let alpha = if i == shared.hotspot_slot() { 140 } else { 70 };
+            painter.circle_stroke(mp, fov_r.max(3.0), Stroke::new(1.0, theme::with_alpha(AMBER, alpha)));
+        }
     }
 
     // Hover card + click select.
@@ -550,91 +559,89 @@ fn keepout_image(cfg: &crate::state::Config, n: usize) -> egui::ColorImage {
     egui::ColorImage { size: [n, n], pixels: px }
 }
 
-pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx_cam: &crossbeam_channel::Sender<CamCmd>, show_solve: bool) {
-    let cam = shared.cam.load();
-    let mount = shared.mount.load();
-    let Some(cam) = cam.as_ref() else {
-        theme::section(ui, "camera 1");
-        ui.label(egui::RichText::new("waiting for frames…").color(DIM));
-        return;
-    };
-    if cam.seq != st.cam_seq {
-        let img = egui::ColorImage::from_gray([cam.width, cam.height], &cam.data);
-        match st.cam_tex.as_mut() {
-            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
-            None => st.cam_tex = Some(ui.ctx().load_texture("cam1", img, egui::TextureOptions::LINEAR)),
-        }
-        st.cam_seq = cam.seq;
+/// Gamma-stretch LUT (display only): out = 255 * (in/255)^gamma.
+pub fn gamma_lut(gamma: f64) -> [u8; 256] {
+    let g = gamma.clamp(0.05, 5.0);
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = ((i as f64 / 255.0).powf(g) * 255.0).round().clamp(0.0, 255.0) as u8;
     }
+    lut
+}
+
+/// Upload the newest frame of `slot` as a texture (gamma applied when
+/// enabled); returns the texture id + frame size when available.
+pub fn cam_texture(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, slot: usize) -> Option<(egui::TextureId, usize, usize)> {
+    let cam = shared.cam(slot)?;
+    if cam.width == 0 || cam.height == 0 {
+        return None;
+    }
+    while st.cam_tex.len() <= slot {
+        st.cam_tex.push(None);
+        st.cam_seq.push(u64::MAX);
+    }
+    let settings = shared.cam_settings[slot].load();
+    // Re-upload on a new frame or when the gamma settings changed.
+    let key = cam.seq ^ ((settings.gamma * 1000.0) as u64) << 40 ^ (settings.gamma_enabled as u64) << 63;
+    if key != st.cam_seq[slot] {
+        let img = if settings.gamma_enabled {
+            let lut = gamma_lut(settings.gamma);
+            let mapped: Vec<u8> = cam.data.iter().map(|&v| lut[v as usize]).collect();
+            egui::ColorImage::from_gray([cam.width, cam.height], &mapped)
+        } else {
+            egui::ColorImage::from_gray([cam.width, cam.height], &cam.data)
+        };
+        match st.cam_tex[slot].as_mut() {
+            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+            None => st.cam_tex[slot] = Some(ui.ctx().load_texture(format!("cam{slot}"), img, egui::TextureOptions::LINEAR)),
+        }
+        st.cam_seq[slot] = key;
+    }
+    st.cam_tex[slot].as_ref().map(|t| (t.id(), cam.width, cam.height))
+}
+
+/// Draw a texture rotated by `angle_deg` about the centre of `rect`
+/// (alignment rotation, positive = counter-clockwise like the Python view).
+pub fn rotated_image(painter: &egui::Painter, tex: egui::TextureId, rect: Rect, angle_deg: f64, tint: Color32) {
+    let c = rect.center();
+    let (s, co) = (-(angle_deg.to_radians()) as f32).sin_cos();
+    let rot = |p: Pos2| -> Pos2 {
+        let d = p - c;
+        Pos2::new(c.x + d.x * co - d.y * s, c.y + d.x * s + d.y * co)
+    };
+    let mut mesh = egui::Mesh::with_texture(tex);
+    let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+    let uvs = [Pos2::new(0.0, 0.0), Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0), Pos2::new(0.0, 1.0)];
+    for (p, uv) in corners.iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex { pos: rot(*p), uv, color: tint });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx_cam: &crossbeam_channel::Sender<CamCmd>, show_solve: bool) {
+    // Camera selector.
+    let n = shared.cams.len();
     ui.horizontal(|ui| {
-        theme::section(ui, "camera 1");
+        theme::section(ui, "camera");
+        for i in 0..n {
+            let c = shared.cam(i);
+            let label = shared.config.cam.get(i).map(|c| c.name.split(' ').next().unwrap_or("cam").to_string()).unwrap_or_else(|| format!("cam {}", i + 1));
+            let on = c.as_ref().map_or(false, |c| c.connected);
+            if theme::mode_button(ui, &label, st.cam_view == i, if on { ACCENT } else { DIM }) {
+                st.cam_view = i;
+            }
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(egui::RichText::new(format!("{:.0} fps", cam.fps)).font(theme::mono(10.5)).color(TEXT_2));
-            ui.label(egui::RichText::new(&cam.source).font(theme::mono(10.5)).color(DIM));
+            if let Some(cam) = shared.cam(st.cam_view) {
+                ui.label(egui::RichText::new(format!("{:.0} fps", cam.fps)).font(theme::mono(10.5)).color(TEXT_2));
+                ui.label(egui::RichText::new(&cam.source).font(theme::mono(10.5)).color(DIM));
+            }
         });
     });
-    if let Some(tex) = &st.cam_tex {
-        let avail = ui.available_width();
-        let h = avail * cam.height as f32 / cam.width as f32;
-        let (r, p) = ui.allocate_painter(Vec2::new(avail, h), Sense::hover());
-        p.image(tex.id(), r.rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        let sx = r.rect.width() / cam.width as f32;
-        let sy = r.rect.height() / cam.height as f32;
-        let to_screen = |x: f64, y: f64| Pos2::new(r.rect.left() + x as f32 * sx, r.rect.top() + y as f32 * sy);
-        // Reticle.
-        let c = r.rect.center();
-        let reticle = theme::with_alpha(AMBER, 200);
-        p.line_segment([c + Vec2::new(-16.0, 0.0), c + Vec2::new(-5.0, 0.0)], Stroke::new(1.0, reticle));
-        p.line_segment([c + Vec2::new(5.0, 0.0), c + Vec2::new(16.0, 0.0)], Stroke::new(1.0, reticle));
-        p.line_segment([c + Vec2::new(0.0, -16.0), c + Vec2::new(0.0, -5.0)], Stroke::new(1.0, reticle));
-        p.line_segment([c + Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 16.0)], Stroke::new(1.0, reticle));
-        // Hotspot overlay.
-        if mount.mode == "HOTSPOT" || mount.mode == "HANDOFF" {
-            let gate = shared.config.hotspot_gate_radius as f32 * sx;
-            p.circle_stroke(c, gate, Stroke::new(1.0, theme::with_alpha(GREEN, 60)));
-            if let Some((cx, cy)) = mount.hotspot_centroid {
-                let hp = to_screen(cx, cy);
-                let col = if mount.hotspot_acquired { GREEN } else { theme::with_alpha(GREEN, 120) };
-                p.circle_stroke(hp, 9.0, Stroke::new(1.4, col));
-                p.line_segment([c, hp], Stroke::new(1.0, theme::with_alpha(col, 120)));
-                p.text(hp + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER, format!("snr {:.1}", mount.hotspot_snr), theme::mono(10.5), col);
-            }
-            p.text(
-                r.rect.left_bottom() + Vec2::new(6.0, -6.0),
-                Align2::LEFT_BOTTOM,
-                format!("{}  {}", mount.mode, mount.hotspot_status),
-                theme::mono(10.5),
-                if mount.hotspot_acquired { GREEN } else { AMBER },
-            );
-        }
-        // Plate-solve overlay.
-        if show_solve {
-            let sv = shared.solve.load();
-            if sv.frame_seq != 0 {
-                for cpt in &sv.centroids {
-                    p.circle_stroke(to_screen(cpt[1], cpt[0]), 5.0, Stroke::new(0.8, theme::with_alpha(ACCENT, 140)));
-                }
-                for m in &sv.matched {
-                    p.circle_stroke(to_screen(m[1], m[0]), 7.0, Stroke::new(1.2, GREEN));
-                }
-            }
-        }
-        // Capture tag.
-        if cam.armed {
-            p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, RED);
-            p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, format!("REC {}", cam.armed_frames), theme::mono(10.5), RED);
-        }
-        p.text(
-            r.rect.left_top() + Vec2::new(6.0, 6.0),
-            Align2::LEFT_TOP,
-            format!("FOV {:.2}°  {}×{}  #{}", cam.fov_deg, cam.width, cam.height, cam.seq),
-            theme::mono(10.0),
-            theme::with_alpha(TEXT_2, 200),
-        );
-        if cam.deep_stars > 0 {
-            p.text(r.rect.right_bottom() + Vec2::new(-6.0, -6.0), Align2::RIGHT_BOTTOM, format!("{} Tycho stars", cam.deep_stars), theme::mono(9.5), DIM);
-        }
-    }
+    camera_view(ui, shared, st, st.cam_view, show_solve, None);
+    let slot = st.cam_view;
+    let Some(cam) = shared.cam(slot) else { return };
     ui.horizontal(|ui| {
         if theme::mode_button(ui, if cam.armed { "ARMED" } else { "ARM" }, cam.armed, RED) {
             let _ = tx_cam.send(if cam.armed { CamCmd::Disarm } else { CamCmd::Arm });
@@ -643,10 +650,97 @@ pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, t
         if ui.add_enabled(cam.armed, egui::Button::new("save run")).clicked() {
             let _ = tx_cam.send(CamCmd::Dump { name: st.capture_name.clone() });
         }
+        ui.label(egui::RichText::new("(all connected cameras)").font(theme::sans(10.5)).color(DIM));
     });
     if let Some(d) = &cam.last_dump {
         ui.label(egui::RichText::new(d).font(theme::mono(10.0)).color(DIM));
     }
+}
+
+/// One camera's live view with the tracking / solve overlays. `height`
+/// fixes the pane height (None = keep the frame aspect at the available width).
+pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, slot: usize, show_solve: bool, height: Option<f32>) -> Option<Rect> {
+    let mount = shared.mount.load();
+    let Some(cam) = shared.cam(slot) else {
+        ui.label(egui::RichText::new("waiting for frames…").color(DIM));
+        return None;
+    };
+    if !cam.connected {
+        let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), height.unwrap_or(120.0)), Sense::hover());
+        p.rect_filled(r.rect, 3.0, theme::BG);
+        p.text(r.rect.center(), Align2::CENTER_CENTER, format!("{} · {}", cam.name, cam.source), theme::mono(11.0), DIM);
+        return Some(r.rect);
+    }
+    let settings = shared.cam_settings[slot].load();
+    let tex = cam_texture(ui, shared, st, slot);
+    let avail = ui.available_width();
+    let h = height.unwrap_or(avail * cam.height as f32 / cam.width as f32);
+    let (r, p) = ui.allocate_painter(Vec2::new(avail, h), Sense::hover());
+    p.rect_filled(r.rect, 0.0, Color32::BLACK);
+    // Fit the frame into the pane keeping aspect.
+    let scale = (r.rect.width() / cam.width as f32).min(r.rect.height() / cam.height as f32);
+    let img_size = Vec2::new(cam.width as f32 * scale, cam.height as f32 * scale);
+    let img_rect = Rect::from_center_size(r.rect.center(), img_size);
+    if let Some((id, _, _)) = tex {
+        rotated_image(&p, id, img_rect, settings.rotation_deg, Color32::WHITE);
+    }
+    let sx = img_rect.width() / cam.width as f32;
+    let sy = img_rect.height() / cam.height as f32;
+    let to_screen = |x: f64, y: f64| Pos2::new(img_rect.left() + x as f32 * sx, img_rect.top() + y as f32 * sy);
+    let c = img_rect.center();
+    // Reticle.
+    let reticle = theme::with_alpha(AMBER, 200);
+    p.line_segment([c + Vec2::new(-16.0, 0.0), c + Vec2::new(-5.0, 0.0)], Stroke::new(1.0, reticle));
+    p.line_segment([c + Vec2::new(5.0, 0.0), c + Vec2::new(16.0, 0.0)], Stroke::new(1.0, reticle));
+    p.line_segment([c + Vec2::new(0.0, -16.0), c + Vec2::new(0.0, -5.0)], Stroke::new(1.0, reticle));
+    p.line_segment([c + Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 16.0)], Stroke::new(1.0, reticle));
+    // ROI box.
+    if settings.roi_frac < 0.999 {
+        let rw = img_rect.width() * settings.roi_frac as f32;
+        let rh = img_rect.height() * settings.roi_frac as f32;
+        let rc = Pos2::new(img_rect.left() + img_rect.width() * settings.roi_cx as f32, img_rect.top() + img_rect.height() * settings.roi_cy as f32);
+        p.rect_stroke(Rect::from_center_size(rc, Vec2::new(rw, rh)), 0.0, Stroke::new(1.0, GREEN));
+    }
+    // Hotspot overlay (only on the hotspot camera).
+    if slot == shared.hotspot_slot() && (mount.mode == "HOTSPOT" || mount.mode == "HANDOFF") {
+        let gate = shared.config.hotspot_gate_radius as f32 * sx;
+        p.circle_stroke(c, gate, Stroke::new(1.0, theme::with_alpha(GREEN, 60)));
+        if let Some((cx, cy)) = mount.hotspot_centroid {
+            let hp = to_screen(cx, cy);
+            let col = if mount.hotspot_acquired { GREEN } else { theme::with_alpha(GREEN, 120) };
+            p.circle_stroke(hp, 9.0, Stroke::new(1.4, col));
+            p.line_segment([c, hp], Stroke::new(1.0, theme::with_alpha(col, 120)));
+            p.text(hp + Vec2::new(12.0, 0.0), Align2::LEFT_CENTER, format!("snr {:.1}", mount.hotspot_snr), theme::mono(10.5), col);
+        }
+        p.text(r.rect.left_bottom() + Vec2::new(6.0, -6.0), Align2::LEFT_BOTTOM, format!("{}  {}", mount.mode, mount.hotspot_status), theme::mono(10.5), if mount.hotspot_acquired { GREEN } else { AMBER });
+    }
+    // Plate-solve overlay (solve camera).
+    if show_solve && slot == shared.solve_slot() {
+        let sv = shared.solve.load();
+        if sv.frame_seq != 0 {
+            for cpt in &sv.centroids {
+                p.circle_stroke(to_screen(cpt[1], cpt[0]), 5.0, Stroke::new(0.8, theme::with_alpha(ACCENT, 140)));
+            }
+            for m in &sv.matched {
+                p.circle_stroke(to_screen(m[1], m[0]), 7.0, Stroke::new(1.2, GREEN));
+            }
+        }
+    }
+    if cam.armed {
+        p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, RED);
+        p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, format!("REC {}", cam.armed_frames), theme::mono(10.5), RED);
+    }
+    p.text(
+        r.rect.left_top() + Vec2::new(6.0, 6.0),
+        Align2::LEFT_TOP,
+        format!("{}  FOV {:.2}°  {}×{}  #{}", cam.name, cam.fov_deg, cam.width, cam.height, cam.seq),
+        theme::mono(10.0),
+        theme::with_alpha(TEXT_2, 200),
+    );
+    if cam.deep_stars > 0 {
+        p.text(r.rect.right_bottom() + Vec2::new(-6.0, -6.0), Align2::RIGHT_BOTTOM, format!("{} Tycho stars", cam.deep_stars), theme::mono(9.5), DIM);
+    }
+    Some(img_rect)
 }
 
 fn mode_color(mode: &str) -> Color32 {

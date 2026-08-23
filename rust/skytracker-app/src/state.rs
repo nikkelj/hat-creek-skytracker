@@ -11,22 +11,107 @@ use skytracker_core::core_loop::Shared as LoopShared;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Per-camera configuration (config.json `camera_configs.cameraN`).
+/// Optical projection of a camera: the mount-borne scopes are pinholes;
+/// the hemispheric "bubble" camera is an equidistant fisheye fixed at the
+/// zenith (r = f * theta).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+    Pinhole,
+    FisheyeEquidistant,
+}
+
+/// Per-camera configuration (config.json `camera_configs.cameraN`). Slots
+/// are logical (1 = guide scope, 2 = main scope, 3 = bubble by default);
+/// `asi_index` is the hardware enumeration index behind the slot and is
+/// what "swap cameras" exchanges.
 #[derive(Clone, Debug)]
 pub struct CameraConfig {
+    pub name: String,
+    pub role: String, // "guide" | "main" | "bubble"
+    pub asi_index: usize,
+    pub enabled: bool,
     pub pixel_um: f64,
     pub focal_mm: f64,
+    pub sensor_w: usize,
+    pub sensor_h: usize,
+    pub bin: usize,
+    pub projection: Projection,
     pub alignment_rotation_deg: f64,
     pub gain: i64,
     pub exposure_ms: i64,
+    pub gamma: f64,
+    pub gamma_enabled: bool,
     pub tetra3_db: Option<String>,
 }
 
 impl CameraConfig {
+    /// Horizontal FOV (deg) for a frame `width_px` wide at the binned plate scale.
     pub fn fov_deg(&self, width_px: f64) -> f64 {
-        let sensor_w_mm = width_px * self.pixel_um / 1000.0;
-        2.0 * (sensor_w_mm / (2.0 * self.focal_mm)).atan().to_degrees()
+        match self.projection {
+            Projection::Pinhole => {
+                let sensor_w_mm = width_px * self.pixel_um * self.bin as f64 / 1000.0;
+                2.0 * (sensor_w_mm / (2.0 * self.focal_mm)).atan().to_degrees()
+            }
+            Projection::FisheyeEquidistant => (width_px * self.pixel_um * self.bin as f64 / 1000.0 / self.focal_mm).to_degrees().min(200.0),
+        }
     }
+    /// Effective pixel size at the current binning (um).
+    pub fn pixel_eff_um(&self) -> f64 {
+        self.pixel_um * self.bin as f64
+    }
+    /// Frame size the worker produces (binned sensor).
+    pub fn frame_size(&self) -> (usize, usize) {
+        ((self.sensor_w / self.bin.max(1)).max(16), (self.sensor_h / self.bin.max(1)).max(16))
+    }
+    pub fn fixed_zenith(&self) -> bool {
+        self.projection == Projection::FisheyeEquidistant
+    }
+}
+
+/// Live, UI-editable camera settings (gain / exposure / gamma / rotation /
+/// ROI) — one ArcSwap per slot; the worker applies changes to the ASI
+/// controls and the UI applies gamma + rotation on display.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CamSettings {
+    pub gain: i64,
+    pub exposure_ms: i64,
+    pub gamma: f64,
+    pub gamma_enabled: bool,
+    pub rotation_deg: f64,
+    /// ROI: fraction of the sensor (1.0 = full) and centre (0..1).
+    pub roi_frac: f64,
+    pub roi_cx: f64,
+    pub roi_cy: f64,
+    pub connected: bool,
+}
+
+impl CamSettings {
+    pub fn from_config(c: &CameraConfig) -> Self {
+        CamSettings {
+            gain: c.gain,
+            exposure_ms: c.exposure_ms,
+            gamma: c.gamma,
+            gamma_enabled: c.gamma_enabled,
+            rotation_deg: c.alignment_rotation_deg,
+            roi_frac: 1.0,
+            roi_cx: 0.5,
+            roi_cy: 0.5,
+            connected: c.enabled,
+        }
+    }
+}
+
+/// A filter wheel: ASI EFW (electronic, controlled through EFW_filter.dll)
+/// or manual (position tracked by the operator). Slot names are the filter
+/// assignments; persisted in config.json `filter_wheels`.
+#[derive(Clone, Debug)]
+pub struct FilterWheelConfig {
+    pub name: String,
+    pub kind: String, // "efw" | "manual"
+    pub camera: usize, // logical camera slot it sits in front of
+    pub efw_index: usize,
+    pub slots: Vec<String>,
+    pub position: usize,
 }
 
 /// Hardware-simulator settings (config.json `sim_config`), live-editable
@@ -103,7 +188,9 @@ pub struct Config {
     pub hotspot_rate_gate_dps: f64,
     pub hotspot_camera_index: usize,
     pub plate_solve_camera_index: usize,
-    pub cam: [CameraConfig; 2],
+    pub cam: Vec<CameraConfig>,
+    pub filter_wheels: Vec<FilterWheelConfig>,
+    pub efw_dll: String,
     pub star_limit_mag: f64,
     pub max_stars: usize,
     pub ui_vsync: bool,
@@ -163,17 +250,75 @@ impl Config {
         let f = |k: &str, d: f64| num(&v[k], d);
         let b = |k: &str, d: bool| boolean(&v[k], d);
         let s = |k: &str, d: &str| v[k].as_str().unwrap_or(d).to_string();
-        let cam = |name: &str, pix: f64, foc: f64| {
-            let c = &v["camera_configs"][name];
+        // Cameras: defaults describe the 2026-08 rig -- slot 1 guide scope
+        // (the tetra3 camera), slot 2 ASI432MM on the main scope, slot 3
+        // ASI462MM hemispheric bubble cam (fisheye, fixed at the zenith).
+        let cam_defaults: [(&str, &str, f64, f64, usize, usize, usize, &str, usize); 3] = [
+            ("Guide 50 mm", "guide", 2.9, 162.0, 3096, 2080, 1, "pinhole", 0),
+            ("Main ASI432MM", "main", 9.0, 2000.0, 1608, 1104, 1, "pinhole", 1),
+            ("Bubble ASI462MM", "bubble", 2.9, 1.55, 1936, 1096, 2, "fisheye", 2),
+        ];
+        let cam = |i: usize| {
+            let (dname, drole, pix, foc, sw, sh, bin, proj, asi) = cam_defaults[i];
+            let name = format!("camera{}", i + 1);
+            let c = &v["camera_configs"][&name];
+            let proj_s = c["projection"].as_str().unwrap_or(proj);
             CameraConfig {
+                name: c["name"].as_str().unwrap_or(dname).to_string(),
+                role: c["role"].as_str().unwrap_or(drole).to_string(),
+                asi_index: num(&c["asi_index"], asi as f64) as usize,
+                enabled: boolean(&c["enabled"], true),
                 pixel_um: num(&c["pixel_size"], pix),
                 focal_mm: num(&c["focal_length"], foc),
-                alignment_rotation_deg: num(&c["alignment_rotation"], 180.0),
+                sensor_w: num(&c["sensor_width"], sw as f64) as usize,
+                sensor_h: num(&c["sensor_height"], sh as f64) as usize,
+                bin: (num(&c["bin"], bin as f64) as usize).clamp(1, 8),
+                projection: if proj_s.starts_with("fish") { Projection::FisheyeEquidistant } else { Projection::Pinhole },
+                alignment_rotation_deg: num(&c["alignment_rotation"], if i == 2 { 0.0 } else { 180.0 }),
                 gain: num(&c["gain"], 200.0) as i64,
                 exposure_ms: num(&c["exposure"], 50.0) as i64,
-                tetra3_db: c["tetra3_db"].as_str().map(|s| s.to_string()),
+                gamma: num(&c["gamma"], 0.1),
+                gamma_enabled: boolean(&c["gamma_enabled"], false),
+                tetra3_db: c["tetra3_db"].as_str().map(|s| s.to_string()).or(if i == 0 { Some("db_cam1_tyc".into()) } else { None }),
             }
         };
+        let n_cams = (1..=8).rev().find(|i| !v["camera_configs"][format!("camera{i}")].is_null()).unwrap_or(0).max(3);
+        let cams: Vec<CameraConfig> = (0..n_cams.min(3).max(3)).map(cam).collect();
+        let mut filter_wheels: Vec<FilterWheelConfig> = v["filter_wheels"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|w| FilterWheelConfig {
+                        name: w["name"].as_str().unwrap_or("wheel").to_string(),
+                        kind: w["kind"].as_str().unwrap_or("manual").to_string(),
+                        camera: num(&w["camera"], 1.0) as usize,
+                        efw_index: num(&w["efw_index"], 0.0) as usize,
+                        slots: w["slots"].as_array().map(|s| s.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default(),
+                        position: num(&w["position"], 0.0) as usize,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if filter_wheels.is_empty() {
+            filter_wheels = vec![
+                FilterWheelConfig {
+                    name: "Main EFW".into(),
+                    kind: "efw".into(),
+                    camera: 1,
+                    efw_index: 0,
+                    slots: ["L", "R", "G", "B", "Ha", "OIII", "SII"].iter().map(|s| s.to_string()).collect(),
+                    position: 0,
+                },
+                FilterWheelConfig {
+                    name: "Guide manual wheel".into(),
+                    kind: "manual".into(),
+                    camera: 0,
+                    efw_index: 0,
+                    slots: ["Clear", "R", "G", "B", "ND"].iter().map(|s| s.to_string()).collect(),
+                    position: 0,
+                },
+            ];
+        }
         let sc = &v["sim_config"];
         let sd = SimSettings::default();
         let sim = SimSettings {
@@ -223,7 +368,9 @@ impl Config {
             hotspot_rate_gate_dps: f("hotspot_rate_gate_dps", 0.15),
             hotspot_camera_index: f("hotspot_camera_index", 0.0) as usize,
             plate_solve_camera_index: f("plate_solve_camera_index", 0.0) as usize,
-            cam: [cam("camera1", 2.9, 162.0), cam("camera2", 2.4, 2000.0)],
+            cam: cams,
+            filter_wheels,
+            efw_dll: s("efw_dll", "EFW_filter.dll"),
             star_limit_mag: f("star_limiting_magnitude", 6.5),
             max_stars: f("max_rendered_star_count", 2000.0) as usize,
             ui_vsync: b("ui_vsync", true),
@@ -309,23 +456,42 @@ impl Config {
         set("tetra3_db_dir", json!(self.tetra3_db_dir));
         set("alignment_points", json!(self.alignment_points));
         set("alignment_settle_sec", json!(self.alignment_settle_s));
-        for (i, name) in ["camera1", "camera2"].iter().enumerate() {
-            let c = &self.cam[i];
+        for (i, c) in self.cam.iter().enumerate() {
+            let name = format!("camera{}", i + 1);
             let entry = o
                 .entry("camera_configs")
                 .or_insert_with(|| json!({}))
                 .as_object_mut()
                 .unwrap()
-                .entry(*name)
+                .entry(name)
                 .or_insert_with(|| json!({}));
             let e = entry.as_object_mut().unwrap();
+            e.insert("name".into(), json!(c.name));
+            e.insert("role".into(), json!(c.role));
+            e.insert("asi_index".into(), json!(c.asi_index));
+            e.insert("enabled".into(), json!(c.enabled));
             e.insert("pixel_size".into(), json!(c.pixel_um));
             e.insert("focal_length".into(), json!(c.focal_mm));
+            e.insert("sensor_width".into(), json!(c.sensor_w));
+            e.insert("sensor_height".into(), json!(c.sensor_h));
+            e.insert("bin".into(), json!(c.bin));
+            e.insert("projection".into(), json!(if c.projection == Projection::Pinhole { "pinhole" } else { "fisheye" }));
             e.insert("alignment_rotation".into(), json!(c.alignment_rotation_deg));
             e.insert("gain".into(), json!(c.gain));
             e.insert("exposure".into(), json!(c.exposure_ms));
+            e.insert("gamma".into(), json!(c.gamma));
+            e.insert("gamma_enabled".into(), json!(c.gamma_enabled));
             e.insert("tetra3_db".into(), json!(c.tetra3_db));
         }
+        o.insert(
+            "filter_wheels".into(),
+            json!(self
+                .filter_wheels
+                .iter()
+                .map(|w| json!({"name": w.name, "kind": w.kind, "camera": w.camera, "efw_index": w.efw_index, "slots": w.slots, "position": w.position}))
+                .collect::<Vec<_>>()),
+        );
+        o.insert("efw_dll".into(), json!(self.efw_dll));
         let sc = o.entry("sim_config").or_insert_with(|| json!({})).as_object_mut().unwrap();
         let s = &self.sim;
         sc.insert("mount_misalignment_az_deg".into(), json!(s.misalign_az_deg));
@@ -546,6 +712,9 @@ pub struct MountSnapshot {
 /// Published by the camera worker for every pumped frame.
 #[derive(Clone)]
 pub struct CamSnapshot {
+    pub slot: usize,
+    pub name: String,
+    pub role: String,
     pub data: Arc<Vec<u8>>,
     pub width: usize,
     pub height: usize,
@@ -553,11 +722,46 @@ pub struct CamSnapshot {
     pub fps: f64,
     pub utc_midpoint_s: f64,
     pub fov_deg: f64,
+    /// Effective plate scale (deg/px) at the published frame size.
+    pub deg_per_px: f64,
+    pub fisheye: bool,
     pub source: String,
+    pub connected: bool,
     pub armed: bool,
     pub armed_frames: usize,
     pub last_dump: Option<String>,
     pub deep_stars: usize,
+    pub hw_index: usize,
+}
+
+/// Filter wheel state published by the filter-wheel worker.
+#[derive(Clone, Debug, Default)]
+pub struct WheelState {
+    pub name: String,
+    pub kind: String,
+    pub camera: usize,
+    pub slots: Vec<String>,
+    pub position: usize,
+    pub target: Option<usize>,
+    pub moving: bool,
+    pub connected: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FilterWheelSnapshot {
+    pub wheels: Vec<WheelState>,
+    pub sdk: String,
+}
+
+/// UI -> filter-wheel worker.
+#[derive(Clone, Debug)]
+pub enum FwCmd {
+    Goto { wheel: usize, slot: usize },
+    SetSlotName { wheel: usize, slot: usize, name: String },
+    /// Manual wheel: the operator reports the position.
+    MarkPosition { wheel: usize, slot: usize },
+    Save,
 }
 
 /// Plate-solve result on the live frame (alignment worker).
@@ -627,9 +831,14 @@ pub enum MountCmd {
 /// UI -> camera worker.
 #[derive(Clone, Debug)]
 pub enum CamCmd {
+    /// Arm every connected camera (one run directory, CameraN_ files).
     Arm,
     Dump { name: String },
     Disarm,
+    /// Live settings changed (gain / exposure / gamma / rotation / ROI / connect).
+    Apply { slot: usize },
+    /// Exchange the hardware indices behind two logical slots and reconnect.
+    Swap { a: usize, b: usize },
 }
 
 /// UI -> alignment/plate-solve worker.
@@ -648,7 +857,12 @@ pub struct Shared {
     pub sky: ArcSwap<SkySnapshot>,
     pub passes: ArcSwap<PassesSnapshot>,
     pub mount: ArcSwap<MountSnapshot>,
-    pub cam: ArcSwap<Option<CamSnapshot>>,
+    /// Per logical camera slot.
+    pub cams: Vec<ArcSwap<Option<CamSnapshot>>>,
+    pub cam_settings: Vec<ArcSwap<CamSettings>>,
+    /// Hardware (ASI enumeration) index behind each logical slot; swapped by CamCmd::Swap.
+    pub cam_hw: std::sync::Mutex<Vec<usize>>,
+    pub filter_wheels: ArcSwap<FilterWheelSnapshot>,
     pub solve: ArcSwap<SolveSnapshot>,
     pub align: ArcSwap<AlignSnapshot>,
     pub sim: ArcSwap<SimSettings>,
@@ -660,6 +874,19 @@ pub struct Shared {
 }
 
 impl Shared {
+    /// Snapshot of one camera slot (None when the slot has no frames yet).
+    pub fn cam(&self, slot: usize) -> Option<CamSnapshot> {
+        self.cams.get(slot).and_then(|c| c.load().as_ref().clone())
+    }
+    /// The camera slot HOTSPOT/HANDOFF detect on.
+    pub fn hotspot_slot(&self) -> usize {
+        self.config.hotspot_camera_index.min(self.config.cam.len().saturating_sub(1))
+    }
+    /// The camera slot the plate solver uses.
+    pub fn solve_slot(&self) -> usize {
+        self.config.plate_solve_camera_index.min(self.config.cam.len().saturating_sub(1))
+    }
+
     pub fn new(config: Config, core: Arc<LoopShared>) -> Arc<Self> {
         let sim = config.sim.clone();
         Arc::new(Shared {
@@ -667,7 +894,10 @@ impl Shared {
             sky: ArcSwap::from_pointee(SkySnapshot::default()),
             passes: ArcSwap::from_pointee(PassesSnapshot::default()),
             mount: ArcSwap::from_pointee(MountSnapshot::default()),
-            cam: ArcSwap::from_pointee(None),
+            cams: config.cam.iter().map(|_| ArcSwap::from_pointee(None)).collect(),
+            cam_settings: config.cam.iter().map(|c| ArcSwap::from_pointee(CamSettings::from_config(c))).collect(),
+            cam_hw: std::sync::Mutex::new(config.cam.iter().map(|c| c.asi_index).collect()),
+            filter_wheels: ArcSwap::from_pointee(FilterWheelSnapshot::default()),
             solve: ArcSwap::from_pointee(SolveSnapshot::default()),
             align: ArcSwap::from_pointee(AlignSnapshot::default()),
             sim: ArcSwap::from_pointee(sim),

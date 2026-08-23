@@ -16,6 +16,7 @@ mod align_runner;
 mod camera;
 mod catalogs;
 mod deepsky;
+mod filterwheel;
 mod mount;
 mod mount3d;
 mod passes_bridge;
@@ -34,6 +35,7 @@ use theme::{ACCENT, DIM, GREEN, RED, TEXT_2};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Screen {
     Track,
+    Cameras,
     Passes,
     Align,
     Replay,
@@ -43,10 +45,11 @@ enum Screen {
 }
 
 impl Screen {
-    const ALL: [Screen; 7] = [Screen::Track, Screen::Passes, Screen::Align, Screen::Replay, Screen::Mount3d, Screen::Sim, Screen::Config];
+    const ALL: [Screen; 8] = [Screen::Track, Screen::Cameras, Screen::Passes, Screen::Align, Screen::Replay, Screen::Mount3d, Screen::Sim, Screen::Config];
     fn label(self) -> &'static str {
         match self {
             Screen::Track => "Track",
+            Screen::Cameras => "Cameras",
             Screen::Passes => "Passes",
             Screen::Align => "Align",
             Screen::Replay => "Replay",
@@ -58,6 +61,7 @@ impl Screen {
     fn slug(self) -> &'static str {
         match self {
             Screen::Track => "track",
+            Screen::Cameras => "cameras",
             Screen::Passes => "passes",
             Screen::Align => "align",
             Screen::Replay => "replay",
@@ -81,7 +85,9 @@ struct App {
     tx: crossbeam_channel::Sender<MountCmd>,
     tx_cam: crossbeam_channel::Sender<CamCmd>,
     tx_align: crossbeam_channel::Sender<AlignCmd>,
+    tx_fw: crossbeam_channel::Sender<state::FwCmd>,
     ui: ui::UiState,
+    cameras: screens::CamerasState,
     passes: screens::PassesState,
     align: screens::AlignState,
     config: screens::ConfigState,
@@ -119,6 +125,7 @@ impl App {
         tx: crossbeam_channel::Sender<MountCmd>,
         tx_cam: crossbeam_channel::Sender<CamCmd>,
         tx_align: crossbeam_channel::Sender<AlignCmd>,
+        tx_fw: crossbeam_channel::Sender<state::FwCmd>,
     ) -> Self {
         theme::install(&cc.egui_ctx);
         let shots = std::env::var("SKYTRACKER_SCREENSHOT_DIR").ok().map(|d| Screenshots {
@@ -133,7 +140,9 @@ impl App {
             tx,
             tx_cam,
             tx_align,
+            tx_fw,
             ui: ui::UiState::default(),
+            cameras: screens::CamerasState::default(),
             passes: screens::PassesState::default(),
             align: screens::AlignState::default(),
             config: screens::ConfigState::default(),
@@ -234,7 +243,7 @@ impl eframe::App for App {
             }
             if shots.idx < Screen::ALL.len() {
                 self.screen = Screen::ALL[shots.idx];
-                let dwell = match shots.idx { 0 => 12.0, 2 => 8.0, 3 => 9.0, _ => 4.0 };
+                let dwell = match shots.idx { 0 => 12.0, 1 => 5.0, 3 => 8.0, 4 => 9.0, _ => 4.0 };
                 if shots.idx == 0 && self.ui.selected.is_none() && shots.switched_at.elapsed().as_secs_f64() > 3.0 {
                     // Select something for the track screen so arcs + labels show.
                     if let Some(s) = pick_demo_target(&self.shared) {
@@ -320,7 +329,7 @@ impl eframe::App for App {
                     }
                 }
                 let m = self.shared.mount.load();
-                let c = self.shared.cam.load();
+                let c = self.shared.cam(self.shared.hotspot_slot());
                 if let Some(tt) = self.shared.sky.load().target.as_ref() {
                     eprintln!("autotest   target {} ({}): az {:.3} el {:.3} rates {:+.4}/{:+.4} °/s  setpoint {:?}", tt.name, tt.key, tt.az, tt.el, tt.az_rate, tt.el_rate, m.setpoint.map(|(a, e)| ((a * 1000.0).round() / 1000.0, (e * 1000.0).round() / 1000.0)));
                 }
@@ -328,7 +337,7 @@ impl eframe::App for App {
                     "autotest t={t:5.1}s mode={:<8} az={:8.3} el={:7.3} err={:+.4}/{:+.4} rate={:+}/{:+} hs={} snr={:.1} cen={:?} handoff={} loop={:.1}Hz cam={:.0}fps",
                     m.mode, m.az, m.el, m.az_error, m.el_error, m.rate_cmd.0, m.rate_cmd.1, m.hotspot_status, m.hotspot_snr,
                     m.hotspot_centroid.map(|(x, y)| ((x * 10.0).round() / 10.0, (y * 10.0).round() / 10.0)), m.handoff_count, m.actual_hz,
-                    c.as_ref().as_ref().map(|c| c.fps).unwrap_or(0.0)
+                    c.as_ref().map(|c| c.fps).unwrap_or(0.0)
                 );
                 if let Some(s) = m.status.last() {
                     eprintln!("autotest   last: {s}");
@@ -407,6 +416,11 @@ impl eframe::App for App {
                     ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                 });
             }
+            Screen::Cameras => {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    screens::cameras_screen(ui, &self.shared, &mut self.ui, &mut self.cameras, &self.tx_cam, &self.tx_fw);
+                });
+            }
             Screen::Passes => {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     screens::passes_screen(ui, &self.shared, &mut self.ui, &mut self.passes, &self.tx);
@@ -427,7 +441,7 @@ impl eframe::App for App {
                 egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
                     let m = self.shared.mount.load();
                     let cfg = &self.shared.config;
-                    let cam_fov = self.shared.cam.load().as_ref().as_ref().map(|c| c.fov_deg).unwrap_or(1.0);
+                    let cam_fov = self.shared.cam(self.shared.hotspot_slot()).map(|c| c.fov_deg).unwrap_or(1.0);
                     // Sky objects for the dome: bright stars, bodies, the
                     // trackable satellites (dead-reckoned), the selection.
                     let sky = self.shared.sky.load();
@@ -533,12 +547,14 @@ fn main() -> eframe::Result<()> {
     let (tx, rx) = crossbeam_channel::unbounded::<MountCmd>();
     let (tx_cam, rx_cam) = crossbeam_channel::unbounded::<CamCmd>();
     let (tx_align, rx_align) = crossbeam_channel::unbounded::<AlignCmd>();
+    let (tx_fw, rx_fw) = crossbeam_channel::unbounded::<state::FwCmd>();
 
     sky::spawn(shared.clone(), root.clone());
     mount::spawn(shared.clone(), rx, root.clone(), tx_cam.clone());
     camera::spawn(shared.clone(), rx_cam, root.clone());
     adsb::spawn(shared.clone());
     align::spawn(shared.clone(), rx_align, tx.clone());
+    filterwheel::spawn(shared.clone(), rx_fw, root.clone());
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -549,10 +565,10 @@ fn main() -> eframe::Result<()> {
         vsync,
         ..Default::default()
     };
-    let (tx2, tx_cam2, tx_align2) = (tx.clone(), tx_cam.clone(), tx_align.clone());
+    let (tx2, tx_cam2, tx_align2, tx_fw2) = (tx.clone(), tx_cam.clone(), tx_align.clone(), tx_fw.clone());
     eframe::run_native(
         "Hat Creek Skytracker",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, tx2, tx_cam2, tx_align2)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, shared, tx2, tx_cam2, tx_align2, tx_fw2)))),
     )
 }

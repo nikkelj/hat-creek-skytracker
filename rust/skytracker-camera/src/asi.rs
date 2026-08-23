@@ -132,6 +132,14 @@ impl AsiSdk {
         }
     }
 
+    /// ASISetStartPos: top-left of the ROI in (binned) sensor pixels.
+    pub fn set_start_pos(&self, camera_id: i32, x: i32, y: i32) -> Result<(), AsiError> {
+        unsafe {
+            let f: Symbol<unsafe extern "C" fn(c_int, c_int, c_int) -> c_int> = self.sym(b"ASISetStartPos")?;
+            check(f(camera_id, x, y), "ASISetStartPos")
+        }
+    }
+
     pub fn set_control(&self, camera_id: i32, control: c_int, value: i64, auto: bool) -> Result<(), AsiError> {
         unsafe {
             let f: Symbol<unsafe extern "C" fn(c_int, c_int, i64, c_int) -> c_int> =

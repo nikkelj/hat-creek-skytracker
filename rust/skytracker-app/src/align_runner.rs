@@ -52,7 +52,8 @@ fn params(cfg: &Config, n_points: usize, supervised: bool) -> AlignmentParams {
     p.n_points = n_points.clamp(4, 60);
     p.el_min_deg = AlignmentParams::el_min_from_mask(cfg.elevation_mask_deg);
     p.settle_s = cfg.alignment_settle_s.max(0.0);
-    p.fov_deg = cfg.cam[cfg.plate_solve_camera_index.min(1)].fov_deg(crate::camera::CAM_W as f64).max(0.2);
+    let sc = &cfg.cam[cfg.plate_solve_camera_index.min(cfg.cam.len().saturating_sub(1))];
+    p.fov_deg = sc.fov_deg(crate::camera::sim_frame_size(sc).0 as f64).max(0.2);
     p.pause_on_fail = false; // unattended: failed points are skipped, not parked for a joystick rescue
     p.confirm_each_point = supervised;
     p

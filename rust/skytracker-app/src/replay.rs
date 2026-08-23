@@ -2242,10 +2242,10 @@ fn fit_box(max_w: f32, max_h: f32, aspect: f32) -> Vec2 {
 
 fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
     let Some(l) = st.loaded.as_mut() else { return };
-    let n = l.run.cams.len().min(2).max(1);
+    let n = l.run.cams.len().min(3).max(1);
     let avail = ui.available_size();
     let gap = 10.0;
-    let half_w = if n > 1 { (avail.x - gap) / 2.0 } else { avail.x };
+    let half_w = if n > 1 { (avail.x - gap * (n as f32 - 1.0)) / n as f32 } else { avail.x };
     let top_left = ui.cursor().min;
     let mut draft_commit: Option<Annotation> = None;
     let mut pending_text: Option<(usize, f64, f64)> = None;

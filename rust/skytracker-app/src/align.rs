@@ -22,7 +22,7 @@ pub fn spawn(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mou
 
 fn find_db(shared: &Shared) -> Result<(String, std::path::PathBuf), String> {
     let cfg = &shared.config;
-    let cam = &cfg.cam[cfg.plate_solve_camera_index.min(1)];
+    let cam = &cfg.cam[shared.solve_slot()];
     let name = cam.tetra3_db.clone().unwrap_or_else(|| "db_cam1_tyc".into());
     for dir in cfg.tetra3_search_dirs() {
         let p = dir.join(format!("{name}.npz"));
@@ -156,7 +156,7 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
         }
 
         if want_solve {
-            let cam = shared.cam.load();
+            let cam = shared.cam(shared.solve_slot());
             match (db.as_ref(), cam.as_ref()) {
                 (Some(d), Some(f)) => {
                     snap.busy = true;

@@ -69,7 +69,7 @@ pub fn make_inputs(cfg: &Config) -> Inputs {
     inputs.guide_rate_max_dps = cfg.guide_rate_max_dps;
     inputs.output_filter_tau = cfg.output_filter_tau;
     inputs.handoff_min_frames = cfg.handoff_min_frames.max(1);
-    let cam = &cfg.cam[cfg.hotspot_camera_index.min(1)];
+    let cam = &cfg.cam[cfg.hotspot_camera_index.min(cfg.cam.len().saturating_sub(1))];
     inputs.hotspot = HotspotParams {
         snr_threshold: cfg.hotspot_snr,
         gate_radius: cfg.hotspot_gate_radius,
@@ -77,7 +77,7 @@ pub fn make_inputs(cfg: &Config) -> Inputs {
         max_rate_dps: cfg.hotspot_max_rate_dps,
         x_sign: cfg.hotspot_x_sign,
         y_sign: cfg.hotspot_y_sign,
-        pixel_size_um: cam.pixel_um,
+        pixel_size_um: cam.pixel_eff_um(),
         focal_length_mm: cam.focal_mm,
         rotation_deg: cam.alignment_rotation_deg,
         star_filter: cfg.hotspot_star_filter,
@@ -175,7 +175,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     let mut i = loop_shared.inputs.lock().unwrap();
                     i.mode = mode;
                     i.stopped = false;
-                    if !matches!(mode, Mode::Program | Mode::Handoff) {
+                    if !matches!(mode, Mode::Program | Mode::Handoff | Mode::Hotspot) {
                         i.setpoint = None;
                     }
                     drop(i);
@@ -295,7 +295,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                             let mut i = loop_shared.inputs.lock().unwrap();
                             i.mode = mode;
                             i.stopped = false;
-                            if !matches!(mode, Mode::Program | Mode::Handoff) {
+                            if !matches!(mode, Mode::Program | Mode::Handoff | Mode::Hotspot) {
                                 i.setpoint = None;
                             }
                             drop(i);
@@ -323,7 +323,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             }
         }
         if armed_toggle {
-            let armed = shared.cam.load().as_ref().as_ref().map(|c| c.armed).unwrap_or(false);
+            let armed = shared.cam(shared.hotspot_slot()).map(|c| c.armed).unwrap_or(false);
             let _ = tx_cam.send(if armed {
                 crate::state::CamCmd::Dump { name: target.clone().unwrap_or_else(|| "manual".into()) }
             } else {
@@ -336,8 +336,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             loop_shared.inputs.lock().unwrap().rate_cmd = (az_rate, el_rate);
         }
 
-        // PROGRAM / HANDOFF: live setpoint from the selected satellite.
-        if matches!(mode, Mode::Program | Mode::Handoff) {
+        // PROGRAM / HANDOFF / HOTSPOT: live setpoint from the selected target
+        // (HOTSPOT rides its trajectory feed-forward + star-filter rate reference).
+        if matches!(mode, Mode::Program | Mode::Handoff | Mode::Hotspot) {
             let sp = target.as_ref().and_then(|sn| {
                 // Non-satellite selections (body / star / DSO / aircraft) ride
                 // the sky or ADS-B worker's live track, dead-reckoned.
@@ -393,7 +394,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 let out = loop_shared.outputs.lock().unwrap().clone();
                 let e_az = ((taz - out.azm + 540.0).rem_euclid(360.0) - 180.0).abs();
                 let e_al = (tal - out.alt).abs();
-                if e_az > 2.0 || e_al > 2.0 {
+                if (e_az > 2.0 || e_al > 2.0) && mode != Mode::Hotspot {
                     slewing = true;
                 }
                 if slewing && e_az < 0.7 && e_al < 0.7 {
@@ -409,7 +410,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 }
             }
             // While slewing the loop must not fight the goto: hold the setpoint back.
-            loop_shared.inputs.lock().unwrap().setpoint = if slewing { None } else { sp };
+            loop_shared.inputs.lock().unwrap().setpoint = if slewing && mode != Mode::Hotspot { None } else { sp };
         } else {
             last_setpoint = None;
             slewing = false;
@@ -423,7 +424,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 mode = req;
                 let mut i = loop_shared.inputs.lock().unwrap();
                 i.mode = mode;
-                if !matches!(mode, Mode::Program | Mode::Handoff) {
+                if !matches!(mode, Mode::Program | Mode::Handoff | Mode::Hotspot) {
                     i.setpoint = None;
                 }
                 drop(i);

@@ -241,6 +241,7 @@ seven screens rendered from worker snapshots at a 120 Hz repaint target
 | Screen | What it does |
 |---|---|
 | **Track** | Polar skyplot (Hipparcos stars with IAU proper names, the gated satellite set dead-reckoned between 2 Hz snapshots, sun/moon/planets, Messier + NGC overlays, ADS-B aircraft with predicted tracks, the mount keepout wash, mask ring, the selected satellite's ±10 min track with minute ticks, mount boresight + camera FOV + PROGRAM setpoint vector, hover cards, de-conflicted labels — every object click-selectable and PROGRAM-trackable), live camera with tracking overlay (reticle, HOTSPOT gate/centroid/SNR, REC tag), the mount instrument panel (STANDBY/RATE/PROGRAM/HANDOFF/HOTSPOT/STOP, az/el readouts, errors, gains, autotune, log), capture arm/save, and the sortable visible-now table. Gamepad: Circle = STOP, R3/L3 = cycle mode, L1 = feed-forward toggle, Cross = capture arm/save |
+| **Cameras** | The sensor-calibration view for **three cameras** (guide 50 mm scope, ASI432MM on the main scope, ASI462MM hemispheric bubble cam — fisheye, fixed at the zenith): live feeds with per-camera **connect, gain, integration time, gamma stretch (+ enable), alignment rotation, ROI size + click-to-centre**, swap (exchanges the hardware index behind two logical slots, settings stay with the slot), arm/save runs across all cameras, reset / save to config; the **combined view** overlays the chosen feeds opacity-blended with rotation applied, optionally scaled to a common plate scale for co-boresighting; **filter wheel** cards for the ASI EFW on the main scope (goto slot, live position via EFW_filter.dll) and the manual wheel on the guide scope (mark position), with editable, persisted filter assignments |
 | **Passes** | Upcoming passes over the next 6 h from the Rust pass predictor (AOS/TCA/LOS, peak el @ az, duration, peak rate, range, apogee, estimated magnitude / `ecl`), sortable on every column, LEO/GEO filters, name/NORAD filter, click-to-select |
 | **Align** | Live camera with centroid/match overlay, one-click tetra3 plate solve (RA/Dec/roll/FOV/rmse → true az/el and pointing error vs the mount), 0.05° paddles, and the pointing-model alignment run (Fibonacci grid + holdout, spiral grid search, supervised confirm, 7-term fit with residuals) |
 | **Replay** | Run library over `data/` (Python and native captures alike), synchronized two-camera replay with scrubber/speed, gamma / brightness / contrast, flow stabilization, sharpening, stack-N, in-track/cross-track overlays, annotations, H.264 MP4 export — all on worker threads |
@@ -258,7 +259,10 @@ seven screens rendered from worker snapshots at a 120 Hz repaint target
 
 ![Mount 3D](doc/screenshots/rust_app_mount3d.png)
 
-The camera source is the Rust hardware simulator by default (Tycho-2 stars
+Cameras are logical slots (`camera_configs.camera1..3`: name, role, `asi_index`, pixel size,
+focal length, sensor size, bin, projection pinhole/fisheye, gain/exposure/gamma/rotation,
+tetra3 db); `hotspot_camera_index` / `plate_solve_camera_index` pick the slots the loop and
+the solver use. The camera source is the Rust hardware simulator by default (Tycho-2 stars
 to mag 10 + the live satellites projected through camera 1's pinhole at the
 mount's *true* pointing, Gaussian PSFs + read noise, through the real
 capture pump at ~100 FPS) or a ZWO ASI camera (`"camera_source": "asi"`);

@@ -1,7 +1,7 @@
 //! Secondary screens: Passes, Align, Sim, Config. Each renders snapshots and
 //! sends commands; none touches worker state directly.
 
-use crate::state::{AlignCmd, MountCmd, Shared, SimSettings};
+use crate::state::{AlignCmd, CamCmd, CamSettings, FwCmd, MountCmd, Shared, SimSettings};
 use crate::theme::{self, ACCENT, AMBER, DIM, GREEN, RED, TEXT, TEXT_2};
 use crate::ui::UiState;
 use egui::{RichText, Sense};
@@ -423,16 +423,40 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
                 num(ui, "y sign", &mut c.hotspot_y_sign, 1.0, 0);
                 boolean(ui, "star filter", &mut c.hotspot_star_filter);
                 num(ui, "rate gate °/s", &mut c.hotspot_rate_gate_dps, 0.01, 2);
+                let mut hc = c.hotspot_camera_index as f64;
+                num(ui, "hotspot camera (0-based)", &mut hc, 1.0, 0);
+                c.hotspot_camera_index = hc.max(0.0) as usize;
+                let mut pc = c.plate_solve_camera_index as f64;
+                num(ui, "plate-solve camera", &mut pc, 1.0, 0);
+                c.plate_solve_camera_index = pc.max(0.0) as usize;
                 let mut hf = c.handoff_min_frames as f64;
                 num(ui, "handoff frames", &mut hf, 1.0, 0);
                 c.handoff_min_frames = hf.max(1.0) as u32;
             });
             let ui = &mut cols[2];
-            for (i, name) in ["camera 1", "camera 2"].iter().enumerate() {
-                theme::section(ui, name);
+            for i in 0..c.cam.len() {
+                theme::section(ui, &format!("camera {}", i + 1));
                 egui::Grid::new(format!("cfg_cam{i}")).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                    text(ui, "name", &mut c.cam[i].name);
+                    combo(ui, "role", &mut c.cam[i].role, &["guide", "main", "bubble"]);
+                    let mut proj = if c.cam[i].projection == crate::state::Projection::Pinhole { "pinhole".to_string() } else { "fisheye".to_string() };
+                    combo(ui, "projection", &mut proj, &["pinhole", "fisheye"]);
+                    c.cam[i].projection = if proj == "fisheye" { crate::state::Projection::FisheyeEquidistant } else { crate::state::Projection::Pinhole };
+                    let mut hw = c.cam[i].asi_index as f64;
+                    num(ui, "ASI index", &mut hw, 1.0, 0);
+                    c.cam[i].asi_index = hw.max(0.0) as usize;
+                    boolean(ui, "enabled", &mut c.cam[i].enabled);
                     num(ui, "pixel µm", &mut c.cam[i].pixel_um, 0.01, 2);
-                    num(ui, "focal mm", &mut c.cam[i].focal_mm, 1.0, 1);
+                    num(ui, "focal mm", &mut c.cam[i].focal_mm, 1.0, 2);
+                    let mut sw = c.cam[i].sensor_w as f64;
+                    num(ui, "sensor w px", &mut sw, 1.0, 0);
+                    c.cam[i].sensor_w = sw.max(16.0) as usize;
+                    let mut sh = c.cam[i].sensor_h as f64;
+                    num(ui, "sensor h px", &mut sh, 1.0, 0);
+                    c.cam[i].sensor_h = sh.max(16.0) as usize;
+                    let mut b = c.cam[i].bin as f64;
+                    num(ui, "bin", &mut b, 1.0, 0);
+                    c.cam[i].bin = (b as usize).clamp(1, 8);
                     num(ui, "rotation °", &mut c.cam[i].alignment_rotation_deg, 1.0, 1);
                     let mut g = c.cam[i].gain as f64;
                     num(ui, "gain", &mut g, 1.0, 0);
@@ -440,6 +464,8 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
                     let mut e = c.cam[i].exposure_ms as f64;
                     num(ui, "exposure ms", &mut e, 1.0, 0);
                     c.cam[i].exposure_ms = e as i64;
+                    num(ui, "gamma", &mut c.cam[i].gamma, 0.01, 2);
+                    boolean(ui, "gamma enabled", &mut c.cam[i].gamma_enabled);
                     let mut db = c.cam[i].tetra3_db.clone().unwrap_or_default();
                     text(ui, "tetra3 db", &mut db);
                     c.cam[i].tetra3_db = if db.is_empty() { None } else { Some(db) };
@@ -487,4 +513,308 @@ fn combo(ui: &mut egui::Ui, label: &str, v: &mut String, options: &[&str]) {
         }
     });
     ui.end_row();
+}
+
+// ---------------------------------------------------------------------------
+// Cameras: the sensor-calibration view (port of camera_manager.render_sensor_calibration)
+// ---------------------------------------------------------------------------
+
+pub struct CamerasState {
+    pub combined: bool,
+    pub opacity: f32,
+    pub match_scale: bool,
+    pub include: Vec<bool>,
+    pub base: usize,
+    pub roi_pick: Option<usize>,
+    pub message: String,
+    pub name_edits: Vec<Vec<String>>,
+}
+
+impl Default for CamerasState {
+    fn default() -> Self {
+        CamerasState { combined: false, opacity: 0.5, match_scale: true, include: vec![true, true, false], base: 0, roi_pick: None, message: String::new(), name_edits: Vec::new() }
+    }
+}
+
+const ROI_FRACS: [(f64, &str); 5] = [(1.0, "1.0"), (0.5, ".5"), (0.25, ".25"), (0.125, ".125"), (0.0625, ".063")];
+
+pub fn cameras_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, cs: &mut CamerasState, tx_cam: &crossbeam_channel::Sender<CamCmd>, tx_fw: &crossbeam_channel::Sender<FwCmd>) {
+    let n = shared.cams.len();
+    while cs.include.len() < n {
+        cs.include.push(false);
+    }
+    // ---- header row: combined view controls, capture, reset / save
+    ui.horizontal(|ui| {
+        theme::section(ui, "cameras · sensor calibration");
+        ui.add_space(10.0);
+        if theme::mode_button(ui, "COMBINED VIEW", cs.combined, theme::ACCENT) {
+            cs.combined = !cs.combined;
+        }
+        if cs.combined {
+            ui.label(RichText::new("opacity").color(TEXT_2));
+            ui.add(egui::Slider::new(&mut cs.opacity, 0.0..=1.0).show_value(false));
+            ui.checkbox(&mut cs.match_scale, "match plate scale");
+            for i in 0..n {
+                let name = shared.config.cam[i].name.split(' ').next().unwrap_or("cam").to_string();
+                ui.checkbox(&mut cs.include[i], name);
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if theme::mode_button(ui, "save to config", false, GREEN) {
+                // Persist the live settings of every slot into config.json.
+                let mut c = shared.config.clone();
+                for (i, cam) in c.cam.iter_mut().enumerate() {
+                    let s = shared.cam_settings[i].load();
+                    cam.gain = s.gain;
+                    cam.exposure_ms = s.exposure_ms;
+                    cam.gamma = s.gamma;
+                    cam.gamma_enabled = s.gamma_enabled;
+                    cam.alignment_rotation_deg = s.rotation_deg;
+                    cam.enabled = s.connected;
+                    cam.asi_index = shared.cam_hw.lock().unwrap().get(i).copied().unwrap_or(cam.asi_index);
+                }
+                cs.message = match c.save() {
+                    Ok(()) => "camera settings saved".into(),
+                    Err(e) => format!("save failed: {e}"),
+                };
+                let _ = tx_fw.send(FwCmd::Save);
+            }
+            if ui.button("reset to config").clicked() {
+                for (i, cam) in shared.config.cam.iter().enumerate() {
+                    let mut s = (**shared.cam_settings[i].load()).clone();
+                    let d = CamSettings::from_config(cam);
+                    s.gain = d.gain;
+                    s.exposure_ms = d.exposure_ms;
+                    s.gamma = d.gamma;
+                    s.gamma_enabled = d.gamma_enabled;
+                    s.rotation_deg = d.rotation_deg;
+                    s.roi_frac = 1.0;
+                    s.roi_cx = 0.5;
+                    s.roi_cy = 0.5;
+                    shared.cam_settings[i].store(Arc::new(s));
+                    let _ = tx_cam.send(CamCmd::Apply { slot: i });
+                }
+                cs.message = "settings reset to config.json".into();
+            }
+            let any_armed = (0..n).any(|i| shared.cam(i).map_or(false, |c| c.armed));
+            if theme::mode_button(ui, if any_armed { "ARMED" } else { "ARM ALL" }, any_armed, RED) {
+                let _ = tx_cam.send(if any_armed { CamCmd::Disarm } else { CamCmd::Arm });
+            }
+            ui.add(egui::TextEdit::singleline(&mut st.capture_name).desired_width(100.0).hint_text("run name"));
+            if ui.add_enabled(any_armed, egui::Button::new("save run")).clicked() {
+                let _ = tx_cam.send(CamCmd::Dump { name: st.capture_name.clone() });
+            }
+            ui.label(RichText::new(&cs.message).font(theme::mono(10.5)).color(TEXT_2));
+        });
+    });
+
+    // ---- feeds
+    let avail = ui.available_size();
+    let feed_h = (avail.y * 0.5).clamp(220.0, 520.0);
+    if cs.combined {
+        combined_view(ui, shared, st, cs, feed_h);
+    } else {
+        ui.columns(n, |cols| {
+            for (i, col) in cols.iter_mut().enumerate() {
+                let rect = crate::ui::camera_view(col, shared, st, i, true, Some(feed_h));
+                // Click in the pane sets the ROI centre (when a ROI size is active).
+                if let Some(r) = rect {
+                    let resp = col.interact(r, egui::Id::new(("roi_pick", i)), Sense::click());
+                    if resp.clicked() {
+                        if let Some(p) = resp.interact_pointer_pos() {
+                            let mut s = (**shared.cam_settings[i].load()).clone();
+                            if s.roi_frac < 0.999 {
+                                s.roi_cx = ((p.x - r.left()) / r.width()).clamp(0.0, 1.0) as f64;
+                                s.roi_cy = ((p.y - r.top()) / r.height()).clamp(0.0, 1.0) as f64;
+                                shared.cam_settings[i].store(Arc::new(s));
+                                let _ = tx_cam.send(CamCmd::Apply { slot: i });
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    ui.add_space(6.0);
+
+    // ---- per-camera controls
+    ui.columns(n, |cols| {
+        for (i, col) in cols.iter_mut().enumerate() {
+            camera_controls(col, shared, i, tx_cam, n);
+        }
+    });
+    ui.add_space(8.0);
+
+    // ---- filter wheels
+    filter_wheel_cards(ui, shared, cs, tx_fw);
+}
+
+fn camera_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, i: usize, tx_cam: &crossbeam_channel::Sender<CamCmd>, n: usize) {
+    let cfg = &shared.config.cam[i];
+    let snap = shared.cam(i);
+    let mut s = (**shared.cam_settings[i].load()).clone();
+    let before = s.clone();
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&cfg.name).font(theme::sans(13.0)).color(TEXT));
+            theme::tag(ui, &cfg.role, if cfg.role == "main" { AMBER } else if cfg.role == "bubble" { theme::VIOLET } else { ACCENT });
+            let hw = shared.cam_hw.lock().unwrap().get(i).copied().unwrap_or(0);
+            ui.label(RichText::new(format!("hw #{hw}")).font(theme::mono(10.5)).color(DIM));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let connected = snap.as_ref().map_or(false, |c| c.connected);
+                if theme::mode_button(ui, if s.connected { "CONNECTED" } else { "CONNECT" }, connected, GREEN) {
+                    s.connected = !s.connected;
+                }
+                if let Some(c) = &snap {
+                    ui.label(RichText::new(format!("{:.0} fps · {}", c.fps, c.source)).font(theme::mono(10.0)).color(DIM));
+                }
+            });
+        });
+        egui::Grid::new(("cam_ctl", i)).num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new("gain").color(TEXT_2));
+            ui.add(egui::Slider::new(&mut s.gain, 0..=600));
+            ui.end_row();
+            ui.label(RichText::new("exposure ms").color(TEXT_2));
+            ui.add(egui::Slider::new(&mut s.exposure_ms, 1..=2000).logarithmic(true));
+            ui.end_row();
+            ui.label(RichText::new("gamma").color(TEXT_2));
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut s.gamma_enabled, "");
+                ui.add(egui::Slider::new(&mut s.gamma, 0.05..=2.0).logarithmic(true).fixed_decimals(2));
+            });
+            ui.end_row();
+            ui.label(RichText::new("rotation °").color(TEXT_2));
+            ui.add(egui::Slider::new(&mut s.rotation_deg, -180.0..=180.0).fixed_decimals(1));
+            ui.end_row();
+            ui.label(RichText::new("ROI").color(TEXT_2));
+            ui.horizontal(|ui| {
+                for (f, label) in ROI_FRACS {
+                    if theme::mode_button(ui, label, (s.roi_frac - f).abs() < 1e-6, ACCENT) {
+                        s.roi_frac = f;
+                        if f >= 0.999 {
+                            s.roi_cx = 0.5;
+                            s.roi_cy = 0.5;
+                        }
+                    }
+                }
+                ui.label(RichText::new("click the feed to centre").font(theme::sans(10.0)).color(DIM));
+            });
+            ui.end_row();
+        });
+        ui.horizontal(|ui| {
+            let (w, h) = cfg.frame_size();
+            ui.label(RichText::new(format!("{:.1} µm × bin {} · f {:.0} mm · {}×{} · FOV {:.2}°", cfg.pixel_um, cfg.bin, cfg.focal_mm, w, h, cfg.fov_deg(w as f64))).font(theme::mono(10.0)).color(DIM));
+            if n > 1 {
+                let j = (i + 1) % n;
+                if ui.small_button(format!("swap ↔ {}", shared.config.cam[j].name.split(' ').next().unwrap_or("cam"))).clicked() {
+                    let _ = tx_cam.send(CamCmd::Swap { a: i, b: j });
+                }
+            }
+        });
+    });
+    if s != before {
+        shared.cam_settings[i].store(Arc::new(s));
+        let _ = tx_cam.send(CamCmd::Apply { slot: i });
+    }
+}
+
+/// Opacity-blended overlay of the included feeds (rotation applied), either
+/// fitted to the pane or scaled to a common plate scale for co-boresighting.
+fn combined_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, cs: &mut CamerasState, h: f32) {
+    let avail = ui.available_width();
+    let (r, p) = ui.allocate_painter(egui::Vec2::new(avail, h), Sense::click());
+    p.rect_filled(r.rect, 0.0, egui::Color32::BLACK);
+    let included: Vec<usize> = (0..shared.cams.len()).filter(|&i| cs.include[i]).collect();
+    if included.is_empty() {
+        p.text(r.rect.center(), egui::Align2::CENTER_CENTER, "select cameras to overlay", theme::mono(11.0), DIM);
+        return;
+    }
+    cs.base = included[0];
+    let base = shared.cam(cs.base);
+    let Some(base) = base.filter(|c| c.connected && c.width > 0) else {
+        p.text(r.rect.center(), egui::Align2::CENTER_CENTER, "base camera has no frames", theme::mono(11.0), DIM);
+        return;
+    };
+    let scale = (r.rect.width() / base.width as f32).min(r.rect.height() / base.height as f32);
+    let mut first = true;
+    for &i in &included {
+        let Some(cam) = shared.cam(i) else { continue };
+        if !cam.connected || cam.width == 0 {
+            continue;
+        }
+        let Some((tex, w, hh)) = crate::ui::cam_texture(ui, shared, st, i) else { continue };
+        let settings = shared.cam_settings[i].load();
+        let k = if cs.match_scale && base.deg_per_px > 0.0 && cam.deg_per_px > 0.0 { (cam.deg_per_px / base.deg_per_px) as f32 } else { (base.width as f32 / w as f32).min(base.height as f32 / hh as f32) };
+        let size = egui::Vec2::new(w as f32 * scale * k, hh as f32 * scale * k);
+        let rect = egui::Rect::from_center_size(r.rect.center(), size);
+        let alpha = if first { 255 } else { (cs.opacity * 255.0) as u8 };
+        let tint = egui::Color32::from_white_alpha(alpha);
+        crate::ui::rotated_image(&p.with_clip_rect(r.rect), tex, rect, settings.rotation_deg, tint);
+        first = false;
+    }
+    let c = r.rect.center();
+    p.line_segment([c + egui::Vec2::new(-16.0, 0.0), c + egui::Vec2::new(16.0, 0.0)], egui::Stroke::new(1.0, AMBER));
+    p.line_segment([c + egui::Vec2::new(0.0, -16.0), c + egui::Vec2::new(0.0, 16.0)], egui::Stroke::new(1.0, AMBER));
+    let names: Vec<String> = included.iter().map(|&i| shared.config.cam[i].name.clone()).collect();
+    p.text(r.rect.left_top() + egui::Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP, format!("combined · {} · opacity {:.1}{}", names.join(" + "), cs.opacity, if cs.match_scale { " · plate-scale matched" } else { "" }), theme::mono(10.5), egui::Color32::from_rgb(80, 200, 200));
+}
+
+fn filter_wheel_cards(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut CamerasState, tx_fw: &crossbeam_channel::Sender<FwCmd>) {
+    let fw = shared.filter_wheels.load();
+    ui.horizontal(|ui| {
+        theme::section(ui, "filter wheels");
+        ui.label(RichText::new(&fw.sdk).font(theme::mono(10.0)).color(DIM));
+    });
+    while cs.name_edits.len() < fw.wheels.len() {
+        cs.name_edits.push(Vec::new());
+    }
+    let n = fw.wheels.len().max(1);
+    ui.columns(n, |cols| {
+        for (wi, w) in fw.wheels.iter().enumerate() {
+            let ui = &mut cols[wi];
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&w.name).font(theme::sans(13.0)).color(TEXT));
+                    theme::tag(ui, if w.kind == "efw" { "EFW" } else { "MANUAL" }, if w.kind == "efw" { ACCENT } else { AMBER });
+                    let cam_name = shared.config.cam.get(w.camera).map(|c| c.name.clone()).unwrap_or_default();
+                    ui.label(RichText::new(format!("on {cam_name}")).font(theme::sans(10.5)).color(TEXT_2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let col = if w.moving { AMBER } else if w.connected { GREEN } else { DIM };
+                        theme::tag(ui, if w.moving { "MOVING" } else if w.connected { "READY" } else { "OFFLINE" }, col);
+                        ui.label(RichText::new(&w.message).font(theme::mono(10.0)).color(DIM));
+                    });
+                });
+                // Slot buttons: current highlighted; click = goto (EFW) / mark (manual).
+                ui.horizontal_wrapped(|ui| {
+                    for (si, name) in w.slots.iter().enumerate() {
+                        let label = if name.is_empty() { format!("{}", si + 1) } else { format!("{} {}", si + 1, name) };
+                        let current = w.position == si;
+                        let target = w.target == Some(si);
+                        if theme::mode_button(ui, &label, current || target, if current { GREEN } else { AMBER }) {
+                            let _ = tx_fw.send(if w.kind == "efw" { FwCmd::Goto { wheel: wi, slot: si } } else { FwCmd::MarkPosition { wheel: wi, slot: si } });
+                        }
+                    }
+                });
+                let cur = w.slots.get(w.position).cloned().unwrap_or_default();
+                ui.label(RichText::new(format!("current filter: {}", if cur.is_empty() { "(unnamed)".to_string() } else { cur })).font(theme::mono(11.0)).color(TEXT));
+                // Assignments editor.
+                egui::CollapsingHeader::new(RichText::new("filter assignments").font(theme::sans(11.0)).color(TEXT_2)).id_salt(("fw_edit", wi)).show(ui, |ui| {
+                    let edits = &mut cs.name_edits[wi];
+                    while edits.len() < w.slots.len() {
+                        edits.push(w.slots[edits.len()].clone());
+                    }
+                    egui::Grid::new(("fw_grid", wi)).num_columns(3).spacing([8.0, 3.0]).show(ui, |ui| {
+                        for si in 0..w.slots.len() {
+                            ui.label(RichText::new(format!("slot {}", si + 1)).color(TEXT_2));
+                            ui.add(egui::TextEdit::singleline(&mut edits[si]).desired_width(110.0));
+                            if edits[si] != w.slots[si] && ui.small_button("set").clicked() {
+                                let _ = tx_fw.send(FwCmd::SetSlotName { wheel: wi, slot: si, name: edits[si].clone() });
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        }
+    });
 }

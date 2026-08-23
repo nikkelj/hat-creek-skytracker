@@ -18,12 +18,14 @@ use skytracker_core::transforms::{self, MountMode};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub fn spawn(shared: Arc<Shared>, rx: Receiver<MountCmd>, repo_root: std::path::PathBuf) {
+pub fn spawn(shared: Arc<Shared>, rx: Receiver<MountCmd>, repo_root: std::path::PathBuf, tx_cam: crossbeam_channel::Sender<crate::state::CamCmd>) {
     std::thread::Builder::new()
         .name("mount-worker".into())
-        .spawn(move || run(shared, rx, repo_root))
+        .spawn(move || run(shared, rx, repo_root, tx_cam))
         .expect("spawn mount worker");
 }
+
+const MODE_CYCLE: [Mode; 5] = [Mode::Standby, Mode::Rate, Mode::Program, Mode::Handoff, Mode::Hotspot];
 
 pub fn parse_mount_mode(s: &str) -> MountMode {
     match s.to_ascii_lowercase().replace('-', "_").as_str() {
@@ -115,7 +117,7 @@ fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String,
     (CoreLoop::spawn(mount, loop_shared.clone(), hz), "sim".into(), notes)
 }
 
-fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf) {
+fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx_cam: crossbeam_channel::Sender<crate::state::CamCmd>) {
     let cfg = shared.config.clone();
     let loop_shared = shared.core.clone();
     let (_core, transport, notes) = spawn_loop(&cfg, &loop_shared);
@@ -234,6 +236,14 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf) {
                     drop(i);
                     push_status(&mut status, format!("hotspot signs x{x:+.0} y{y:+.0}"));
                 }
+                MountCmd::ToggleFeedForward => {
+                    let mut i = loop_shared.inputs.lock().unwrap();
+                    let on = !(i.ff_azm_enabled && i.ff_alt_enabled);
+                    i.ff_azm_enabled = on;
+                    i.ff_alt_enabled = on;
+                    drop(i);
+                    push_status(&mut status, format!("feed-forward {}", if on { "ON" } else { "OFF" }));
+                }
                 MountCmd::AutotuneStart => {
                     let i = loop_shared.inputs.lock().unwrap();
                     let (a, b) = (i.azm_gains, i.alt_gains);
@@ -259,8 +269,51 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf) {
         // Gamepad -> gearbox -> rate command.
         let mut stick = (0.0, 0.0);
         let mut joystick_name = None;
+        let mut armed_toggle = false;
         if let Some(g) = gilrs.as_mut() {
-            while let Some(_ev) = g.next_event() {}
+            while let Some(ev) = g.next_event() {
+                // DualShock layout (mirrors joystick_controller.process_joystick_events):
+                // Cross = capture arm/save, Circle = STOP, R3 = cycle mode
+                // forward, touchpad/L3 = cycle backward, L1 = feed-forward toggle.
+                if let gilrs::EventType::ButtonPressed(b, _) = ev.event {
+                    use gilrs::Button;
+                    match b {
+                        Button::East => {
+                            mode = Mode::Standby;
+                            let mut i = loop_shared.inputs.lock().unwrap();
+                            i.mode = Mode::Standby;
+                            i.rate_cmd = (0, 0);
+                            i.setpoint = None;
+                            drop(i);
+                            loop_shared.commands.lock().unwrap().push_back(Command::Stop);
+                            push_status(&mut status, "STOP (gamepad)".into());
+                        }
+                        Button::RightThumb | Button::LeftThumb => {
+                            let cur = MODE_CYCLE.iter().position(|m| *m == mode).unwrap_or(0);
+                            let next = if b == Button::RightThumb { (cur + 1) % MODE_CYCLE.len() } else { (cur + MODE_CYCLE.len() - 1) % MODE_CYCLE.len() };
+                            mode = MODE_CYCLE[next];
+                            let mut i = loop_shared.inputs.lock().unwrap();
+                            i.mode = mode;
+                            i.stopped = false;
+                            if !matches!(mode, Mode::Program | Mode::Handoff) {
+                                i.setpoint = None;
+                            }
+                            drop(i);
+                            push_status(&mut status, format!("mode -> {} (gamepad)", mode_name(mode)));
+                        }
+                        Button::LeftTrigger => {
+                            let mut i = loop_shared.inputs.lock().unwrap();
+                            let on = !(i.ff_azm_enabled && i.ff_alt_enabled);
+                            i.ff_azm_enabled = on;
+                            i.ff_alt_enabled = on;
+                            drop(i);
+                            push_status(&mut status, format!("feed-forward {} (gamepad)", if on { "ON" } else { "OFF" }));
+                        }
+                        Button::South => armed_toggle = true,
+                        _ => {}
+                    }
+                }
+            }
             if let Some((_id, pad)) = g.gamepads().next() {
                 joystick_name = Some(pad.name().to_string());
                 stick = (
@@ -268,6 +321,15 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf) {
                     -(pad.value(gilrs::Axis::LeftStickY) as f64),
                 );
             }
+        }
+        if armed_toggle {
+            let armed = shared.cam.load().as_ref().as_ref().map(|c| c.armed).unwrap_or(false);
+            let _ = tx_cam.send(if armed {
+                crate::state::CamCmd::Dump { name: target.clone().unwrap_or_else(|| "manual".into()) }
+            } else {
+                crate::state::CamCmd::Arm
+            });
+            push_status(&mut status, if armed { "capture saved (gamepad)".into() } else { "capture ARMED (gamepad)".into() });
         }
         let (az_rate, el_rate) = mapper.update(stick.0, stick.1, now);
         if mode == Mode::Rate {
@@ -277,6 +339,30 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf) {
         // PROGRAM / HANDOFF: live setpoint from the selected satellite.
         if matches!(mode, Mode::Program | Mode::Handoff) {
             let sp = target.as_ref().and_then(|sn| {
+                // Non-satellite selections (body / star / DSO / aircraft) ride
+                // the sky or ADS-B worker's live track, dead-reckoned.
+                if let Some(tt) = shared.sky.load().target.as_ref().filter(|t| &t.key == sn) {
+                    let age = (crate::sky::now_jd_tt() - tt.jd_tt) * 86400.0;
+                    let el = tt.el + tt.el_rate * age;
+                    return Some(Setpoint {
+                        az_deg: (tt.az + tt.az_rate * age).rem_euclid(360.0),
+                        el_deg: if el <= 0.0 { cfg.elevation_mask_deg } else { el },
+                        ff_az_dps: tt.az_rate,
+                        ff_el_dps: tt.el_rate,
+                    });
+                }
+                if let Some(icao) = sn.strip_prefix("adsb:") {
+                    let adsb = shared.adsb.load();
+                    let a = adsb.aircraft.iter().find(|a| a.icao == icao)?;
+                    let age = crate::sky::now_unix() - a.fit_t_unix;
+                    let el = a.fit_el + a.el_rate * age;
+                    return Some(Setpoint {
+                        az_deg: (a.fit_az + a.az_rate * age).rem_euclid(360.0),
+                        el_deg: if el <= 0.0 { cfg.elevation_mask_deg } else { el },
+                        ff_az_dps: a.az_rate,
+                        ff_el_dps: a.el_rate,
+                    });
+                }
                 let cat = catalog.as_ref()?;
                 let sat = cat.get(sn)?;
                 let jd_tt = crate::sky::now_jd_tt();

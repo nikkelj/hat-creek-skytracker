@@ -25,6 +25,7 @@ skytracker-camera = { path = "../skytracker-camera" }
 skytracker-imaging = { path = "../skytracker-imaging" }
 skytracker-platesolve = { path = "../skytracker-platesolve" }
 skytracker-pointing = { path = "../skytracker-pointing" }
+skytracker-adsb = { path = "../skytracker-adsb" }
 
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.29"

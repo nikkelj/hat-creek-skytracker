@@ -240,7 +240,7 @@ seven screens rendered from worker snapshots at a 120 Hz repaint target
 
 | Screen | What it does |
 |---|---|
-| **Track** | Polar skyplot (Hipparcos stars, the gated satellite set dead-reckoned between 2 Hz snapshots, planets, mask ring, the selected satellite's ±10 min track with minute ticks, mount boresight + camera FOV + PROGRAM setpoint vector, hover cards, de-conflicted labels), live camera with tracking overlay (reticle, HOTSPOT gate/centroid/SNR, REC tag), the mount instrument panel (STANDBY/RATE/PROGRAM/HANDOFF/HOTSPOT/STOP, az/el readouts, errors, gains, autotune, log), capture arm/save, and the sortable visible-now table |
+| **Track** | Polar skyplot (Hipparcos stars with IAU proper names, the gated satellite set dead-reckoned between 2 Hz snapshots, sun/moon/planets, Messier + NGC overlays, ADS-B aircraft with predicted tracks, the mount keepout wash, mask ring, the selected satellite's ±10 min track with minute ticks, mount boresight + camera FOV + PROGRAM setpoint vector, hover cards, de-conflicted labels — every object click-selectable and PROGRAM-trackable), live camera with tracking overlay (reticle, HOTSPOT gate/centroid/SNR, REC tag), the mount instrument panel (STANDBY/RATE/PROGRAM/HANDOFF/HOTSPOT/STOP, az/el readouts, errors, gains, autotune, log), capture arm/save, and the sortable visible-now table. Gamepad: Circle = STOP, R3/L3 = cycle mode, L1 = feed-forward toggle, Cross = capture arm/save |
 | **Passes** | Upcoming passes over the next 6 h from the Rust pass predictor (AOS/TCA/LOS, peak el @ az, duration, peak rate, range, apogee, estimated magnitude / `ecl`), sortable on every column, LEO/GEO filters, name/NORAD filter, click-to-select |
 | **Align** | Live camera with centroid/match overlay, one-click tetra3 plate solve (RA/Dec/roll/FOV/rmse → true az/el and pointing error vs the mount), 0.05° paddles, and the pointing-model alignment run (Fibonacci grid + holdout, spiral grid search, supervised confirm, 7-term fit with residuals) |
 | **Replay** | Run library over `data/` (Python and native captures alike), synchronized two-camera replay with scrubber/speed, gamma / brightness / contrast, flow stabilization, sharpening, stack-N, in-track/cross-track overlays, annotations, H.264 MP4 export — all on worker threads |
@@ -281,6 +281,11 @@ runs an 8-point alignment while logging the loop once a second;
 logs displayed-vs-wanted frames (replay runs synced as OneDrive online-only
 placeholders download on first playback — the transport says so).
 `SKYTRACKER_VSYNC=0` / `"ui_vsync": false` unlocks the frame rate.
+`SKYTRACKER_AUTOTEST_TARGET=body:sun|star:HIP32349|dso:M031|adsb:<icao>`
+makes the autotest PROGRAM-track a celestial/aircraft target instead.
+ADS-B: `"adsb_source_mode": "dump1090"` reads a dump1090 SBS feed
+(`adsb_dump1090_host/port`), `"sim"` (or `SKYTRACKER_ADSB=sim`) flies three
+simulated aircraft; native RTL-SDR demodulation is not ported yet.
 
 ## Hardware Simulator
 

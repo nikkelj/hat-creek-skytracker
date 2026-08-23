@@ -5,6 +5,28 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — Native app 7g: replay proxies, skyplot layers, ADS-B, gamepad, celestial tracking
+
+- **Replay** (`SKYTRACKER_REPLAY_TEST`): on a local 196-frame run the
+  worker displays ~43 fps at 1x and stays within 5 frames of the playhead;
+  the earlier "sluggish Yaogan playback" was OneDrive online-only
+  placeholders (12.4 s first read per 18 MB frame) — now detected and
+  labelled, playback buffers instead of racing (LEARNINGS 2026-08-23).
+- **Skyplot layers**: IAU-CSN names (HIP→name, Sirius/Achernar checked),
+  OpenNGC Messier (110 + the M45 patch) and NGC (mag-limited), mount keepout
+  wash (same reachability scan as rendering_threads, incl. the AltAz flip),
+  ADS-B aircraft with linear-fit prediction — all click-selectable.
+- **Celestial / aircraft PROGRAM tracking**: the sky worker publishes the
+  selection's live az/el + rates (bodies via DE421, stars via apparent
+  places, DSOs via ICRS→ENU); `SKYTRACKER_AUTOTEST_TARGET=body:sun` →
+  PROGRAM follows the Sun's azimuth with 0.003–0.006° error (Sun below the
+  horizon at test time, so the setpoint correctly parked at the mask).
+- **Gamepad** (DualShock via gilrs): Circle STOP, R3/L3 mode cycle, L1
+  feed-forward toggle, Cross capture arm/save — mirrors joystick_controller.
+- App crate tests: 20/20 (catalogs, replay, mount3d, alignment adapter).
+
+---
+
 ## 2026-08-22 — Native app Phase 7b–7f: every screen, closed-loop in the sim
 
 **What landed** (`rust/skytracker-app`, one session after first light):

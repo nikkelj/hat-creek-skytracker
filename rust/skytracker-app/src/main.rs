@@ -10,9 +10,11 @@
 //!
 //! SKYTRACKER_SCREENSHOT_DIR=<dir> cycles every screen and saves PNGs.
 
+mod adsb;
 mod align;
 mod align_runner;
 mod camera;
+mod catalogs;
 mod deepsky;
 mod mount;
 mod mount3d;
@@ -270,7 +272,15 @@ impl eframe::App for App {
         if let Some(at) = self.autotest.as_mut() {
             let t = self.started.elapsed().as_secs_f64();
             if !at.armed && t > 4.0 {
-                if let Some(s) = pick_demo_target(&self.shared) {
+                // SKYTRACKER_AUTOTEST_TARGET=body:moon|star:HIP32349|dso:M031|adsb:<icao>
+                // tracks that key in PROGRAM instead of a satellite in HANDOFF.
+                if let Ok(key) = std::env::var("SKYTRACKER_AUTOTEST_TARGET") {
+                    self.ui.selected = Some(key.clone());
+                    let _ = self.tx.send(MountCmd::SelectTarget(Some(key.clone())));
+                    let _ = self.tx.send(MountCmd::SetMode("PROGRAM".into()));
+                    eprintln!("autotest: PROGRAM on {key} at t={t:.1}s");
+                    at.armed = true;
+                } else if let Some(s) = pick_demo_target(&self.shared) {
                     let mut sim = (**self.shared.sim.load()).clone();
                     sim.misalign_az_deg = 0.04;
                     sim.misalign_el_deg = -0.03;
@@ -311,6 +321,9 @@ impl eframe::App for App {
                 }
                 let m = self.shared.mount.load();
                 let c = self.shared.cam.load();
+                if let Some(tt) = self.shared.sky.load().target.as_ref() {
+                    eprintln!("autotest   target {} ({}): az {:.3} el {:.3} rates {:+.4}/{:+.4} °/s  setpoint {:?}", tt.name, tt.key, tt.az, tt.el, tt.az_rate, tt.el_rate, m.setpoint.map(|(a, e)| ((a * 1000.0).round() / 1000.0, (e * 1000.0).round() / 1000.0)));
+                }
                 eprintln!(
                     "autotest t={t:5.1}s mode={:<8} az={:8.3} el={:7.3} err={:+.4}/{:+.4} rate={:+}/{:+} hs={} snr={:.1} cen={:?} handoff={} loop={:.1}Hz cam={:.0}fps",
                     m.mode, m.az, m.el, m.az_error, m.el_error, m.rate_cmd.0, m.rate_cmd.1, m.hotspot_status, m.hotspot_snr,
@@ -385,6 +398,11 @@ impl eframe::App for App {
                         ui.checkbox(&mut self.ui.show_sats, "satellites");
                         ui.checkbox(&mut self.ui.show_labels, "labels");
                         ui.checkbox(&mut self.ui.show_below_mask, "below mask");
+                        ui.checkbox(&mut self.ui.show_names, "star names");
+                        ui.checkbox(&mut self.ui.show_messier, "Messier");
+                        ui.checkbox(&mut self.ui.show_ngc, "NGC");
+                        ui.checkbox(&mut self.ui.show_aircraft, "aircraft");
+                        ui.checkbox(&mut self.ui.show_keepout, "keepout");
                     });
                     ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                 });
@@ -517,8 +535,9 @@ fn main() -> eframe::Result<()> {
     let (tx_align, rx_align) = crossbeam_channel::unbounded::<AlignCmd>();
 
     sky::spawn(shared.clone(), root.clone());
-    mount::spawn(shared.clone(), rx, root.clone());
+    mount::spawn(shared.clone(), rx, root.clone(), tx_cam.clone());
     camera::spawn(shared.clone(), rx_cam, root.clone());
+    adsb::spawn(shared.clone());
     align::spawn(shared.clone(), rx_align, tx.clone());
 
     let options = eframe::NativeOptions {

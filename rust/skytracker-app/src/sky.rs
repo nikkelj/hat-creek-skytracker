@@ -4,7 +4,9 @@
 //! upcoming-pass table every minute and the selected satellite's track
 //! every 2 s), entirely off the UI thread.
 
-use crate::state::{ArcPoint, BodyMark, PassRow, PassesSnapshot, SatMark, Shared, SkySnapshot, StarMark};
+use crate::catalogs;
+use crate::state::{ArcPoint, BodyMark, DsoMark, PassRow, PassesSnapshot, SatMark, Shared, SkySnapshot, StarMark, TargetTrack};
+use skytracker_astro::apparent::FrameContext;
 use skytracker_astro::engine::Engine;
 use skytracker_astro::sgp4_pass::{self, Observer};
 use skytracker_astro::stars;
@@ -123,6 +125,19 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
         "planet:Jupiter", "planet:Saturn", "planet:Uranus", "planet:Neptune",
     ];
 
+    // Catalogue layers: IAU names, Messier + NGC (OpenNGC).
+    let star_names = Arc::new(catalogs::iau_star_names(&root.join("catalogs/iau-csn.txt")));
+    let (messier, ngc) = catalogs::load_openngc(&root.join("catalogs/openngc.csv"));
+    eprintln!("skytracker: {} star names, {} Messier, {} NGC objects", star_names.len(), messier.len(), ngc.len());
+    let mut dso_marks: Vec<DsoMark> = Vec::new();
+    let dso_altaz = |d: &catalogs::Dso, jd_tt: f64| -> (f64, f64) {
+        let ctx = FrameContext::new(jd_tt);
+        let (sr, cr) = d.ra_deg.to_radians().sin_cos();
+        let (sd, cd) = d.dec_deg.to_radians().sin_cos();
+        let (alt, az) = ctx.altaz_from_icrs(&[cd * cr, cd * sr, sd], &geom);
+        (az, alt)
+    };
+
     let mut visible: Vec<String> = Vec::new();
     let mut last_gate = Instant::now() - Duration::from_secs(3600);
     let mut last_stars = Instant::now() - Duration::from_secs(3600);
@@ -189,6 +204,28 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             }
         }
 
+        // DSOs every 5 s (fixed ICRS directions; Messier always, NGC to the limit).
+        if last_stars.elapsed() > Duration::from_secs(5) {
+            let mut marks = Vec::new();
+            if cfg.messier_enabled {
+                for d in &messier {
+                    let (az, el) = dso_altaz(d, jd_tt);
+                    if el > -2.0 {
+                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: true });
+                    }
+                }
+            }
+            if cfg.ngc_enabled {
+                for d in ngc.iter().filter(|d| d.mag <= cfg.ngc_limit_mag) {
+                    let (az, el) = dso_altaz(d, jd_tt);
+                    if el > 0.0 {
+                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: false });
+                    }
+                }
+            }
+            dso_marks = marks;
+        }
+
         // Stars every 5 s (apparent places; ~0.1 s for 2000 stars).
         if last_stars.elapsed() > Duration::from_secs(5) && !star_cat.is_empty() {
             if let Some(eph) = engine.eph.as_ref() {
@@ -210,6 +247,36 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             last_stars = Instant::now();
         }
 
+        // Non-satellite selection: live az/el + rates from +-0.5 s.
+        let selected_key = shared.selected.load();
+        let target = selected_key.as_ref().as_ref().and_then(|key| {
+            let dt = 0.5 / 86400.0;
+            let pos_at = |jd: f64| -> Option<(f64, f64, String)> {
+                if let Some(b) = key.strip_prefix("body:") {
+                    let name = if matches!(b, "sun" | "moon") { b.to_string() } else { format!("planet:{b}") };
+                    let (alt, az, _) = engine.body_altaz_dist(&name, jd, &observer).ok()?;
+                    Some((az, alt, b.to_string()))
+                } else if let Some(h) = key.strip_prefix("star:HIP") {
+                    let hip: i64 = h.parse().ok()?;
+                    let s = star_cat.iter().find(|s| s.hip == hip)?;
+                    let eph = engine.eph.as_ref()?;
+                    let app = stars::star_apparent(s, eph, jd, &geom).ok()?;
+                    let name = star_names.get(&hip).cloned().unwrap_or_else(|| format!("HIP {hip}"));
+                    Some((app.az_deg, app.alt_deg, name))
+                } else if key.starts_with("dso:") {
+                    let d = messier.iter().chain(ngc.iter()).find(|d| &d.key == key)?;
+                    let (az, el) = dso_altaz(d, jd);
+                    Some((az, el, d.name.clone()))
+                } else {
+                    None
+                }
+            };
+            let (az, el, name) = pos_at(jd_tt)?;
+            let (a_m, e_m, _) = pos_at(jd_tt - dt)?;
+            let (a_p, e_p, _) = pos_at(jd_tt + dt)?;
+            Some(TargetTrack { key: key.clone(), name, jd_tt, az, el, az_rate: sgp4_pass::unwrap_az_diff(a_p - a_m), el_rate: e_p - e_m })
+        });
+
         let compute_ms = t0.elapsed().as_secs_f64() * 1000.0;
         shared.sky.store(Arc::new(SkySnapshot {
             jd_tt,
@@ -218,6 +285,9 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             sats,
             stars: star_marks.clone(),
             bodies: body_marks,
+            dsos: dso_marks.clone(),
+            star_names: star_names.clone(),
+            target,
             n_catalog,
             compute_ms,
             status: if load_error.is_empty() {

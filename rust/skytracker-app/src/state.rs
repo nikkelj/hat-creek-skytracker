@@ -116,6 +116,16 @@ pub struct Config {
     pub tetra3_db_dir: String,
     pub alignment_points: usize,
     pub alignment_settle_s: f64,
+    pub ngc_limit_mag: f64,
+    pub messier_enabled: bool,
+    pub ngc_enabled: bool,
+    pub adsb_source_mode: String,
+    pub adsb_host: String,
+    pub adsb_port: u16,
+    pub adsb_fit_points: usize,
+    pub adsb_predict_horizon_s: f64,
+    pub adsb_predict_step_s: f64,
+    pub adsb_stale_timeout_s: f64,
     pub sim: SimSettings,
 }
 
@@ -226,6 +236,16 @@ impl Config {
             tetra3_db_dir: s("tetra3_db_dir", ""),
             alignment_points: f("alignment_points", 12.0) as usize,
             alignment_settle_s: f("alignment_settle_sec", 2.0),
+            ngc_limit_mag: f("ngc_limiting_magnitude", 10.0),
+            messier_enabled: b("messier_enabled", true),
+            ngc_enabled: b("ngc_enabled", false),
+            adsb_source_mode: s("adsb_source_mode", "off"),
+            adsb_host: s("adsb_dump1090_host", "127.0.0.1"),
+            adsb_port: f("adsb_dump1090_port", 30003.0) as u16,
+            adsb_fit_points: f("adsb_fit_points", 5.0) as usize,
+            adsb_predict_horizon_s: f("adsb_predict_horizon_sec", 60.0),
+            adsb_predict_step_s: f("adsb_predict_step_sec", 2.0),
+            adsb_stale_timeout_s: f("adsb_stale_timeout_sec", 30.0),
             sim,
             raw,
         }
@@ -378,6 +398,29 @@ pub struct BodyMark {
     pub dist_km: f64,
 }
 
+#[derive(Clone, Debug)]
+pub struct DsoMark {
+    pub key: String,
+    pub name: String,
+    pub az: f64,
+    pub el: f64,
+    pub mag: f64,
+    pub messier: bool,
+}
+
+/// Live track of a non-satellite selection (body / star / DSO), so the
+/// mount worker can follow it without its own ephemeris.
+#[derive(Clone, Debug)]
+pub struct TargetTrack {
+    pub key: String,
+    pub name: String,
+    pub jd_tt: f64,
+    pub az: f64,
+    pub el: f64,
+    pub az_rate: f64,
+    pub el_rate: f64,
+}
+
 /// Published by the sky worker (~2 Hz sats/bodies, ~0.2 Hz stars).
 #[derive(Clone, Debug, Default)]
 pub struct SkySnapshot {
@@ -386,6 +429,10 @@ pub struct SkySnapshot {
     pub sats: Vec<SatMark>,
     pub stars: Vec<StarMark>,
     pub bodies: Vec<BodyMark>,
+    pub dsos: Vec<DsoMark>,
+    /// HIP -> IAU proper name (shared, built once).
+    pub star_names: Arc<std::collections::HashMap<i64, String>>,
+    pub target: Option<TargetTrack>,
     pub n_catalog: usize,
     pub n_visible: usize,
     pub compute_ms: f64,
@@ -428,6 +475,40 @@ pub struct PassesSnapshot {
     /// Track of the selected satellite, -10..+10 min around now.
     pub arc: Vec<ArcPoint>,
     pub arc_satnum: Option<String>,
+}
+
+/// One aircraft from the ADS-B worker.
+#[derive(Clone, Debug)]
+pub struct AircraftMark {
+    pub icao: String,
+    pub label: String,
+    pub az: f64,
+    pub el: f64,
+    pub range_km: f64,
+    pub alt_m: f64,
+    pub speed_kt: Option<f64>,
+    pub track_deg: Option<f64>,
+    pub t_fix_unix: f64,
+    pub age_s: f64,
+    /// Linear-fit state at `fit_t_unix` (deg, deg/s) for dead reckoning.
+    pub fit_az: f64,
+    pub fit_el: f64,
+    pub fit_t_unix: f64,
+    pub az_rate: f64,
+    pub el_rate: f64,
+    /// Predicted (unix, az, el) ahead of the last fix.
+    pub predicted: Vec<(f64, f64, f64)>,
+    /// Observed (unix, az, el) history.
+    pub history: Vec<(f64, f64, f64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AdsbSnapshot {
+    pub status: String,
+    pub mode: String,
+    pub n_aircraft: usize,
+    pub n_msgs: u64,
+    pub aircraft: Vec<AircraftMark>,
 }
 
 /// Published by the mount worker every control cycle.
@@ -540,6 +621,7 @@ pub enum MountCmd {
     AutotuneStop { revert: bool },
     /// Nudge the commanded position in RATE-less modes (alignment paddles).
     Nudge { daz: f64, del: f64 },
+    ToggleFeedForward,
 }
 
 /// UI -> camera worker.
@@ -562,6 +644,7 @@ pub enum AlignCmd {
 }
 
 pub struct Shared {
+    pub adsb: ArcSwap<AdsbSnapshot>,
     pub sky: ArcSwap<SkySnapshot>,
     pub passes: ArcSwap<PassesSnapshot>,
     pub mount: ArcSwap<MountSnapshot>,
@@ -580,6 +663,7 @@ impl Shared {
     pub fn new(config: Config, core: Arc<LoopShared>) -> Arc<Self> {
         let sim = config.sim.clone();
         Arc::new(Shared {
+            adsb: ArcSwap::from_pointee(AdsbSnapshot::default()),
             sky: ArcSwap::from_pointee(SkySnapshot::default()),
             passes: ArcSwap::from_pointee(PassesSnapshot::default()),
             mount: ArcSwap::from_pointee(MountSnapshot::default()),

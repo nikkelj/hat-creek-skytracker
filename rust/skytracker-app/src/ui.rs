@@ -21,6 +21,12 @@ pub struct UiState {
     pub capture_name: String,
     pub gains_edit: Option<[[f64; 3]; 2]>,
     pub table_sort: (usize, bool),
+    pub show_names: bool,
+    pub show_messier: bool,
+    pub show_ngc: bool,
+    pub show_aircraft: bool,
+    pub show_keepout: bool,
+    pub keepout_tex: Option<(egui::TextureHandle, String)>,
 }
 
 impl Default for UiState {
@@ -39,6 +45,12 @@ impl Default for UiState {
             capture_name: "manual".into(),
             gains_edit: None,
             table_sort: (2, false),
+            show_names: true,
+            show_messier: true,
+            show_ngc: false,
+            show_aircraft: true,
+            show_keepout: true,
+            keepout_tex: None,
         }
     }
 }
@@ -106,6 +118,29 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         let shade = 12 + i as u8 * 2;
         painter.circle_filled(center, r, Color32::from_rgb(shade, shade + 2, shade + 6));
     }
+    // Mount keepout wash: sky directions with NO axis solution inside the
+    // limits (canonical + the over-the-zenith flip in AltAz/Passthrough),
+    // the same transform PROGRAM track uses. Cached as a texture keyed on
+    // everything that shapes it.
+    if st.show_keepout {
+        let key = format!(
+            "{}|{}|{:?}|{:?}|{}|{}",
+            cfg.mount_mode, cfg.altaz_side_flip, cfg.azm_limit, cfg.alt_limit, cfg.alignment_az, cfg.alignment_el
+        );
+        if st.keepout_tex.as_ref().map_or(true, |(_, k)| *k != key) {
+            let img = keepout_image(cfg, 161);
+            let tex = ui.ctx().load_texture("keepout", img, egui::TextureOptions::LINEAR);
+            st.keepout_tex = Some((tex, key));
+        }
+        if let Some((tex, _)) = &st.keepout_tex {
+            painter.image(
+                tex.id(),
+                Rect::from_center_size(center, Vec2::splat(2.0 * radius)),
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+    }
     // Rings + spokes.
     for el in [0.0, 30.0, 60.0] {
         let r = radius * ((90.0 - el) / 90.0) as f32;
@@ -148,6 +183,23 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             painter.circle_filled(p, size, Color32::from_rgb(g, g, (g as u16 + 12).min(255) as u8));
         }
     }
+    let pointer = resp.hover_pos();
+    // (distance, selection key, hover text, screen pos)
+    let mut best: Option<(f32, String, String, Pos2)> = None;
+    let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
+    let mut consider = |best: &mut Option<(f32, String, String, Pos2)>, p: Pos2, key: String, text: String, reach: f32| {
+        if let Some(ptr) = pointer {
+            let d = ptr.distance(p);
+            if d < reach && best.as_ref().map_or(true, |b| d < b.0) {
+                *best = Some((d, key, text, p));
+            }
+        }
+    };
+    let sel_ring = |p: Pos2| {
+        painter.circle_stroke(p, 8.0, Stroke::new(1.6, ACCENT));
+        painter.circle_stroke(p, 12.0, Stroke::new(0.8, theme::with_alpha(ACCENT, 90)));
+    };
+
     // Bodies.
     let mut grid = LabelGrid::new(rect, 12.0);
     for b in &sky.bodies {
@@ -161,8 +213,127 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             _ => (Color32::from_rgb(235, 205, 140), 3.2),
         };
         painter.circle_filled(p, r, col);
+        let key = format!("body:{}", b.name);
+        if st.selected.as_deref() == Some(key.as_str()) {
+            sel_ring(p);
+        }
         if grid.claim(p + Vec2::new(8.0, -6.0), 44.0, 12.0) {
             painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, &b.name, theme::sans(11.0), theme::with_alpha(col, 220));
+        }
+        consider(&mut best, p, key, format!("{}\naz {:.1}°  el {:.1}°   {:.0} km", b.name, b.az, b.el, b.dist_km), 9.0);
+    }
+    // Named stars (IAU-CSN): gold spike + name, click-selectable.
+    if st.show_stars && st.show_names {
+        for s in &sky.stars {
+            if s.el < 0.0 {
+                continue;
+            }
+            let Some(name) = sky.star_names.get(&s.hip) else { continue };
+            let p = polar(center, radius, s.az, s.el);
+            let gold = Color32::from_rgb(232, 196, 110);
+            painter.line_segment([p + Vec2::new(-5.0, 0.0), p + Vec2::new(5.0, 0.0)], Stroke::new(0.8, theme::with_alpha(gold, 160)));
+            painter.line_segment([p + Vec2::new(0.0, -5.0), p + Vec2::new(0.0, 5.0)], Stroke::new(0.8, theme::with_alpha(gold, 160)));
+            let key = format!("star:HIP{}", s.hip);
+            if st.selected.as_deref() == Some(key.as_str()) {
+                sel_ring(p);
+            }
+            if s.mag < 2.5 || st.selected.as_deref() == Some(key.as_str()) {
+                let lp = p + Vec2::new(7.0, -6.0);
+                if grid.claim(lp, 6.0 * name.len() as f32, 12.0) {
+                    painter.text(lp, Align2::LEFT_CENTER, name, theme::sans(10.5), theme::with_alpha(gold, 210));
+                }
+            }
+            consider(&mut best, p, key, format!("{name}\nHIP {}  mag {:.1}\naz {:.1}°  el {:.1}°", s.hip, s.mag, s.az, s.el), 8.0);
+        }
+    }
+    // Deep-sky objects: Messier violet squares, NGC teal circles.
+    if st.show_messier || st.show_ngc {
+        for d in &sky.dsos {
+            if d.el < 0.0 || (d.messier && !st.show_messier) || (!d.messier && !st.show_ngc) {
+                continue;
+            }
+            let p = polar(center, radius, d.az, d.el);
+            if d.messier {
+                painter.rect_stroke(Rect::from_center_size(p, Vec2::splat(6.0)), 1.0, Stroke::new(1.0, VIOLET));
+            } else {
+                painter.circle_stroke(p, 2.6, Stroke::new(0.9, Color32::from_rgb(80, 190, 190)));
+            }
+            if st.selected.as_deref() == Some(d.key.as_str()) {
+                sel_ring(p);
+            }
+            if d.messier || st.selected.as_deref() == Some(d.key.as_str()) {
+                let short = d.name.split(' ').next().unwrap_or(&d.name).to_string();
+                let lp = p + Vec2::new(7.0, 6.0);
+                if grid.claim(lp, 6.0 * short.len() as f32, 12.0) {
+                    painter.text(lp, Align2::LEFT_CENTER, short, theme::sans(10.0), theme::with_alpha(VIOLET, 200));
+                }
+            }
+            consider(&mut best, p, d.key.clone(), format!("{}\nmag {:.1}   az {:.1}°  el {:.1}°", d.name, d.mag, d.az, d.el), 8.0);
+        }
+    }
+    // Aircraft (ADS-B): cyan chevrons, predicted track when selected.
+    if st.show_aircraft {
+        let adsb = shared.adsb.load();
+        let cyan = Color32::from_rgb(90, 220, 230);
+        let now_u = crate::sky::now_unix();
+        for a in &adsb.aircraft {
+            let age = (now_u - a.fit_t_unix).clamp(0.0, 120.0);
+            let (az, el) = (a.fit_az + a.az_rate * age, a.fit_el + a.el_rate * age);
+            if el < -1.0 {
+                continue;
+            }
+            let p = polar(center, radius, az, el);
+            let key = format!("adsb:{}", a.icao);
+            let selected = st.selected.as_deref() == Some(key.as_str());
+            // Heading chevron along the track direction on the plot.
+            let p2 = polar(center, radius, az + a.az_rate * 20.0, el + a.el_rate * 20.0);
+            let dir = (p2 - p).normalized();
+            let dir = if dir.x.is_nan() { Vec2::new(0.0, -1.0) } else { dir };
+            let side = Vec2::new(-dir.y, dir.x);
+            let tri = vec![p + dir * 6.0, p - dir * 4.0 + side * 4.0, p - dir * 4.0 - side * 4.0];
+            painter.add(egui::Shape::convex_polygon(tri, theme::with_alpha(cyan, 220), Stroke::new(0.8, cyan)));
+            if selected {
+                sel_ring(p);
+                let mut prev: Option<Pos2> = None;
+                for (_, paz, pel) in &a.predicted {
+                    let q = polar(center, radius, *paz, *pel);
+                    if let Some(pp) = prev {
+                        painter.line_segment([pp, q], Stroke::new(1.2, theme::with_alpha(cyan, 170)));
+                    }
+                    prev = Some(q);
+                }
+                let mut prev: Option<Pos2> = None;
+                for (_, haz, hel) in &a.history {
+                    let q = polar(center, radius, *haz, *hel);
+                    if let Some(pp) = prev {
+                        painter.line_segment([pp, q], Stroke::new(1.0, theme::with_alpha(cyan, 80)));
+                    }
+                    prev = Some(q);
+                }
+            }
+            if selected || el > 20.0 {
+                let lp = p + Vec2::new(8.0, 0.0);
+                if selected || grid.claim(lp, 6.0 * a.label.len() as f32, 12.0) {
+                    painter.text(lp, Align2::LEFT_CENTER, &a.label, theme::sans(10.5), theme::with_alpha(cyan, 220));
+                }
+            }
+            consider(
+                &mut best,
+                p,
+                key,
+                format!(
+                    "{}  ({})\nalt {:.0} m  range {:.0} km  {}\naz {:.1}°  el {:.1}°   fix {:.0} s ago",
+                    a.label,
+                    a.icao.to_uppercase(),
+                    a.alt_m,
+                    a.range_km,
+                    a.speed_kt.map(|v| format!("{v:.0} kt")).unwrap_or_default(),
+                    az,
+                    el,
+                    a.age_s
+                ),
+                9.0,
+            );
         }
     }
 
@@ -203,9 +374,6 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
 
     // Satellites + hit-testing. Marks are dead-reckoned forward with their
     // rates so motion is smooth at the display rate.
-    let pointer = resp.hover_pos();
-    let mut best: Option<(f32, String, String, Pos2)> = None;
-    let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
     let mut n_labels = 0;
     if st.show_sats {
         // Draw in two passes so the trackable set sits on top of the chaff.
@@ -347,6 +515,39 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         theme::mono(11.0),
         AMBER,
     );
+}
+
+/// Reachability lattice over the sky disc (port of rendering_threads
+/// _build_keepout_surface): +x = east, +y = south, r = (90 - el) / 90.
+fn keepout_image(cfg: &crate::state::Config, n: usize) -> egui::ColorImage {
+    use skytracker_core::transforms::{sky_to_mount, MountMode};
+    let mode = crate::mount::parse_mount_mode(&cfg.mount_mode);
+    let flips: &[bool] = if matches!(mode, MountMode::AltAz | MountMode::Passthrough) { &[false, true] } else { &[false] };
+    let (azm_min, azm_max) = cfg.azm_limit;
+    let (alt_min, alt_max) = cfg.alt_limit;
+    let half = (n as f64 - 1.0) / 2.0;
+    let mut px = vec![Color32::TRANSPARENT; n * n];
+    for iy in 0..n {
+        for ix in 0..n {
+            let dx = (ix as f64 - half) / half;
+            let dy = (iy as f64 - half) / half;
+            let r = (dx * dx + dy * dy).sqrt();
+            if r > 1.0 {
+                continue;
+            }
+            let el = 90.0 * (1.0 - r);
+            let az = dx.atan2(-dy).to_degrees().rem_euclid(360.0);
+            let reachable = flips.iter().any(|&flip| {
+                let (a, e) = if flip { ((az + 180.0).rem_euclid(360.0), 180.0 - el) } else { (az, el) };
+                let (azm, alt) = sky_to_mount(mode, a, e, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip);
+                azm_min <= azm && azm <= azm_max && alt_min <= alt && alt <= alt_max
+            });
+            if !reachable {
+                px[iy * n + ix] = Color32::from_rgba_unmultiplied(255, 70, 70, 46);
+            }
+        }
+    }
+    egui::ColorImage { size: [n, n], pixels: px }
 }
 
 pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx_cam: &crossbeam_channel::Sender<CamCmd>, show_solve: bool) {
@@ -493,7 +694,15 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
     egui::Grid::new("mount_grid").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
         theme::kv(ui, "rate cmd", format!("{:+} / {:+}   gear {}", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling));
         theme::kv(ui, "joystick", format!("{}   {:+.2} / {:+.2}", m.joystick.clone().unwrap_or_else(|| "none".into()), m.stick.0, m.stick.1));
-        theme::kv_colored(ui, "target", m.target.clone().unwrap_or_else(|| "—".into()), if m.target.is_some() { ACCENT } else { DIM });
+        let tname = {
+            let sky = shared.sky.load();
+            match (&m.target, &sky.target) {
+                (Some(t), Some(tt)) if &tt.key == t => format!("{}  ({t})", tt.name),
+                (Some(t), _) => t.clone(),
+                (None, _) => "—".into(),
+            }
+        };
+        theme::kv_colored(ui, "target", tname, if m.target.is_some() { ACCENT } else { DIM });
         if let Some((a, e)) = m.setpoint {
             theme::kv(ui, "setpoint", format!("{a:8.3}° / {e:7.3}°"));
         }

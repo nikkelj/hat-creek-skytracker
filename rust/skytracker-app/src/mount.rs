@@ -418,6 +418,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
         let mut stick = (0.0, 0.0);
         let mut stick_raw = (0.0, 0.0);
         let mut joystick_name = None;
+        let mut joy_buttons = 0u32;
+        let mut joy_left = (0.0, 0.0);
+        let mut joy_right = (0.0, 0.0);
+        let mut joy_trig = (0.0, 0.0);
         let mut want_tare = false;
         let mut want_cycle_mode = false;
         let mut armed_toggle = false;
@@ -496,6 +500,22 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             }
             if let Some((_id, pad)) = g.gamepads().next() {
                 joystick_name = Some(pad.name().to_string());
+                use gilrs::{Axis as Ax, Button as B};
+                joy_left = (pad.value(Ax::LeftStickX) as f64, pad.value(Ax::LeftStickY) as f64);
+                joy_right = (pad.value(Ax::RightStickX) as f64, pad.value(Ax::RightStickY) as f64);
+                let trig = |b: B| pad.button_data(b).map(|d| d.value() as f64).unwrap_or(0.0);
+                joy_trig = (trig(B::LeftTrigger2), trig(B::RightTrigger2));
+                for (bit, b) in [
+                    (0u32, B::South), (1, B::East), (2, B::West), (3, B::North),
+                    (4, B::Select), (5, B::Mode), (6, B::Start),
+                    (7, B::LeftThumb), (8, B::RightThumb),
+                    (9, B::LeftTrigger), (10, B::RightTrigger),
+                    (11, B::DPadUp), (12, B::DPadDown), (13, B::DPadLeft), (14, B::DPadRight),
+                ] {
+                    if pad.is_pressed(b) {
+                        joy_buttons |= 1 << bit;
+                    }
+                }
                 let (ax, ay) = if cfg.joystick_rate_stick.eq_ignore_ascii_case("left") { (gilrs::Axis::LeftStickX, gilrs::Axis::LeftStickY) } else { (gilrs::Axis::RightStickX, gilrs::Axis::RightStickY) };
                 stick_raw = (pad.value(ax) as f64, -(pad.value(ay) as f64));
                 stick = ((stick_raw.0 - tare.0).clamp(-1.0, 1.0), (stick_raw.1 - tare.1).clamp(-1.0, 1.0));
@@ -709,6 +729,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             pointing_model_on: shared.pointing.load().0,
             pointing_corr: pm_corr_last,
             joystick_tare: tare,
+            joy_buttons,
+            joy_left,
+            joy_right,
+            joy_triggers: joy_trig,
+            gear_base: cfg.joy_rate_base_ceiling.clamp(1, 9),
+            gear_max: 9,
         }));
 
         let sleep = Duration::from_millis(33).saturating_sub(t0.elapsed());

@@ -267,8 +267,18 @@ type-appropriate cards for planets, stars, DSOs, aircraft and launches) with
 **camera parameter/FOV cards** beneath it, color-matched to each camera's
 FOV footprint drawn on the plot (the fisheye bubble as a zenith-centred
 coverage circle). Every layout carries the **visible-satellites table**
-(bottom panel in tabs, rollups elsewhere) and per-camera quick controls
-(gain / exposure / gamma / rotation / ROI) under each Track camera view.
+(bottom panel in tabs, rollups elsewhere) and a single-row control strip
+(gain / exposure / gamma / rotation / ROI) under each Track camera view;
+mousewheel over any camera view **pixel-zooms** about the cursor (drag to
+pan, reset button) independently of the hardware ROI.
+
+The mount panel carries a **KSP-style navball** (orthographic sky/ground
+ball with grid, cardinal letters, bezel, waterline boresight reticle, the
+target's arc + purple setpoint crosshair, ADS-B diamonds, HDG/PITCH box), a
+**virtual controller panel** (live DualShock mirror: buttons light up,
+stick crosshairs move, RATE-stick tare marker, L2/R2 bars, the
+adaptive-rate gear ladder, and a function legend), and **inline PID
+tuning** — dragging the P/I/D values applies to the loop live.
 
 ![Track](doc/screenshots/rust_app_track.png)
 

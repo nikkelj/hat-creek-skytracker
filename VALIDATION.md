@@ -5,6 +5,38 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — UI round 5: KSP navball, virtual controller, live PID, pixel zoom
+
+- **KSP-style navball** (port of joystick_panels.render_navball): true
+  orthographic ball — sky/ground hemisphere fill (texture cached on
+  quantized elevation; the fill depends only on el since world-up in the
+  camera frame is (0, cos e, sin e)), 30° meridians + 10° parallels, bright
+  horizon, cardinal letters, green pitch-numeral chips, bezel with ticks +
+  heading index, fixed yellow "waterline" boresight reticle, the selected
+  target's arc (grey past / yellow future) + purple KSP crosshair at the
+  setpoint, ADS-B diamonds, and the green HDG/PITCH instrument box with
+  past-pole normalization. Verified in the fresh-state tour.
+- **Virtual controller panel** (port of render_joystick_status): stylized
+  DualShock drawn per frame from live gamepad state now published in
+  MountSnapshot (buttons bitmask, both sticks, L2/R2 analog) — pressed
+  buttons light green, stick crosshairs move live, the RATE stick is
+  amber-tagged with the tare point marked, L2/R2 fill bars, the
+  adaptive-rate gear ladder (green base / orange boost / grey outside RATE),
+  and a function legend that highlights while a control is held.
+- **Inline live PID tuning**: the gains… popup became a PID GAINS section in
+  the mount panel — dragging P/I/D applies to the loop immediately
+  (SetGains); "sync from loop" re-reads after a mode-profile switch.
+- **Camera pixel zoom**: mousewheel over any camera view zooms about the
+  cursor (1–16×), drag pans, reset button appears — a pure display
+  transform, independent of the hardware ROI; all overlays (reticle, ROI
+  box, hotspot, solve marks) ride the same transform.
+- **Track camera controls** are now a single always-visible row
+  (gain / exposure / γ / rotation / ROI) instead of a collapsible.
+- Note: egui persistence keeps collapse state per user — screenshot tours
+  need a fresh app.ron to show the default-open panels.
+
+---
+
 ## 2026-08-23 — UI round 4: skyplot zoom + info panes, deterministic splitters
 
 - **Skyplot zoom/pan**: mousewheel zooms about the cursor (1–60×), drag pans

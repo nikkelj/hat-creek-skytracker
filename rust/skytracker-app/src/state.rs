@@ -831,6 +831,16 @@ pub struct MountSnapshot {
     /// Last pointing-model correction applied to the setpoint (deg).
     pub pointing_corr: (f64, f64),
     pub joystick_tare: (f64, f64),
+    /// Live gamepad state (virtual-controller panel). Bit order mirrors the
+    /// Python BUTTON_LABELS: 0=Cross 1=Circle 2=Square 3=Triangle 4=Share
+    /// 5=PS 6=Options 7=L3 8=R3 9=L1 10=R1 11..14=DPad U/D/L/R.
+    pub joy_buttons: u32,
+    pub joy_left: (f64, f64),
+    pub joy_right: (f64, f64),
+    /// L2 / R2 analog values (0..1).
+    pub joy_triggers: (f64, f64),
+    pub gear_base: i32,
+    pub gear_max: i32,
 }
 
 /// Published by the camera worker for every pumped frame.

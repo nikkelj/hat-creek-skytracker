@@ -56,6 +56,12 @@ pub struct UiState {
     pub quad_cam_h: f32,
     pub scope_sky_h: f32,
     pub scope_ctl_h: f32,
+    /// Navball hemisphere texture, cached on quantized elevation.
+    pub navball_tex: Option<(egui::TextureHandle, i32)>,
+    /// Temporary per-camera pixel zoom (mousewheel) + pan — display only,
+    /// independent of the hardware ROI.
+    pub cam_zoom: Vec<f32>,
+    pub cam_pan: Vec<Vec2>,
 }
 
 impl Default for UiState {
@@ -102,6 +108,9 @@ impl Default for UiState {
             quad_cam_h: 470.0,
             scope_sky_h: 320.0,
             scope_ctl_h: 150.0,
+            navball_tex: None,
+            cam_zoom: Vec::new(),
+            cam_pan: Vec::new(),
         }
     }
 }
@@ -174,50 +183,42 @@ pub fn vdrag_handle(ui: &mut egui::Ui, id_salt: &str, val: &mut f32, min: f32, m
 }
 
 /// Compact per-camera gain / exposure / gamma / rotation / ROI controls for
-/// the Track-screen camera views (full controls live on the Cameras screen).
+/// the Track-screen camera views: one always-visible row (full controls live
+/// on the Cameras screen).
 pub fn camera_quick_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, slot: usize, tx_cam: &crossbeam_channel::Sender<CamCmd>) {
     if slot >= shared.cam_settings.len() {
         return;
     }
     let mut s = (**shared.cam_settings[slot].load()).clone();
     let before = s.clone();
-    egui::CollapsingHeader::new(egui::RichText::new("controls").font(theme::sans(10.5)).color(TEXT_2))
-        .id_salt(("quickcam", slot))
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.spacing_mut().slider_width = (ui.available_width() - 150.0).clamp(70.0, 170.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("gain").font(theme::sans(10.0)).color(DIM));
-                ui.add(egui::Slider::new(&mut s.gain, 0..=600));
-            });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("exp ").font(theme::sans(10.0)).color(DIM));
-                ui.add(
-                    egui::Slider::new(&mut s.exposure_us, 1..=2_000_000)
-                        .logarithmic(true)
-                        .custom_formatter(|v, _| crate::screens::fmt_exposure(v as i64))
-                        .custom_parser(crate::screens::parse_exposure),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut s.gamma_enabled, egui::RichText::new("γ").font(theme::sans(11.0)).color(DIM));
-                ui.add(egui::Slider::new(&mut s.gamma, 0.05..=2.0).logarithmic(true).fixed_decimals(2));
-            });
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("rot ").font(theme::sans(10.0)).color(DIM));
-                ui.add(egui::DragValue::new(&mut s.rotation_deg).speed(0.5).suffix("°").range(-180.0..=180.0));
-                ui.label(egui::RichText::new("ROI").font(theme::sans(10.0)).color(DIM));
-                for (f, label) in [(1.0, "1"), (0.5, "½"), (0.25, "¼"), (0.125, "⅛")] {
-                    if theme::mode_button(ui, label, (s.roi_frac - f).abs() < 1e-6, ACCENT) {
-                        s.roi_frac = f;
-                        if f >= 0.999 {
-                            s.roi_cx = 0.5;
-                            s.roi_cy = 0.5;
-                        }
-                    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let lbl = |ui: &mut egui::Ui, t: &str| ui.label(egui::RichText::new(t).font(theme::sans(10.0)).color(DIM));
+        lbl(ui, "gain");
+        ui.add(egui::DragValue::new(&mut s.gain).speed(2).range(0..=600));
+        lbl(ui, "exp");
+        ui.add(
+            egui::DragValue::new(&mut s.exposure_us)
+                .speed(40)
+                .range(1..=2_000_000)
+                .custom_formatter(|v, _| crate::screens::fmt_exposure(v as i64))
+                .custom_parser(crate::screens::parse_exposure),
+        );
+        ui.checkbox(&mut s.gamma_enabled, egui::RichText::new("γ").font(theme::sans(11.0)).color(DIM));
+        ui.add(egui::DragValue::new(&mut s.gamma).speed(0.01).range(0.05..=2.0).max_decimals(2));
+        lbl(ui, "rot");
+        ui.add(egui::DragValue::new(&mut s.rotation_deg).speed(0.5).suffix("°").range(-180.0..=180.0));
+        lbl(ui, "roi");
+        for (f, label) in [(1.0, "1"), (0.5, "½"), (0.25, "¼"), (0.125, "⅛")] {
+            if theme::mode_button(ui, label, (s.roi_frac - f).abs() < 1e-6, ACCENT) {
+                s.roi_frac = f;
+                if f >= 0.999 {
+                    s.roi_cx = 0.5;
+                    s.roi_cy = 0.5;
                 }
-            });
-        });
+            }
+        }
+    });
     if s != before {
         shared.cam_settings[slot].store(Arc::new(s));
         let _ = tx_cam.send(CamCmd::Apply { slot });
@@ -1115,10 +1116,41 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
     let h = height.unwrap_or(avail * cam.height as f32 / cam.width as f32);
     let (r, p) = ui.allocate_painter(Vec2::new(avail, h), Sense::hover());
     p.rect_filled(r.rect, 0.0, Color32::BLACK);
-    // Fit the frame into the pane keeping aspect.
-    let scale = (r.rect.width() / cam.width as f32).min(r.rect.height() / cam.height as f32);
+    let p = p.with_clip_rect(r.rect);
+    // Temporary pixel-zoom: mousewheel about the cursor, drag pans; purely a
+    // display transform, independent of the hardware ROI.
+    while st.cam_zoom.len() <= slot {
+        st.cam_zoom.push(1.0);
+        st.cam_pan.push(Vec2::ZERO);
+    }
+    let drag = ui.interact(r.rect, ui.id().with(("cam_pixel_zoom", slot)), Sense::drag());
+    if let Some(ptr) = drag.hover_pos() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll != 0.0 {
+            let old = st.cam_zoom[slot];
+            let new = (old * (scroll * 0.0022).exp()).clamp(1.0, 16.0);
+            if new != old {
+                let cpos = r.rect.center() + st.cam_pan[slot];
+                st.cam_pan[slot] = (ptr + (cpos - ptr) * (new / old)) - r.rect.center();
+                st.cam_zoom[slot] = new;
+            }
+        }
+    }
+    if drag.dragged() && st.cam_zoom[slot] > 1.001 {
+        st.cam_pan[slot] += drag.drag_delta();
+    }
+    if st.cam_zoom[slot] <= 1.001 {
+        st.cam_zoom[slot] = 1.0;
+        st.cam_pan[slot] = Vec2::ZERO;
+    } else {
+        let lim = Vec2::new(r.rect.width(), r.rect.height()) * st.cam_zoom[slot] * 0.6;
+        st.cam_pan[slot] = st.cam_pan[slot].clamp(-lim, lim);
+    }
+    let zoom = st.cam_zoom[slot];
+    // Fit the frame into the pane keeping aspect, then apply the pixel zoom.
+    let scale = (r.rect.width() / cam.width as f32).min(r.rect.height() / cam.height as f32) * zoom;
     let img_size = Vec2::new(cam.width as f32 * scale, cam.height as f32 * scale);
-    let img_rect = Rect::from_center_size(r.rect.center(), img_size);
+    let img_rect = Rect::from_center_size(r.rect.center() + st.cam_pan[slot], img_size);
     if let Some((id, _, _)) = tex {
         rotated_image(&p, id, img_rect, settings.rotation_deg, Color32::WHITE);
     }
@@ -1162,6 +1194,16 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
             for m in &sv.matched {
                 p.circle_stroke(to_screen(m[1], m[0]), 7.0, Stroke::new(1.2, GREEN));
             }
+        }
+    }
+    if zoom > 1.0 {
+        let br = Rect::from_min_size(r.rect.right_bottom() + Vec2::new(-92.0, -24.0), Vec2::new(84.0, 18.0));
+        let rb = ui.interact(br, ui.id().with(("cam_zoom_reset", slot)), Sense::click());
+        p.rect(br, 4.0, theme::with_alpha(theme::RAISED, 230), Stroke::new(1.0, if rb.hovered() { ACCENT } else { HAIRLINE }));
+        p.text(br.center(), Align2::CENTER_CENTER, format!("{zoom:.1}× · reset"), theme::mono(9.5), if rb.hovered() { TEXT } else { TEXT_2 });
+        if rb.clicked() {
+            st.cam_zoom[slot] = 1.0;
+            st.cam_pan[slot] = Vec2::ZERO;
         }
     }
     if cam.armed {
@@ -1298,44 +1340,45 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         if m.bias != (0.0, 0.0) && ui.small_button("bias 0").clicked() {
             let _ = tx.send(MountCmd::BiasReset);
         }
-        if ui.small_button("gains…").clicked() {
-            st.gains_edit = Some(if st.gains_edit.is_some() { st.gains_edit.unwrap() } else { m.gains });
-            if st.gains_edit.is_some() && ui.input(|i| i.modifiers.shift) {
-                st.gains_edit = None;
-            }
-        }
     });
     if let Some(t) = &m.autotune {
         ui.label(egui::RichText::new(t).font(theme::mono(10.5)).color(ACCENT));
     }
-    if let Some(mut g) = st.gains_edit {
-        let mut close = false;
-        theme::card(ui, |ui| {
-            egui::Grid::new("gains_grid").num_columns(4).spacing([8.0, 3.0]).show(ui, |ui| {
-                ui.label(egui::RichText::new("").small());
-                for h in ["P", "I", "D"] {
-                    ui.label(egui::RichText::new(h).color(DIM));
+    // Inline PID tuning: edits apply to the loop immediately (SetGains).
+    // Per-mode gain profiles still load on mode change — "sync from loop"
+    // re-reads the live gains after that.
+    egui::CollapsingHeader::new(egui::RichText::new("PID GAINS").font(theme::sans(10.5)).color(DIM)).id_salt("pid_gains").default_open(false).show(ui, |ui| {
+        let mut g = st.gains_edit.unwrap_or(m.gains);
+        let before = g;
+        egui::Grid::new("gains_grid").num_columns(4).spacing([8.0, 3.0]).show(ui, |ui| {
+            ui.label(egui::RichText::new("").small());
+            for h in ["P", "I", "D"] {
+                ui.label(egui::RichText::new(h).color(DIM));
+            }
+            ui.end_row();
+            for (i, name) in ["az", "el"].iter().enumerate() {
+                ui.label(egui::RichText::new(*name).color(TEXT_2));
+                for j in 0..3 {
+                    ui.add(egui::DragValue::new(&mut g[i][j]).speed(0.00001).max_decimals(6));
                 }
                 ui.end_row();
-                for (i, name) in ["az", "el"].iter().enumerate() {
-                    ui.label(egui::RichText::new(*name).color(TEXT_2));
-                    for j in 0..3 {
-                        ui.add(egui::DragValue::new(&mut g[i][j]).speed(0.00001).max_decimals(6));
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("apply").clicked() {
-                    let _ = tx.send(MountCmd::SetGains { azm: (g[0][0], g[0][1], g[0][2]), alt: (g[1][0], g[1][1], g[1][2]) });
-                }
-                if ui.button("close").clicked() {
-                    close = true;
-                }
-            });
+            }
         });
-        st.gains_edit = if close { None } else { Some(g) };
-    }
+        if g != before {
+            st.gains_edit = Some(g);
+            let _ = tx.send(MountCmd::SetGains { azm: (g[0][0], g[0][1], g[0][2]), alt: (g[1][0], g[1][1], g[1][2]) });
+        }
+        ui.horizontal(|ui| {
+            if st.gains_edit.is_some() {
+                if ui.small_button("sync from loop").clicked() {
+                    st.gains_edit = None;
+                }
+                ui.label(egui::RichText::new("edited · applying live").font(theme::sans(9.5)).color(AMBER));
+            } else {
+                ui.label(egui::RichText::new("live loop gains · drag to tune").font(theme::sans(9.5)).color(DIM));
+            }
+        });
+    });
     // PID diagnostics: tracking-error and rate-command strip charts + navball
     // (render_tracking_strip_charts / render_pid_diagnostics / render_navball).
     {
@@ -1353,8 +1396,11 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         strip_chart(ui, &st.history, |h| (h.1, h.2), "error az / el  (°)", tracking, true);
         strip_chart(ui, &st.history, |h| (h.3, h.4), "rate cmd az / el  (steps)", tracking, false);
     });
-    egui::CollapsingHeader::new(egui::RichText::new("NAVBALL").font(theme::sans(10.5)).color(DIM)).id_salt("navball").default_open(false).show(ui, |ui| {
-        navball(ui, m.az, m.el, m.connected && !m.loop_dead, m.setpoint);
+    egui::CollapsingHeader::new(egui::RichText::new("NAVBALL").font(theme::sans(10.5)).color(DIM)).id_salt("navball").default_open(true).show(ui, |ui| {
+        navball(ui, shared, st, &m);
+    });
+    egui::CollapsingHeader::new(egui::RichText::new("JOYSTICK").font(theme::sans(10.5)).color(DIM)).id_salt("joypanel").default_open(true).show(ui, |ui| {
+        joystick_panel(ui, &m, shared.config.joystick_rate_stick.eq_ignore_ascii_case("left"));
     });
     ui.add_space(4.0);
     // Connection controls (mirrors render_connection_controls / ADS-B controls).
@@ -1486,70 +1532,356 @@ fn strip_chart(ui: &mut egui::Ui, hist: &std::collections::VecDeque<(f64, f64, f
 /// KSP-style navball: heading tape at the top, pitch ladder under a fixed
 /// boresight reticle; the ball moves, the reticle stays. Target shown as a
 /// green marker when a setpoint exists.
-fn navball(ui: &mut egui::Ui, az: f64, el: f64, connected: bool, target: Option<(f64, f64)>) {
-    let size = ui.available_width().min(220.0);
-    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), size), Sense::hover());
-    let c = r.rect.center();
-    let rad = size / 2.0 - 4.0;
-    let dim = if connected { 255 } else { 110 };
-    p.circle_filled(c, rad, Color32::from_rgb(14, 18, 26));
-    p.circle_stroke(c, rad, Stroke::new(1.0, HAIRLINE));
-    let clip = p.with_clip_rect(Rect::from_center_size(c, Vec2::splat(rad * 2.0)));
-    // Pitch ladder: 10 px per degree around the boresight elevation.
-    let px_per_deg = rad / 30.0;
-    for k in -9..=9 {
-        let ladder_el = ((el / 10.0).round() as i32 + k) * 10;
-        if !(-90..=90).contains(&ladder_el) {
+/// KSP-style navball (port of joystick_panels.render_navball): orthographic
+/// ball with sky/ground hemispheres, meridians + parallels, cardinal letters,
+/// pitch numerals, bezel, fixed "waterline" boresight reticle, the selected
+/// target's trajectory + purple crosshair, ADS-B diamonds, and a green
+/// HDG/PITCH readout. The hemisphere fill is a texture cached on quantized
+/// elevation (the fill depends only on el); the grid is redrawn per frame.
+fn navball(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, m: &crate::state::MountSnapshot) {
+    let size = ui.available_width().min(260.0);
+    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), size + 22.0), Sense::hover());
+    let c = Pos2::new(r.rect.center().x, r.rect.top() + size / 2.0 - 4.0);
+    let rad = size / 2.0 - 16.0;
+    let connected = m.connected && !m.loop_dead;
+    let (az, el) = if connected { (m.az, m.el) } else { (0.0, 15.0) };
+    // Quantize the pointing so the cached fill + grid geometry snap (sub-pixel).
+    let gaz = (az / 0.5).round() * 0.5;
+    let gel = (el / 0.5).round() * 0.5;
+    let (a0, e0) = (gaz.to_radians(), gel.to_radians());
+    let (ce0, se0, sa0, ca0) = (e0.cos(), e0.sin(), a0.sin(), a0.cos());
+    // World axes X=east Y=up Z=north; ball oriented so the pointing sits front-center.
+    let zc = [ce0 * sa0, se0, ce0 * ca0];
+    let yc = [-se0 * sa0, ce0, -se0 * ca0];
+    let xc = [
+        yc[1] * zc[2] - yc[2] * zc[1],
+        yc[2] * zc[0] - yc[0] * zc[2],
+        yc[0] * zc[1] - yc[1] * zc[0],
+    ];
+    let proj = move |az_deg: f64, el_deg: f64| -> (Pos2, f64) {
+        let (ar, er) = (az_deg.to_radians(), el_deg.to_radians());
+        let ce = er.cos();
+        let v = [ce * ar.sin(), er.sin(), ce * ar.cos()];
+        let z = v[0] * zc[0] + v[1] * zc[1] + v[2] * zc[2];
+        let x = v[0] * xc[0] + v[1] * xc[1] + v[2] * xc[2];
+        let y = v[0] * yc[0] + v[1] * yc[1] + v[2] * yc[2];
+        (Pos2::new(c.x + x as f32 * rad, c.y - y as f32 * rad), z)
+    };
+    // Hemisphere fill: world-up in the camera frame is (0, cos e, sin e), so
+    // the texture depends only on elevation — one-deep cache on gel.
+    let key = (gel * 2.0).round() as i32;
+    if st.navball_tex.as_ref().map_or(true, |(_, k)| *k != key) {
+        const NT: usize = 192;
+        let mut px = vec![Color32::TRANSPARENT; NT * NT];
+        let half = (NT as f64 - 1.0) / 2.0;
+        for iy in 0..NT {
+            for ix in 0..NT {
+                let nx = (ix as f64 - half) / half;
+                let ny = (half - iy as f64) / half;
+                let rr = nx * nx + ny * ny;
+                if rr > 1.0 {
+                    continue;
+                }
+                let nz = (1.0 - rr).sqrt();
+                let vy = ce0 * ny + se0 * nz;
+                let (br, bg, bb) = if vy >= 0.0 { (86.0, 150.0, 220.0) } else { (150.0, 110.0, 70.0) };
+                let sh = 0.55 + 0.45 * nz; // spherical shading
+                px[iy * NT + ix] = Color32::from_rgb((br * sh) as u8, (bg * sh) as u8, (bb * sh) as u8);
+            }
+        }
+        let img = egui::ColorImage { size: [NT, NT], pixels: px };
+        let tex = ui.ctx().load_texture("navball_ball", img, egui::TextureOptions::LINEAR);
+        st.navball_tex = Some((tex, key));
+    }
+    let tint = if connected { Color32::WHITE } else { Color32::from_rgba_unmultiplied(255, 255, 255, 80) };
+    if let Some((tex, _)) = &st.navball_tex {
+        p.image(tex.id(), Rect::from_center_size(c, Vec2::splat(rad * 2.0)), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
+    }
+    let clip = p.with_clip_rect(Rect::from_center_size(c, Vec2::splat(rad * 2.0 + 2.0)));
+    let alpha: u8 = if connected { 255 } else { 80 };
+    let wa = |col: Color32| theme::with_alpha(col, alpha);
+    // Grid: azimuth meridians (tines) + elevation parallels + bright horizon.
+    let draw_curve = |samples: &mut dyn Iterator<Item = (f64, f64)>, col: Color32, width: f32| {
+        let mut run: Vec<Pos2> = Vec::new();
+        for (a_d, e_d) in samples {
+            let (pt, z) = proj(a_d, e_d);
+            if z > 0.0 {
+                run.push(pt);
+            } else if run.len() >= 2 {
+                clip.add(egui::Shape::line(std::mem::take(&mut run), Stroke::new(width, col)));
+            } else {
+                run.clear();
+            }
+        }
+        if run.len() >= 2 {
+            clip.add(egui::Shape::line(run, Stroke::new(width, col)));
+        }
+    };
+    let meridian = wa(Color32::from_rgb(206, 210, 222));
+    let sky_line = wa(Color32::from_rgb(225, 234, 246));
+    let gnd_line = wa(Color32::from_rgb(212, 196, 176));
+    for az_line in (0..360).step_by(30) {
+        draw_curve(&mut (-17..=17).map(|e| (az_line as f64, e as f64 * 5.0)), meridian, 1.0);
+    }
+    for el_line in (-8..=8).map(|k| k * 10) {
+        if el_line == 0 {
             continue;
         }
-        let y = c.y + ((el - ladder_el as f64) * px_per_deg as f64) as f32;
-        if (y - c.y).abs() > rad {
+        let col = if el_line > 0 { sky_line } else { gnd_line };
+        draw_curve(&mut (0..=72).map(|a| (a as f64 * 5.0, el_line as f64)), col, if el_line % 30 == 0 { 1.5 } else { 0.8 });
+    }
+    draw_curve(&mut (0..=72).map(|a| (a as f64 * 5.0, 0.0)), wa(Color32::from_rgb(250, 250, 252)), 2.2);
+    // Pitch numerals in a gap between tines (green chips, KSP style).
+    let gap_az = (gaz / 30.0).floor() * 30.0 + 15.0;
+    for el_line in [-60i32, -30, 30, 60] {
+        let (pt, z) = proj(gap_az, el_line as f64);
+        if z > 0.0 {
+            let galley = clip.layout_no_wrap(format!("{el_line:+}"), theme::mono(9.0), wa(Color32::from_rgb(130, 255, 140)));
+            let bgr = Rect::from_center_size(pt, galley.size() + Vec2::new(6.0, 2.0));
+            clip.rect_filled(bgr, 2.0, theme::with_alpha(Color32::from_rgb(16, 26, 18), alpha.saturating_sub(40)));
+            clip.galley(bgr.min + Vec2::new(3.0, 1.0), galley, wa(Color32::from_rgb(130, 255, 140)));
+        }
+    }
+    // Cardinal / intercardinal letters where their meridian meets the horizon.
+    for (h, lbl) in [(0.0, "N"), (45.0, "NE"), (90.0, "E"), (135.0, "SE"), (180.0, "S"), (225.0, "SW"), (270.0, "W"), (315.0, "NW")] {
+        let (pt, z) = proj(h, 0.0);
+        if z <= 0.0 {
             continue;
         }
-        let half = if ladder_el == 0 { rad } else { rad * 0.45 };
-        let col = if ladder_el == 0 { theme::with_alpha(TEXT, dim) } else if ladder_el > 0 { theme::with_alpha(ACCENT, dim.min(170)) } else { theme::with_alpha(Color32::from_rgb(160, 120, 80), dim.min(170)) };
-        clip.line_segment([Pos2::new(c.x - half, y), Pos2::new(c.x + half, y)], Stroke::new(if ladder_el == 0 { 1.4 } else { 1.0 }, col));
-        if ladder_el != 0 {
-            clip.text(Pos2::new(c.x + half + 4.0, y), Align2::LEFT_CENTER, format!("{ladder_el}"), theme::mono(9.5), col);
+        let col = if lbl.len() == 1 { wa(Color32::from_rgb(255, 230, 110)) } else { wa(Color32::from_rgb(214, 218, 228)) };
+        clip.text(pt + Vec2::new(0.0, -3.0), Align2::CENTER_BOTTOM, lbl, theme::sans(10.5), col);
+    }
+    if connected {
+        // Selected target's arc (grey past, yellow future) — mirrors the skyplot.
+        let passes = shared.passes.load();
+        for w in passes.arc.windows(2) {
+            if w[0].el <= 0.0 || w[1].el <= 0.0 {
+                continue;
+            }
+            let (p0, z0) = proj(w[0].az, w[0].el);
+            let (p1, z1) = proj(w[1].az, w[1].el);
+            if z0 <= 0.0 || z1 <= 0.0 {
+                continue;
+            }
+            let col = if w[1].t_rel_s < 0.0 { Color32::from_rgb(130, 130, 130) } else { Color32::from_rgb(255, 255, 0) };
+            clip.line_segment([p0, p1], Stroke::new(1.6, col));
+        }
+        // Live target: purple KSP crosshair at the commanded setpoint.
+        if let Some((taz, tel)) = m.setpoint {
+            let (pt, z) = proj(taz, tel);
+            if z > 0.0 {
+                let purple = Color32::from_rgb(205, 95, 255);
+                let rr = (rad * 0.075).max(6.0);
+                clip.circle_stroke(pt, rr, Stroke::new(1.6, purple));
+                for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                    clip.line_segment([pt + Vec2::new(dx * rr, dy * rr), pt + Vec2::new(dx * (rr + 6.0), dy * (rr + 6.0))], Stroke::new(1.6, purple));
+                }
+                clip.circle_filled(pt, 1.4, purple);
+            }
+        }
+        // ADS-B aircraft: orange diamonds, white ring on the selection.
+        let adsb = shared.adsb.load();
+        for a in adsb.aircraft.iter() {
+            if a.el <= 0.0 {
+                continue;
+            }
+            let (pt, z) = proj(a.az, a.el);
+            if z <= 0.0 {
+                continue;
+            }
+            let d = (rad * 0.03).max(3.0);
+            let ac = Color32::from_rgb(255, 170, 60);
+            clip.add(egui::Shape::convex_polygon(
+                vec![pt + Vec2::new(0.0, -d), pt + Vec2::new(d, 0.0), pt + Vec2::new(0.0, d), pt + Vec2::new(-d, 0.0)],
+                ac,
+                Stroke::NONE,
+            ));
+            if st.selected.as_deref() == Some(format!("adsb:{}", a.icao).as_str()) {
+                clip.circle_stroke(pt, d + 3.0, Stroke::new(1.5, Color32::WHITE));
+            }
         }
     }
-    // Heading tape along the top: every 30 deg, 2 px per degree.
-    let tape_y = c.y - rad + 14.0;
-    let px_per_deg_h = (rad * 2.0) / 120.0;
-    for k in -6..=6 {
-        let hdg = ((az / 30.0).round() as i32 + k) * 30;
-        let x = c.x + (((hdg as f64) - az) * px_per_deg_h as f64) as f32;
-        if (x - c.x).abs() > rad - 6.0 {
-            continue;
-        }
-        let label = match hdg.rem_euclid(360) {
-            0 => "N".to_string(),
-            90 => "E".to_string(),
-            180 => "S".to_string(),
-            270 => "W".to_string(),
-            h => format!("{h}"),
-        };
-        clip.line_segment([Pos2::new(x, tape_y - 5.0), Pos2::new(x, tape_y + 5.0)], Stroke::new(1.0, theme::with_alpha(TEXT_2, dim)));
-        clip.text(Pos2::new(x, tape_y + 8.0), Align2::CENTER_TOP, label, theme::mono(9.5), theme::with_alpha(TEXT_2, dim));
+    // Bezel ring, 30° ticks, fixed heading index.
+    let bezel = wa(Color32::from_rgb(188, 190, 200));
+    p.circle_stroke(c, rad + 1.0, Stroke::new(2.0, bezel));
+    for deg in (0..360).step_by(30) {
+        let ang = (deg as f32 - 90.0).to_radians();
+        let (ca, sa) = (ang.cos(), ang.sin());
+        p.line_segment(
+            [Pos2::new(c.x + (rad + 2.0) * ca, c.y + (rad + 2.0) * sa), Pos2::new(c.x + (rad + 8.0) * ca, c.y + (rad + 8.0) * sa)],
+            Stroke::new(2.0, bezel),
+        );
     }
-    // Target marker (green) relative to the boresight.
-    if let Some((taz, tel)) = target {
-        let daz = (taz - az + 540.0).rem_euclid(360.0) - 180.0;
-        let x = c.x + (daz * el.to_radians().cos() * px_per_deg as f64) as f32;
-        let y = c.y - ((tel - el) * px_per_deg as f64) as f32;
-        if (x - c.x).powi(2) + (y - c.y).powi(2) < rad * rad {
-            clip.circle_stroke(Pos2::new(x, y), 5.0, Stroke::new(1.2, GREEN));
-        }
+    p.add(egui::Shape::convex_polygon(
+        vec![Pos2::new(c.x, c.y - rad + 1.0), Pos2::new(c.x - 6.0, c.y - rad - 9.0), Pos2::new(c.x + 6.0, c.y - rad - 9.0)],
+        wa(Color32::from_rgb(255, 230, 110)),
+        Stroke::NONE,
+    ));
+    // Fixed boresight "waterline" reticle (yellow aircraft marker).
+    let yellow = wa(Color32::from_rgb(255, 214, 0));
+    let r0 = (rad * 0.055).max(4.0);
+    let wing = (rad * 0.20).max(10.0);
+    let drop = (wing / 3.0).max(3.0);
+    p.circle_stroke(c, r0, Stroke::new(2.0, yellow));
+    for sx in [-1.0f32, 1.0] {
+        let x_in = c.x + sx * (r0 + 2.0);
+        let x_out = c.x + sx * (r0 + wing);
+        p.line_segment([Pos2::new(x_in, c.y), Pos2::new(x_out, c.y)], Stroke::new(2.5, yellow));
+        p.line_segment([Pos2::new(x_out, c.y), Pos2::new(x_out, c.y + drop)], Stroke::new(2.5, yellow));
     }
-    // Fixed boresight reticle.
-    p.circle_stroke(c, 6.0, Stroke::new(1.4, AMBER));
-    p.line_segment([c + Vec2::new(-18.0, 0.0), c + Vec2::new(-6.0, 0.0)], Stroke::new(1.4, AMBER));
-    p.line_segment([c + Vec2::new(6.0, 0.0), c + Vec2::new(18.0, 0.0)], Stroke::new(1.4, AMBER));
-    p.line_segment([c + Vec2::new(0.0, -14.0), c + Vec2::new(0.0, -6.0)], Stroke::new(1.4, AMBER));
-    p.text(c + Vec2::new(0.0, rad - 4.0), Align2::CENTER_BOTTOM, format!("az {:.1}°  el {:.1}°", az, el), theme::mono(10.0), theme::with_alpha(TEXT, dim));
+    p.line_segment([Pos2::new(c.x, c.y - r0 - 2.0), Pos2::new(c.x, c.y - r0 - (wing / 2.0).max(5.0))], Stroke::new(2.5, yellow));
+    // Green HDG / PITCH instrument box (past-pole orientations normalized).
+    let box_w = 2.0 * rad * 0.95;
+    let bx = Rect::from_min_size(Pos2::new(c.x - box_w / 2.0, c.y + rad + 12.0), Vec2::new(box_w, 19.0));
+    p.rect(bx, 2.0, Color32::from_rgb(16, 26, 18), Stroke::new(1.0, Color32::from_rgb(70, 110, 80)));
+    let readout = if connected {
+        let mut el_d = (el + 180.0).rem_euclid(360.0) - 180.0;
+        let mut az_d = az;
+        if el_d > 90.0 {
+            az_d += 180.0;
+            el_d = 180.0 - el_d;
+        } else if el_d < -90.0 {
+            az_d += 180.0;
+            el_d = -180.0 - el_d;
+        }
+        format!("HDG {:05.1}°   PITCH {:+5.1}°", az_d.rem_euclid(360.0), el_d)
+    } else {
+        "HDG ---.-°   PITCH --.-°".to_string()
+    };
+    p.text(bx.center(), Align2::CENTER_CENTER, readout, theme::mono(11.0), if connected { Color32::from_rgb(130, 255, 140) } else { Color32::from_rgb(110, 130, 110) });
     if !connected {
-        p.text(c, Align2::CENTER_CENTER, "mount offline", theme::mono(10.5), DIM);
+        p.text(c, Align2::CENTER_CENTER, "mount offline", theme::mono(10.5), TEXT_2);
     }
+}
+
+/// Virtual-controller panel (port of render_joystick_status): a stylized
+/// DualShock with live button/stick/trigger state, the rate-stick crosshair,
+/// the tare marker, the adaptive-rate gear ladder, and a function legend
+/// that highlights while a control is held.
+pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_stick_left: bool) {
+    let connected = m.joystick.is_some();
+    ui.label(egui::RichText::new(format!("joystick: {}", m.joystick.clone().unwrap_or_else(|| "none".into()))).font(theme::mono(10.5)).color(if connected { TEXT_2 } else { RED }));
+    let w = ui.available_width().min(340.0);
+    let pad_h = w * 0.55;
+    let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), pad_h), Sense::hover());
+    let body = Rect::from_center_size(Pos2::new(r.rect.center().x, r.rect.top() + pad_h * 0.60), Vec2::new(w * 0.94, pad_h * 0.70));
+    let alpha: u8 = if connected { 255 } else { 90 };
+    let wa = |col: Color32| theme::with_alpha(col, alpha);
+    let btn = |bit: u32| connected && (m.joy_buttons >> bit) & 1 == 1;
+    let off_fill = theme::with_alpha(theme::BG, alpha);
+    p.rect(body, 26.0, theme::with_alpha(theme::RAISED, alpha.saturating_sub(55)), Stroke::new(1.0, wa(HAIRLINE)));
+    let at = |fx: f32, fy: f32| Pos2::new(body.left() + body.width() * fx, body.top() + body.height() * fy);
+    // Shoulders: L1/R1 buttons with L2/R2 analog fill bars above them.
+    for (side, l2v, l1bit, l1, l2) in [(-1.0f32, m.joy_triggers.0, 9u32, "L1", "L2"), (1.0, m.joy_triggers.1, 10, "R1", "R2")] {
+        let x = body.center().x + side * body.width() * 0.32;
+        let l2r = Rect::from_center_size(Pos2::new(x, body.top() - 22.0), Vec2::new(46.0, 8.0));
+        p.rect(l2r, 3.0, off_fill, Stroke::new(1.0, wa(HAIRLINE)));
+        let fillw = l2r.width() * (l2v as f32).clamp(0.0, 1.0);
+        if fillw > 0.5 {
+            p.rect_filled(Rect::from_min_size(l2r.min, Vec2::new(fillw, l2r.height())), 3.0, AMBER);
+        }
+        p.text(l2r.right_center() + Vec2::new(4.0, 0.0), Align2::LEFT_CENTER, l2, theme::mono(7.5), wa(DIM));
+        let l1r = Rect::from_center_size(Pos2::new(x, body.top() - 9.0), Vec2::new(46.0, 11.0));
+        p.rect(l1r, 4.0, if btn(l1bit) { GREEN } else { off_fill }, Stroke::new(1.0, wa(HAIRLINE)));
+        p.text(l1r.center(), Align2::CENTER_CENTER, l1, theme::mono(8.5), if btn(l1bit) { Color32::BLACK } else { wa(TEXT_2) });
+    }
+    // D-pad cross (bias).
+    let dc = at(0.17, 0.36);
+    let sq = w * 0.047;
+    let off = w * 0.052;
+    for (bit, dx, dy) in [(11u32, 0.0f32, -1.0f32), (12, 0.0, 1.0), (13, -1.0, 0.0), (14, 1.0, 0.0)] {
+        let cr = Rect::from_center_size(dc + Vec2::new(dx * off, dy * off), Vec2::splat(sq));
+        p.rect(cr, 2.0, if btn(bit) { GREEN } else { off_fill }, Stroke::new(1.0, wa(HAIRLINE)));
+    }
+    // Face buttons (PS symbols, PS colors; pressed = green fill).
+    let fc = at(0.83, 0.36);
+    let fr = w * 0.034;
+    let foff = w * 0.058;
+    for (bit, dx, dy, sym, col) in [
+        (3u32, 0.0f32, -1.0f32, "△", Color32::from_rgb(64, 226, 160)),
+        (1, 1.0, 0.0, "○", Color32::from_rgb(255, 102, 102)),
+        (0, 0.0, 1.0, "✕", Color32::from_rgb(124, 178, 232)),
+        (2, -1.0, 0.0, "□", Color32::from_rgb(255, 105, 248)),
+    ] {
+        let bc = fc + Vec2::new(dx * foff, dy * foff);
+        p.circle_filled(bc, fr, if btn(bit) { GREEN } else { off_fill });
+        p.circle_stroke(bc, fr, Stroke::new(1.2, wa(col)));
+        p.text(bc, Align2::CENTER_CENTER, sym, theme::mono(10.0), if btn(bit) { Color32::BLACK } else { wa(col) });
+    }
+    // Share / Options / PS.
+    for (bit, fx, lbl) in [(4u32, 0.35f32, "share"), (6, 0.65, "opts")] {
+        let br = Rect::from_center_size(at(fx, 0.18), Vec2::new(32.0, 11.0));
+        p.rect(br, 3.0, if btn(bit) { GREEN } else { off_fill }, Stroke::new(1.0, wa(HAIRLINE)));
+        p.text(br.center(), Align2::CENTER_CENTER, lbl, theme::mono(7.5), if btn(bit) { Color32::BLACK } else { wa(DIM) });
+    }
+    {
+        let bc = at(0.5, 0.42);
+        p.circle_filled(bc, 7.0, if btn(5) { GREEN } else { off_fill });
+        p.circle_stroke(bc, 7.0, Stroke::new(1.0, wa(HAIRLINE)));
+        p.text(bc, Align2::CENTER_CENTER, "PS", theme::mono(7.0), if btn(5) { Color32::BLACK } else { wa(DIM) });
+    }
+    // Sticks: live crosshair boxes (the Python 2D crosshairs, on the pad);
+    // the RATE stick is amber-tagged and shows the tare point.
+    for (fx, vx, vy, tbit, is_rate) in [
+        (0.36f32, m.joy_left.0, m.joy_left.1, 7u32, rate_stick_left),
+        (0.64, m.joy_right.0, m.joy_right.1, 8, !rate_stick_left),
+    ] {
+        let sc = at(fx, 0.74);
+        let sr = w * 0.083;
+        p.circle_filled(sc, sr, off_fill);
+        let ring = if is_rate { AMBER } else { HAIRLINE };
+        p.circle_stroke(sc, sr, Stroke::new(if btn(tbit) { 2.2 } else { 1.2 }, if btn(tbit) { GREEN } else { wa(ring) }));
+        let sclip = p.with_clip_rect(Rect::from_center_size(sc, Vec2::splat(sr * 2.0)));
+        let cp = sc + Vec2::new((vx as f32).clamp(-1.0, 1.0) * sr * 0.72, -(vy as f32).clamp(-1.0, 1.0) * sr * 0.72);
+        sclip.line_segment([Pos2::new(cp.x, sc.y - sr), Pos2::new(cp.x, sc.y + sr)], Stroke::new(1.0, wa(TEXT)));
+        sclip.line_segment([Pos2::new(sc.x - sr, cp.y), Pos2::new(sc.x + sr, cp.y)], Stroke::new(1.0, wa(TEXT)));
+        p.circle_filled(cp, 2.5, if is_rate { AMBER } else { wa(TEXT_2) });
+        if is_rate {
+            p.text(sc + Vec2::new(0.0, sr + 2.0), Align2::CENTER_TOP, "RATE", theme::mono(7.5), wa(AMBER));
+            if m.joystick_tare != (0.0, 0.0) {
+                let tp = sc + Vec2::new(m.joystick_tare.0 as f32 * sr * 0.72, m.joystick_tare.1 as f32 * sr * 0.72);
+                p.circle_stroke(tp, 3.0, Stroke::new(1.2, wa(VIOLET)));
+            }
+        }
+    }
+    // Adaptive-rate gear ladder: green base gears, orange boost, grey outside RATE.
+    let boosted = m.gear_ceiling > m.gear_base;
+    ui.label(
+        egui::RichText::new(format!("slew gear {}/{}{}", m.gear_ceiling, m.gear_max, if boosted && m.mode == "RATE" { "  BOOST" } else { "" }))
+            .font(theme::mono(10.0))
+            .color(if boosted && m.mode == "RATE" { AMBER } else { TEXT_2 }),
+    );
+    let (gr, gp) = ui.allocate_painter(Vec2::new(ui.available_width(), 15.0), Sense::hover());
+    for sgear in 1..=m.gear_max {
+        let seg = Rect::from_min_size(gr.rect.min + Vec2::new((sgear - 1) as f32 * 14.0, 1.0), Vec2::new(12.0, 13.0));
+        let col = if m.mode == "RATE" && sgear <= m.gear_ceiling {
+            if sgear <= m.gear_base { GREEN } else { AMBER }
+        } else {
+            theme::with_alpha(DIM, 60)
+        };
+        gp.rect(seg, 2.0, col, Stroke::new(1.0, HAIRLINE));
+    }
+    ui.label(egui::RichText::new("hold the stick pinned to wind up the boost gears").font(theme::sans(9.0)).color(DIM));
+    // Function legend, live-highlighted while a control is held.
+    egui::Grid::new("joy_legend").num_columns(2).spacing([10.0, 1.0]).show(ui, |ui| {
+        let rows: [(&str, String, bool); 10] = [
+            ("✕", "capture arm / save run".into(), btn(0)),
+            ("○", "STOP → standby".into(), btn(1)),
+            ("□", "tare rate stick".into(), btn(2)),
+            ("△", "park".into(), btn(3)),
+            ("L1", "feed-forward toggle".into(), btn(9)),
+            ("L3/R3", "cycle tracking mode".into(), btn(7) || btn(8)),
+            ("share", format!("bias step ({})", if m.bias_fine { "fine .01°" } else { "coarse .1°" }), btn(4)),
+            ("opts", format!("mount mode ({})", m.mount_mode), btn(6)),
+            ("d-pad", format!("bias {:+.2}° / {:+.2}°", m.bias.0, m.bias.1), btn(11) || btn(12) || btn(13) || btn(14)),
+            (if rate_stick_left { "L-stick" } else { "R-stick" }, "RATE slew (adaptive gearbox)".into(), false),
+        ];
+        for (k, v, active) in rows {
+            ui.label(egui::RichText::new(k).font(theme::mono(9.5)).color(if active { GREEN } else { DIM }));
+            ui.label(egui::RichText::new(v).font(theme::sans(9.5)).color(if active { GREEN } else { TEXT_2 }));
+            ui.end_row();
+        }
+    });
 }
 
 pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &crossbeam_channel::Sender<MountCmd>) {

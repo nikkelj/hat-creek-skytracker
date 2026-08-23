@@ -216,6 +216,9 @@ pub struct Config {
     pub adsb_device_index: usize,
     pub adsb_gain: String,
     pub adsb_dll: String,
+    /// Per-mode PID gain profiles (config `pid_mode_profiles`): mode -> (azm (p,i,d), alt (p,i,d)).
+    pub pid_profiles: std::collections::HashMap<String, ((f64, f64, f64), (f64, f64, f64))>,
+    pub launches_dir: String,
     pub sim: SimSettings,
 }
 
@@ -399,6 +402,27 @@ impl Config {
             adsb_device_index: f("adsb_device_index", 0.0) as usize,
             adsb_gain: match &v["adsb_gain"] { Value::String(g) => g.clone(), Value::Number(n) => n.to_string(), _ => "auto".into() },
             adsb_dll: s("adsb_rtlsdr_dll", "rtlsdr.dll"),
+            pid_profiles: v["pid_mode_profiles"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(mode, p)| {
+                            let g = &p["gains"];
+                            if g.is_null() {
+                                return None;
+                            }
+                            Some((
+                                mode.to_ascii_uppercase(),
+                                (
+                                    (num(&g["pid_azm_p_gain"], 0.0023), num(&g["pid_azm_i_gain"], 0.00025), num(&g["pid_azm_d_gain"], 0.00027)),
+                                    (num(&g["pid_alt_p_gain"], 0.0027), num(&g["pid_alt_i_gain"], 0.00028), num(&g["pid_alt_d_gain"], 0.00027)),
+                                ),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            launches_dir: s("launches_dir", "launches"),
             sim,
             raw,
         }
@@ -580,6 +604,16 @@ pub struct DsoMark {
     pub messier: bool,
 }
 
+/// A launch trajectory (launches/*.txt: T0 + ECEF states, or *.csv with
+/// time/azimuthDegs/elevationDegs/rangeKm), converted to topocentric rows.
+#[derive(Clone, Debug)]
+pub struct LaunchTrack {
+    pub key: String,
+    pub name: String,
+    /// (unix s, az, el, range_km)
+    pub rows: Vec<(f64, f64, f64, f64)>,
+}
+
 /// Live track of a non-satellite selection (body / star / DSO), so the
 /// mount worker can follow it without its own ephemeris.
 #[derive(Clone, Debug)]
@@ -602,6 +636,8 @@ pub struct SkySnapshot {
     pub stars: Vec<StarMark>,
     pub bodies: Vec<BodyMark>,
     pub dsos: Vec<DsoMark>,
+    /// Rocket launch trajectories from the launches directory.
+    pub launches: Arc<Vec<LaunchTrack>>,
     /// HIP -> IAU proper name (shared, built once).
     pub star_names: Arc<std::collections::HashMap<i64, String>>,
     pub target: Option<TargetTrack>,
@@ -713,6 +749,10 @@ pub struct MountSnapshot {
     pub gains: [[f64; 3]; 2],
     pub autotune: Option<String>,
     pub loop_dead: bool,
+    /// Operator bias (cross-el, el) in degrees and the D-pad step mode.
+    pub bias: (f64, f64),
+    pub bias_fine: bool,
+    pub parking: bool,
 }
 
 /// Published by the camera worker for every pumped frame.
@@ -832,6 +872,12 @@ pub enum MountCmd {
     /// Nudge the commanded position in RATE-less modes (alignment paddles).
     Nudge { daz: f64, del: f64 },
     ToggleFeedForward,
+    /// Operator bias on the setpoint: on-sky cross-elevation / elevation (deg).
+    Bias { daz: f64, del: f64 },
+    BiasReset,
+    BiasFine(bool),
+    /// Park: drive the axes to the configured offsets (mount frame 0/0).
+    Park,
 }
 
 /// UI -> camera worker.

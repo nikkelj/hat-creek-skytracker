@@ -274,6 +274,46 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             consider(&mut best, p, d.key.clone(), format!("{}\nmag {:.1}   az {:.1}°  el {:.1}°", d.name, d.mag, d.az, d.el), 8.0);
         }
     }
+    // Rocket launches: the trajectory arc + the rocket's current position.
+    {
+        let now_u = crate::sky::now_unix();
+        for l in sky.launches.iter() {
+            let col = Color32::from_rgb(0, 220, 230);
+            let mut prev: Option<Pos2> = None;
+            for &(t, az, el, _) in l.rows.iter().step_by(5) {
+                if el < -1.0 {
+                    prev = None;
+                    continue;
+                }
+                let p = polar(center, radius, az, el);
+                if let Some(pp) = prev {
+                    let a = if t < now_u { 70 } else { 170 };
+                    painter.line_segment([pp, p], Stroke::new(1.2, theme::with_alpha(col, a)));
+                }
+                prev = Some(p);
+            }
+            if let Some((az, el, _)) = crate::launches::interp(l, now_u) {
+                if el > -1.0 {
+                    let p = polar(center, radius, az, el);
+                    painter.circle_filled(p, 4.0, col);
+                    painter.circle_stroke(p, 7.0, Stroke::new(1.0, theme::with_alpha(col, 160)));
+                    if st.selected.as_deref() == Some(l.key.as_str()) {
+                        sel_ring(p);
+                    }
+                    painter.text(p + Vec2::new(9.0, -6.0), Align2::LEFT_CENTER, &l.name, theme::sans(10.5), col);
+                    consider(&mut best, p, l.key.clone(), format!("launch {}\naz {:.1}°  el {:.1}°", l.name, az, el), 10.0);
+                }
+            } else if let Some(&(t0, az, el, _)) = l.rows.first() {
+                // Before T0: mark the pad / first point with a countdown.
+                if el > -1.0 && t0 > now_u {
+                    let p = polar(center, radius, az, el);
+                    painter.circle_stroke(p, 4.0, Stroke::new(1.0, theme::with_alpha(col, 150)));
+                    painter.text(p + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, format!("{} T-{:.0}s", l.name, t0 - now_u), theme::sans(10.0), theme::with_alpha(col, 180));
+                    consider(&mut best, p, l.key.clone(), format!("launch {} in {:.0} s", l.name, t0 - now_u), 9.0);
+                }
+            }
+        }
+    }
     // Aircraft (ADS-B): cyan chevrons, predicted track when selected.
     if st.show_aircraft {
         let adsb = shared.adsb.load();
@@ -799,6 +839,12 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
     ui.add_space(4.0);
     egui::Grid::new("mount_grid").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
         theme::kv(ui, "rate cmd", format!("{:+} / {:+}   gear {}", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling));
+        if m.bias != (0.0, 0.0) || m.parking {
+            theme::kv_colored(ui, "bias", format!("{:+.2}° cross-el / {:+.2}° el  ({})", m.bias.0, m.bias.1, if m.bias_fine { "fine" } else { "coarse" }), AMBER);
+        }
+        if m.parking {
+            theme::kv_colored(ui, "park", "driving to the configured offsets".to_string(), AMBER);
+        }
         theme::kv(ui, "joystick", format!("{}   {:+.2} / {:+.2}", m.joystick.clone().unwrap_or_else(|| "none".into()), m.stick.0, m.stick.1));
         let tname = {
             let sky = shared.sky.load();
@@ -837,6 +883,21 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         }
         if tuning && ui.small_button("revert").clicked() {
             let _ = tx.send(MountCmd::AutotuneStop { revert: true });
+        }
+        if ui.small_button("park").on_hover_text("drive both axes to the configured offsets (gamepad: Triangle)").clicked() {
+            let _ = tx.send(MountCmd::Park);
+        }
+        let step = if m.bias_fine { 0.01 } else { 0.1 };
+        for (l, dx, dy) in [("◀", -step, 0.0), ("▶", step, 0.0), ("▲", 0.0, step), ("▼", 0.0, -step)] {
+            if ui.small_button(l).on_hover_text(format!("operator bias {:+.2}° (gamepad D-pad; Share toggles fine/coarse)", if dx != 0.0 { dx } else { dy })).clicked() {
+                let _ = tx.send(MountCmd::Bias { daz: dx, del: dy });
+            }
+        }
+        if ui.small_button(if m.bias_fine { "fine" } else { "coarse" }).clicked() {
+            let _ = tx.send(MountCmd::BiasFine(!m.bias_fine));
+        }
+        if m.bias != (0.0, 0.0) && ui.small_button("bias 0").clicked() {
+            let _ = tx.send(MountCmd::BiasReset);
         }
         if ui.small_button("gains…").clicked() {
             st.gains_edit = Some(if st.gains_edit.is_some() { st.gains_edit.unwrap() } else { m.gains });

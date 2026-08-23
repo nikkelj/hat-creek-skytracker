@@ -156,6 +156,29 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut slewing = false;
     let mut last_goto = Instant::now() - Duration::from_secs(10);
     let mut prev_target: Option<String> = None;
+    // Operator bias (on-sky cross-el / el, deg) and its D-pad step.
+    let mut bias = (0.0f64, 0.0f64);
+    let mut bias_fine = false;
+    let mut parking = false;
+    let apply_profile = |mode: Mode, loop_shared: &Arc<LoopShared>, status: &mut Vec<String>| {
+        let key = match mode {
+            Mode::Program | Mode::Handoff => "PROGRAM",
+            Mode::Hotspot => "HOTSPOT",
+            _ => return,
+        };
+        if let Some((a, e)) = cfg.pid_profiles.get(key) {
+            let mut i = loop_shared.inputs.lock().unwrap();
+            if i.azm_gains != *a || i.alt_gains != *e {
+                i.azm_gains = *a;
+                i.alt_gains = *e;
+                drop(i);
+                status.push(format!("gains <- {key} profile"));
+                if status.len() > 8 {
+                    status.remove(0);
+                }
+            }
+        }
+    };
 
     loop {
         let t0 = Instant::now();
@@ -180,6 +203,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     }
                     drop(i);
                     push_status(&mut status, format!("mode -> {}", mode_name(mode)));
+                    apply_profile(mode, &loop_shared, &mut status);
+                    parking = false;
                 }
                 MountCmd::SelectTarget(t) => {
                     target = t;
@@ -235,6 +260,23 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     i.hotspot.y_sign = y;
                     drop(i);
                     push_status(&mut status, format!("hotspot signs x{x:+.0} y{y:+.0}"));
+                }
+                MountCmd::Bias { daz, del } => {
+                    bias.0 = (bias.0 + daz).clamp(-3.0, 3.0);
+                    bias.1 = (bias.1 + del).clamp(-3.0, 3.0);
+                }
+                MountCmd::BiasReset => bias = (0.0, 0.0),
+                MountCmd::BiasFine(f) => bias_fine = f,
+                MountCmd::Park => {
+                    mode = Mode::Standby;
+                    let mut i = loop_shared.inputs.lock().unwrap();
+                    i.mode = Mode::Standby;
+                    i.rate_cmd = (0, 0);
+                    i.setpoint = None;
+                    drop(i);
+                    loop_shared.commands.lock().unwrap().push_back(Command::GotoMount { azm_deg: cfg.offsets.0, alt_deg: cfg.offsets.1 });
+                    parking = true;
+                    push_status(&mut status, "PARK -> configured offsets".into());
                 }
                 MountCmd::ToggleFeedForward => {
                     let mut i = loop_shared.inputs.lock().unwrap();
@@ -310,6 +352,33 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                             push_status(&mut status, format!("feed-forward {} (gamepad)", if on { "ON" } else { "OFF" }));
                         }
                         Button::South => armed_toggle = true,
+                        Button::North => {
+                            mode = Mode::Standby;
+                            let mut i = loop_shared.inputs.lock().unwrap();
+                            i.mode = Mode::Standby;
+                            i.rate_cmd = (0, 0);
+                            i.setpoint = None;
+                            drop(i);
+                            loop_shared.commands.lock().unwrap().push_back(Command::GotoMount { azm_deg: cfg.offsets.0, alt_deg: cfg.offsets.1 });
+                            parking = true;
+                            push_status(&mut status, "PARK (gamepad)".into());
+                        }
+                        Button::Select => {
+                            bias_fine = !bias_fine;
+                            push_status(&mut status, format!("bias step {}", if bias_fine { "fine 0.01°" } else { "coarse 0.1°" }));
+                        }
+                        Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight => {
+                            let step = if bias_fine { 0.01 } else { 0.1 };
+                            let (dx, dy) = match b {
+                                Button::DPadLeft => (-step, 0.0),
+                                Button::DPadRight => (step, 0.0),
+                                Button::DPadUp => (0.0, step),
+                                _ => (0.0, -step),
+                            };
+                            bias.0 = (bias.0 + dx).clamp(-3.0, 3.0);
+                            bias.1 = (bias.1 + dy).clamp(-3.0, 3.0);
+                            push_status(&mut status, format!("bias {:+.2}° / {:+.2}°", bias.0, bias.1));
+                        }
                         _ => {}
                     }
                 }
@@ -384,6 +453,14 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     ff_el_dps: ff_el,
                 })
             });
+            let sp = sp.map(|mut s| {
+                if bias != (0.0, 0.0) {
+                    let cos_el = s.el_deg.to_radians().cos().max(0.087);
+                    s.az_deg = (s.az_deg + bias.0 / cos_el).rem_euclid(360.0);
+                    s.el_deg += bias.1;
+                }
+                s
+            });
             last_setpoint = sp.as_ref().map(|s| (s.az_deg, s.el_deg));
             if prev_target != target {
                 prev_target = target.clone();
@@ -429,6 +506,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 }
                 drop(i);
                 push_status(&mut status, format!("loop -> {}", mode_name(mode)));
+                apply_profile(mode, &loop_shared, &mut status);
             }
         }
         for m in &out.status_msgs {
@@ -488,6 +566,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             gains,
             autotune: autotune_text,
             loop_dead: out.loop_dead,
+            bias,
+            bias_fine,
+            parking,
         }));
 
         let sleep = Duration::from_millis(33).saturating_sub(t0.elapsed());

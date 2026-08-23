@@ -17,6 +17,7 @@ mod camera;
 mod catalogs;
 mod deepsky;
 mod filterwheel;
+mod launches;
 mod mount;
 mod mount3d;
 mod passes_bridge;

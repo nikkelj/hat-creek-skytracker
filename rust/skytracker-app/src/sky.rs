@@ -130,6 +130,12 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     let (messier, ngc) = catalogs::load_openngc(&root.join("catalogs/openngc.csv"));
     eprintln!("skytracker: {} star names, {} Messier, {} NGC objects", star_names.len(), messier.len(), ngc.len());
     let mut dso_marks: Vec<DsoMark> = Vec::new();
+    let launches_dir = root.join(&cfg.launches_dir);
+    let mut launches = Arc::new(crate::launches::load_dir(&launches_dir, &observer));
+    if !launches.is_empty() {
+        eprintln!("skytracker: {} launch trajectories from {}", launches.len(), launches_dir.display());
+    }
+    let mut last_launch_scan = Instant::now();
     let dso_altaz = |d: &catalogs::Dso, jd_tt: f64| -> (f64, f64) {
         let ctx = FrameContext::new(jd_tt);
         let (sr, cr) = d.ra_deg.to_radians().sin_cos();
@@ -204,6 +210,11 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             }
         }
 
+        if last_launch_scan.elapsed() > Duration::from_secs(60) {
+            launches = Arc::new(crate::launches::load_dir(&launches_dir, &observer));
+            last_launch_scan = Instant::now();
+        }
+
         // DSOs every 5 s (fixed ICRS directions; Messier always, NGC to the limit).
         if last_stars.elapsed() > Duration::from_secs(5) {
             let mut marks = Vec::new();
@@ -267,6 +278,10 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                     let d = messier.iter().chain(ngc.iter()).find(|d| &d.key == key)?;
                     let (az, el) = dso_altaz(d, jd);
                     Some((az, el, d.name.clone()))
+                } else if key.starts_with("launch:") {
+                    let l = launches.iter().find(|l| &l.key == key)?;
+                    let (az, el, _) = crate::launches::interp(l, jd_tt_to_unix(jd))?;
+                    Some((az, el, l.name.clone()))
                 } else {
                     None
                 }
@@ -286,6 +301,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             stars: star_marks.clone(),
             bodies: body_marks,
             dsos: dso_marks.clone(),
+            launches: launches.clone(),
             star_names: star_names.clone(),
             target,
             n_catalog,

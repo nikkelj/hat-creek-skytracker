@@ -253,6 +253,13 @@ impl eframe::App for App {
                         let _ = self.tx.send(MountCmd::SetMode("PROGRAM".into()));
                     }
                 }
+                if Screen::ALL[shots.idx] == Screen::Cameras && !shots.solve_sent && shots.switched_at.elapsed().as_secs_f64() > 1.0 {
+                    // Show the weighted combined overlay in the tour.
+                    self.cameras.combined = true;
+                    self.cameras.match_scale = true;
+                    self.cameras.weights = vec![1.0, 0.6, 0.0];
+                    shots.solve_sent = true;
+                }
                 if Screen::ALL[shots.idx] == Screen::Replay && !shots.solve_sent && shots.switched_at.elapsed().as_secs_f64() > 1.0 {
                     // Load the newest real run and play it for the screenshot.
                     if let Some(idx) = self.replay.find_run("YAOGAN").or_else(|| if self.replay.library_len().unwrap_or(0) > 0 { Some(0) } else { None }) {
@@ -390,34 +397,99 @@ impl eframe::App for App {
 
         match self.screen {
             Screen::Track => {
-                egui::SidePanel::right("right").default_width(430.0).min_width(360.0).show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui::camera_panel(ui, &self.shared, &mut self.ui, &self.tx_cam, false);
-                        ui.add_space(8.0);
-                        ui.separator();
-                        ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
-                    });
-                });
-                egui::TopBottomPanel::bottom("bottom").default_height(230.0).resizable(true).show(ctx, |ui| {
-                    ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
-                });
-                egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        ui.checkbox(&mut self.ui.show_stars, "stars");
-                        ui.checkbox(&mut self.ui.show_sats, "satellites");
-                        ui.checkbox(&mut self.ui.show_labels, "labels");
-                        ui.checkbox(&mut self.ui.show_below_mask, "below mask");
-                        ui.checkbox(&mut self.ui.show_names, "star names");
-                        ui.checkbox(&mut self.ui.show_messier, "Messier");
-                        ui.checkbox(&mut self.ui.show_ngc, "NGC");
-                        ui.checkbox(&mut self.ui.show_aircraft, "aircraft");
-                        ui.checkbox(&mut self.ui.show_keepout, "keepout");
-                        ui.checkbox(&mut self.ui.show_meo, "MEO");
-                        ui.checkbox(&mut self.ui.show_geo, "GEO");
-                    });
-                    ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
-                });
+                // Layout selector rides in the toggles row; the choice persists.
+                let layout = self.ui.track_layout.clone();
+                match layout.as_str() {
+                    // ---- stacked: controls column + a full camera column ----
+                    "stack" => {
+                        egui::SidePanel::right("right").default_width(400.0).min_width(330.0).show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
+                            });
+                        });
+                        egui::SidePanel::right("cams_col").default_width(360.0).min_width(280.0).show(ctx, |ui| {
+                            let n = self.shared.cams.len().max(1);
+                            let h = (ui.available_height() - 20.0 * n as f32) / n as f32;
+                            for slot in 0..n {
+                                ui::camera_view(ui, &self.shared, &mut self.ui, slot, false, Some(h));
+                                ui.add_space(4.0);
+                            }
+                        });
+                        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                            track_toggles(ui, &mut self.ui, &self.shared);
+                            ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
+                        });
+                    }
+                    // ---- quad: controls | skyplot on top, cameras across the bottom ----
+                    "quad" => {
+                        egui::TopBottomPanel::bottom("quad_cams").resizable(true).default_height(470.0).height_range(240.0..=820.0).show(ctx, |ui| {
+                            let k = self.ui.quad_cams.clamp(2, 3);
+                            let h = ui.available_height() - 6.0;
+                            ui.columns(k, |cols| {
+                                for (slot, col) in cols.iter_mut().enumerate() {
+                                    ui::camera_view(col, &self.shared, &mut self.ui, slot, false, Some(h));
+                                }
+                            });
+                        });
+                        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                            ui.columns(2, |cols| {
+                                egui::ScrollArea::vertical().id_salt("quad_ctl").show(&mut cols[0], |ui| {
+                                    ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
+                                });
+                                let ui = &mut cols[1];
+                                track_toggles(ui, &mut self.ui, &self.shared);
+                                ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
+                            });
+                        });
+                    }
+                    // ---- scope: guide + main dominate; skyplot + controls peripheral ----
+                    "scope" => {
+                        egui::SidePanel::right("scope_side").default_width(330.0).min_width(280.0).show(ctx, |ui| {
+                            let w = ui.available_width();
+                            ui.allocate_ui(egui::Vec2::new(w, w.min(330.0)), |ui| {
+                                ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
+                            });
+                            ui.separator();
+                            ui::compact_mount(ui, &self.shared, &self.tx);
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui::camera_view(ui, &self.shared, &mut self.ui, 2, false, Some(180.0));
+                            });
+                        });
+                        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                            track_toggles(ui, &mut self.ui, &self.shared);
+                            let h = ui.available_height() - 4.0;
+                            if self.ui.scope_combined {
+                                let (r, _) = ui.allocate_painter(egui::Vec2::new(ui.available_width(), h), egui::Sense::hover());
+                                let w = self.ui.scope_weights;
+                                ui::weighted_overlay(ui, &self.shared, &mut self.ui, r.rect, &[(0, w[0]), (1, w[1])], true);
+                            } else {
+                                ui.columns(2, |cols| {
+                                    ui::camera_view(&mut cols[0], &self.shared, &mut self.ui, 0, false, Some(h));
+                                    ui::camera_view(&mut cols[1], &self.shared, &mut self.ui, 1, false, Some(h));
+                                });
+                            }
+                        });
+                    }
+                    // ---- tabs (default): the original layout ----
+                    _ => {
+                        egui::SidePanel::right("right").default_width(430.0).min_width(360.0).show(ctx, |ui| {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui::camera_panel(ui, &self.shared, &mut self.ui, &self.tx_cam, false);
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
+                            });
+                        });
+                        egui::TopBottomPanel::bottom("bottom").default_height(230.0).resizable(true).show(ctx, |ui| {
+                            ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
+                        });
+                        egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
+                            track_toggles(ui, &mut self.ui, &self.shared);
+                            ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
+                        });
+                    }
+                }
             }
             Screen::Cameras => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -497,6 +569,62 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+
+/// The Track screen's toggle strip: skyplot layers + the layout selector.
+fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) {
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let before = (st.track_layout.clone(), st.quad_cams, st.scope_combined);
+        egui::ComboBox::from_id_salt("track_layout").selected_text(st.track_layout.clone()).width(70.0).show_ui(ui, |ui| {
+            for l in ["tabs", "stack", "quad", "scope"] {
+                ui.selectable_value(&mut st.track_layout, l.to_string(), l);
+            }
+        });
+        if st.track_layout == "quad" {
+            for k in [2usize, 3] {
+                if ui.selectable_label(st.quad_cams == k, format!("{k} cams")).clicked() {
+                    st.quad_cams = k;
+                }
+            }
+        }
+        if st.track_layout == "scope" {
+            ui.checkbox(&mut st.scope_combined, "combined");
+            if st.scope_combined {
+                ui.add(egui::Slider::new(&mut st.scope_weights[0], 0.0..=1.0).show_value(false));
+                ui.label(egui::RichText::new("guide/main").font(theme::sans(10.0)).color(DIM));
+                ui.add(egui::Slider::new(&mut st.scope_weights[1], 0.0..=1.0).show_value(false));
+            }
+        }
+        if before != (st.track_layout.clone(), st.quad_cams, st.scope_combined) {
+            // Persist the layout choice.
+            if let Ok(text) = std::fs::read_to_string(&shared.config.path) {
+                if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(o) = raw.as_object_mut() {
+                        o.insert("track_layout".into(), serde_json::json!(st.track_layout));
+                        o.insert("track_quad_cams".into(), serde_json::json!(st.quad_cams));
+                        o.insert("track_scope_combined".into(), serde_json::json!(st.scope_combined));
+                        if let Ok(s) = serde_json::to_string_pretty(&raw) {
+                            let _ = std::fs::write(&shared.config.path, s);
+                        }
+                    }
+                }
+            }
+        }
+        ui.separator();
+        ui.checkbox(&mut st.show_stars, "stars");
+        ui.checkbox(&mut st.show_sats, "satellites");
+        ui.checkbox(&mut st.show_labels, "labels");
+        ui.checkbox(&mut st.show_below_mask, "below mask");
+        ui.checkbox(&mut st.show_names, "star names");
+        ui.checkbox(&mut st.show_messier, "Messier");
+        ui.checkbox(&mut st.show_ngc, "NGC");
+        ui.checkbox(&mut st.show_aircraft, "aircraft");
+        ui.checkbox(&mut st.show_keepout, "keepout");
+        ui.checkbox(&mut st.show_meo, "MEO");
+        ui.checkbox(&mut st.show_geo, "GEO");
+    });
 }
 
 /// A good demo/track target: a LEO satellite well above the mask that

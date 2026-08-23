@@ -42,6 +42,12 @@ pub struct UiState {
     pub history_t0: std::time::Instant,
     pub show_charts: bool,
     pub show_navball: bool,
+    /// Track screen layout: "tabs" | "stack" | "quad" | "scope" (persisted).
+    pub track_layout: String,
+    pub quad_cams: usize,
+    /// Scope layout: weighted-combined guide+main instead of a split.
+    pub scope_combined: bool,
+    pub scope_weights: [f32; 2],
 }
 
 impl Default for UiState {
@@ -79,6 +85,10 @@ impl Default for UiState {
             history_t0: std::time::Instant::now(),
             show_charts: true,
             show_navball: true,
+            track_layout: "tabs".into(),
+            quad_cams: 3,
+            scope_combined: false,
+            scope_weights: [1.0, 1.0],
         }
     }
 }
@@ -137,6 +147,9 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     let rect = resp.rect;
     painter.rect_filled(rect, 0.0, BG);
     let radius = (rect.width().min(rect.height()) / 2.0 - 30.0).max(60.0);
+    // Peripheral/mini form: drop the corner readouts, legend and automatic
+    // labels so the plot itself stays readable at small sizes.
+    let compact = radius < 240.0;
     let center = rect.center();
     let mask = cfg.elevation_mask_deg;
     if !st.toggles_init {
@@ -146,6 +159,9 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         st.show_labels = cfg.satellite_labels_enabled;
         st.show_messier = cfg.messier_enabled;
         st.show_ngc = cfg.ngc_enabled;
+        st.track_layout = std::env::var("SKYTRACKER_LAYOUT").unwrap_or_else(|_| cfg.raw["track_layout"].as_str().unwrap_or("tabs").to_string());
+        st.quad_cams = cfg.raw["track_quad_cams"].as_u64().unwrap_or(3).clamp(2, 3) as usize;
+        st.scope_combined = cfg.raw["track_scope_combined"].as_bool().unwrap_or(false);
     }
 
     // Dome shading: a few concentric fills, lighter toward the zenith.
@@ -486,7 +502,7 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 } else if hovered {
                     painter.circle_stroke(p, 7.0, Stroke::new(1.0, theme::with_alpha(TEXT, 180)));
                 }
-                let want_label = st.show_labels && (selected || hovered || (above && el > 35.0 && s.range_km < 20_000.0 && n_labels < 36));
+                let want_label = st.show_labels && (selected || hovered || (!compact && above && el > 35.0 && s.range_km < 20_000.0 && n_labels < 36));
                 if want_label {
                     let lp = p + Vec2::new(7.0, 0.0);
                     let w = 6.0 * s.name.len() as f32;
@@ -568,7 +584,11 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         let _ = tx.send(MountCmd::SelectTarget(None));
     }
 
-    // Corner readouts.
+    // Corner readouts (full-size plot only).
+    if compact {
+        painter.text(rect.left_top() + Vec2::new(6.0, 4.0), Align2::LEFT_TOP, format!("{} visible", sky.n_visible), theme::mono(9.5), DIM);
+        return;
+    }
     painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &sky.utc_iso, theme::mono(12.5), TEXT);
     let err = sky.status.contains("failed") || sky.status.contains("not found");
     painter.text(
@@ -705,6 +725,44 @@ pub fn rotated_image(painter: &egui::Painter, tex: egui::TextureId, rect: Rect, 
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
     painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Weighted overlay of several camera feeds into `rect` (co-boresighting):
+/// painting layer k with alpha w_k / (w_1 + … + w_k) yields the exact
+/// weighted mean of the layers, so the sliders shift which camera dominates.
+/// `match_scale` sizes each feed by its plate scale (deg/px) relative to the
+/// first camera; rotation is each feed's alignment rotation.
+pub fn weighted_overlay(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, rect: Rect, cams: &[(usize, f32)], match_scale: bool) {
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, Color32::BLACK);
+    let active: Vec<(usize, f32)> = cams.iter().copied().filter(|&(i, w)| w > 0.001 && shared.cam(i).map_or(false, |c| c.connected && c.width > 0)).collect();
+    let Some(&(base_slot, _)) = active.first() else {
+        p.text(rect.center(), Align2::CENTER_CENTER, "no feeds to overlay", theme::mono(11.0), DIM);
+        return;
+    };
+    let base = shared.cam(base_slot).unwrap();
+    let scale = (rect.width() / base.width as f32).min(rect.height() / base.height as f32);
+    let mut wsum = 0.0f32;
+    let mut names = Vec::new();
+    for &(i, w) in &active {
+        let Some(cam) = shared.cam(i) else { continue };
+        let Some((tex, cw, ch)) = cam_texture(ui, shared, st, i) else { continue };
+        let settings = shared.cam_settings[i].load();
+        let k = if match_scale && base.deg_per_px > 0.0 && cam.deg_per_px > 0.0 {
+            (cam.deg_per_px / base.deg_per_px) as f32
+        } else {
+            (base.width as f32 / cw as f32).min(base.height as f32 / ch as f32)
+        };
+        let size = Vec2::new(cw as f32 * scale * k, ch as f32 * scale * k);
+        wsum += w;
+        let alpha = ((w / wsum).clamp(0.0, 1.0) * 255.0) as u8;
+        rotated_image(&p.with_clip_rect(rect), tex, Rect::from_center_size(rect.center(), size), settings.rotation_deg, Color32::from_white_alpha(alpha));
+        names.push(format!("{} ×{:.2}", cam.name.split(' ').next().unwrap_or("cam"), w));
+    }
+    let c = rect.center();
+    p.line_segment([c + Vec2::new(-16.0, 0.0), c + Vec2::new(16.0, 0.0)], Stroke::new(1.0, AMBER));
+    p.line_segment([c + Vec2::new(0.0, -16.0), c + Vec2::new(0.0, 16.0)], Stroke::new(1.0, AMBER));
+    p.text(rect.left_top() + Vec2::new(8.0, 8.0), Align2::LEFT_TOP, format!("combined · {}{}", names.join(" + "), if match_scale { " · plate-scale matched" } else { "" }), theme::mono(10.5), Color32::from_rgb(80, 200, 200));
 }
 
 pub fn camera_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx_cam: &crossbeam_channel::Sender<CamCmd>, show_solve: bool) {
@@ -1064,6 +1122,35 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
     for s in m.status.iter().rev().take(6) {
         ui.label(egui::RichText::new(s).font(theme::mono(10.5)).color(TEXT_2));
     }
+}
+
+/// Compact mount readouts for camera-first layouts: mode buttons, az/el,
+/// error, hotspot state — the essentials in ~150 px of height.
+pub fn compact_mount(ui: &mut egui::Ui, shared: &Arc<Shared>, tx: &crossbeam_channel::Sender<MountCmd>) {
+    let m = shared.mount.load();
+    ui.horizontal_wrapped(|ui| {
+        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT"] {
+            if theme::mode_button(ui, mode, m.mode == mode, mode_color(mode)) {
+                let _ = tx.send(MountCmd::SetMode(mode.to_string()));
+            }
+        }
+        if theme::mode_button(ui, "STOP", false, RED) {
+            let _ = tx.send(MountCmd::Stop);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{:8.3}° / {:7.3}°", m.az, m.el)).font(theme::mono(15.0)).color(theme::TEXT));
+        let ec = if m.az_error.abs() + m.el_error.abs() < 0.01 { GREEN } else { AMBER };
+        ui.label(egui::RichText::new(format!("err {:+.3} / {:+.3}", m.az_error, m.el_error)).font(theme::mono(12.0)).color(ec));
+    });
+    ui.horizontal(|ui| {
+        if let Some(t) = &m.target {
+            ui.label(egui::RichText::new(format!("target {t}")).font(theme::mono(10.5)).color(ACCENT));
+        }
+        if m.mode == "HOTSPOT" || m.mode == "HANDOFF" {
+            ui.label(egui::RichText::new(format!("{} snr {:.1}", m.hotspot_status, m.hotspot_snr)).font(theme::mono(10.5)).color(if m.hotspot_acquired { GREEN } else { AMBER }));
+        }
+    });
 }
 
 /// A two-trace strip chart over the last 30 s (az amber, el accent).

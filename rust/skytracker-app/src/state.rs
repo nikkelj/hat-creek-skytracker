@@ -38,7 +38,9 @@ pub struct CameraConfig {
     pub projection: Projection,
     pub alignment_rotation_deg: f64,
     pub gain: i64,
-    pub exposure_ms: i64,
+    /// Integration time in MICROSECONDS (config `exposure_us`, falling back
+    /// to the Python-era `exposure` in ms). ASI cameras go down to ~32 µs.
+    pub exposure_us: i64,
     pub gamma: f64,
     pub gamma_enabled: bool,
     pub tetra3_db: Option<String>,
@@ -74,7 +76,7 @@ impl CameraConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CamSettings {
     pub gain: i64,
-    pub exposure_ms: i64,
+    pub exposure_us: i64,
     pub gamma: f64,
     pub gamma_enabled: bool,
     pub rotation_deg: f64,
@@ -89,7 +91,7 @@ impl CamSettings {
     pub fn from_config(c: &CameraConfig) -> Self {
         CamSettings {
             gain: c.gain,
-            exposure_ms: c.exposure_ms,
+            exposure_us: c.exposure_us,
             gamma: c.gamma,
             gamma_enabled: c.gamma_enabled,
             rotation_deg: c.alignment_rotation_deg,
@@ -301,7 +303,10 @@ impl Config {
                 projection: if proj_s.starts_with("fish") { Projection::FisheyeEquidistant } else { Projection::Pinhole },
                 alignment_rotation_deg: num(&c["alignment_rotation"], if i == 2 { 0.0 } else { 180.0 }),
                 gain: num(&c["gain"], 200.0) as i64,
-                exposure_ms: num(&c["exposure"], 50.0) as i64,
+                exposure_us: {
+                    let us = num(&c["exposure_us"], f64::NAN);
+                    if us.is_finite() { us as i64 } else { (num(&c["exposure"], 50.0) * 1000.0) as i64 }
+                },
                 gamma: num(&c["gamma"], 0.1),
                 gamma_enabled: boolean(&c["gamma_enabled"], false),
                 tetra3_db: c["tetra3_db"].as_str().map(|s| s.to_string()).or(if i == 0 { Some("db_cam1_tyc".into()) } else { None }),
@@ -562,7 +567,8 @@ impl Config {
             e.insert("projection".into(), json!(if c.projection == Projection::Pinhole { "pinhole" } else { "fisheye" }));
             e.insert("alignment_rotation".into(), json!(c.alignment_rotation_deg));
             e.insert("gain".into(), json!(c.gain));
-            e.insert("exposure".into(), json!(c.exposure_ms));
+            e.insert("exposure".into(), json!(c.exposure_us as f64 / 1000.0));
+            e.insert("exposure_us".into(), json!(c.exposure_us));
             e.insert("gamma".into(), json!(c.gamma));
             e.insert("gamma_enabled".into(), json!(c.gamma_enabled));
             e.insert("tetra3_db".into(), json!(c.tetra3_db));

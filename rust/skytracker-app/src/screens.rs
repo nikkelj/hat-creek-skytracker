@@ -498,9 +498,9 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
                     let mut g = c.cam[i].gain as f64;
                     num(ui, "gain", &mut g, 1.0, 0);
                     c.cam[i].gain = g as i64;
-                    let mut e = c.cam[i].exposure_ms as f64;
-                    num(ui, "exposure ms", &mut e, 1.0, 0);
-                    c.cam[i].exposure_ms = e as i64;
+                    let mut e = c.cam[i].exposure_us as f64;
+                    num(ui, "exposure µs", &mut e, 10.0, 0);
+                    c.cam[i].exposure_us = e.max(32.0) as i64;
                     num(ui, "gamma", &mut c.cam[i].gamma, 0.01, 2);
                     boolean(ui, "gamma enabled", &mut c.cam[i].gamma_enabled);
                     let mut db = c.cam[i].tetra3_db.clone().unwrap_or_default();
@@ -564,7 +564,8 @@ fn combo(ui: &mut egui::Ui, label: &str, v: &mut String, options: &[&str]) {
 
 pub struct CamerasState {
     pub combined: bool,
-    pub opacity: f32,
+    /// Per-camera dominance weight in the combined overlay (0 = excluded).
+    pub weights: Vec<f32>,
     pub match_scale: bool,
     pub include: Vec<bool>,
     pub base: usize,
@@ -575,7 +576,7 @@ pub struct CamerasState {
 
 impl Default for CamerasState {
     fn default() -> Self {
-        CamerasState { combined: false, opacity: 0.5, match_scale: true, include: vec![true, true, false], base: 0, roi_pick: None, message: String::new(), name_edits: Vec::new() }
+        CamerasState { combined: false, weights: vec![1.0, 1.0, 0.0], match_scale: true, include: vec![true, true, false], base: 0, roi_pick: None, message: String::new(), name_edits: Vec::new() }
     }
 }
 
@@ -594,13 +595,16 @@ pub fn cameras_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState,
             cs.combined = !cs.combined;
         }
         if cs.combined {
-            ui.label(RichText::new("opacity").color(TEXT_2));
-            ui.add(egui::Slider::new(&mut cs.opacity, 0.0..=1.0).show_value(false));
             ui.checkbox(&mut cs.match_scale, "match plate scale");
+            while cs.weights.len() < n {
+                cs.weights.push(0.0);
+            }
             for i in 0..n {
                 let name = shared.config.cam[i].name.split(' ').next().unwrap_or("cam").to_string();
-                ui.checkbox(&mut cs.include[i], name);
+                ui.label(RichText::new(name).color(TEXT_2));
+                ui.add(egui::Slider::new(&mut cs.weights[i], 0.0..=1.0).show_value(false).fixed_decimals(2));
             }
+            ui.label(RichText::new("weights shift which camera dominates").font(theme::sans(10.0)).color(DIM));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if theme::mode_button(ui, "save to config", false, GREEN) {
@@ -609,7 +613,7 @@ pub fn cameras_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState,
                 for (i, cam) in c.cam.iter_mut().enumerate() {
                     let s = shared.cam_settings[i].load();
                     cam.gain = s.gain;
-                    cam.exposure_ms = s.exposure_ms;
+                    cam.exposure_us = s.exposure_us;
                     cam.gamma = s.gamma;
                     cam.gamma_enabled = s.gamma_enabled;
                     cam.alignment_rotation_deg = s.rotation_deg;
@@ -627,7 +631,7 @@ pub fn cameras_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState,
                     let mut s = (**shared.cam_settings[i].load()).clone();
                     let d = CamSettings::from_config(cam);
                     s.gain = d.gain;
-                    s.exposure_ms = d.exposure_ms;
+                    s.exposure_us = d.exposure_us;
                     s.gamma = d.gamma;
                     s.gamma_enabled = d.gamma_enabled;
                     s.rotation_deg = d.rotation_deg;
@@ -717,8 +721,15 @@ fn camera_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, i: usize, tx_cam: &c
             ui.label(RichText::new("gain").color(TEXT_2));
             ui.add(egui::Slider::new(&mut s.gain, 0..=600));
             ui.end_row();
-            ui.label(RichText::new("exposure ms").color(TEXT_2));
-            ui.add(egui::Slider::new(&mut s.exposure_ms, 1..=2000).logarithmic(true));
+            ui.label(RichText::new("exposure").color(TEXT_2));
+            // Logarithmic 32 µs .. 2 s: half the slider travel sits below ~8 ms,
+            // so the microsecond region has real motion range.
+            ui.add(
+                egui::Slider::new(&mut s.exposure_us, 32..=2_000_000)
+                    .logarithmic(true)
+                    .custom_formatter(|v, _| fmt_exposure(v as i64))
+                    .custom_parser(parse_exposure),
+            );
             ui.end_row();
             ui.label(RichText::new("gamma").color(TEXT_2));
             ui.horizontal(|ui| {
@@ -761,45 +772,14 @@ fn camera_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, i: usize, tx_cam: &c
     }
 }
 
-/// Opacity-blended overlay of the included feeds (rotation applied), either
-/// fitted to the pane or scaled to a common plate scale for co-boresighting.
+/// Weighted overlay of the selected feeds (rotation applied), either fitted
+/// or scaled to a common plate scale for co-boresighting; the per-camera
+/// weight sliders shift which feed dominates the brightness.
 fn combined_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, cs: &mut CamerasState, h: f32) {
     let avail = ui.available_width();
-    let (r, p) = ui.allocate_painter(egui::Vec2::new(avail, h), Sense::click());
-    p.rect_filled(r.rect, 0.0, egui::Color32::BLACK);
-    let included: Vec<usize> = (0..shared.cams.len()).filter(|&i| cs.include[i]).collect();
-    if included.is_empty() {
-        p.text(r.rect.center(), egui::Align2::CENTER_CENTER, "select cameras to overlay", theme::mono(11.0), DIM);
-        return;
-    }
-    cs.base = included[0];
-    let base = shared.cam(cs.base);
-    let Some(base) = base.filter(|c| c.connected && c.width > 0) else {
-        p.text(r.rect.center(), egui::Align2::CENTER_CENTER, "base camera has no frames", theme::mono(11.0), DIM);
-        return;
-    };
-    let scale = (r.rect.width() / base.width as f32).min(r.rect.height() / base.height as f32);
-    let mut first = true;
-    for &i in &included {
-        let Some(cam) = shared.cam(i) else { continue };
-        if !cam.connected || cam.width == 0 {
-            continue;
-        }
-        let Some((tex, w, hh)) = crate::ui::cam_texture(ui, shared, st, i) else { continue };
-        let settings = shared.cam_settings[i].load();
-        let k = if cs.match_scale && base.deg_per_px > 0.0 && cam.deg_per_px > 0.0 { (cam.deg_per_px / base.deg_per_px) as f32 } else { (base.width as f32 / w as f32).min(base.height as f32 / hh as f32) };
-        let size = egui::Vec2::new(w as f32 * scale * k, hh as f32 * scale * k);
-        let rect = egui::Rect::from_center_size(r.rect.center(), size);
-        let alpha = if first { 255 } else { (cs.opacity * 255.0) as u8 };
-        let tint = egui::Color32::from_white_alpha(alpha);
-        crate::ui::rotated_image(&p.with_clip_rect(r.rect), tex, rect, settings.rotation_deg, tint);
-        first = false;
-    }
-    let c = r.rect.center();
-    p.line_segment([c + egui::Vec2::new(-16.0, 0.0), c + egui::Vec2::new(16.0, 0.0)], egui::Stroke::new(1.0, AMBER));
-    p.line_segment([c + egui::Vec2::new(0.0, -16.0), c + egui::Vec2::new(0.0, 16.0)], egui::Stroke::new(1.0, AMBER));
-    let names: Vec<String> = included.iter().map(|&i| shared.config.cam[i].name.clone()).collect();
-    p.text(r.rect.left_top() + egui::Vec2::new(8.0, 8.0), egui::Align2::LEFT_TOP, format!("combined · {} · opacity {:.1}{}", names.join(" + "), cs.opacity, if cs.match_scale { " · plate-scale matched" } else { "" }), theme::mono(10.5), egui::Color32::from_rgb(80, 200, 200));
+    let (r, _p) = ui.allocate_painter(egui::Vec2::new(avail, h), Sense::hover());
+    let cams: Vec<(usize, f32)> = (0..shared.cams.len()).map(|i| (i, cs.weights.get(i).copied().unwrap_or(0.0))).collect();
+    crate::ui::weighted_overlay(ui, shared, st, r.rect, &cams, cs.match_scale);
 }
 
 fn filter_wheel_cards(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut CamerasState, tx_fw: &crossbeam_channel::Sender<FwCmd>) {
@@ -860,4 +840,31 @@ fn filter_wheel_cards(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut CamerasS
             });
         }
     });
+}
+
+/// 570 -> "570 µs", 57_000 -> "57.0 ms", 1_500_000 -> "1.50 s".
+pub fn fmt_exposure(us: i64) -> String {
+    if us < 1_000 {
+        format!("{us} µs")
+    } else if us < 1_000_000 {
+        let n = format!("{:.3}", us as f64 / 1000.0);
+        format!("{} ms", n.trim_end_matches('0').trim_end_matches('.'))
+    } else {
+        format!("{:.2} s", us as f64 / 1e6)
+    }
+}
+
+/// Accepts "570", "570us", "5.7ms", "0.5s" (bare numbers = µs).
+pub fn parse_exposure(text: &str) -> Option<f64> {
+    let t = text.trim().to_ascii_lowercase().replace('µ', "u");
+    let (num, mult) = if let Some(x) = t.strip_suffix("us") {
+        (x, 1.0)
+    } else if let Some(x) = t.strip_suffix("ms") {
+        (x, 1_000.0)
+    } else if let Some(x) = t.strip_suffix('s') {
+        (x, 1_000_000.0)
+    } else {
+        (t.as_str(), 1.0)
+    };
+    num.trim().parse::<f64>().ok().map(|v| v * mult)
 }

@@ -200,7 +200,7 @@ impl SimRenderer {
         let (w, h) = (self.w, self.h);
         // Exposure / gain scale the signal (gain ~ 0.1 dB per unit on ASI; keep it gentle).
         let gain_scale = 10f64.powf((settings.gain as f64 - self.base_gain) / 200.0);
-        let exp_scale = (settings.exposure_ms.max(1) as f64 / self.base_exposure.max(1.0)).clamp(0.05, 20.0);
+        let exp_scale = (settings.exposure_us.max(1) as f64 / self.base_exposure.max(1.0)).clamp(0.02, 50.0);
         let signal = (gain_scale * exp_scale) as f32;
         // Background + read noise.
         let bg = sim.background_level as f32 * exp_scale as f32;
@@ -319,7 +319,7 @@ fn open_asi(cfg: &crate::state::Config, cam: &CameraConfig, hw_index: usize, set
     if frac < 0.999 {
         sdk.set_start_pos(id, sx, sy).map_err(|e| e.0)?;
     }
-    sdk.set_control(id, ASI_EXPOSURE, settings.exposure_ms.max(1) * 1000, false).map_err(|e| e.0)?;
+    sdk.set_control(id, ASI_EXPOSURE, settings.exposure_us.max(32), false).map_err(|e| e.0)?;
     sdk.set_control(id, ASI_GAIN, settings.gain, false).map_err(|e| e.0)?;
     sdk.start_video(id).map_err(|e| e.0)?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -486,7 +486,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         t0: Instant::now(),
                         fixed_zenith: cam_cfg.fixed_zenith(),
                         base_gain: cam_cfg.gain as f64,
-                        base_exposure: cam_cfg.exposure_ms as f64,
+                        base_exposure: cam_cfg.exposure_us as f64,
                     };
                     source = Source::Sim { push, renderer };
                     if !want_asi {
@@ -528,8 +528,8 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
             if settings.gain != last_applied.gain {
                 let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_GAIN, settings.gain, false);
             }
-            if settings.exposure_ms != last_applied.exposure_ms {
-                let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_EXPOSURE, settings.exposure_ms.max(1) * 1000, false);
+            if settings.exposure_us != last_applied.exposure_us {
+                let _ = sdk.set_control(*id, skytracker_camera::asi::ASI_EXPOSURE, settings.exposure_us.max(32), false);
             }
             last_applied = settings.clone();
         }

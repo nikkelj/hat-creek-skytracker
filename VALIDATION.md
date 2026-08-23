@@ -5,6 +5,29 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — UI round 3: track layouts, µs exposure, weighted combined view
+
+- **Exposure** is now microseconds internally (`exposure_us`, config keeps the
+  ms `exposure` for Python compat): log slider 32 µs – 2 s with µs/ms/s
+  formatting and typed entry ("570us", "5.7ms", "0.5s"); ASI gets the value
+  directly, the sim scales its signal by exposure × gain.
+- **Track layouts** (`track_layout`, live selector, persisted): tabs / stack
+  (three cameras in a full column) / quad (controls | skyplot, 2-or-3-camera
+  bottom row) / scope (guide+main split or weighted-combined dominate;
+  compact skyplot + essentials peripheral). Screenshots:
+  rust_app_track_{quad,stack,scope}.png. The skyplot drops its readouts,
+  legend and auto-labels below 240 px radius so the mini form stays clean.
+- **Combined view** re-verified in the tour (it existed but was unexercised)
+  and upgraded from a single opacity to **per-camera dominance weights** —
+  painting layer k with alpha w_k/Σw gives the exact weighted mean; shared
+  `weighted_overlay` also powers the scope layout. Plate-scale matching shows
+  the Main FOV correctly inset within the Guide field.
+- Quad camera row initially collapsed to a sliver: `default_height` computed
+  from `screen_rect()` on the first frame (window not yet sized) — fixed with
+  a fixed default; noted for future panels.
+
+---
+
 ## 2026-08-23 — Parity round: pointing model applied, gamepad map complete, runtime connect, diagnostics, sim noise
 
 - **Pointing model in the loop**: PROGRAM/HANDOFF setpoints are pre-corrected

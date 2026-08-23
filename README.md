@@ -249,7 +249,21 @@ seven screens rendered from worker snapshots at a 120 Hz repaint target
 | **Sim** | Live hardware-simulator controls: injected misalignment / periodic error, camera background / noise / target brightness / Tycho star limit |
 | **Config** | Editor for the native app's config.json surface (site, mount + transport + serial port, control gains, hotspot/handoff, both cameras, sources & paths) — round-trips unknown keys, applies gains + hotspot signs live |
 
+The Track screen has four selectable layouts (persisted as `track_layout`):
+**tabs** (camera tabs in the control column), **stack** (all three cameras in
+their own column), **quad** (controls | skyplot on top, 2 or 3 cameras across
+the bottom — the classic Python arrangement), and **scope** (guide + main
+split or weighted-combined dominate the screen; skyplot, bubble cam and the
+essential mount controls go peripheral). Exposure controls are logarithmic
+from **32 µs to 2 s** (µs/ms/s formatting, typed values accepted). The
+Cameras screen's combined view blends the selected feeds with **per-camera
+dominance weights** (exact weighted mean), optionally plate-scale matched.
+
 ![Track](doc/screenshots/rust_app_track.png)
+
+![Track — quad layout](doc/screenshots/rust_app_track_quad.png)
+
+![Track — stacked cameras](doc/screenshots/rust_app_track_stack.png)
 
 ![Passes](doc/screenshots/rust_app_passes.png)
 

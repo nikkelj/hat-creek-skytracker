@@ -1,12 +1,15 @@
-//! ADS-B worker: aircraft from a dump1090 SBS/BaseStation TCP feed (config
-//! `adsb_source_mode` = "dump1090", host/port) or a built-in simulator
-//! ("sim"); native RTL-SDR demodulation is not ported yet ("rtlsdr" reports
-//! that and idles). Port of adsb_receiver.AdsbTracker's essentials: per-ICAO
+//! ADS-B worker: aircraft from the RTL-SDR / Nooelec dongle (config
+//! `adsb_source_mode` = "rtlsdr": librtlsdr via libloading at 2 MS/s on
+//! 1090 MHz + the pyModeS-equivalent demodulator in skytracker-adsb), a
+//! dump1090 SBS/BaseStation TCP feed ("dump1090", host/port) or a built-in
+//! simulator ("sim"). Port of adsb_receiver.AdsbTracker's essentials: per-ICAO
 //! fix history, linear ENU fit over the last N fixes for prediction, stale
 //! pruning, topocentric az/el/range through skytracker-adsb's geometry.
 
 use crate::state::{AdsbSnapshot, AircraftMark, Shared};
+use skytracker_adsb::demod::{magnitudes_u8, Demodulator};
 use skytracker_adsb::geom::{ecef_to_enu, enu_to_azel_range, geodetic_to_ecef};
+use skytracker_adsb::modes::{decode_message, Decoded};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
@@ -49,7 +52,7 @@ fn linfit(ts: &[f64], ys: &[f64]) -> (f64, f64) {
 fn run(shared: Arc<Shared>) {
     let cfg = shared.config.clone();
     let mode = std::env::var("SKYTRACKER_ADSB").unwrap_or_else(|_| cfg.adsb_source_mode.clone()).to_ascii_lowercase();
-    let (tx, rx) = crossbeam_channel::unbounded::<String>();
+    let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
     let mut status = match mode.as_str() {
         "dump1090" | "sbs" => {
             let addr = format!("{}:{}", cfg.adsb_host, cfg.adsb_port);
@@ -60,8 +63,12 @@ fn run(shared: Arc<Shared>) {
             spawn_sim_source(cfg.lat_deg, cfg.lon_deg, tx.clone());
             "simulated traffic".to_string()
         }
+        "rtlsdr" => {
+            spawn_rtlsdr_source(cfg.clone(), tx.clone());
+            "RTL-SDR 1090 MHz".to_string()
+        }
         "off" | "" | "none" => "off".to_string(),
-        other => format!("{other}: native demod not ported yet (use dump1090 SBS or sim)"),
+        other => format!("{other}: unknown adsb_source_mode (rtlsdr | dump1090 | sim | off)"),
     };
     let mut aircraft: HashMap<String, Aircraft> = HashMap::new();
     let (ox, oy, oz) = geodetic_to_ecef(cfg.lat_deg, cfg.lon_deg, cfg.alt_m);
@@ -71,14 +78,19 @@ fn run(shared: Arc<Shared>) {
     loop {
         // Drain SBS lines.
         let mut got = false;
-        while let Ok(line) = rx.try_recv() {
+        while let Ok(m) = rx.try_recv() {
             got = true;
-            n_msgs += 1;
-            if line.starts_with("STATUS ") {
-                status = line[7..].to_string();
-                continue;
+            match m {
+                Msg::Status(s) => status = s,
+                Msg::Line(line) => {
+                    n_msgs += 1;
+                    parse_sbs(&line, &mut aircraft);
+                }
+                Msg::Dec(d) => {
+                    n_msgs += 1;
+                    ingest_decoded(d, &mut aircraft);
+                }
             }
-            parse_sbs(&line, &mut aircraft);
         }
         if !got {
             std::thread::sleep(Duration::from_millis(50));
@@ -194,28 +206,28 @@ fn parse_sbs(line: &str, aircraft: &mut HashMap<String, Aircraft>) {
     }
 }
 
-fn spawn_sbs_reader(addr: String, tx: crossbeam_channel::Sender<String>) {
+fn spawn_sbs_reader(addr: String, tx: crossbeam_channel::Sender<Msg>) {
     std::thread::Builder::new()
         .name("adsb-sbs".into())
         .spawn(move || loop {
             match std::net::TcpStream::connect_timeout(&addr.parse().unwrap_or_else(|_| "127.0.0.1:30003".parse().unwrap()), Duration::from_secs(3)) {
                 Ok(stream) => {
-                    let _ = tx.send(format!("STATUS connected to {addr}"));
+                    let _ = tx.send(Msg::Status(format!("connected to {addr}")));
                     let reader = BufReader::new(stream);
                     for line in reader.lines() {
                         match line {
                             Ok(l) => {
-                                if tx.send(l).is_err() {
+                                if tx.send(Msg::Line(l)).is_err() {
                                     return;
                                 }
                             }
                             Err(_) => break,
                         }
                     }
-                    let _ = tx.send(format!("STATUS lost {addr}, reconnecting"));
+                    let _ = tx.send(Msg::Status(format!("lost {addr}, reconnecting")));
                 }
                 Err(e) => {
-                    let _ = tx.send(format!("STATUS {addr}: {e} (retrying)"));
+                    let _ = tx.send(Msg::Status(format!("{addr}: {e} (retrying)")));
                 }
             }
             std::thread::sleep(Duration::from_secs(3));
@@ -224,7 +236,7 @@ fn spawn_sbs_reader(addr: String, tx: crossbeam_channel::Sender<String>) {
 }
 
 /// Two simulated airliners crossing the sky at 10–11 km, emitted as SBS lines.
-fn spawn_sim_source(lat0: f64, lon0: f64, tx: crossbeam_channel::Sender<String>) {
+fn spawn_sim_source(lat0: f64, lon0: f64, tx: crossbeam_channel::Sender<Msg>) {
     std::thread::Builder::new()
         .name("adsb-sim".into())
         .spawn(move || {
@@ -245,12 +257,176 @@ fn spawn_sim_source(lat0: f64, lon0: f64, tx: crossbeam_channel::Sender<String>)
                     let lat = lat0 + n_km / 111.32;
                     let lon = lon0 + e_km / (111.32 * lat0.to_radians().cos());
                     let alt_ft = alt / 0.3048;
-                    let _ = tx.send(format!(
+                    let _ = tx.send(Msg::Line(format!(
                         "MSG,3,1,1,{},1,,,,,{},{:.0},{:.0},{:.0},{:.6},{:.6},,,,,,",
                         icao.to_uppercase(), cs, alt_ft, spd * 1.94384, hdg, lat, lon
-                    ));
+                    )));
                 }
                 std::thread::sleep(Duration::from_millis(1000));
+            }
+        })
+        .ok();
+}
+
+/// Events from a source thread to the tracker.
+enum Msg {
+    Status(String),
+    /// SBS/BaseStation line (dump1090, sim).
+    Line(String),
+    /// Locally demodulated + decoded Mode S message (RTL-SDR).
+    Dec(Decoded),
+}
+
+fn ingest_decoded(d: Decoded, aircraft: &mut HashMap<String, Aircraft>) {
+    let now = crate::sky::now_unix();
+    match d {
+        Decoded::Ident { icao, callsign } => {
+            let a = aircraft.entry(icao.to_ascii_lowercase()).or_insert_with(Aircraft::new);
+            a.last_seen = Instant::now();
+            if !callsign.is_empty() {
+                a.callsign = callsign;
+            }
+        }
+        Decoded::Position { icao, lat, lon, alt_m } => {
+            let a = aircraft.entry(icao.to_ascii_lowercase()).or_insert_with(Aircraft::new);
+            a.last_seen = Instant::now();
+            if let Some(alt) = alt_m {
+                a.alt_m = Some(alt);
+            }
+            a.history.push_back((now, lat, lon, a.alt_m.unwrap_or(0.0)));
+            while a.history.len() > 240 {
+                a.history.pop_front();
+            }
+        }
+        Decoded::Velocity { icao, speed_kt, track_deg, .. } => {
+            let a = aircraft.entry(icao.to_ascii_lowercase()).or_insert_with(Aircraft::new);
+            a.last_seen = Instant::now();
+            if speed_kt.is_some() {
+                a.speed_kt = speed_kt;
+            }
+            if track_deg.is_some() {
+                a.track_deg = track_deg;
+            }
+        }
+    }
+}
+
+/// librtlsdr through libloading (`rtlsdr.dll` ships in the repo root):
+/// 2 MS/s at 1090 MHz, synchronous reads, pyModeS-equivalent demodulation.
+struct RtlSdr {
+    _lib: libloading::Library,
+    dev: *mut std::ffi::c_void,
+    read_sync: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, std::os::raw::c_int, *mut std::os::raw::c_int) -> std::os::raw::c_int,
+    close: unsafe extern "C" fn(*mut std::ffi::c_void) -> std::os::raw::c_int,
+}
+unsafe impl Send for RtlSdr {}
+
+impl RtlSdr {
+    fn open(dll: &str, index: u32, gain: &str) -> Result<Self, String> {
+        use std::os::raw::{c_int, c_uint};
+        type Dev = *mut std::ffi::c_void;
+        unsafe {
+            let lib = libloading::Library::new(dll).map_err(|e| format!("{dll}: {e}"))?;
+            let get_count: libloading::Symbol<unsafe extern "C" fn() -> c_uint> = lib.get(b"rtlsdr_get_device_count\0").map_err(|e| e.to_string())?;
+            let n = get_count();
+            if index >= n {
+                return Err(format!("device {index} not found ({n} RTL-SDR device(s))"));
+            }
+            let open: libloading::Symbol<unsafe extern "C" fn(*mut Dev, c_uint) -> c_int> = lib.get(b"rtlsdr_open\0").map_err(|e| e.to_string())?;
+            let mut dev: Dev = std::ptr::null_mut();
+            let r = open(&mut dev, index);
+            if r != 0 || dev.is_null() {
+                return Err(format!("rtlsdr_open failed ({r}) -- device in use by another program?"));
+            }
+            let set_rate: libloading::Symbol<unsafe extern "C" fn(Dev, c_uint) -> c_int> = lib.get(b"rtlsdr_set_sample_rate\0").map_err(|e| e.to_string())?;
+            let set_freq: libloading::Symbol<unsafe extern "C" fn(Dev, c_uint) -> c_int> = lib.get(b"rtlsdr_set_center_freq\0").map_err(|e| e.to_string())?;
+            let set_gain_mode: libloading::Symbol<unsafe extern "C" fn(Dev, c_int) -> c_int> = lib.get(b"rtlsdr_set_tuner_gain_mode\0").map_err(|e| e.to_string())?;
+            let set_gain: libloading::Symbol<unsafe extern "C" fn(Dev, c_int) -> c_int> = lib.get(b"rtlsdr_set_tuner_gain\0").map_err(|e| e.to_string())?;
+            let reset: libloading::Symbol<unsafe extern "C" fn(Dev) -> c_int> = lib.get(b"rtlsdr_reset_buffer\0").map_err(|e| e.to_string())?;
+            set_rate(dev, 2_000_000);
+            set_freq(dev, 1_090_000_000);
+            match gain.trim().parse::<f64>() {
+                Ok(db) => {
+                    set_gain_mode(dev, 1);
+                    set_gain(dev, (db * 10.0).round() as c_int);
+                }
+                Err(_) => {
+                    set_gain_mode(dev, 0);
+                }
+            }
+            reset(dev);
+            let read_sync = *lib.get::<unsafe extern "C" fn(Dev, *mut u8, c_int, *mut c_int) -> c_int>(b"rtlsdr_read_sync\0").map_err(|e| e.to_string())?;
+            let close = *lib.get::<unsafe extern "C" fn(Dev) -> c_int>(b"rtlsdr_close\0").map_err(|e| e.to_string())?;
+            Ok(RtlSdr { _lib: lib, dev, read_sync, close })
+        }
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
+        let mut n: std::os::raw::c_int = 0;
+        let r = unsafe { (self.read_sync)(self.dev, buf.as_mut_ptr(), buf.len() as std::os::raw::c_int, &mut n) };
+        if r != 0 {
+            return Err(format!("rtlsdr_read_sync failed ({r})"));
+        }
+        Ok(n.max(0) as usize)
+    }
+}
+
+impl Drop for RtlSdr {
+    fn drop(&mut self) {
+        unsafe {
+            (self.close)(self.dev);
+        }
+    }
+}
+
+fn spawn_rtlsdr_source(cfg: crate::state::Config, tx: crossbeam_channel::Sender<Msg>) {
+    std::thread::Builder::new()
+        .name("adsb-rtlsdr".into())
+        .spawn(move || {
+            let root = cfg.repo_root();
+            let dll = if std::path::Path::new(&cfg.adsb_dll).is_absolute() { cfg.adsb_dll.clone() } else { root.join(&cfg.adsb_dll).to_string_lossy().to_string() };
+            let mut failures = 0;
+            loop {
+                let sdr = match RtlSdr::open(&dll, cfg.adsb_device_index as u32, &cfg.adsb_gain) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        failures += 1;
+                        let _ = tx.send(Msg::Status(format!("rtlsdr: {e}{}", if failures >= 3 { " (giving up; fix and restart)" } else { " (retrying)" })));
+                        if failures >= 3 {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(1500));
+                        continue;
+                    }
+                };
+                let _ = tx.send(Msg::Status("rtlsdr: receiving 1090 MHz".into()));
+                let mut demod = Demodulator::default();
+                let mut buf = vec![0u8; 1024 * 100 * 2];
+                let mut n_frames: u64 = 0;
+                let mut last_report = Instant::now();
+                loop {
+                    match sdr.read(&mut buf) {
+                        Ok(n) => {
+                            let mags = magnitudes_u8(&buf[..n]);
+                            for hex in demod.push(&mags) {
+                                n_frames += 1;
+                                if let Some(d) = decode_message(&hex, cfg.lat_deg, cfg.lon_deg) {
+                                    if tx.send(Msg::Dec(d)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            if last_report.elapsed() > Duration::from_secs(5) {
+                                last_report = Instant::now();
+                                let _ = tx.send(Msg::Status(format!("rtlsdr: receiving 1090 MHz · {n_frames} Mode S frames · noise {:.3}", demod.noise_floor)));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Status(format!("rtlsdr: {e} (restarting)")));
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
             }
         })
         .ok();

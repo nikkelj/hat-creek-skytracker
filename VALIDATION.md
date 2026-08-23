@@ -5,6 +5,24 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-23 — Native RTL-SDR ADS-B: real Mode S frames on the first run
+
+`skytracker-adsb::demod` ports pyModeS' RtlReader (100 µs-window noise
+floor, 10 dB minimum amplitude, 16-sample preamble match with the 0.8
+amplitude tolerance, PPM bit decision per half-chip pair, DF/CRC acceptance)
+— unit-tested on synthesized frames (round-trip, streaming in noise,
+corrupted frame rejected: 4/4). The app binds `rtlsdr.dll` (repo root) with
+libloading: 2 MS/s, 1090 MHz, auto/manual gain, synchronous reads, then
+`modes::decode_message` → the same aircraft table as the SBS path.
+
+First run with the Nooelec dongle attached to this PC (config
+`adsb_source_mode: "rtlsdr"`), 20 s into the screenshot tour:
+**"rtlsdr: receiving 1090 MHz · 17 Mode S frames · noise 0.066 · 1 aircraft
+· 3 msgs"** — a real aircraft decoded and plotted. The last Python-only
+ADS-B piece is gone; `adsb_receiver.py` is now fully superseded natively.
+
+---
+
 ## 2026-08-23 — Native app: three cameras, sensor-calibration view, filter wheels, HOTSPOT feed-forward fix
 
 - **Camera model**: logical slots with role / projection / hardware index /

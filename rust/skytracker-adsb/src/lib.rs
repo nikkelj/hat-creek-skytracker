@@ -6,4 +6,5 @@
 //! path arrives with the Phase 7 app.
 
 pub mod geom;
+pub mod demod;
 pub mod modes;

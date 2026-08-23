@@ -509,6 +509,18 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         theme::mono(10.0),
         DIM,
     );
+    {
+        let adsb = shared.adsb.load();
+        if adsb.mode != "off" {
+            painter.text(
+                rect.left_top() + Vec2::new(10.0, 54.0),
+                Align2::LEFT_TOP,
+                format!("ads-b: {} · {} aircraft · {} msgs", adsb.status, adsb.n_aircraft, adsb.n_msgs),
+                theme::mono(10.0),
+                if adsb.status.contains("giving up") || adsb.status.contains("not found") { RED } else { DIM },
+            );
+        }
+    }
     // Legend.
     let mut ly = rect.bottom() - 14.0;
     for (name, col) in [("GEO", VIOLET), ("MEO", Color32::from_rgb(232, 150, 72)), ("LEO far", theme::sat_color(2400.0)), ("LEO near", theme::sat_color(400.0))] {

@@ -287,9 +287,10 @@ placeholders download on first playback — the transport says so).
 `SKYTRACKER_VSYNC=0` / `"ui_vsync": false` unlocks the frame rate.
 `SKYTRACKER_AUTOTEST_TARGET=body:sun|star:HIP32349|dso:M031|adsb:<icao>`
 makes the autotest PROGRAM-track a celestial/aircraft target instead.
-ADS-B: `"adsb_source_mode": "dump1090"` reads a dump1090 SBS feed
-(`adsb_dump1090_host/port`), `"sim"` (or `SKYTRACKER_ADSB=sim`) flies three
-simulated aircraft; native RTL-SDR demodulation is not ported yet.
+ADS-B: `"adsb_source_mode": "rtlsdr"` receives 1090 MHz natively through
+`rtlsdr.dll` (2 MS/s, pyModeS-equivalent demodulator in `skytracker-adsb`),
+`"dump1090"` reads a dump1090 SBS feed (`adsb_dump1090_host/port`), `"sim"`
+(or `SKYTRACKER_ADSB=sim`) flies three simulated aircraft.
 
 ## Hardware Simulator
 

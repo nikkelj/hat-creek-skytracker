@@ -213,6 +213,9 @@ pub struct Config {
     pub adsb_predict_horizon_s: f64,
     pub adsb_predict_step_s: f64,
     pub adsb_stale_timeout_s: f64,
+    pub adsb_device_index: usize,
+    pub adsb_gain: String,
+    pub adsb_dll: String,
     pub sim: SimSettings,
 }
 
@@ -393,6 +396,9 @@ impl Config {
             adsb_predict_horizon_s: f("adsb_predict_horizon_sec", 60.0),
             adsb_predict_step_s: f("adsb_predict_step_sec", 2.0),
             adsb_stale_timeout_s: f("adsb_stale_timeout_sec", 30.0),
+            adsb_device_index: f("adsb_device_index", 0.0) as usize,
+            adsb_gain: match &v["adsb_gain"] { Value::String(g) => g.clone(), Value::Number(n) => n.to_string(), _ => "auto".into() },
+            adsb_dll: s("adsb_rtlsdr_dll", "rtlsdr.dll"),
             sim,
             raw,
         }

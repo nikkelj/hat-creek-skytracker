@@ -277,6 +277,8 @@ checkout):
 cargo run --release --manifest-path rust/Cargo.toml -p skytracker-app
 ```
 
+Phase 8 (Python retirement) inventory + rig checklist: [doc/PHASE8_READINESS.md](doc/PHASE8_READINESS.md).
+
 Headless checks: `SKYTRACKER_AUTOTEST=<seconds>` injects a sim misalignment,
 selects a LEO target, arms HANDOFF, captures a short run, plate-solves and
 runs an 8-point alignment while logging the loop once a second;

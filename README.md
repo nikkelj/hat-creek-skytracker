@@ -276,7 +276,10 @@ cargo run --release --manifest-path rust/Cargo.toml -p skytracker-app
 Headless checks: `SKYTRACKER_AUTOTEST=<seconds>` injects a sim misalignment,
 selects a LEO target, arms HANDOFF, captures a short run, plate-solves and
 runs an 8-point alignment while logging the loop once a second;
-`SKYTRACKER_SCREENSHOT_DIR=<dir>` tours every screen and saves PNGs.
+`SKYTRACKER_SCREENSHOT_DIR=<dir>` tours every screen and saves PNGs;
+`SKYTRACKER_REPLAY_TEST=<run-folder-substring>` plays a run headlessly and
+logs displayed-vs-wanted frames (replay runs synced as OneDrive online-only
+placeholders download on first playback — the transport says so).
 `SKYTRACKER_VSYNC=0` / `"ui_vsync": false` unlocks the frame rate.
 
 ## Hardware Simulator

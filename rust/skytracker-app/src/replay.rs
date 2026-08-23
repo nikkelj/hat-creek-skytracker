@@ -1053,6 +1053,103 @@ struct FrameRequest {
     pane_w: usize,
     params: ProcParams,
     gen: u64,
+    /// Playing: prefer the pre-decoded proxy frames (smooth) over a fresh
+    /// full-resolution decode (sharp but ~100 ms per 6 MP BMP).
+    playing: bool,
+}
+
+/// Whole-run reduced-resolution frames decoded once in the background
+/// (rayon), so playback never waits on a 19 MB BMP decode. Capped at
+/// PROXY_MAX_W px wide and ~PROXY_BUDGET bytes per camera.
+pub struct Proxy {
+    pub reduce: std::sync::atomic::AtomicUsize,
+    pub frames: std::sync::Mutex<Vec<Option<Arc<Gray>>>>,
+    pub done: std::sync::atomic::AtomicUsize,
+    pub total: usize,
+}
+
+const PROXY_MAX_W: usize = 1024;
+const PROXY_BUDGET: usize = 160 << 20;
+
+impl Proxy {
+    fn new(total: usize) -> Self {
+        Proxy {
+            reduce: std::sync::atomic::AtomicUsize::new(0),
+            frames: std::sync::Mutex::new(vec![None; total]),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total,
+        }
+    }
+    fn get(&self, idx: usize) -> Option<Arc<Gray>> {
+        self.frames.lock().unwrap().get(idx).and_then(|f| f.clone())
+    }
+    pub fn reduce(&self) -> usize {
+        self.reduce.load(Ordering::Relaxed)
+    }
+    pub fn progress(&self) -> (usize, usize) {
+        (self.done.load(Ordering::Relaxed), self.total)
+    }
+}
+
+/// Proxy reduction for a run: power of two so width <= PROXY_MAX_W and the
+/// whole run fits the byte budget.
+fn proxy_reduce_for(w: usize, h: usize, n: usize) -> usize {
+    let mut r = 1;
+    while w / r > PROXY_MAX_W || (w / r) * (h / r) * n > PROXY_BUDGET {
+        r *= 2;
+        if r >= 64 {
+            break;
+        }
+    }
+    r
+}
+
+fn spawn_proxy_builder(cam: Arc<CamFrames>, proxy: Arc<Proxy>, stop: Arc<AtomicBool>, ctx: Option<egui::Context>) {
+    std::thread::Builder::new()
+        .name(format!("replay-proxy{}", cam.cam_index + 1))
+        .spawn(move || {
+            use rayon::prelude::*;
+            let frames = &cam.frames;
+            if frames.is_empty() {
+                return;
+            }
+            // First frame sets the geometry.
+            let Ok(g0) = load_gray(&frames[0].path) else { return };
+            let reduce = proxy_reduce_for(g0.w, g0.h, frames.len());
+            proxy.reduce.store(reduce, Ordering::Relaxed);
+            let store = |i: usize, g: Gray| {
+                let r = if reduce > 1 { g.downsample(reduce) } else { g };
+                proxy.frames.lock().unwrap()[i] = Some(Arc::new(r));
+                proxy.done.fetch_add(1, Ordering::Relaxed);
+            };
+            store(0, g0);
+            let pool = rayon::ThreadPoolBuilder::new().num_threads((num_cpus_hint() / 2).max(2)).build();
+            let work = |i: usize| {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok(g) = load_gray(&frames[i].path) {
+                    store(i, g);
+                }
+                if i % 8 == 0 {
+                    if let Some(c) = &ctx {
+                        c.request_repaint();
+                    }
+                }
+            };
+            match pool {
+                Ok(p) => p.install(|| (1..frames.len()).into_par_iter().for_each(work)),
+                Err(_) => (1..frames.len()).into_par_iter().for_each(work),
+            }
+            if let Some(c) = &ctx {
+                c.request_repaint();
+            }
+        })
+        .ok();
+}
+
+fn num_cpus_hint() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
 pub struct ProcessedFrame {
@@ -1077,6 +1174,7 @@ struct CamWorker {
     out: Arc<ArcSwapOption<ProcessedFrame>>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    proxy: Arc<Proxy>,
 }
 
 impl Drop for CamWorker {
@@ -1098,10 +1196,25 @@ impl DecodeCache {
         DecodeCache { map: HashMap::new(), order: VecDeque::new(), full: HashMap::new(), full_order: VecDeque::new() }
     }
 
-    fn get(&mut self, frames: &[FrameRef], idx: usize, reduce: usize) -> Result<Arc<Gray>, String> {
+    fn get(&mut self, frames: &[FrameRef], idx: usize, reduce: usize, proxy: &Proxy) -> Result<Arc<Gray>, String> {
         let key = (idx, reduce);
         if let Some(g) = self.map.get(&key) {
             return Ok(g.clone());
+        }
+        // Proxy hit: derive from the pre-decoded reduced frame (cheap).
+        let pr = proxy.reduce();
+        if pr > 0 && reduce >= pr && reduce % pr == 0 {
+            if let Some(p) = proxy.get(idx) {
+                let g = if reduce > pr { Arc::new(p.downsample(reduce / pr)) } else { p };
+                self.map.insert(key, g.clone());
+                self.order.push_back(key);
+                while self.order.len() > DECODE_CACHE {
+                    if let Some(k) = self.order.pop_front() {
+                        self.map.remove(&k);
+                    }
+                }
+                return Ok(g);
+            }
         }
         let full = match self.full.get(&idx) {
             Some(f) => f.clone(),
@@ -1139,16 +1252,19 @@ fn spawn_cam_worker(slot: usize, cam: Arc<CamFrames>, ctx: Option<egui::Context>
     let (tx, rx) = crossbeam_channel::unbounded::<FrameRequest>();
     let out: Arc<ArcSwapOption<ProcessedFrame>> = Arc::new(ArcSwapOption::from(None));
     let stop = Arc::new(AtomicBool::new(false));
+    let proxy = Arc::new(Proxy::new(cam.frames.len()));
+    spawn_proxy_builder(cam.clone(), proxy.clone(), stop.clone(), ctx.clone());
     let out2 = out.clone();
     let stop2 = stop.clone();
+    let proxy2 = proxy.clone();
     let handle = std::thread::Builder::new()
         .name(format!("replay-cam{}", cam.cam_index + 1))
-        .spawn(move || cam_worker_loop(slot, cam, rx, out2, stop2, ctx))
+        .spawn(move || cam_worker_loop(slot, cam, rx, out2, stop2, ctx, proxy2))
         .ok();
-    CamWorker { tx, out, stop, handle }
+    CamWorker { tx, out, stop, handle, proxy }
 }
 
-fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>, out: Arc<ArcSwapOption<ProcessedFrame>>, stop: Arc<AtomicBool>, ctx: Option<egui::Context>) {
+fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>, out: Arc<ArcSwapOption<ProcessedFrame>>, stop: Arc<AtomicBool>, ctx: Option<egui::Context>, proxy: Arc<Proxy>) {
     let frames = &cam.frames;
     let mut cache = DecodeCache::new();
     let mut stab_cache: Option<StabCache> = None;
@@ -1171,7 +1287,7 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
                         }
                         let j = l.frame_idx + d;
                         if j < frames.len() {
-                            let _ = cache.get(frames, j, reduce);
+                            let _ = cache.get(frames, j, reduce, &proxy);
                         }
                     }
                 }
@@ -1191,7 +1307,7 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
         // Reduce factor needs the full frame width: decode full first time.
         let (fw, fh) = match full_shape {
             Some(s) => s,
-            None => match cache.get(frames, idx, 1) {
+            None => match cache.get(frames, idx, 1, &proxy) {
                 Ok(g) => {
                     full_shape = Some((g.w, g.h));
                     (g.w, g.h)
@@ -1207,8 +1323,14 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
                 }
             },
         };
-        let reduce = reduce_for(fw, req.pane_w.max(1));
-        let raw = match cache.get(frames, idx, reduce) {
+        let mut reduce = reduce_for(fw, req.pane_w.max(1));
+        let pr = proxy.reduce();
+        if req.playing && pr > 0 && proxy.get(idx).is_some() {
+            // Smooth playback: use the proxy resolution (>= pane/2 px) rather
+            // than a full decode per frame; a pause re-requests full quality.
+            reduce = reduce.max(pr);
+        }
+        let raw = match cache.get(frames, idx, reduce, &proxy) {
             Ok(g) => g,
             Err(e) => {
                 seq += 1;
@@ -1229,7 +1351,7 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
             let key = (ref_idx, reduce, lut, p.stab);
             let fresh = stab_cache.as_ref().map_or(true, |c| c.key != key);
             if fresh {
-                if let Ok(ref_raw) = cache.get(frames, ref_idx, reduce) {
+                if let Ok(ref_raw) = cache.get(frames, ref_idx, reduce, &proxy) {
                     let ref_proc = if is_default_params(p.gamma, p.brightness, p.contrast) { (*ref_raw).clone() } else { ref_raw.apply_lut(&lut) };
                     stab_cache = Some(StabCache { key, stab: Stabilizer::new(&ref_proc, p.stab) });
                 }
@@ -1277,7 +1399,7 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
             }
             let j = idx + d;
             if j < frames.len() {
-                let _ = cache.get(frames, j, reduce);
+                let _ = cache.get(frames, j, reduce, &proxy);
             }
         }
         last = Some(req);
@@ -1546,7 +1668,7 @@ struct LoadedRun {
     textures: Vec<Option<egui::TextureHandle>>,
     tex_seq: Vec<u64>,
     last_frame: Vec<Option<Arc<ProcessedFrame>>>,
-    last_sent: Vec<Option<(usize, usize, ProcParams)>>,
+    last_sent: Vec<Option<(usize, usize, ProcParams, bool)>>,
     pane_w: Vec<usize>,
     reference_idx: Vec<usize>,
     adjust: Vec<CamAdjust>,
@@ -1554,6 +1676,24 @@ struct LoadedRun {
     sidecar: Sidecar,
     t0: f64,
     t1: f64,
+    /// Frames live in OneDrive as online-only placeholders: the first read
+    /// of each frame is a cloud download (seconds per 18 MB BMP).
+    cloud_only: bool,
+}
+
+/// Windows: FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS |
+/// RECALL_ON_OPEN mark OneDrive Files-On-Demand placeholders.
+fn is_cloud_placeholder(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(m) = std::fs::metadata(path) {
+            let a = m.file_attributes();
+            return a & (0x1000 | 0x40000 | 0x400000) != 0;
+        }
+    }
+    let _ = path;
+    false
 }
 
 fn make_params(stabilize: bool, stab: StabSettings, sharpen: SharpenSettings, l: &LoadedRun, slot: usize) -> ProcParams {
@@ -1583,6 +1723,9 @@ pub struct ReplayState {
     pub playing: bool,
     pub speed_idx: usize,
     pub looping: bool,
+    /// Playback is holding the playhead because the decoders have not
+    /// caught up yet (proxy cache still building / cloud download).
+    pub buffering: bool,
     pub in_marker: f64,
     pub out_marker: f64,
     last_tick: Instant,
@@ -1619,6 +1762,7 @@ impl Default for ReplayState {
             playing: false,
             speed_idx: 2,
             looping: true,
+            buffering: false,
             in_marker: 0.0,
             out_marker: 0.0,
             last_tick: Instant::now(),
@@ -1644,6 +1788,35 @@ impl Default for ReplayState {
 impl ReplayState {
     pub fn speed(&self) -> f64 {
         SPEEDS[self.speed_idx.min(SPEEDS.len() - 1)]
+    }
+
+    /// Library size after a scan (None until the scan has landed).
+    pub fn library_len(&self) -> Option<usize> {
+        self.library.as_ref().map(|l| l.len())
+    }
+
+    /// Index of the first library run whose folder name contains `needle`.
+    pub fn find_run(&self, needle: &str) -> Option<usize> {
+        let lib = self.library.as_ref()?;
+        lib.iter().position(|r| r.path.to_string_lossy().contains(needle) || r.display_name().contains(needle))
+    }
+
+    /// One-line status for the headless benchmark: playhead, per-camera
+    /// displayed frame index / process time, proxy cache progress.
+    pub fn debug_status(&self) -> String {
+        let Some(l) = &self.loaded else { return "no run".into() };
+        let mut s = format!("t={:7.2}s play={}", self.t - l.t0, self.playing);
+        for (slot, w) in l.workers.iter().enumerate() {
+            let (pd, pt) = w.proxy.progress();
+            let shown = l.last_frame[slot].as_ref().map(|f| (f.frame_idx, f.reduce, f.proc_ms)).unwrap_or((0, 0, 0.0));
+            let want = l.run.frame_index_at(slot, self.t).unwrap_or(0);
+            s.push_str(&format!("  cam{slot}: shown {} want {} /{} {:.0}ms proxy {pd}/{pt}", shown.0, want, shown.1, shown.2));
+        }
+        s
+    }
+
+    pub fn shown_frame_index(&self, slot: usize) -> Option<usize> {
+        self.loaded.as_ref()?.last_frame.get(slot)?.as_ref().map(|f| f.frame_idx)
     }
 
     pub fn loaded_run(&self) -> Option<&Arc<RunInfo>> {
@@ -1685,6 +1858,7 @@ impl ReplayState {
         let workers: Vec<CamWorker> = run.cams.iter().enumerate().map(|(slot, cam)| spawn_cam_worker(slot, Arc::new(cam.clone()), ctx.clone())).collect();
         let t0 = run.t0().unwrap_or(0.0);
         let t1 = run.t1().unwrap_or(t0);
+        let cloud_only = run.cams.iter().filter_map(|c| c.frames.get(c.frames.len() / 2)).any(|f| is_cloud_placeholder(&f.path));
         self.t = t0;
         self.in_marker = t0;
         self.out_marker = t1;
@@ -1709,6 +1883,7 @@ impl ReplayState {
             adjust: vec![CamAdjust::default(); n],
             t0,
             t1,
+            cloud_only,
         });
         self.last_tick = Instant::now();
     }
@@ -1741,7 +1916,20 @@ impl ReplayState {
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.25);
         self.last_tick = now;
         let Some(l) = &self.loaded else { return };
+        self.buffering = false;
         if self.playing && l.t1 > l.t0 {
+            // Hold the playhead while the decoders are behind and the proxy
+            // cache is still building: better a pause than skipping frames.
+            let slot = self.active_cam.min(l.run.cams.len().saturating_sub(1));
+            let next_t = self.t + dt * self.speed();
+            if let (Some(w), Some(shown)) = (l.run.frame_index_at(slot, next_t), l.last_frame.get(slot).and_then(|f| f.as_ref())) {
+                let (pd, pt) = l.workers[slot].proxy.progress();
+                let proxies_building = pd < pt;
+                if proxies_building && w > shown.frame_idx + 2 {
+                    self.buffering = true;
+                    return;
+                }
+            }
             self.t += dt * self.speed();
             if self.t >= l.t1 {
                 if self.looping {
@@ -2143,7 +2331,9 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
                 let (txt, col) = if s.ok { (format!("STAB ok · {} inliers", s.inliers), theme::GREEN) } else { (format!("STAB passthrough · {}", s.reason.clone().unwrap_or_default()), theme::AMBER) };
                 painter.text(rect.right_bottom() + Vec2::new(-6.0, -6.0), Align2::RIGHT_BOTTOM, txt, theme::mono(10.0), col);
             }
-            painter.text(rect.left_bottom() + Vec2::new(6.0, -6.0), Align2::LEFT_BOTTOM, format!("{}x{} /{}  {:.0} ms", f.w, f.h, f.reduce, f.proc_ms), theme::mono(9.5), theme::DIM);
+            let (pd, pt) = l.workers[slot].proxy.progress();
+            let cache_txt = if pd < pt { format!("  · caching {pd}/{pt}") } else { String::new() };
+            painter.text(rect.left_bottom() + Vec2::new(6.0, -6.0), Align2::LEFT_BOTTOM, format!("{}x{} /{}  {:.0} ms{cache_txt}", f.w, f.h, f.reduce, f.proc_ms), theme::mono(9.5), theme::DIM);
         }
         // Draft annotation preview.
         if let Some((dc, x0, y0, x1, y1)) = st.annot_draft {
@@ -2236,11 +2426,11 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         let Some(idx) = l.run.frame_index_at(slot, st.t) else { continue };
         let params = make_params(st.stabilize, st.stab, st.sharpen, l, slot);
         let pane_w = l.pane_w[slot];
-        let same = l.last_sent[slot].as_ref().map_or(false, |(i, w, p)| *i == idx && *w == pane_w && *p == params);
+        let same = l.last_sent[slot].as_ref().map_or(false, |(i, w, p, pl)| *i == idx && *w == pane_w && *p == params && *pl == st.playing);
         if !same {
             st.req_gen += 1;
-            let _ = l.workers[slot].tx.send(FrameRequest { frame_idx: idx, pane_w, params: params.clone(), gen: st.req_gen });
-            l.last_sent[slot] = Some((idx, pane_w, params));
+            let _ = l.workers[slot].tx.send(FrameRequest { frame_idx: idx, pane_w, params: params.clone(), gen: st.req_gen, playing: st.playing });
+            l.last_sent[slot] = Some((idx, pane_w, params, st.playing));
         }
     }
     if save_needed {
@@ -2326,6 +2516,15 @@ fn transport_panel(ui: &mut egui::Ui, st: &mut ReplayState) {
         if let Some(l) = &st.loaded {
             let frames: Vec<String> = (0..l.run.cams.len()).filter_map(|s| l.run.frame_index_at(s, st.t).map(|i| format!("c{} {}/{}", l.run.cams[s].cam_index + 1, i + 1, l.run.cams[s].frames.len()))).collect();
             ui.label(egui::RichText::new(frames.join("  ")).font(theme::mono(11.0)).color(theme::DIM));
+            let (pd, pt): (usize, usize) = l.workers.iter().map(|w| w.proxy.progress()).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            if pd < pt {
+                let what = if l.cloud_only { "downloading from OneDrive" } else { "caching" };
+                let txt = if st.buffering { format!("buffering · {what} {pd}/{pt}") } else { format!("{what} {pd}/{pt}") };
+                ui.label(egui::RichText::new(txt).font(theme::mono(11.0)).color(theme::AMBER));
+            }
+            if l.cloud_only {
+                ui.label(egui::RichText::new("online-only run: first playback pulls every frame from the cloud (right-click the folder → Always keep on this device)").font(theme::sans(10.5)).color(theme::TEXT_2));
+            }
         }
     });
 }

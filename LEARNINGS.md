@@ -6,6 +6,32 @@ Newest entries first.
 
 ---
 
+## 2026-08-23 — "Sluggish replay" was OneDrive Files-On-Demand, not the decoder
+
+Replaying the YAOGAN-11 run in the native app: the playhead raced along,
+the frames barely changed. A headless benchmark (`SKYTRACKER_REPLAY_TEST`)
+showed the decode worker blocked for **24.9 s on one frame** and the
+background proxy cache filling at ~2 s/frame. `Get-Item` on the frames:
+attributes `4199968` = `RecallOnDataAccess | Offline | ReparsePoint` —
+the run synced from the MSI machine as **online-only placeholders**; the
+first `ReadAllBytes` of one 18 MB BMP took 12.4 s (cloud download), the
+re-read 15 ms. A 625-frame run is ~11 GB of first-touch downloads. On a
+local run (196 frames) the same code displays ~43 fps at 1x with the
+worker within 5 frames of the playhead.
+
+Fixes that are the app's business: a whole-run reduced-resolution proxy
+cache built in the background (rayon; ≤ 1024 px wide, ≤ 160 MB per
+camera) so playback never waits on a 6 MP BMP decode; playback rides the
+proxies while playing and re-requests full resolution on pause; the
+playhead **holds ("buffering")** while the decoders are behind instead of
+skipping; the transport shows "downloading from OneDrive n/m" when the
+frames carry the placeholder attributes, with the remedy (right-click the
+folder → Always keep on this device). Lesson: when a pipeline that is
+fast on local files crawls on a synced folder, check the file attributes
+before the profiler.
+
+---
+
 ## 2026-08-22 — HOTSPOT geometry was alt-az only; AltAz-Side needs the axis rotation
 
 Running the native app's headless closed-loop check (`SKYTRACKER_AUTOTEST`)

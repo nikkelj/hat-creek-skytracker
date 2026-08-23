@@ -89,6 +89,15 @@ struct App {
     started: Instant,
     shots: Option<Screenshots>,
     autotest: Option<Autotest>,
+    replay_test: Option<ReplayTest>,
+}
+
+struct ReplayTest {
+    needle: String,
+    loaded: bool,
+    last_log: f64,
+    started: Option<Instant>,
+    shown_hist: Vec<(usize, usize)>,
 }
 
 struct Autotest {
@@ -132,6 +141,7 @@ impl App {
             started: Instant::now(),
             shots,
             autotest: std::env::var("SKYTRACKER_AUTOTEST").ok().and_then(|v| v.parse::<f64>().ok()).map(|d| Autotest { duration: d, armed: false, captured: false, dumped: false, solved: false, aligned: false, last_log: 0.0 }),
+            replay_test: std::env::var("SKYTRACKER_REPLAY_TEST").ok().map(|n| ReplayTest { needle: n, loaded: false, last_log: 0.0, started: None, shown_hist: Vec::new() }),
         }
     }
 
@@ -211,6 +221,7 @@ impl eframe::App for App {
                     }
                     shots.idx += 1;
                     shots.requested = false;
+                    shots.solve_sent = false;
                     shots.switched_at = Instant::now();
                     if shots.idx >= Screen::ALL.len() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -221,13 +232,21 @@ impl eframe::App for App {
             }
             if shots.idx < Screen::ALL.len() {
                 self.screen = Screen::ALL[shots.idx];
-                let dwell = match shots.idx { 0 => 12.0, 2 => 8.0, _ => 4.0 };
+                let dwell = match shots.idx { 0 => 12.0, 2 => 8.0, 3 => 9.0, _ => 4.0 };
                 if shots.idx == 0 && self.ui.selected.is_none() && shots.switched_at.elapsed().as_secs_f64() > 3.0 {
                     // Select something for the track screen so arcs + labels show.
                     if let Some(s) = pick_demo_target(&self.shared) {
                         self.ui.selected = Some(s.clone());
                         let _ = self.tx.send(MountCmd::SelectTarget(Some(s)));
                         let _ = self.tx.send(MountCmd::SetMode("PROGRAM".into()));
+                    }
+                }
+                if Screen::ALL[shots.idx] == Screen::Replay && !shots.solve_sent && shots.switched_at.elapsed().as_secs_f64() > 1.0 {
+                    // Load the newest real run and play it for the screenshot.
+                    if let Some(idx) = self.replay.find_run("YAOGAN").or_else(|| if self.replay.library_len().unwrap_or(0) > 0 { Some(0) } else { None }) {
+                        self.replay.load_run(idx, Some(ctx.clone()));
+                        self.replay.playing = true;
+                        shots.solve_sent = true;
                     }
                 }
                 if Screen::ALL[shots.idx] == Screen::Align && shots.switched_at.elapsed().as_secs_f64() > 0.5 {
@@ -308,6 +327,42 @@ impl eframe::App for App {
             }
         }
 
+        // Headless replay benchmark: SKYTRACKER_REPLAY_TEST=<run-name-substring>
+        // loads that run, plays it at 1x and logs displayed-vs-wanted frames
+        // once a second; exits at the end of the run.
+        if let Some(rt) = self.replay_test.as_mut() {
+            self.screen = Screen::Replay;
+            let t = self.started.elapsed().as_secs_f64();
+            if !rt.loaded {
+                if let Some(idx) = self.replay.find_run(&rt.needle) {
+                    self.replay.load_run(idx, Some(ctx.clone()));
+                    self.replay.looping = false;
+                    self.replay.playing = true;
+                    rt.loaded = true;
+                    rt.started = Some(Instant::now());
+                    eprintln!("replaytest: loaded run #{idx} ({})", rt.needle);
+                } else if t > 8.0 {
+                    eprintln!("replaytest: run '{}' not found in library ({:?} entries)", rt.needle, self.replay.library_len());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            } else {
+                let a = self.replay.shown_frame_index(0).unwrap_or(0);
+                let b = self.replay.shown_frame_index(1).unwrap_or(0);
+                if rt.shown_hist.last() != Some(&(a, b)) {
+                    rt.shown_hist.push((a, b));
+                }
+                if t - rt.last_log >= 1.0 {
+                    rt.last_log = t;
+                    eprintln!("replaytest {:5.1}s {}  distinct frames so far: {}", rt.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0), self.replay.debug_status(), rt.shown_hist.len());
+                }
+                if !self.replay.playing && rt.started.map_or(false, |s| s.elapsed().as_secs_f64() > 3.0) {
+                    let el = rt.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0);
+                    eprintln!("replaytest: done in {el:.1}s, {} distinct (cam0,cam1) frame pairs displayed", rt.shown_hist.len());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
         self.top_bar(ctx, ui_fps);
 
         match self.screen {
@@ -355,7 +410,32 @@ impl eframe::App for App {
                     let m = self.shared.mount.load();
                     let cfg = &self.shared.config;
                     let cam_fov = self.shared.cam.load().as_ref().as_ref().map(|c| c.fov_deg).unwrap_or(1.0);
+                    // Sky objects for the dome: bright stars, bodies, the
+                    // trackable satellites (dead-reckoned), the selection.
+                    let sky = self.shared.sky.load();
+                    let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
+                    let mask = cfg.elevation_mask_deg;
+                    let mut marks: Vec<mount3d::SkyMark> = Vec::with_capacity(1200);
+                    for s in sky.stars.iter().filter(|s| s.mag <= 4.5) {
+                        marks.push(mount3d::SkyMark { az: s.az, el: s.el, kind: mount3d::SkyKind::Star { mag: s.mag as f32 } });
+                    }
+                    for b in &sky.bodies {
+                        marks.push(mount3d::SkyMark { az: b.az, el: b.el, kind: mount3d::SkyKind::Body { name: b.name.clone() } });
+                    }
+                    for s in &sky.sats {
+                        let el = s.el + s.el_rate * age_s;
+                        if el < mask {
+                            continue;
+                        }
+                        let selected = self.ui.selected.as_deref() == Some(s.satnum.as_str());
+                        marks.push(mount3d::SkyMark {
+                            az: s.az + s.az_rate * age_s,
+                            el,
+                            kind: mount3d::SkyKind::Sat { selected, geo: s.range_km > 20_000.0, name: s.name.clone() },
+                        });
+                    }
                     let pose = mount3d::MountPose {
+                        sky: &marks,
                         az_deg: m.azm,
                         el_deg: m.alt,
                         mount_mode: &cfg.mount_mode,

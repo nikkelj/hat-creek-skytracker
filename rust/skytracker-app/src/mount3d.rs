@@ -580,7 +580,24 @@ fn sky_point(az: f64, el: f64) -> V3 {
 /// el = 90 - ALT). `target` is a sky (az, el) direction; `fov_deg` is the
 /// camera's horizontal FOV (a 3:2 frame is drawn). Limits are in mount axis
 /// degrees: `(min, max)` allowed spans for AZM and ALT.
+/// A sky object painted on the dome.
+#[derive(Clone, Debug)]
+pub struct SkyMark {
+    pub az: f64,
+    pub el: f64,
+    pub kind: SkyKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum SkyKind {
+    Star { mag: f32 },
+    Body { name: String },
+    Sat { selected: bool, geo: bool, name: String },
+}
+
 pub struct MountPose<'a> {
+    /// Stars / planets / satellites to paint on the dome (may be empty).
+    pub sky: &'a [SkyMark],
     pub az_deg: f64,
     pub el_deg: f64,
     /// "AltAz" | "AltAzSide" | "Passthrough" | "Eq" (case/punctuation-insensitive).
@@ -640,7 +657,8 @@ impl Mount3dView {
         // ---- interaction -------------------------------------------------
         if response.dragged_by(PointerButton::Primary) {
             let d = response.drag_delta();
-            self.yaw_deg = (self.yaw_deg - d.x * 0.4).rem_euclid(360.0);
+            // Drag right -> the scene turns with the hand (yaw increases).
+            self.yaw_deg = (self.yaw_deg + d.x * 0.4).rem_euclid(360.0);
             self.pitch_deg = (self.pitch_deg + d.y * 0.4).clamp(-89.0, 89.0);
         }
         if response.hovered() {
@@ -724,6 +742,38 @@ impl Mount3dView {
             // Label on the far side of the dome (straight ahead of the camera).
             if let Some(p) = cam.project(sky_point(self.yaw_deg as f64 + 180.0, el)) {
                 painter.text(p + Vec2::new(0.0, -3.0), Align2::CENTER_BOTTOM, format!("{el:.0}°"), theme::mono(10.0), theme::DIM);
+            }
+        }
+
+        // ---- sky objects on the dome ---------------------------------------
+        for m in pose.sky {
+            if m.el < -0.5 {
+                continue;
+            }
+            let Some(p) = cam.project(sky_point(m.az, m.el)) else { continue };
+            match &m.kind {
+                SkyKind::Star { mag } => {
+                    let r = (2.4 - mag * 0.4).clamp(0.7, 2.4);
+                    let g = (205.0 - mag * 18.0).clamp(90.0, 220.0) as u8;
+                    painter.circle_filled(p, r, Color32::from_rgb(g, g, (g as u16 + 12).min(255) as u8));
+                }
+                SkyKind::Body { name } => {
+                    let (col, r) = match name.as_str() {
+                        "sun" => (Color32::from_rgb(255, 225, 130), 5.5),
+                        "moon" => (Color32::from_rgb(215, 218, 228), 4.5),
+                        _ => (Color32::from_rgb(235, 205, 140), 3.0),
+                    };
+                    painter.circle_filled(p, r, col);
+                    painter.text(p + Vec2::new(7.0, -5.0), Align2::LEFT_CENTER, name, theme::sans(10.5), theme::with_alpha(col, 220));
+                }
+                SkyKind::Sat { selected, geo, name } => {
+                    let col = if *geo { theme::VIOLET } else { Color32::from_rgb(255, 236, 200) };
+                    painter.circle_filled(p, if *selected { 3.0 } else { 2.0 }, if *selected { theme::ACCENT } else { theme::with_alpha(col, 200) });
+                    if *selected {
+                        painter.circle_stroke(p, 8.0, Stroke::new(1.4, theme::ACCENT));
+                        painter.text(p + Vec2::new(11.0, 0.0), Align2::LEFT_CENTER, name, theme::sans(11.0), theme::TEXT);
+                    }
+                }
             }
         }
 

@@ -118,6 +118,20 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
     shared.solve.store(Arc::new(snap.clone()));
 
     let mut runner = crate::align_runner::Runner::new(&cfg);
+    // Continuous background solving (plate_solve_enabled) + polar align state.
+    let mut continuous = cfg.raw["plate_solve_enabled"].as_bool().unwrap_or(false);
+    let mut last_auto_solve = Instant::now();
+    let mut align_az_live = cfg.alignment_az;
+    struct PolarRun {
+        targets: Vec<f64>,
+        alt_axis: f64,
+        idx: usize,
+        samples: Vec<[f64; 2]>,
+        awaiting: bool,
+        started: Instant,
+    }
+    let mut polar: Option<PolarRun> = None;
+    let mut polar_result: Option<(f64, f64, f64, f64, usize)> = None;
     let mut align = AlignSnapshot::default();
     align.status = "idle".into();
     shared.align.store(Arc::new(align.clone()));
@@ -134,7 +148,48 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
                 }
                 AlignCmd::Accept => runner.user(true),
                 AlignCmd::Reject => runner.user(false),
-                AlignCmd::Abort => runner.abort(),
+                AlignCmd::Abort => {
+                    runner.abort();
+                    if polar.is_some() {
+                        polar = None;
+                        align.log.push("polar align aborted".into());
+                    }
+                }
+                AlignCmd::RetryFailed => {
+                    runner.retry_failed(crate::sky::now_unix());
+                }
+                AlignCmd::Skip => runner.skip(),
+                AlignCmd::QuickRefit => {
+                    let (_, seed) = **shared.pointing.load();
+                    let m = shared.mount.load();
+                    runner.start_quick(seed, m.az, m.el, crate::sky::now_unix());
+                }
+                AlignCmd::Continuous(on) => {
+                    continuous = on;
+                    crate::mount::persist_config_key(&cfg.path, "plate_solve_enabled", serde_json::json!(on));
+                    align.log.push(format!("continuous plate solve {}", if on { "ON" } else { "OFF" }));
+                }
+                AlignCmd::ApplyAlign => {
+                    // Fold the latest solve's azimuth error into alignment_azimuth
+                    // (apply_instantaneous_alignment): one-star align.
+                    if snap.last_ok {
+                        let daz = (snap.true_az - snap.mount_az + 540.0).rem_euclid(360.0) - 180.0;
+                        align_az_live += daz;
+                        let _ = mount_tx.send(MountCmd::SetAlignmentOffsets { az: align_az_live, el: cfg.alignment_el });
+                        align.log.push(format!("instantaneous align: alignment_azimuth {:+.4}° -> {:.4}°", daz, align_az_live));
+                    } else {
+                        align.log.push("apply align: no good solve yet".into());
+                    }
+                }
+                AlignCmd::PolarStart { n_points, sweep_deg } => {
+                    let m = shared.mount.load();
+                    let n = n_points.clamp(3, 24);
+                    let half = sweep_deg.abs().max(10.0) / 2.0;
+                    let targets: Vec<f64> = (0..n).map(|i| m.azm - half + sweep_deg.abs() * i as f64 / (n - 1) as f64).collect();
+                    polar = Some(PolarRun { targets, alt_axis: m.alt, idx: 0, samples: Vec::new(), awaiting: false, started: Instant::now() });
+                    polar_result = None;
+                    align.log.push(format!("polar align: sweeping RA axis {half:.0}° each side, {n} solves"));
+                }
                 AlignCmd::ApplyModel => {
                     if let Some(t) = runner.terms() {
                         shared.pointing.store(Arc::new((true, t)));
@@ -152,6 +207,9 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
                             }
                         }
                         align.log.push(format!("pointing model APPLIED + saved: {}", skytracker_pointing::altaz::TERM_NAMES.iter().zip(t.iter()).map(|(n, v)| format!("{n} {:+.2}′", v * 60.0)).collect::<Vec<_>>().join("  ")));
+                        if (**shared.mount_mode.load()).eq_ignore_ascii_case("eq") {
+                            align.log.push("note: this fit is ALT-AZ; the Eq residual model (eq_pointing_model_*) is separate and unchanged".into());
+                        }
                     } else {
                         align.log.push("no fit to apply yet".into());
                     }
@@ -162,6 +220,41 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
         // Runner step: it may ask for a slew, a solve, or a pause.
         let m = shared.mount.load();
         let now = crate::sky::now_unix();
+        // Polar-align sweep: goto next axis target, solve when arrived.
+        if let Some(p) = polar.as_mut() {
+            if p.started.elapsed() > Duration::from_secs(600) {
+                align.log.push("polar align TIMED OUT".into());
+                polar = None;
+            } else if p.idx >= p.targets.len() {
+                let (pole_az, pole_el) = if cfg.lat_deg >= 0.0 { (0.0, cfg.lat_deg) } else { (180.0, -cfg.lat_deg) };
+                if let Some((ax_az, ax_el)) = skytracker_pointing::polar::fit_polar_axis(&p.samples, pole_az, pole_el) {
+                    let daz = (ax_az - pole_az + 540.0).rem_euclid(360.0) - 180.0;
+                    let del = ax_el - pole_el;
+                    polar_result = Some((ax_az, ax_el, daz, del, p.samples.len()));
+                    align.log.push(format!(
+                        "polar axis: az {ax_az:.3}° el {ax_el:.3}° — turn base {daz:+.3}° {}, tilt {del:+.3}° {}",
+                        if daz > 0.0 { "west" } else { "east" },
+                        if del > 0.0 { "down" } else { "up" }
+                    ));
+                } else {
+                    align.log.push(format!("polar align: fit failed ({} samples)", p.samples.len()));
+                }
+                polar = None;
+            } else if !p.awaiting {
+                let tgt = p.targets[p.idx];
+                let d = ((m.azm - tgt + 540.0).rem_euclid(360.0) - 180.0).abs();
+                if d < 0.2 {
+                    p.awaiting = true;
+                    want_solve = true;
+                } else {
+                    let _ = mount_tx.send(MountCmd::GotoAxes { azm: tgt, alt: p.alt_axis });
+                }
+            }
+        }
+        if continuous && !want_solve && polar.is_none() && !align.running && last_auto_solve.elapsed() > Duration::from_secs(2) {
+            last_auto_solve = Instant::now();
+            want_solve = true;
+        }
         match runner.step(now, m.az, m.el) {
             crate::align_runner::Step::Idle => {}
             crate::align_runner::Step::Slew { az, el } => {
@@ -199,6 +292,13 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
                             snap.matched = s.matched;
                             snap.frame_seq = f.seq;
                             runner.on_solve(now, Some((s.true_az, s.true_el, s.rmse_arcsec)), m.az, m.el);
+                            if let Some(p) = polar.as_mut() {
+                                if p.awaiting {
+                                    p.samples.push([s.true_az, s.true_el]);
+                                    p.idx += 1;
+                                    p.awaiting = false;
+                                }
+                            }
                         }
                         Err(e) => {
                             snap.last_ok = false;
@@ -207,6 +307,13 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
                             snap.centroids.clear();
                             snap.matched.clear();
                             runner.on_solve(now, None, m.az, m.el);
+                            if let Some(p) = polar.as_mut() {
+                                if p.awaiting {
+                                    align.log.push(format!("polar point {} failed to solve — skipped", p.idx + 1));
+                                    p.idx += 1;
+                                    p.awaiting = false;
+                                }
+                            }
                         }
                     }
                     snap.busy = false;
@@ -224,6 +331,12 @@ fn run(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mount_tx:
         // Publish runner state.
         let st = runner.snapshot();
         align.running = st.running;
+        align.manual = st.manual;
+        align.n_failed = st.failed.len();
+        align.failed = st.failed;
+        align.continuous = continuous;
+        align.polar = polar_result;
+        align.polar_running = polar.is_some();
         align.status = st.status;
         align.action = st.action;
         align.point = st.point;

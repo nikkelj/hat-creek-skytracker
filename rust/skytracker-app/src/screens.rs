@@ -152,10 +152,29 @@ pub fn align_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, a
         let ui = &mut cols[0];
         crate::ui::camera_panel(ui, shared, st, tx_cam, true);
         ui.add_space(6.0);
+        // Prerequisite checklist (alignment_ui readiness panel).
+        ui.horizontal_wrapped(|ui| {
+            let cam_ok = shared.cam(shared.solve_slot()).map_or(false, |c| c.connected && c.fps > 1.0);
+            for (ok, label) in [
+                (solve.db_loaded, "tetra3 db"),
+                (mount.connected, "mount"),
+                (cam_ok, "camera streaming"),
+            ] {
+                theme::tag(ui, &format!("{} {label}", if ok { "✓" } else { "✗" }), if ok { GREEN } else { RED });
+            }
+            ui.label(RichText::new(&solve.db_name).font(theme::mono(9.5)).color(DIM));
+        });
         theme::section(ui, "plate solve");
         ui.horizontal(|ui| {
             if ui.add_enabled(solve.db_loaded && !solve.busy, egui::Button::new("solve now")).clicked() {
                 let _ = tx_align.send(AlignCmd::SolveNow);
+            }
+            let mut cont = align.continuous;
+            if ui.checkbox(&mut cont, "continuous").on_hover_text("background plate solve ~0.5 Hz (plate_solve_enabled)").changed() {
+                let _ = tx_align.send(AlignCmd::Continuous(cont));
+            }
+            if ui.add_enabled(solve.last_ok, egui::Button::new("apply align")).on_hover_text("one-star alignment: fold this solve's azimuth error into alignment_azimuth (persisted)").clicked() {
+                let _ = tx_align.send(AlignCmd::ApplyAlign);
             }
             ui.label(RichText::new(&solve.message).font(theme::mono(10.5)).color(if solve.last_ok { GREEN } else if solve.db_loaded { TEXT_2 } else { RED }));
         });
@@ -202,8 +221,45 @@ pub fn align_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, a
                 if ui.add_enabled(solve.db_loaded, egui::Button::new("start")).clicked() {
                     let _ = tx_align.send(AlignCmd::Start { n_points: als.n_points, supervised: als.supervised });
                 }
+                if ui.add_enabled(solve.db_loaded, egui::Button::new("quick refit")).on_hover_text("6 points, IA/IE free, other terms frozen at the live model").clicked() {
+                    let _ = tx_align.send(AlignCmd::QuickRefit);
+                }
+                if align.n_failed > 0 {
+                    if ui.button(format!("retry failed ({})", align.n_failed)).on_hover_text("re-run only the unsolved points, append + refit").clicked() {
+                        let _ = tx_align.send(AlignCmd::RetryFailed);
+                    }
+                }
             } else if theme::mode_button(ui, "abort", true, RED) {
                 let _ = tx_align.send(AlignCmd::Abort);
+            }
+        });
+        if align.manual {
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::tag(ui, "MANUAL", AMBER);
+                    ui.label(RichText::new("point failed to solve — paddle the mount onto stars, or").font(theme::sans(10.5)).color(TEXT));
+                    if theme::mode_button(ui, "skip point", true, AMBER) {
+                        let _ = tx_align.send(AlignCmd::Skip);
+                    }
+                    if theme::mode_button(ui, "abort run", false, RED) {
+                        let _ = tx_align.send(AlignCmd::Abort);
+                    }
+                });
+            });
+        }
+        // Polar alignment (Eq): RA-axis sweep + plate solves + axis fit.
+        ui.horizontal(|ui| {
+            theme::section(ui, "polar align");
+            if align.polar_running {
+                theme::tag(ui, "SWEEPING", AMBER);
+                if theme::mode_button(ui, "abort", false, RED) {
+                    let _ = tx_align.send(AlignCmd::Abort);
+                }
+            } else if ui.add_enabled(solve.db_loaded, egui::Button::new("run sweep")).on_hover_text("slew the RA axis ±30° in 5 steps, solve each, fit the axis direction and report base-rotation / tilt knob corrections").clicked() {
+                let _ = tx_align.send(AlignCmd::PolarStart { n_points: 5, sweep_deg: 60.0 });
+            }
+            if let Some((ax_az, ax_el, daz, del, n)) = align.polar {
+                ui.label(RichText::new(format!("axis {ax_az:.3}°/{ax_el:.3}° · base {daz:+.3}° · tilt {del:+.3}° ({n} pts)")).font(theme::mono(10.0)).color(GREEN));
             }
         });
         ui.horizontal(|ui| {
@@ -245,6 +301,10 @@ pub fn align_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, a
             let t = crate::ui::polar(c, rad, s.true_az, s.true_el);
             p.circle_filled(q, 2.5, GREEN);
             p.line_segment([q, t], egui::Stroke::new(1.0, theme::with_alpha(ACCENT, 180)));
+        }
+        for (az, el) in &align.failed {
+            let q = crate::ui::polar(c, rad, *az, *el);
+            p.circle_stroke(q, 4.0, egui::Stroke::new(1.2, RED));
         }
         let mp = crate::ui::polar(c, rad, mount.az, mount.el);
         p.circle_stroke(mp, 5.0, egui::Stroke::new(1.2, AMBER));
@@ -522,6 +582,10 @@ pub fn config_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, cs: &mut ConfigSta
                 num(ui, "align target rms ′", &mut c.alignment_target_rms_arcmin, 0.1, 1);
                 boolean(ui, "align pause on fail", &mut c.alignment_pause_on_fail);
                 num(ui, "align settle s", &mut c.alignment_settle_s, 0.1, 1);
+                num(ui, "align settle tol °", &mut c.alignment_settle_tol_deg, 0.005, 3);
+                let mut sc2 = c.alignment_settle_cycles as f64;
+                num(ui, "align settle cycles", &mut sc2, 1.0, 0);
+                c.alignment_settle_cycles = sc2.max(1.0) as usize;
                 let mut ms = c.max_stars as f64;
                 num(ui, "max stars", &mut ms, 100.0, 0);
                 c.max_stars = ms as usize;

@@ -404,6 +404,20 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     persist_config_key(&cfg.path, "hotspot_star_filter_enabled", serde_json::json!(on));
                     push_status(&mut status, format!("hotspot star filter {}", if on { "ON" } else { "OFF" }));
                 }
+                MountCmd::SetAlignmentOffsets { az, el } => {
+                    cfg.alignment_az = az;
+                    cfg.alignment_el = el;
+                    let mut i = loop_shared.inputs.lock().unwrap();
+                    i.alignment_az = az;
+                    i.alignment_el = el;
+                    drop(i);
+                    persist_config_key(&cfg.path, "alignment_azimuth", serde_json::json!(format!("{az}")));
+                    persist_config_key(&cfg.path, "alignment_elevation", serde_json::json!(format!("{el}")));
+                    push_status(&mut status, format!("alignment offsets -> az {az:.4}° / el {el:.4}°"));
+                }
+                MountCmd::GotoAxes { azm, alt } => {
+                    loop_shared.commands.lock().unwrap().push_back(Command::GotoMount { azm_deg: azm + cfg.offsets.0, alt_deg: alt + cfg.offsets.1 });
+                }
                 MountCmd::SetFeedForward { az, el } => {
                     let mut i = loop_shared.inputs.lock().unwrap();
                     i.ff_azm_enabled = az;

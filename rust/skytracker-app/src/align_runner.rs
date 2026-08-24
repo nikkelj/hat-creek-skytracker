@@ -19,6 +19,8 @@ pub enum Step {
 
 pub struct RunnerSnapshot {
     pub running: bool,
+    pub manual: bool,
+    pub failed: Vec<(f64, f64)>,
     pub status: String,
     pub action: String,
     pub point: usize,
@@ -41,6 +43,9 @@ pub struct Runner {
     slew_started: f64,
     last_pos: (f64, f64),
     last_status: String,
+    settle_tol: f64,
+    settle_cycles: usize,
+    arrive_count: usize,
     n_samples_logged: usize,
     done_logged: bool,
 }
@@ -75,6 +80,9 @@ impl Runner {
             slew_started: 0.0,
             last_pos: (0.0, 0.0),
             last_status: String::new(),
+            settle_tol: cfg.alignment_settle_tol_deg.max(0.005),
+            settle_cycles: cfg.alignment_settle_cycles.max(1),
+            arrive_count: 0,
             n_samples_logged: 0,
             done_logged: false,
         }
@@ -100,6 +108,35 @@ impl Runner {
         if let Some(e) = self.inner.error() {
             self.log.push(format!("alignment error: {e}"));
         }
+    }
+
+    pub fn retry_failed(&mut self, now: f64) -> bool {
+        let n = self.inner.failed_points().len();
+        if self.inner.start_retry(now) {
+            self.log.push(format!("retrying {n} failed point(s)"));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn skip(&mut self) {
+        self.inner.skip();
+        self.log.push("point skipped".into());
+    }
+
+    /// Quick Refit: few points, seed with the live model, fit IA/IE only.
+    pub fn start_quick(&mut self, seed: [f64; 7], az: f64, el: f64, now: f64) {
+        let mut p = params(&self.cfg, 6, false);
+        p.seed_terms = seed;
+        p.free_idx = Some(vec![0, 1]);
+        self.log.push("quick refit: 6 points, IA/IE free, other terms frozen".into());
+        self.inner = AlignmentRunner::new(p);
+        self.inner.start(now);
+        self.last_pos = (az, el);
+        self.slew_target = None;
+        self.n_samples_logged = 0;
+        self.done_logged = false;
     }
 
     pub fn abort(&mut self) {
@@ -133,10 +170,18 @@ impl Runner {
                 }
                 let daz = ((az - az_deg + 540.0).rem_euclid(360.0) - 180.0).abs();
                 let del = (el - el_deg).abs();
-                if (daz < 0.05 && del < 0.05 && !moved) || now - self.slew_started > 90.0 {
+                // Asymptotic settle (alignment.py): within tol AND not moving
+                // for `settle_cycles` consecutive reads.
+                if daz < self.settle_tol && del < self.settle_tol && !moved {
+                    self.arrive_count += 1;
+                } else {
+                    self.arrive_count = 0;
+                }
+                if self.arrive_count >= self.settle_cycles || now - self.slew_started > 90.0 {
                     if now - self.slew_started > 90.0 {
                         self.log.push(format!("slew to {az_deg:.1}/{el_deg:.1} timed out -- capturing anyway"));
                     }
+                    self.arrive_count = 0;
                     self.inner.on_arrived(now);
                     Step::Wait
                 } else if self.last_goto.elapsed() > Duration::from_millis(1500) {
@@ -212,7 +257,10 @@ impl Runner {
             }
         }
         let (done, total) = self.inner.progress();
+        let manual = matches!(self.inner.next_action(0.0), Action::Manual { .. });
         RunnerSnapshot {
+            manual,
+            failed: self.inner.failed_points().to_vec(),
             running: self.inner.is_running(),
             status: if status.contains("confirm") || matches!(self.inner.next_action(0.0), Action::AwaitUser { .. }) {
                 format!("{status} · accept?")

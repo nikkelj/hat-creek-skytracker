@@ -209,6 +209,10 @@ pub struct Config {
     pub tetra3_db_dir: String,
     pub alignment_points: usize,
     pub alignment_settle_s: f64,
+    /// Asymptotic settle: within tol for N consecutive reads (Python
+    /// alignment_settle_tol_deg / alignment_settle_cycles).
+    pub alignment_settle_tol_deg: f64,
+    pub alignment_settle_cycles: usize,
     pub alignment_grid_search_cells: usize,
     pub alignment_target_rms_arcmin: f64,
     pub alignment_pause_on_fail: bool,
@@ -423,6 +427,8 @@ impl Config {
             tetra3_db_dir: s("tetra3_db_dir", ""),
             alignment_points: f("alignment_points", 12.0) as usize,
             alignment_settle_s: f("alignment_settle_sec", 2.0),
+            alignment_settle_tol_deg: f("alignment_settle_tol_deg", 0.05),
+            alignment_settle_cycles: f("alignment_settle_cycles", 3.0).max(1.0) as usize,
             alignment_grid_search_cells: f("alignment_grid_search_cells", 100.0) as usize,
             alignment_target_rms_arcmin: f("alignment_target_rms_arcmin", 0.0),
             alignment_pause_on_fail: b("alignment_pause_on_fail", false),
@@ -562,6 +568,8 @@ impl Config {
         set("tetra3_db_dir", json!(self.tetra3_db_dir));
         set("alignment_points", json!(self.alignment_points));
         set("alignment_settle_sec", json!(self.alignment_settle_s));
+        set("alignment_settle_tol_deg", json!(self.alignment_settle_tol_deg));
+        set("alignment_settle_cycles", json!(self.alignment_settle_cycles));
         set("alignment_grid_search_cells", json!(self.alignment_grid_search_cells));
         set("alignment_target_rms_arcmin", json!(self.alignment_target_rms_arcmin));
         set("alignment_pause_on_fail", json!(self.alignment_pause_on_fail));
@@ -974,6 +982,14 @@ pub struct AlignSample {
 #[derive(Clone, Debug, Default)]
 pub struct AlignSnapshot {
     pub running: bool,
+    /// Parked in manual recovery (paddles / skip / abort).
+    pub manual: bool,
+    pub n_failed: usize,
+    pub failed: Vec<(f64, f64)>,
+    pub continuous: bool,
+    /// Polar-align result: (axis_az, axis_el, Δaz knob, Δel knob, n samples).
+    pub polar: Option<(f64, f64, f64, f64, usize)>,
+    pub polar_running: bool,
     pub status: String,
     pub action: String,
     pub point: usize,
@@ -1008,6 +1024,10 @@ pub enum MountCmd {
     SetLeadTime(f64),
     SetStarFilter(bool),
     SetFeedForward { az: bool, el: bool },
+    /// Live alignment-offset update (instantaneous align): degrees.
+    SetAlignmentOffsets { az: f64, el: f64 },
+    /// Raw mount-axis goto (polar-align RA sweep).
+    GotoAxes { azm: f64, alt: f64 },
     /// Park: drive the axes to the configured offsets (mount frame 0/0).
     Park,
     /// Options button: cycle AltAz -> AltAz-Side -> Eq -> Passthrough (persisted).
@@ -1045,6 +1065,19 @@ pub enum AlignCmd {
     Reject,
     Abort,
     ApplyModel,
+    /// Re-run only the failed points, appending + refitting.
+    RetryFailed,
+    /// Skip the point currently parked in manual recovery.
+    Skip,
+    /// Seeded partial refit of IA/IE only (few points, other terms frozen).
+    QuickRefit,
+    /// Continuous background plate solving on/off (plate_solve_enabled).
+    Continuous(bool),
+    /// One-solve instantaneous alignment: fold the latest solve's azimuth
+    /// error into alignment_azimuth (apply_instantaneous_alignment).
+    ApplyAlign,
+    /// Polar-alignment routine: RA-axis sweep + plate solves + axis fit.
+    PolarStart { n_points: usize, sweep_deg: f64 },
 }
 
 pub struct Shared {

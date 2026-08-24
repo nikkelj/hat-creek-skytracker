@@ -516,7 +516,13 @@ impl eframe::App for App {
                                 ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
                             });
                         });
-                        egui::TopBottomPanel::bottom("bottom").default_height(230.0).resizable(true).show(ctx, |ui| {
+                        // Deterministic height + drag handle: the resizable
+                        // bottom panel auto-grew each frame once sky_table
+                        // gained the launch selector, collapsing the skyplot.
+                        let max_h = (ctx.screen_rect().height() - 300.0).max(160.0);
+                        self.ui.tabs_table_h = self.ui.tabs_table_h.clamp(120.0, max_h);
+                        egui::TopBottomPanel::bottom("bottom").resizable(false).exact_height(self.ui.tabs_table_h).show(ctx, |ui| {
+                            ui::vdrag_handle(ui, "tabs_split", &mut self.ui.tabs_table_h, 120.0, max_h, true);
                             ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {

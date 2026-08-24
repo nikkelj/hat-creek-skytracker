@@ -70,6 +70,8 @@ pub struct UiState {
     pub alt_max_km: String,
     /// Secondary sort key for the passes/table (shift-click).
     pub table_sort2: Option<(usize, bool)>,
+    /// Tabs-layout bottom (visible-now) panel height — ours, not egui's.
+    pub tabs_table_h: f32,
 }
 
 impl Default for UiState {
@@ -124,6 +126,7 @@ impl Default for UiState {
             alt_min_km: String::new(),
             alt_max_km: String::new(),
             table_sort2: None,
+            tabs_table_h: 230.0,
         }
     }
 }
@@ -2150,6 +2153,15 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
         if asc { o } else { o.reverse() }
     });
     let headers = ["Name", "NORAD", "El °", "Az °", "Range km", "Az rate °/s"];
+    // The table gets the pane height minus the launch strip: TableBuilder
+    // scrolls inside a fixed box, so this function's content never exceeds
+    // its container (a growing panel would feed back into its own height).
+    let launch_h: f32 = if sky.launches.is_empty() { 0.0 } else { 92.0 };
+    let table_h = (ui.available_height() - launch_h).max(80.0);
+    let table_w = ui.available_width();
+    ui.allocate_ui(Vec2::new(table_w, table_h), |ui| {
+        ui.set_min_size(Vec2::new(table_w, table_h));
+        ui.set_max_height(table_h);
     TableBuilder::new(ui)
         .striped(true)
         .sense(Sense::click())
@@ -2192,10 +2204,11 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
             });
         });
 
+    });
     // Launch-trajectory selector (tracking_visuals "Launch Trajectories" box).
     if !sky.launches.is_empty() {
-        ui.separator();
         theme::section(ui, &format!("launch trajectories · {}", sky.launches.len()));
+        egui::ScrollArea::vertical().id_salt("launch_sel").max_height(launch_h - 26.0).show(ui, |ui| {
         for l in sky.launches.iter() {
             let sel = st.selected.as_deref() == Some(l.key.as_str());
             let dur = l.rows.last().map(|r| r.0 - l.rows.first().map(|f| f.0).unwrap_or(r.0)).unwrap_or(0.0);
@@ -2209,5 +2222,6 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
                 let _ = tx.send(MountCmd::SelectTarget(key));
             }
         }
+        });
     }
 }

@@ -34,7 +34,7 @@
       "focal_length": 162.0,
       "alignment_rotation": 180.0,
       "gain": 225,
-      "exposure": 57,
+      "exposure": 57000,
       "gamma": 0.1,
       "gamma_enabled": false,
       "tetra3_db": "db_cam1_tyc",
@@ -45,7 +45,8 @@
       "sensor_height": 2080,
       "bin": 1,
       "projection": "pinhole",
-      "enabled": true
+      "enabled": true,
+      "exposure_us": 57000
     },
     "camera2": {
       "pixel_size": 9.0,
@@ -53,7 +54,7 @@
       "focal_length": 2000.0,
       "alignment_rotation": 180.0,
       "gain": 304,
-      "exposure": 170,
+      "exposure": 170000,
       "gamma": 0.1,
       "gamma_enabled": false,
       "tetra3_db": null,
@@ -64,7 +65,8 @@
       "sensor_height": 1104,
       "bin": 1,
       "projection": "pinhole",
-      "enabled": true
+      "enabled": true,
+      "exposure_us": 170000
     },
     "camera3": {
       "name": "Bubble ASI462MM",
@@ -79,11 +81,12 @@
       "projection": "fisheye",
       "alignment_rotation": 0.0,
       "gain": 200,
-      "exposure": 50,
+      "exposure": 50000,
       "gamma": 0.1,
       "gamma_enabled": false,
       "tetra3_db": null,
-      "enabled": true
+      "enabled": true,
+      "exposure_us": 50000
     }
   },
   "pid_azm_p_gain": 0.014,

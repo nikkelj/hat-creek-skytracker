@@ -688,6 +688,8 @@ pub struct StarMark {
     pub mag: f64,
     pub az: f64,
     pub el: f64,
+    pub ra_deg: f64,
+    pub dec_deg: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -706,6 +708,8 @@ pub struct DsoMark {
     pub el: f64,
     pub mag: f64,
     pub messier: bool,
+    pub ra_deg: f64,
+    pub dec_deg: f64,
 }
 
 /// A launch trajectory (launches/*.txt: T0 + ECEF states, or *.csv with
@@ -745,6 +749,9 @@ pub struct SkySnapshot {
     /// HIP -> IAU proper name (shared, built once).
     pub star_names: Arc<std::collections::HashMap<i64, String>>,
     pub target: Option<TargetTrack>,
+    /// Sliding trajectory window for a non-satellite selection (±45 min at
+    /// 15 s steps) — the celestial/aircraft/launch polyline.
+    pub target_arc: Vec<ArcPoint>,
     pub n_catalog: usize,
     pub n_visible: usize,
     pub compute_ms: f64,
@@ -757,6 +764,9 @@ pub struct ArcPoint {
     pub t_rel_s: f64,
     pub az: f64,
     pub el: f64,
+    /// Cylindrical Earth-shadow test at this point (satellites; true for
+    /// everything else).
+    pub sunlit: bool,
 }
 
 /// Upcoming-pass row (published by the sky worker every minute).
@@ -1111,6 +1121,10 @@ pub struct Shared {
     pub eq_pointing: ArcSwap<(bool, [f64; 7])>,
     /// ADS-B linear-fit depth (fixes), live-tunable from the UI.
     pub adsb_fit_points: std::sync::atomic::AtomicUsize,
+    /// Visualization clock: scrub offset (s) and pause (frozen jd_tt). The
+    /// mount keeps tracking live — only the sky/passes rendering scrubs.
+    pub time_offset_s: ArcSwap<f64>,
+    pub time_paused: ArcSwap<Option<f64>>,
     /// Launch override: LAUNCH button re-bases the selected trajectory's T0
     /// to "now" and pre-empts every other target until aborted.
     pub launch_armed: ArcSwap<Option<(String, f64)>>,
@@ -1164,6 +1178,8 @@ impl Shared {
             eq_pointing: ArcSwap::from_pointee(eq0),
             adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
             launch_armed: ArcSwap::from_pointee(None),
+            time_offset_s: ArcSwap::from_pointee(0.0),
+            time_paused: ArcSwap::from_pointee(None),
             mount_mode: ArcSwap::from_pointee(mount_mode0),
             serial_ports: ArcSwap::from_pointee(Vec::new()),
             adsb_request: ArcSwap::from_pointee(None),

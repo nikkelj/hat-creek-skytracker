@@ -62,6 +62,14 @@ pub struct UiState {
     /// independent of the hardware ROI.
     pub cam_zoom: Vec<f32>,
     pub cam_pan: Vec<Vec2>,
+    /// Global tooltips on/off (tooltips_enabled), persisted.
+    pub show_tips: bool,
+    /// Visible-now table filters (tracking_visuals filter boxes).
+    pub table_filter: String,
+    pub alt_min_km: String,
+    pub alt_max_km: String,
+    /// Secondary sort key for the passes/table (shift-click).
+    pub table_sort2: Option<(usize, bool)>,
 }
 
 impl Default for UiState {
@@ -111,6 +119,11 @@ impl Default for UiState {
             navball_tex: None,
             cam_zoom: Vec::new(),
             cam_pan: Vec::new(),
+            show_tips: true,
+            table_filter: String::new(),
+            alt_min_km: String::new(),
+            alt_max_km: String::new(),
+            table_sort2: None,
         }
     }
 }
@@ -143,6 +156,13 @@ fn fmt_unix(t: f64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", sod / 3600, (sod / 60) % 60)
+}
+
+/// "05h 34.5m" from degrees RA (celestial info-pane formatting).
+fn fmt_ra(ra_deg: f64) -> String {
+    let h = ra_deg.rem_euclid(360.0) / 15.0;
+    let hh = h.floor();
+    format!("{:02.0}h {:04.1}m", hh, (h - hh) * 60.0)
 }
 
 /// A small painter-drawn key/value card (info + camera panes on the skyplot).
@@ -309,6 +329,10 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         st.show_labels = cfg.satellite_labels_enabled;
         st.show_messier = cfg.messier_enabled;
         st.show_ngc = cfg.ngc_enabled;
+        st.show_tips = cfg.raw["tooltips_enabled"].as_bool().unwrap_or(true);
+        st.show_stars = cfg.raw["starfield_enabled"].as_bool().unwrap_or(true);
+        st.show_sats = cfg.raw["satellites_enabled"].as_bool().unwrap_or(true);
+        st.show_aircraft = cfg.raw["aircraft_enabled"].as_bool().unwrap_or(st.show_aircraft);
         st.track_layout = std::env::var("SKYTRACKER_LAYOUT").unwrap_or_else(|_| cfg.raw["track_layout"].as_str().unwrap_or("tabs").to_string());
         st.quad_cams = cfg.raw["track_quad_cams"].as_u64().unwrap_or(3).clamp(2, 3) as usize;
         st.scope_combined = cfg.raw["track_scope_combined"].as_bool().unwrap_or(false);
@@ -405,22 +429,27 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     // Bodies.
     let mut grid = LabelGrid::new(rect, 12.0);
     for b in &sky.bodies {
-        if b.el < -2.0 {
+        if b.el < -30.0 {
             continue;
         }
-        let p = polar(center, radius, b.az, b.el);
+        // Below-horizon sun/moon/planets pin dimmed to the horizon rim
+        // with a "(below hrz)" tag (rendering_threads).
+        let below_rim = b.el < 0.0;
+        let p = polar(center, radius, b.az, if below_rim { 0.0 } else { b.el });
         let (col, r) = match b.name.as_str() {
             "sun" => (Color32::from_rgb(255, 225, 130), 6.5),
             "moon" => (Color32::from_rgb(215, 218, 228), 5.5),
             _ => (Color32::from_rgb(235, 205, 140), 3.2),
         };
-        painter.circle_filled(p, r, col);
+        let col = if below_rim { theme::with_alpha(col, 90) } else { col };
+        painter.circle_filled(p, if below_rim { r * 0.7 } else { r }, col);
         let key = format!("body:{}", b.name);
         if st.selected.as_deref() == Some(key.as_str()) {
             sel_ring(p);
         }
         if grid.claim(p + Vec2::new(8.0, -6.0), 44.0, 12.0) {
-            painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, &b.name, theme::sans(11.0), theme::with_alpha(col, 220));
+            let label = if below_rim { format!("{} (below hrz)", b.name) } else { b.name.clone() };
+            painter.text(p + Vec2::new(8.0, -6.0), Align2::LEFT_CENTER, label, theme::sans(if below_rim { 9.5 } else { 11.0 }), theme::with_alpha(col, 220));
         }
         consider(&mut best, p, key, format!("{}\naz {:.1}°  el {:.1}°   {:.0} km", b.name, b.az, b.el, b.dist_km), 9.0);
     }
@@ -590,10 +619,14 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
                 let p = polar(center, radius, a.az, a.el);
                 if let Some((pp, _)) = prev {
+                    // Grey past, yellow sunlit future, red eclipsed future
+                    // (rendering_threads arc coloring).
                     let (col, w) = if a.t_rel_s <= 0.0 {
-                        (theme::with_alpha(ACCENT, 70), 1.2)
+                        (theme::with_alpha(Color32::from_rgb(130, 130, 130), 110), 1.2)
+                    } else if a.sunlit {
+                        (theme::with_alpha(Color32::from_rgb(235, 220, 60), 200), 1.6)
                     } else {
-                        (theme::with_alpha(ACCENT, 200), 1.6)
+                        (theme::with_alpha(Color32::from_rgb(240, 90, 90), 200), 1.6)
                     };
                     painter.line_segment([pp, p], Stroke::new(w, col));
                 }
@@ -640,9 +673,24 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 let selected = st.selected.as_deref() == Some(s.satnum.as_str());
                 let hovered = st.hover.as_deref() == Some(s.satnum.as_str());
                 let col = theme::sat_color(s.range_km);
+                let geo = s.apogee_km > 30_000.0;
+                let meo = !geo && s.apogee_km > 8_000.0;
                 if above {
-                    let r = if s.range_km > 20_000.0 { 2.2 } else { 2.6 };
-                    painter.circle_filled(p, r, col);
+                    // Orbit-class shapes (rendering_threads): GEO = triangle,
+                    // MEO = hexagon, LEO = dot.
+                    if geo {
+                        let d = 3.2;
+                        painter.add(egui::Shape::convex_polygon(vec![p + Vec2::new(0.0, -d), p + Vec2::new(d, d * 0.8), p + Vec2::new(-d, d * 0.8)], col, Stroke::NONE));
+                    } else if meo {
+                        let d = 2.8;
+                        let hex: Vec<Pos2> = (0..6).map(|k| {
+                            let a = std::f32::consts::TAU * k as f32 / 6.0;
+                            p + Vec2::new(d * a.cos(), d * a.sin())
+                        }).collect();
+                        painter.add(egui::Shape::convex_polygon(hex, col, Stroke::NONE));
+                    } else {
+                        painter.circle_filled(p, 2.6, col);
+                    }
                 } else {
                     painter.circle_filled(p, 1.4, theme::with_alpha(col, 70));
                 }
@@ -687,6 +735,39 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         }
     }
 
+    // Non-satellite selection's sliding-window polyline (violet future /
+    // grey past), from the sky worker's target_arc.
+    if let (Some(t), false) = (sky.target.as_ref(), sky.target_arc.is_empty()) {
+        if st.selected.as_deref() == Some(t.key.as_str()) {
+            let mut prev: Option<Pos2> = None;
+            for a in &sky.target_arc {
+                if a.el < -1.0 {
+                    prev = None;
+                    continue;
+                }
+                let p = polar(center, radius, a.az, a.el);
+                if let Some(pp) = prev {
+                    let col = if a.t_rel_s <= 0.0 { theme::with_alpha(Color32::from_rgb(130, 130, 130), 110) } else { theme::with_alpha(VIOLET, 200) };
+                    painter.line_segment([pp, p], Stroke::new(1.4, col));
+                }
+                prev = Some(p);
+            }
+        }
+    }
+    // Plate-solved boresight marker (rendering_threads "solved" cross).
+    {
+        let sv = shared.solve.load();
+        if sv.last_ok && sv.frame_seq != 0 {
+            let cy = Color32::from_rgb(80, 220, 230);
+            let p = polar(center, radius, sv.true_az, sv.true_el);
+            painter.circle_stroke(p, 6.0, Stroke::new(1.2, cy));
+            painter.line_segment([p + Vec2::new(-10.0, 0.0), p + Vec2::new(10.0, 0.0)], Stroke::new(1.0, cy));
+            painter.line_segment([p + Vec2::new(0.0, -10.0), p + Vec2::new(0.0, 10.0)], Stroke::new(1.0, cy));
+            if !compact {
+                painter.text(p + Vec2::new(8.0, -8.0), Align2::LEFT_BOTTOM, format!("solved {}m", sv.matches), theme::mono(9.0), cy);
+            }
+        }
+    }
     // Mount boresight + camera FOV footprint + setpoint vector.
     let mp = polar(center, radius, mount.az, mount.el);
     if let Some((saz, sel)) = mount.setpoint {
@@ -712,9 +793,35 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 let r = (radius * (cam.fov_deg / 2.0 / 90.0) as f32).min(radius);
                 painter.circle_stroke(center, r, Stroke::new(1.0, theme::with_alpha(col, 80)));
             } else {
-                let fov_r = radius * (cam.fov_deg / 90.0) as f32 / 2.0;
+                // Rotated-rectangle footprint at true scale + a 10× dashed
+                // magnified copy (rendering_threads camera FOV rendering).
+                let s2 = shared.cam_settings[i].load();
+                let hdeg = cam.deg_per_px * cam.height as f64;
+                let rot = (s2.rotation_deg.to_radians()) as f32;
+                let half = Vec2::new(radius * (cam.fov_deg / 90.0) as f32 / 2.0, radius * (hdeg / 90.0) as f32 / 2.0);
                 let alpha = if i == shared.hotspot_slot() { 170 } else { 110 };
-                painter.circle_stroke(mp, fov_r.max(2.5), Stroke::new(1.2, theme::with_alpha(col, alpha)));
+                let (cr, srot) = (rot.cos(), rot.sin());
+                let rectangle = |half: Vec2| -> [Pos2; 4] {
+                    let rv = |v: Vec2| Vec2::new(v.x * cr - v.y * srot, v.x * srot + v.y * cr);
+                    [
+                        mp + rv(Vec2::new(-half.x, -half.y)),
+                        mp + rv(Vec2::new(half.x, -half.y)),
+                        mp + rv(Vec2::new(half.x, half.y)),
+                        mp + rv(Vec2::new(-half.x, half.y)),
+                    ]
+                };
+                let pts = rectangle(Vec2::new(half.x.max(2.5), half.y.max(2.0)));
+                for k in 0..4 {
+                    painter.line_segment([pts[k], pts[(k + 1) % 4]], Stroke::new(1.2, theme::with_alpha(col, alpha)));
+                }
+                if !compact && st.sky_zoom < 8.0 {
+                    let pts10 = rectangle(half * 10.0);
+                    for k in 0..4 {
+                        for sh in egui::Shape::dashed_line(&[pts10[k], pts10[(k + 1) % 4]], Stroke::new(1.0, theme::with_alpha(col, 70)), 4.0, 4.0) {
+                            painter.add(sh);
+                        }
+                    }
+                }
             }
         }
     }
@@ -761,6 +868,17 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         return;
     }
     painter.text(rect.left_top() + Vec2::new(10.0, 8.0), Align2::LEFT_TOP, &sky.utc_iso, theme::mono(12.5), TEXT);
+    let scrub_s = (crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0;
+    if scrub_s.abs() > 3.0 {
+        painter.text(rect.left_top() + Vec2::new(190.0, 8.0), Align2::LEFT_TOP, format!("⏱ {:+.1} min vs live", -scrub_s / 60.0), theme::mono(10.5), AMBER);
+    }
+    painter.text(
+        rect.left_top() + Vec2::new(10.0, 68.0),
+        Align2::LEFT_TOP,
+        format!("lim mag {:.1} · {} stars", shared.config.star_limit_mag, sky.stars.len()),
+        theme::mono(10.0),
+        DIM,
+    );
     let err = sky.status.contains("failed") || sky.status.contains("not found");
     painter.text(
         rect.left_top() + Vec2::new(10.0, 26.0),
@@ -811,7 +929,9 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     let lb = Color32::from_rgb(150, 200, 255); // az
     let lg = Color32::from_rgb(150, 230, 150); // el
     let ly2 = Color32::from_rgb(235, 220, 140); // spot size
-    if let Some(sel) = &st.selected {
+    let pane_sel = st.selected.clone().or_else(|| st.hover.clone());
+    if let Some(sel) = &pane_sel {
+        let sel = &sel.clone();
         let mut title = String::new();
         let mut lines: Vec<(String, String, Color32)> = Vec::new();
         let mut kv = |lines: &mut Vec<(String, String, Color32)>, k: &str, v: String, c: Color32| lines.push((k.into(), v, c));
@@ -842,20 +962,24 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 kv(&mut lines, "distance", if b.dist_km > 1e6 { format!("{:.4} au", b.dist_km / 1.495_978_707e8) } else { format!("{:.0} km", b.dist_km) }, TEXT_2);
             }
         } else if let Some(h) = sel.strip_prefix("star:") {
-            let hip: i64 = h.parse().unwrap_or(-1);
+            let hip: i64 = h.trim_start_matches("HIP").parse().unwrap_or(-1);
             if let Some(s) = sky.stars.iter().find(|s| s.hip == hip) {
                 title = sky.star_names.get(&hip).cloned().unwrap_or_else(|| format!("HIP {hip}"));
                 kv(&mut lines, "type", "star".into(), TEXT_2);
                 kv(&mut lines, "hip", format!("{hip}"), TEXT_2);
                 kv(&mut lines, "v mag", format!("{:.2}", s.mag), TEXT_2);
+                kv(&mut lines, "ra", fmt_ra(s.ra_deg), TEXT_2);
+                kv(&mut lines, "dec", format!("{:+.3}°", s.dec_deg), TEXT_2);
                 kv(&mut lines, "azimuth", format!("{:.2}°", s.az), lb);
                 kv(&mut lines, "elevation", format!("{:.2}°", s.el), lg);
             }
-        } else if let Some(k) = sel.strip_prefix("dso:") {
-            if let Some(d) = sky.dsos.iter().find(|d| d.key == k) {
+        } else if sel.starts_with("dso:") {
+            if let Some(d) = sky.dsos.iter().find(|d| &d.key == sel) {
                 title = d.name.clone();
                 kv(&mut lines, "type", if d.messier { "Messier".into() } else { "NGC".into() }, TEXT_2);
                 kv(&mut lines, "v mag", format!("{:.1}", d.mag), TEXT_2);
+                kv(&mut lines, "ra", fmt_ra(d.ra_deg), TEXT_2);
+                kv(&mut lines, "dec", format!("{:+.3}°", d.dec_deg), TEXT_2);
                 kv(&mut lines, "azimuth", format!("{:.2}°", d.az), lb);
                 kv(&mut lines, "elevation", format!("{:.2}°", d.el), lg);
             }
@@ -891,9 +1015,19 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
             }
         }
-        if !lines.is_empty() {
-            py += info_pane(&painter, Pos2::new(px, py), pane_w, &title, ACCENT, &lines) + 6.0;
+        // Live rates for non-satellite selections (″/s, celestial info pane).
+        if !sel.chars().all(|c| c.is_ascii_digit()) {
+            if let Some(t) = sky.target.as_ref().filter(|t| &t.key == sel) {
+                kv(&mut lines, "rates", format!("{:+.1}″/{:+.1}″ per s", t.az_rate * 3600.0, t.el_rate * 3600.0), TEXT_2);
+            }
         }
+        if lines.is_empty() {
+            // Selection exists but isn't currently plotted: say so instead of
+            // silently rendering nothing (celestial "below horizon / hidden").
+            title = sel.clone();
+            kv(&mut lines, "status", "below horizon / hidden".into(), DIM);
+        }
+        py += info_pane(&painter, Pos2::new(px, py), pane_w, &title, ACCENT, &lines) + 6.0;
     }
     // ---- Camera parameter / FOV cards, color-matched to the footprints ----
     for (i, c) in shared.cams.iter().enumerate() {
@@ -1698,7 +1832,13 @@ fn navball(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, m: &crate:
             if z0 <= 0.0 || z1 <= 0.0 {
                 continue;
             }
-            let col = if w[1].t_rel_s < 0.0 { Color32::from_rgb(130, 130, 130) } else { Color32::from_rgb(255, 255, 0) };
+            let col = if w[1].t_rel_s < 0.0 {
+                Color32::from_rgb(130, 130, 130)
+            } else if w[1].sunlit {
+                Color32::from_rgb(255, 255, 0)
+            } else {
+                Color32::from_rgb(240, 90, 90)
+            };
             clip.line_segment([p0, p1], Stroke::new(1.6, col));
         }
         // Live target: purple KSP crosshair at the commanded setpoint.
@@ -1951,11 +2091,33 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
     let mask = shared.config.elevation_mask_deg;
     ui.horizontal(|ui| {
         theme::section(ui, &format!("visible now · {}", sky.n_visible));
+        ui.add(egui::TextEdit::singleline(&mut st.table_filter).hint_text("name / NORAD").desired_width(110.0));
+        ui.label(egui::RichText::new("alt km").font(theme::sans(10.0)).color(DIM));
+        ui.add(egui::TextEdit::singleline(&mut st.alt_min_km).hint_text("above").desired_width(46.0));
+        ui.add(egui::TextEdit::singleline(&mut st.alt_max_km).hint_text("below").desired_width(46.0));
+        if (!st.table_filter.is_empty() || !st.alt_min_km.is_empty() || !st.alt_max_km.is_empty()) && ui.small_button("clear").clicked() {
+            st.table_filter.clear();
+            st.alt_min_km.clear();
+            st.alt_max_km.clear();
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.checkbox(&mut st.show_below_mask, "below mask");
         });
     });
-    let mut rows: Vec<_> = sky.sats.iter().filter(|s| s.el > 0.0 && (st.show_below_mask || s.el >= mask)).collect();
+    let filt = st.table_filter.to_ascii_lowercase();
+    let alt_min = st.alt_min_km.trim().parse::<f64>().ok();
+    let alt_max = st.alt_max_km.trim().parse::<f64>().ok();
+    let mut rows: Vec<_> = sky
+        .sats
+        .iter()
+        .filter(|s| s.el > 0.0 && (st.show_below_mask || s.el >= mask))
+        .filter(|s| filt.is_empty() || s.name.to_ascii_lowercase().contains(&filt) || s.satnum.contains(&filt))
+        .filter(|s| {
+            // Mean-orbital-altitude filter (tracking_visuals alt-km boxes).
+            let mean_alt = (s.apogee_km + s.perigee_km) / 2.0;
+            alt_min.map_or(true, |v| mean_alt >= v) && alt_max.map_or(true, |v| mean_alt <= v)
+        })
+        .collect();
     let (col, asc) = st.table_sort;
     rows.sort_by(|a, b| {
         let o = match col {
@@ -2010,4 +2172,23 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
                 }
             });
         });
+
+    // Launch-trajectory selector (tracking_visuals "Launch Trajectories" box).
+    if !sky.launches.is_empty() {
+        ui.separator();
+        theme::section(ui, &format!("launch trajectories · {}", sky.launches.len()));
+        for l in sky.launches.iter() {
+            let sel = st.selected.as_deref() == Some(l.key.as_str());
+            let dur = l.rows.last().map(|r| r.0 - l.rows.first().map(|f| f.0).unwrap_or(r.0)).unwrap_or(0.0);
+            let max_el = l.rows.iter().map(|r| r.2).fold(f64::MIN, f64::max);
+            if ui
+                .selectable_label(sel, egui::RichText::new(format!("{} · max el {:.0}° · {:.0} s", l.name, max_el, dur)).font(theme::mono(10.5)))
+                .clicked()
+            {
+                let key = if sel { None } else { Some(l.key.clone()) };
+                st.selected = key.clone();
+                let _ = tx.send(MountCmd::SelectTarget(key));
+            }
+        }
+    }
 }

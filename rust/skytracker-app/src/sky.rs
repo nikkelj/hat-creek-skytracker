@@ -135,7 +135,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     star_cat.truncate(cfg.max_stars);
 
     let bodies = [
-        "sun", "moon", "planet:Mercury", "planet:Venus", "planet:Mars",
+        "sun", "moon", "planet:Mercury", "planet:Venus", "planet:Mars", "planet:Pluto",
         "planet:Jupiter", "planet:Saturn", "planet:Uranus", "planet:Neptune",
     ];
 
@@ -169,7 +169,10 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
 
     loop {
         let t0 = Instant::now();
-        let jd_tt = now_jd_tt();
+        let jd_now = now_jd_tt();
+        // Scrub/pause apply to the visualization clock only (Python's
+        // time-scrub slider + pause buttons); the mount worker stays live.
+        let jd_tt = (**shared.time_paused.load()).unwrap_or(jd_now) + **shared.time_offset_s.load() / 86400.0;
 
         // TLE download / reload.
         if shared.tle_refresh.swap(false, std::sync::atomic::Ordering::Relaxed) && !downloading {
@@ -278,7 +281,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                 for d in &messier {
                     let (az, el) = dso_altaz(d, jd_tt);
                     if el > -2.0 {
-                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: true });
+                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: true, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
                     }
                 }
             }
@@ -286,7 +289,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                 for d in ngc.iter().filter(|d| d.mag <= cfg.ngc_limit_mag) {
                     let (az, el) = dso_altaz(d, jd_tt);
                     if el > 0.0 {
-                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: false });
+                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: false, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
                     }
                 }
             }
@@ -305,6 +308,8 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                                 mag: s.magnitude,
                                 az: app.az_deg,
                                 el: app.alt_deg,
+                                ra_deg: s.ra_deg,
+                                dec_deg: s.dec_deg,
                             });
                         }
                     }
@@ -314,6 +319,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             last_stars = Instant::now();
         }
 
+        let mut target_arc: Vec<ArcPoint> = Vec::new();
         // Non-satellite selection: live az/el + rates from +-0.5 s.
         let selected_key = shared.selected.load();
         let target = selected_key.as_ref().as_ref().and_then(|key| {
@@ -354,6 +360,18 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             let (az, el, name) = pos_at(jd_tt)?;
             let (a_m, e_m, _) = pos_at(jd_tt - dt)?;
             let (a_p, e_p, _) = pos_at(jd_tt + dt)?;
+            // Sliding ±45 min window at 15 s steps (celestial.TRAJ windows):
+            // the skyplot polyline for the non-satellite selection.
+            target_arc.clear();
+            let mut t = -2700.0;
+            while t <= 2700.0 {
+                if let Some((a, e, _)) = pos_at(jd_tt + t / 86400.0) {
+                    if e > -3.0 {
+                        target_arc.push(ArcPoint { t_rel_s: t, az: a, el: e, sunlit: true });
+                    }
+                }
+                t += 15.0;
+            }
             Some(TargetTrack { key: key.clone(), name, jd_tt, az, el, az_rate: sgp4_pass::unwrap_az_diff(a_p - a_m), el_rate: e_p - e_m })
         });
 
@@ -369,6 +387,7 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             launches: launches.clone(),
             star_names: star_names.clone(),
             target,
+            target_arc,
             n_catalog,
             compute_ms,
             status: if load_error.is_empty() {
@@ -396,9 +415,16 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             if let Some(sat) = cat.get(sn) {
                 let mut t = -600.0;
                 while t <= 600.0 {
-                    if let Ok((alt, az, _)) = sgp4_pass::satellite_altaz(sat, jd_tt + t / 86400.0, &geom) {
+                    let jd = jd_tt + t / 86400.0;
+                    if let Ok((alt, az, _)) = sgp4_pass::satellite_altaz(sat, jd, &geom) {
                         if alt > -3.0 {
-                            arc.push(ArcPoint { t_rel_s: t, az, el: alt });
+                            // Sunlit vs Earth-shadow (rendering_threads arc
+                            // coloring: yellow sunlit / red eclipsed).
+                            let sunlit = match (engine.sun_tod_km(jd), sat.position_teme_km(jd)) {
+                                (Some(r_sun), Ok(r_sat)) => !skytracker_astro::passes::is_eclipsed(&r_sat, &r_sun),
+                                _ => true,
+                            };
+                            arc.push(ArcPoint { t_rel_s: t, az, el: alt, sunlit });
                         }
                     }
                     t += 5.0;

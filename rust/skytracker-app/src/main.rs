@@ -395,6 +395,9 @@ impl eframe::App for App {
 
         self.top_bar(ctx, ui_fps);
 
+        ctx.style_mut(|style| {
+            style.interaction.tooltip_delay = if self.ui.show_tips { 0.3 } else { 3600.0 };
+        });
         match self.screen {
             Screen::Track => {
                 // Layout selector rides in the toggles row; the choice persists.
@@ -666,8 +669,45 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
         ui.checkbox(&mut st.show_ngc, "NGC");
         ui.checkbox(&mut st.show_aircraft, "aircraft");
         ui.checkbox(&mut st.show_keepout, "keepout");
+        let toggles_before = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips);
         ui.checkbox(&mut st.show_meo, "MEO");
         ui.checkbox(&mut st.show_geo, "GEO");
+        ui.checkbox(&mut st.show_tips, "tips");
+        // Visualization clock: pause + scrub (the mount stays live).
+        ui.separator();
+        let paused = (**shared.time_paused.load()).is_some();
+        if ui.selectable_label(paused, if paused { "▶" } else { "⏸" }).on_hover_text("pause / resume the visualization clock (tracking stays live)").clicked() {
+            shared.time_paused.store(Arc::new(if paused { None } else { Some(crate::sky::now_jd_tt()) }));
+        }
+        let mut off_min = **shared.time_offset_s.load() / 60.0;
+        ui.spacing_mut().slider_width = 90.0;
+        if ui.add(egui::Slider::new(&mut off_min, -60.0..=60.0).show_value(false)).on_hover_text("time scrub ±60 min").changed() {
+            shared.time_offset_s.store(Arc::new(off_min * 60.0));
+        }
+        if off_min.abs() > 0.01 || paused {
+            ui.label(egui::RichText::new(format!("{}{:+.1}m", if paused { "⏸ " } else { "" }, off_min)).font(theme::mono(10.0)).color(theme::AMBER));
+            if ui.small_button("now").clicked() {
+                shared.time_offset_s.store(Arc::new(0.0));
+                shared.time_paused.store(Arc::new(None));
+            }
+        }
+        // Persist the display toggles (Python config keys) on change.
+        let after = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips);
+        if after != toggles_before {
+            for (key, v) in [
+                ("starfield_enabled", st.show_stars),
+                ("satellites_enabled", st.show_sats),
+                ("aircraft_enabled", st.show_aircraft),
+                ("satellite_labels_enabled", st.show_labels),
+                ("messier_enabled", st.show_messier),
+                ("ngc_enabled", st.show_ngc),
+                ("meo_enabled", st.show_meo),
+                ("geo_enabled", st.show_geo),
+                ("tooltips_enabled", st.show_tips),
+            ] {
+                crate::mount::persist_config_key(&shared.config.path, key, serde_json::json!(v));
+            }
+        }
         // LAUNCH: arm the selected launch trajectory at T0 = now (Python's
         // launch button); shows T+ while armed, click again to abort.
         let armed = (**shared.launch_armed.load()).clone();

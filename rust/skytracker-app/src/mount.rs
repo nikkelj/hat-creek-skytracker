@@ -183,6 +183,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut bias = (0.0f64, 0.0f64);
     let mut bias_fine = false;
     let mut parking = false;
+    let mut stopped = false;
+    let mut rate_limit_warned = false;
     let mut pm_corr_last = (0.0f64, 0.0f64);
     let apply_profile = |mode: Mode, loop_shared: &Arc<LoopShared>, status: &mut Vec<String>| {
         let key = match mode {
@@ -213,6 +215,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             let cmd_copy = cmd.clone();
             match cmd {
                 MountCmd::SetMode(m) => {
+                    stopped = false;
+                    rate_limit_warned = false;
                     mode = match m.as_str() {
                         "RATE" => Mode::Rate,
                         "PROGRAM" => Mode::Program,
@@ -241,6 +245,9 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                             None => "target cleared".into(),
                         },
                     );
+                    if target.as_deref().map_or(false, |t| t.eq_ignore_ascii_case("body:sun")) {
+                        push_status(&mut status, "⚠ SUN selected — NEVER observe without a proper solar filter!".into());
+                    }
                 }
                 MountCmd::Stop => {
                     mode = Mode::Standby;
@@ -250,7 +257,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     i.setpoint = None;
                     drop(i);
                     loop_shared.commands.lock().unwrap().push_back(Command::Stop);
-                    push_status(&mut status, "STOP".into());
+                    stopped = true;
+                    push_status(&mut status, "STOP latched — select a mode or press STOP again to release".into());
                 }
                 MountCmd::Goto { az, el } => {
                     // Sky az/el -> mount axes -> raw encoder degrees (offsets).
@@ -434,19 +442,24 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     use gilrs::Button;
                     match b {
                         Button::East => {
-                            mode = Mode::Standby;
-                            let mut i = loop_shared.inputs.lock().unwrap();
-                            i.mode = Mode::Standby;
-                            i.rate_cmd = (0, 0);
-                            i.setpoint = None;
-                            drop(i);
-                            loop_shared.commands.lock().unwrap().push_back(Command::Stop);
-                            push_status(&mut status, "STOP (gamepad)".into());
+                            stopped = !stopped;
+                            if stopped {
+                                let mut i = loop_shared.inputs.lock().unwrap();
+                                i.rate_cmd = (0, 0);
+                                i.setpoint = None;
+                                drop(i);
+                                loop_shared.commands.lock().unwrap().push_back(Command::Stop);
+                                push_status(&mut status, "STOP latched (gamepad)".into());
+                            } else {
+                                push_status(&mut status, "STOP released (gamepad)".into());
+                            }
                         }
                         Button::RightThumb | Button::LeftThumb => {
                             let cur = MODE_CYCLE.iter().position(|m| *m == mode).unwrap_or(0);
                             let next = if b == Button::RightThumb { (cur + 1) % MODE_CYCLE.len() } else { (cur + MODE_CYCLE.len() - 1) % MODE_CYCLE.len() };
                             mode = MODE_CYCLE[next];
+                            stopped = false;
+                            rate_limit_warned = false;
                             let mut i = loop_shared.inputs.lock().unwrap();
                             i.mode = mode;
                             i.stopped = false;
@@ -547,7 +560,35 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
         }
         let (az_rate, el_rate) = mapper.update(stick.0, stick.1, now);
         if mode == Mode::Rate {
-            loop_shared.inputs.lock().unwrap().rate_cmd = (az_rate, el_rate);
+            // Hardware-limit gating (joystick_controller._rate_control_track):
+            // an axis at its limit refuses to slew further out, but can always
+            // come back in-range.
+            let prev = shared.mount.load();
+            let mut cmd = (az_rate, el_rate);
+            let mut hit = false;
+            if (cmd.0 > 0 && prev.azm >= cfg.azm_limit.1) || (cmd.0 < 0 && prev.azm <= cfg.azm_limit.0) {
+                cmd.0 = 0;
+                hit = true;
+            }
+            if (cmd.1 > 0 && prev.alt >= cfg.alt_limit.1) || (cmd.1 < 0 && prev.alt <= cfg.alt_limit.0) {
+                cmd.1 = 0;
+                hit = true;
+            }
+            if hit && !rate_limit_warned {
+                push_status(&mut status, format!("axis limit — slew blocked (azm {:.1} alt {:.1})", prev.azm, prev.alt));
+                rate_limit_warned = true;
+            } else if !hit {
+                rate_limit_warned = false;
+            }
+            loop_shared.inputs.lock().unwrap().rate_cmd = cmd;
+        }
+        // Universal STOP latch: rates forced to zero in any mode until released.
+        {
+            let mut i = loop_shared.inputs.lock().unwrap();
+            i.stopped = stopped;
+            if stopped {
+                i.rate_cmd = (0, 0);
+            }
         }
 
         // PROGRAM / HANDOFF / HOTSPOT: live setpoint from the selected target
@@ -729,6 +770,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             pointing_model_on: shared.pointing.load().0,
             pointing_corr: pm_corr_last,
             joystick_tare: tare,
+            stopped,
             joy_buttons,
             joy_left,
             joy_right,

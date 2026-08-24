@@ -336,6 +336,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
     let observer = skytracker_astro::sgp4_pass::Observer { lat_deg: cfg.lat_deg, lon_deg: cfg.lon_deg, elevation_m: cfg.alt_m };
     let geom = observer.geometry();
     let recorder = Arc::new(CaptureRecorder::new());
+    recorder.set_capacity(cfg.capture_buffer_frames);
     let period = Duration::from_secs_f64(1.0 / CAM_FPS);
     let core = shared.core.clone();
     let is_hotspot_cam = slot == shared.hotspot_slot();
@@ -378,8 +379,33 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         // One run directory per capture: name_<stamp to the second>.
                         // The BMP writes run on their own thread so the capture
                         // pump (and the HOTSPOT frame feed) never stalls.
+                        // Auto-name from the selection (capture_manager: NAME_NORAD),
+                        // so replay can recover the target.
+                        let name = if name.trim().is_empty() || name == "manual" {
+                            let sel = (**shared.selected.load()).clone();
+                            match sel {
+                                Some(k) if !k.contains(':') => {
+                                    let sky = shared.sky.load();
+                                    sky.sats
+                                        .iter()
+                                        .find(|s| s.satnum == k)
+                                        .map(|s| format!("{}_{}", sanitize_name(&s.name), s.satnum))
+                                        .unwrap_or_else(|| format!("sat_{k}"))
+                                }
+                                Some(k) => sanitize_name(&k),
+                                None => "manual".into(),
+                            }
+                        } else {
+                            name
+                        };
                         let stamp = crate::sky::utc_stamp_compact();
                         let dir = root.join(&cfg.captures_dir).join(format!("{name}_{stamp}"));
+                        // Snapshot the selected target's arc now (worker thread has
+                        // no sky access): rows become trajectory.csv in the dump.
+                        let arc_t0 = crate::sky::now_unix();
+                        let arc: Vec<crate::state::ArcPoint> = shared.passes.load().arc.clone();
+                        let target_label = (**shared.selected.load()).clone().unwrap_or_else(|| "manual".into());
+                        let config_path = cfg.path.clone();
                         let rec = recorder.clone();
                         let (w2, h2, src2, fov2, cname, crole, cn) = (w, h, source_name.clone(), cam_cfg.fov_deg(w as f64), cam_cfg.name.clone(), cam_cfg.role.clone(), name.clone());
                         let slot2 = slot;
@@ -400,6 +426,16 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                                         "start_unix": times.first().copied().unwrap_or(0.0), "end_unix": times.last().copied().unwrap_or(0.0),
                                     });
                                     let _ = std::fs::write(dir.join(format!("run_camera{}.json", slot2 + 1)), serde_json::to_string_pretty(&meta).unwrap());
+                                    // trajectory.csv + config snapshot: written once per
+                                    // run dir (first camera thread to finish wins).
+                                    let csv_path = dir.join("trajectory.csv");
+                                    if !csv_path.exists() && arc.len() >= 2 {
+                                        let _ = std::fs::write(&csv_path, trajectory_csv(&arc, arc_t0, &target_label, &times, slot2));
+                                    }
+                                    let cfg_copy = dir.join(format!("config_{}.json", crate::sky::utc_stamp_compact()));
+                                    if dir.read_dir().map(|mut d| !d.any(|e| e.as_ref().map(|e| e.file_name().to_string_lossy().starts_with("config_")).unwrap_or(false))).unwrap_or(false) {
+                                        let _ = std::fs::copy(&config_path, cfg_copy);
+                                    }
                                     format!("{n} frames -> {}", dir.display())
                                 }
                                 Err(e) => format!("dump failed: {e}"),
@@ -628,4 +664,43 @@ fn feed_loop(core: &skytracker_core::core_loop::Shared, f: &Frame) {
 
 fn clone_geom(g: &skytracker_astro::sgp4_pass::ObserverGeometry) -> skytracker_astro::sgp4_pass::ObserverGeometry {
     skytracker_astro::sgp4_pass::ObserverGeometry { pos_km: g.pos_km, east: g.east, north: g.north, up: g.up }
+}
+
+/// Folder-name-safe target label (capture_manager style).
+fn sanitize_name(s: &str) -> String {
+    let out: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    out.trim_matches('_').to_string()
+}
+
+fn iso_utc(t: f64) -> String {
+    let (y, mo, d, hh, mm, ss) = crate::sky::civil_from_unix(t);
+    let frac = ((t - t.floor()) * 1e6).round().clamp(0.0, 999_999.0) as i64;
+    format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{frac:06}Z")
+}
+
+/// trajectory.csv in the capture_manager format the replay screen reads:
+/// the full pass arc first (camera_index -1), then a row interpolated at each
+/// frame's exposure-midpoint time (camera_index = this camera's slot).
+fn trajectory_csv(arc: &[crate::state::ArcPoint], arc_t0: f64, target: &str, frame_times: &[f64], slot: usize) -> String {
+    let mut out = String::from("timestamp,satellite_name,altitude_deg,azimuth_deg,distance_km,pixel_x,pixel_y,sequence_in_capture,camera_index\n");
+    for p in arc {
+        out.push_str(&format!("{},{},{:.5},{:.5},0,0,0,0,-1\n", iso_utc(arc_t0 + p.t_rel_s), target, p.el, p.az));
+    }
+    let interp = |t: f64| -> Option<(f64, f64)> {
+        let rel = t - arc_t0;
+        let i = arc.partition_point(|p| p.t_rel_s <= rel);
+        if i == 0 || i >= arc.len() {
+            return None;
+        }
+        let (a, b) = (&arc[i - 1], &arc[i]);
+        let k = if b.t_rel_s > a.t_rel_s { (rel - a.t_rel_s) / (b.t_rel_s - a.t_rel_s) } else { 0.0 };
+        let daz = (b.az - a.az + 540.0).rem_euclid(360.0) - 180.0;
+        Some(((a.az + daz * k).rem_euclid(360.0), a.el + (b.el - a.el) * k))
+    };
+    for (i, t) in frame_times.iter().enumerate() {
+        if let Some((az, el)) = interp(*t) {
+            out.push_str(&format!("{},{},{:.5},{:.5},0,0,0,{},{}\n", iso_utc(*t), target, el, az, i + 1, slot));
+        }
+    }
+    out
 }

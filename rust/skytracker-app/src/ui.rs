@@ -1251,7 +1251,7 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
                 let _ = tx.send(MountCmd::SetMode(mode.to_string()));
             }
         }
-        if theme::mode_button(ui, "STOP", false, RED) {
+        if theme::mode_button(ui, "STOP", m.stopped, RED) {
             let _ = tx.send(MountCmd::Stop);
         }
     });
@@ -1472,7 +1472,7 @@ pub fn compact_mount(ui: &mut egui::Ui, shared: &Arc<Shared>, tx: &crossbeam_cha
                 let _ = tx.send(MountCmd::SetMode(mode.to_string()));
             }
         }
-        if theme::mode_button(ui, "STOP", false, RED) {
+        if theme::mode_button(ui, "STOP", m.stopped, RED) {
             let _ = tx.send(MountCmd::Stop);
         }
     });

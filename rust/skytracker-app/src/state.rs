@@ -204,6 +204,8 @@ pub struct Config {
     pub camera_source: String, // "sim" | "asi"
     pub asi_dll: String,
     pub captures_dir: String,
+    /// Armed-capture ring depth in frames (Python `buffer_size`).
+    pub capture_buffer_frames: usize,
     pub tetra3_db_dir: String,
     pub alignment_points: usize,
     pub alignment_settle_s: f64,
@@ -304,8 +306,11 @@ impl Config {
                 alignment_rotation_deg: num(&c["alignment_rotation"], if i == 2 { 0.0 } else { 180.0 }),
                 gain: num(&c["gain"], 200.0) as i64,
                 exposure_us: {
+                    // Python semantics: `exposure` is MICROSECONDS (it goes
+                    // straight to ASI_EXPOSURE). `exposure_us` is the same
+                    // value under the native app's explicit name.
                     let us = num(&c["exposure_us"], f64::NAN);
-                    if us.is_finite() { us as i64 } else { (num(&c["exposure"], 50.0) * 1000.0) as i64 }
+                    if us.is_finite() { us as i64 } else { num(&c["exposure"], 10_000.0) as i64 }
                 },
                 gamma: num(&c["gamma"], 0.1),
                 gamma_enabled: boolean(&c["gamma_enabled"], false),
@@ -371,18 +376,18 @@ impl Config {
             lat_deg: f("lat", 34.8740289),
             lon_deg: f("lon", -120.4461237),
             alt_m: f("alt", 100.0),
-            elevation_mask_deg: f("elevation_mask", 10.0),
+            elevation_mask_deg: f("elevation_mask", 0.0),
             mount_mode: std::env::var("SKYTRACKER_MOUNT_MODE").unwrap_or_else(|_| s("mount_mode", "AltAz")),
             alignment_az: f("alignment_azimuth", 0.0),
             alignment_el: f("alignment_elevation", 0.0),
             altaz_side_flip: b("altaz_side_flip", false),
             azm_gains: (f("pid_azm_p_gain", 0.0023), f("pid_azm_i_gain", 0.00025), f("pid_azm_d_gain", 0.00027)),
             alt_gains: (f("pid_alt_p_gain", 0.0027), f("pid_alt_i_gain", 0.00028), f("pid_alt_d_gain", 0.00027)),
-            azm_limit: (f("azm_limit_min", -360.0), f("azm_limit_max", 360.0)),
-            alt_limit: (f("alt_limit_min", -5.0), f("alt_limit_max", 95.0)),
+            azm_limit: (f("azm_limit_min", -180.0), f("azm_limit_max", 180.0)),
+            alt_limit: (f("alt_limit_min", -100.0), f("alt_limit_max", 100.0)),
             offsets: (f("azm_offset", 0.0), f("alt_offset", 0.0)),
-            ff_azm: b("feed_forward_azm_enabled", true),
-            ff_alt: b("feed_forward_alt_enabled", true),
+            ff_azm: b("feed_forward_azm_enabled", false),
+            ff_alt: b("feed_forward_alt_enabled", false),
             lead_time_s: f("pid_lead_time_sec", 0.0),
             continuous_rate: b("continuous_rate_tracking", false),
             guide_rate_max_dps: f("guide_rate_max_dps", 4.5),
@@ -411,6 +416,7 @@ impl Config {
             camera_source: s("camera_source", "sim"),
             asi_dll: s("asi_dll", "ASICamera2.dll"),
             captures_dir: s("captures_dir", "data"),
+            capture_buffer_frames: f("buffer_size", 1000.0).max(1.0) as usize,
             tetra3_db_dir: s("tetra3_db_dir", ""),
             alignment_points: f("alignment_points", 12.0) as usize,
             alignment_settle_s: f("alignment_settle_sec", 2.0),
@@ -481,13 +487,13 @@ impl Config {
         let mut set = |k: &str, v: Value| {
             o.insert(k.to_string(), v);
         };
-        set("lat", json!(self.lat_deg));
-        set("lon", json!(self.lon_deg));
-        set("alt", json!(self.alt_m));
-        set("elevation_mask", json!(self.elevation_mask_deg));
+        set("lat", json!(format!("{}", self.lat_deg)));
+        set("lon", json!(format!("{}", self.lon_deg)));
+        set("alt", json!(format!("{}", self.alt_m)));
+        set("elevation_mask", json!(format!("{}", self.elevation_mask_deg)));
         set("mount_mode", json!(self.mount_mode));
-        set("alignment_azimuth", json!(self.alignment_az));
-        set("alignment_elevation", json!(self.alignment_el));
+        set("alignment_azimuth", json!(format!("{}", self.alignment_az)));
+        set("alignment_elevation", json!(format!("{}", self.alignment_el)));
         set("altaz_side_flip", json!(self.altaz_side_flip));
         set("pid_azm_p_gain", json!(self.azm_gains.0));
         set("pid_azm_i_gain", json!(self.azm_gains.1));
@@ -495,12 +501,12 @@ impl Config {
         set("pid_alt_p_gain", json!(self.alt_gains.0));
         set("pid_alt_i_gain", json!(self.alt_gains.1));
         set("pid_alt_d_gain", json!(self.alt_gains.2));
-        set("azm_offset", json!(self.offsets.0));
-        set("alt_offset", json!(self.offsets.1));
-        set("azm_limit_min", json!(self.azm_limit.0));
-        set("azm_limit_max", json!(self.azm_limit.1));
-        set("alt_limit_min", json!(self.alt_limit.0));
-        set("alt_limit_max", json!(self.alt_limit.1));
+        set("azm_offset", json!(format!("{}", self.offsets.0)));
+        set("alt_offset", json!(format!("{}", self.offsets.1)));
+        set("azm_limit_min", json!(format!("{}", self.azm_limit.0)));
+        set("azm_limit_max", json!(format!("{}", self.azm_limit.1)));
+        set("alt_limit_min", json!(format!("{}", self.alt_limit.0)));
+        set("alt_limit_max", json!(format!("{}", self.alt_limit.1)));
         set("feed_forward_azm_enabled", json!(self.ff_azm));
         set("feed_forward_alt_enabled", json!(self.ff_alt));
         set("pid_lead_time_sec", json!(self.lead_time_s));
@@ -567,7 +573,7 @@ impl Config {
             e.insert("projection".into(), json!(if c.projection == Projection::Pinhole { "pinhole" } else { "fisheye" }));
             e.insert("alignment_rotation".into(), json!(c.alignment_rotation_deg));
             e.insert("gain".into(), json!(c.gain));
-            e.insert("exposure".into(), json!(c.exposure_us as f64 / 1000.0));
+            e.insert("exposure".into(), json!(c.exposure_us));
             e.insert("exposure_us".into(), json!(c.exposure_us));
             e.insert("gamma".into(), json!(c.gamma));
             e.insert("gamma_enabled".into(), json!(c.gamma_enabled));
@@ -834,6 +840,9 @@ pub struct MountSnapshot {
     /// Live gamepad state (virtual-controller panel). Bit order mirrors the
     /// Python BUTTON_LABELS: 0=Cross 1=Circle 2=Square 3=Triangle 4=Share
     /// 5=PS 6=Options 7=L3 8=R3 9=L1 10=R1 11..14=DPad U/D/L/R.
+    /// Universal STOP latch (Circle / STOP button): rates forced to zero in
+    /// any mode until released by a mode selection or a second press.
+    pub stopped: bool,
     pub joy_buttons: u32,
     pub joy_left: (f64, f64),
     pub joy_right: (f64, f64),

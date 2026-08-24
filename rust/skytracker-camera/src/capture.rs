@@ -55,6 +55,8 @@ pub fn write_bmp(path: &Path, frame: &Frame) -> std::io::Result<()> {
 pub struct CaptureRecorder {
     frames: std::sync::Mutex<Vec<Frame>>,
     armed: std::sync::atomic::AtomicBool,
+    /// Ring depth: oldest frames are dropped past this (config `buffer_size`).
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for CaptureRecorder {
@@ -68,6 +70,7 @@ impl CaptureRecorder {
         CaptureRecorder {
             frames: std::sync::Mutex::new(Vec::new()),
             armed: std::sync::atomic::AtomicBool::new(false),
+            capacity: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -80,10 +83,22 @@ impl CaptureRecorder {
         self.armed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn set_capacity(&self, cap: usize) {
+        self.capacity.store(cap.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Called by the pump for every frame while armed (cheap: Arc clone).
+    /// Ring semantics: past capacity the oldest frames fall off, so a
+    /// forgotten ARM is bounded by `buffer_size`, not by RAM.
     pub fn offer(&self, frame: &Frame) {
         if self.is_armed() {
-            self.frames.lock().unwrap().push(frame.clone());
+            let cap = self.capacity.load(std::sync::atomic::Ordering::SeqCst);
+            let mut frames = self.frames.lock().unwrap();
+            if frames.len() >= cap {
+                let excess = frames.len() + 1 - cap;
+                frames.drain(0..excess);
+            }
+            frames.push(frame.clone());
         }
     }
 

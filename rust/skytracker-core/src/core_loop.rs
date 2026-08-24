@@ -26,6 +26,8 @@ pub enum Command {
     Stop,
     Slew { azm: i32, alt: i32 },
     GotoMount { azm_deg: f64, alt_deg: f64 },
+    /// Focus motor discrete rate (-9..9), L2/R2 triggers.
+    FocusRate(i32),
 }
 
 /// Snapshot the UI polls for display.
@@ -57,6 +59,9 @@ pub struct Outputs {
 
     pub actual_hz: f64,
     pub cycle_ms: f64,
+    /// Focus encoder read-back as a fraction of a revolution (raw/2^24),
+    /// polled at low cadence — display only.
+    pub focus_frac: f64,
 
     /// Monotonic count of loop cycles (including idle/faulted ones). The
     /// Python adapter watches this to detect a dead loop thread — a snapshot
@@ -112,6 +117,7 @@ fn apply_command<T: Transport>(mount: &mut Mount<T>, state: &mut LoopState, cmd:
             let _ = mount.hc_goto_fast(targets::AZM, *azm_deg, 0.0, 0.0);
             mount.hc_goto_fast(targets::ALT, *alt_deg, 0.0, 0.0)
         }
+        Command::FocusRate(r) => mount.hc_slew_fixed(targets::FOCUS, (*r).clamp(-9, 9)),
     };
 }
 
@@ -229,6 +235,15 @@ pub fn run_cycle<T: Transport>(
             && mount.hc_slew_fixed(targets::ALT, r).is_err()
         {
             state.last_wire_cmd[1] = None;
+        }
+    }
+
+    // 5.5) Low-cadence focus encoder poll (~1 Hz at the 15 Hz loop): a
+    //      display read-back is not worth a serial slot every cycle.
+    state.focus_poll_i = state.focus_poll_i.wrapping_add(1);
+    if state.focus_poll_i % 15 == 0 {
+        if let Ok(f) = mount.hc_get_position(targets::FOCUS) {
+            state.last_focus_frac = f / 360.0;
         }
     }
 
@@ -366,7 +381,8 @@ impl CoreLoop {
                     if window.elapsed() >= Duration::from_secs(1) {
                         let hz = count as f64 / window.elapsed().as_secs_f64();
                         let mut o = thread_shared.outputs.lock().unwrap();
-                        o.actual_hz = hz;
+                        o.focus_frac = state.last_focus_frac;
+    o.actual_hz = hz;
                         o.cycle_ms = elapsed.as_secs_f64() * 1000.0;
                         count = 0;
                         window = Instant::now();

@@ -668,6 +668,19 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
         ui.checkbox(&mut st.show_keepout, "keepout");
         ui.checkbox(&mut st.show_meo, "MEO");
         ui.checkbox(&mut st.show_geo, "GEO");
+        // LAUNCH: arm the selected launch trajectory at T0 = now (Python's
+        // launch button); shows T+ while armed, click again to abort.
+        let armed = (**shared.launch_armed.load()).clone();
+        if let Some((key, t0)) = &armed {
+            let t_plus = crate::sky::now_unix() - t0;
+            if ui.add(egui::Button::new(egui::RichText::new(format!("■ T{}{:.0}s", if t_plus >= 0.0 { "+" } else { "-" }, t_plus.abs())).color(egui::Color32::BLACK)).fill(theme::RED)).on_hover_text(format!("{key} armed — click to abort the launch override")).clicked() {
+                shared.launch_armed.store(Arc::new(None));
+            }
+        } else if st.selected.as_deref().map_or(false, |s| s.starts_with("launch:")) {
+            if ui.add(egui::Button::new(egui::RichText::new("LAUNCH").color(egui::Color32::BLACK)).fill(theme::AMBER)).on_hover_text("re-base this trajectory's T0 to now and track it (forces PROGRAM)").clicked() {
+                shared.launch_armed.store(Arc::new(Some((st.selected.clone().unwrap(), crate::sky::now_unix()))));
+            }
+        }
     });
 }
 

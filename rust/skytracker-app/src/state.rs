@@ -237,6 +237,9 @@ pub struct Config {
     /// 7-term alt-az pointing model (IA IE AN AW NPAE CA TF, degrees) and whether it pre-corrects setpoints.
     pub pointing_model_enabled: bool,
     pub pointing_model_terms: [f64; 7],
+    pub eq_pointing_model_enabled: bool,
+    /// IH ID NP CH ME MA TF (skytracker_pointing::eq::TERM_NAMES order).
+    pub eq_pointing_model_terms: [f64; 7],
     /// Gearbox: base ceiling step, wind-up delay (joy_rate_base_ceiling / joy_rate_windup_delay_s).
     pub joy_rate_base_ceiling: i32,
     pub joy_rate_windup_delay_s: f64,
@@ -471,6 +474,15 @@ impl Config {
                 }
                 arr
             },
+            eq_pointing_model_enabled: b("eq_pointing_model_enabled", false),
+            eq_pointing_model_terms: {
+                let t = &v["eq_pointing_model_terms"];
+                let mut arr = [0.0; 7];
+                for (i, name) in skytracker_pointing::eq::TERM_NAMES.iter().enumerate() {
+                    arr[i] = num(&t[*name], 0.0);
+                }
+                arr
+            },
             joy_rate_base_ceiling: f("joy_rate_base_ceiling", 5.0) as i32,
             joy_rate_windup_delay_s: f("joy_rate_windup_delay_s", 0.8),
             joystick_rate_stick: s("joystick_rate_stick", "right"),
@@ -532,6 +544,11 @@ impl Config {
         set(
             "pointing_model_terms",
             json!(skytracker_pointing::altaz::TERM_NAMES.iter().zip(self.pointing_model_terms.iter()).map(|(n, v)| (n.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>()),
+        );
+        set("eq_pointing_model_enabled", json!(self.eq_pointing_model_enabled));
+        set(
+            "eq_pointing_model_terms",
+            json!(skytracker_pointing::eq::TERM_NAMES.iter().zip(self.eq_pointing_model_terms.iter()).map(|(n, v)| (n.to_string(), json!(v))).collect::<serde_json::Map<String, Value>>()),
         );
         set("joy_rate_base_ceiling", json!(self.joy_rate_base_ceiling));
         set("joy_rate_windup_delay_s", json!(self.joy_rate_windup_delay_s));
@@ -843,6 +860,19 @@ pub struct MountSnapshot {
     /// Universal STOP latch (Circle / STOP button): rates forced to zero in
     /// any mode until released by a mode selection or a second press.
     pub stopped: bool,
+    /// Focus motor: commanded discrete rate and encoder counts (24-bit).
+    pub focus_rate: i32,
+    pub focus_pos: i64,
+    /// Operator-bias frame: "azel" or "alongcross" (Share cycles 4 states).
+    pub bias_frame: String,
+    /// In-track / cross-track bias (deg) when the alongcross frame is active.
+    pub bias_it: f64,
+    pub bias_ct: f64,
+    /// Live feed-forward enables (per axis) and lead time, for the panel.
+    pub ff_azm: bool,
+    pub ff_alt: bool,
+    pub lead_time_s: f64,
+    pub star_filter: bool,
     pub joy_buttons: u32,
     pub joy_left: (f64, f64),
     pub joy_right: (f64, f64),
@@ -973,6 +1003,11 @@ pub enum MountCmd {
     Bias { daz: f64, del: f64 },
     BiasReset,
     BiasFine(bool),
+    /// Cycle the bias mode: coarse/azel → fine/azel → coarse/alongcross → fine/alongcross.
+    CycleBiasMode,
+    SetLeadTime(f64),
+    SetStarFilter(bool),
+    SetFeedForward { az: bool, el: bool },
     /// Park: drive the axes to the configured offsets (mount frame 0/0).
     Park,
     /// Options button: cycle AltAz -> AltAz-Side -> Eq -> Passthrough (persisted).
@@ -1038,6 +1073,14 @@ pub struct Shared {
     pub tle_status: ArcSwap<String>,
     /// Live pointing model (enabled, terms) applied to PROGRAM/HANDOFF setpoints.
     pub pointing: ArcSwap<(bool, [f64; 7])>,
+    /// Eq-mode 7-term residual model (enabled, IH..TF), applied in the mount
+    /// (HA/Dec) frame when mount_mode is Eq.
+    pub eq_pointing: ArcSwap<(bool, [f64; 7])>,
+    /// ADS-B linear-fit depth (fixes), live-tunable from the UI.
+    pub adsb_fit_points: std::sync::atomic::AtomicUsize,
+    /// Launch override: LAUNCH button re-bases the selected trajectory's T0
+    /// to "now" and pre-empts every other target until aborted.
+    pub launch_armed: ArcSwap<Option<(String, f64)>>,
     /// Live mount mode name (Options button cycles it).
     pub mount_mode: ArcSwap<String>,
     /// Serial ports enumerated on request (MountCmd::ListPorts).
@@ -1064,6 +1107,8 @@ impl Shared {
         let sim = config.sim.clone();
         let pointing0 = (config.pointing_model_enabled, config.pointing_model_terms);
         let mount_mode0 = config.mount_mode.clone();
+        let eq0 = (config.eq_pointing_model_enabled, config.eq_pointing_model_terms);
+        let fit0 = config.adsb_fit_points.max(2);
         Arc::new(Shared {
             adsb: ArcSwap::from_pointee(AdsbSnapshot::default()),
             sky: ArcSwap::from_pointee(SkySnapshot::default()),
@@ -1083,6 +1128,9 @@ impl Shared {
             tle_refresh: std::sync::atomic::AtomicBool::new(false),
             tle_status: ArcSwap::from_pointee(String::new()),
             pointing: ArcSwap::from_pointee(pointing0),
+            eq_pointing: ArcSwap::from_pointee(eq0),
+            adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
+            launch_armed: ArcSwap::from_pointee(None),
             mount_mode: ArcSwap::from_pointee(mount_mode0),
             serial_ports: ArcSwap::from_pointee(Vec::new()),
             adsb_request: ArcSwap::from_pointee(None),

@@ -47,6 +47,48 @@ pub fn mode_name(m: Mode) -> &'static str {
     }
 }
 
+/// Persist the departing mode's live gains into its pid_mode_profiles entry
+/// (service_gain_profiles): read-modify-write of config.json keeping the
+/// tuned_on / tuned_at / tuned_rms provenance stamps intact. `stamp` adds or
+/// refreshes those stamps (after an autotune completes).
+fn save_gain_profile(path: &std::path::Path, key: &str, azm: (f64, f64, f64), alt: (f64, f64, f64), stamp: Option<(&str, f64)>) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    let Some(o) = raw.as_object_mut() else { return };
+    let profiles = o.entry("pid_mode_profiles").or_insert_with(|| serde_json::json!({}));
+    let Some(po) = profiles.as_object_mut() else { return };
+    let entry = po.entry(key).or_insert_with(|| serde_json::json!({}));
+    if let Some(eo) = entry.as_object_mut() {
+        eo.insert("gains".into(), serde_json::json!({
+            "pid_azm_p_gain": azm.0, "pid_azm_i_gain": azm.1, "pid_azm_d_gain": azm.2,
+            "pid_alt_p_gain": alt.0, "pid_alt_i_gain": alt.1, "pid_alt_d_gain": alt.2,
+        }));
+        if let Some((target, rms)) = stamp {
+            eo.insert("tuned_on".into(), serde_json::json!(target));
+            let (y, mo, d, _, _, _) = crate::sky::civil_from_unix(crate::sky::now_unix());
+            eo.insert("tuned_at".into(), serde_json::json!(format!("{y:04}-{mo:02}-{d:02}")));
+            if rms.is_finite() {
+                eo.insert("tuned_rms".into(), serde_json::json!(rms));
+            }
+        }
+    }
+    if let Ok(out) = serde_json::to_string_pretty(&raw) {
+        let _ = std::fs::write(path, out);
+    }
+}
+
+/// Persist the operator bias (Python bias_azm_deg / bias_alt_deg /
+/// bias_control_mode) so it survives restarts.
+fn persist_bias(path: &std::path::Path, bias: (f64, f64), fine: bool) {
+    persist_config_key(path, "bias_azm_deg", serde_json::json!(bias.0));
+    persist_config_key(path, "bias_alt_deg", serde_json::json!(bias.1));
+    persist_config_key(path, "bias_control_mode", serde_json::json!(if fine { "fine" } else { "coarse" }));
+}
+
+fn raw_f64(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 /// Core-loop inputs from config: gains, limits, transforms, hotspot params
 /// (camera `hotspot_camera_index` supplies the plate scale + rotation).
 pub fn make_inputs(cfg: &Config) -> Inputs {
@@ -95,7 +137,7 @@ pub fn mount_to_sky(cfg: &Config, azm: f64, alt: f64) -> (f64, f64) {
 const MOUNT_MODE_CYCLE: [&str; 4] = ["AltAz", "AltAz-Side", "Eq", "Passthrough"];
 
 /// Persist one top-level config key (read-modify-write, other keys untouched).
-fn persist_config_key(path: &std::path::Path, key: &str, value: serde_json::Value) {
+pub(crate) fn persist_config_key(path: &std::path::Path, key: &str, value: serde_json::Value) {
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(mut raw) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(o) = raw.as_object_mut() {
@@ -179,30 +221,35 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut slewing = false;
     let mut last_goto = Instant::now() - Duration::from_secs(10);
     let mut prev_target: Option<String> = None;
-    // Operator bias (on-sky cross-el / el, deg) and its D-pad step.
-    let mut bias = (0.0f64, 0.0f64);
-    let mut bias_fine = false;
+    // Operator bias (on-sky cross-el / el, deg) and its D-pad step;
+    // persisted across runs (bias_azm_deg / bias_alt_deg / bias_control_mode).
+    let mut bias = (
+        raw_f64(&cfg.raw["bias_azm_deg"]).unwrap_or(0.0).clamp(-3.0, 3.0),
+        raw_f64(&cfg.raw["bias_alt_deg"]).unwrap_or(0.0).clamp(-3.0, 3.0),
+    );
+    let mut bias_fine = cfg.raw["bias_control_mode"].as_str().map_or(false, |s| s == "fine");
+    // Bias frame: "azel" nudges cross-el/el; "alongcross" projects onto the
+    // target's sky-velocity direction (in-track / cross-track).
+    let mut bias_frame_ac = false;
+    let mut bias_it = 0.0f64;
+    let mut bias_ct = 0.0f64;
+    let mut focus_last_rate = 0i32;
+    let mut park_state: Option<(f64, f64)> = None;
     let mut parking = false;
     let mut stopped = false;
     let mut rate_limit_warned = false;
     let mut pm_corr_last = (0.0f64, 0.0f64);
-    let apply_profile = |mode: Mode, loop_shared: &Arc<LoopShared>, status: &mut Vec<String>| {
-        let key = match mode {
-            Mode::Program | Mode::Handoff => "PROGRAM",
-            Mode::Hotspot => "HOTSPOT",
-            _ => return,
-        };
-        if let Some((a, e)) = cfg.pid_profiles.get(key) {
-            let mut i = loop_shared.inputs.lock().unwrap();
-            if i.azm_gains != *a || i.alt_gains != *e {
-                i.azm_gains = *a;
-                i.alt_gains = *e;
-                drop(i);
-                status.push(format!("gains <- {key} profile"));
-                if status.len() > 8 {
-                    status.remove(0);
-                }
-            }
+    // Per-mode PID gain profiles (service_gain_profiles): the departing
+    // mode's live gains are SAVED into its profile (and persisted), the
+    // arriving mode's profile is loaded; first entry seeds from live gains.
+    let mut profiles: std::collections::HashMap<String, ((f64, f64, f64), (f64, f64, f64))> =
+        cfg.pid_profiles.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut active_profile: Option<&'static str> = None;
+    let profile_key = |mode: Mode| -> Option<&'static str> {
+        match mode {
+            Mode::Program | Mode::Handoff => Some("PROGRAM"),
+            Mode::Hotspot => Some("HOTSPOT"),
+            _ => None,
         }
     };
 
@@ -222,6 +269,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                         "PROGRAM" => Mode::Program,
                         "HANDOFF" => Mode::Handoff,
                         "HOTSPOT" => Mode::Hotspot,
+                        "MTI" => Mode::Mti,
                         _ => Mode::Standby,
                     };
                     let mut i = loop_shared.inputs.lock().unwrap();
@@ -232,7 +280,35 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     }
                     drop(i);
                     push_status(&mut status, format!("mode -> {}", mode_name(mode)));
-                    apply_profile(mode, &loop_shared, &mut status);
+                    {
+                    let key = profile_key(mode);
+                    if key != active_profile {
+                        let live = {
+                            let i = loop_shared.inputs.lock().unwrap();
+                            (i.azm_gains, i.alt_gains)
+                        };
+                        if let Some(old_key) = active_profile {
+                            profiles.insert(old_key.to_string(), live);
+                            save_gain_profile(&cfg.path, old_key, live.0, live.1, None);
+                        }
+                        if let Some(k) = key {
+                            if let Some(&(a, e)) = profiles.get(k) {
+                                let mut i = loop_shared.inputs.lock().unwrap();
+                                if i.azm_gains != a || i.alt_gains != e {
+                                    i.azm_gains = a;
+                                    i.alt_gains = e;
+                                    drop(i);
+                                    push_status(&mut status, format!("gains <- {k} profile"));
+                                }
+                            } else {
+                                profiles.insert(k.to_string(), live);
+                                save_gain_profile(&cfg.path, k, live.0, live.1, None);
+                                push_status(&mut status, format!("PID gains: seeded new {k} profile"));
+                            }
+                        }
+                        active_profile = key;
+                    }
+                }
                     parking = false;
                 }
                 MountCmd::SelectTarget(t) => {
@@ -295,11 +371,52 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     push_status(&mut status, format!("hotspot signs x{x:+.0} y{y:+.0}"));
                 }
                 MountCmd::Bias { daz, del } => {
-                    bias.0 = (bias.0 + daz).clamp(-3.0, 3.0);
-                    bias.1 = (bias.1 + del).clamp(-3.0, 3.0);
+                    if bias_frame_ac {
+                        bias_it = (bias_it + daz).clamp(-3.0, 3.0);
+                        bias_ct = (bias_ct + del).clamp(-3.0, 3.0);
+                    } else {
+                        bias.0 = (bias.0 + daz).clamp(-3.0, 3.0);
+                        bias.1 = (bias.1 + del).clamp(-3.0, 3.0);
+                        persist_bias(&cfg.path, bias, bias_fine);
+                    }
                 }
-                MountCmd::BiasReset => bias = (0.0, 0.0),
-                MountCmd::BiasFine(f) => bias_fine = f,
+                MountCmd::BiasReset => {
+                    bias = (0.0, 0.0);
+                    bias_it = 0.0;
+                    bias_ct = 0.0;
+                    persist_bias(&cfg.path, bias, bias_fine);
+                }
+                MountCmd::CycleBiasMode => {
+                    // coarse/azel -> fine/azel -> coarse/alongcross -> fine/alongcross
+                    let idx = (bias_fine as usize) | ((bias_frame_ac as usize) << 1);
+                    let next = (idx + 1) % 4;
+                    bias_fine = next & 1 == 1;
+                    bias_frame_ac = next & 2 == 2;
+                    persist_bias(&cfg.path, bias, bias_fine);
+                    push_status(&mut status, format!("bias mode: {} / {}", if bias_fine { "fine" } else { "coarse" }, if bias_frame_ac { "along/cross-track" } else { "az/el" }));
+                }
+                MountCmd::SetLeadTime(t) => {
+                    loop_shared.inputs.lock().unwrap().lead_time_sec = t.clamp(0.0, 0.5);
+                    persist_config_key(&cfg.path, "pid_lead_time_sec", serde_json::json!(t.clamp(0.0, 0.5)));
+                }
+                MountCmd::SetStarFilter(on) => {
+                    loop_shared.inputs.lock().unwrap().hotspot.star_filter = on;
+                    persist_config_key(&cfg.path, "hotspot_star_filter_enabled", serde_json::json!(on));
+                    push_status(&mut status, format!("hotspot star filter {}", if on { "ON" } else { "OFF" }));
+                }
+                MountCmd::SetFeedForward { az, el } => {
+                    let mut i = loop_shared.inputs.lock().unwrap();
+                    i.ff_azm_enabled = az;
+                    i.ff_alt_enabled = el;
+                    drop(i);
+                    persist_config_key(&cfg.path, "feed_forward_azm_enabled", serde_json::json!(az));
+                    persist_config_key(&cfg.path, "feed_forward_alt_enabled", serde_json::json!(el));
+                    push_status(&mut status, format!("feed-forward az {} / el {}", if az { "ON" } else { "OFF" }, if el { "ON" } else { "OFF" }));
+                }
+                MountCmd::BiasFine(f) => {
+                    bias_fine = f;
+                    persist_bias(&cfg.path, bias, bias_fine);
+                }
                 MountCmd::Park => {
                     mode = Mode::Standby;
                     let mut i = loop_shared.inputs.lock().unwrap();
@@ -492,8 +609,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                         Button::West => want_tare = true,
                         Button::Start => want_cycle_mode = true,
                         Button::Select => {
-                            bias_fine = !bias_fine;
-                            push_status(&mut status, format!("bias step {}", if bias_fine { "fine 0.01°" } else { "coarse 0.1°" }));
+                            let idx = (bias_fine as usize) | ((bias_frame_ac as usize) << 1);
+                            let next = (idx + 1) % 4;
+                            bias_fine = next & 1 == 1;
+                            bias_frame_ac = next & 2 == 2;
+                            persist_bias(&cfg.path, bias, bias_fine);
+                            push_status(&mut status, format!("bias mode: {} / {}", if bias_fine { "fine 0.01°" } else { "coarse 0.1°" }, if bias_frame_ac { "in/cross-track" } else { "az/el" }));
                         }
                         Button::DPadUp | Button::DPadDown | Button::DPadLeft | Button::DPadRight => {
                             let step = if bias_fine { 0.01 } else { 0.1 };
@@ -503,9 +624,16 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                                 Button::DPadUp => (0.0, step),
                                 _ => (0.0, -step),
                             };
-                            bias.0 = (bias.0 + dx).clamp(-3.0, 3.0);
-                            bias.1 = (bias.1 + dy).clamp(-3.0, 3.0);
-                            push_status(&mut status, format!("bias {:+.2}° / {:+.2}°", bias.0, bias.1));
+                            if bias_frame_ac {
+                                bias_it = (bias_it + dx).clamp(-3.0, 3.0);
+                                bias_ct = (bias_ct + dy).clamp(-3.0, 3.0);
+                                push_status(&mut status, format!("bias in-track {:+.2}° / cross {:+.2}°", bias_it, bias_ct));
+                            } else {
+                                bias.0 = (bias.0 + dx).clamp(-3.0, 3.0);
+                                bias.1 = (bias.1 + dy).clamp(-3.0, 3.0);
+                                persist_bias(&cfg.path, bias, bias_fine);
+                                push_status(&mut status, format!("bias {:+.2}° / {:+.2}°", bias.0, bias.1));
+                            }
                         }
                         _ => {}
                     }
@@ -590,6 +718,26 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 i.rate_cmd = (0, 0);
             }
         }
+        // Focus motor from the triggers (R2 forward / L2 backward), rate
+        // proportional to deflection; send only on change (_handle_focus_control).
+        let focus_rate = if stopped {
+            0
+        } else {
+            const DB: f64 = 0.05;
+            let (l2, r2) = joy_trig;
+            if r2 > DB && r2 >= l2 {
+                (r2 * 9.0).round() as i32
+            } else if l2 > DB {
+                -((l2 * 9.0).round() as i32)
+            } else {
+                0
+            }
+        }
+        .clamp(-9, 9);
+        if focus_rate != focus_last_rate {
+            loop_shared.commands.lock().unwrap().push_back(Command::FocusRate(focus_rate));
+            focus_last_rate = focus_rate;
+        }
 
         // PROGRAM / HANDOFF / HOTSPOT: live setpoint from the selected target
         // (HOTSPOT rides its trajectory feed-forward + star-filter rate reference).
@@ -603,8 +751,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     return Some(Setpoint {
                         az_deg: (tt.az + tt.az_rate * age).rem_euclid(360.0),
                         el_deg: if el <= 0.0 { cfg.elevation_mask_deg } else { el },
-                        ff_az_dps: tt.az_rate,
-                        ff_el_dps: tt.el_rate,
+                        ff_az_dps: if el <= 0.0 { 0.0 } else { tt.az_rate },
+                        ff_el_dps: if el <= 0.0 { 0.0 } else { tt.el_rate },
                     });
                 }
                 if let Some(icao) = sn.strip_prefix("adsb:") {
@@ -615,8 +763,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     return Some(Setpoint {
                         az_deg: (a.fit_az + a.az_rate * age).rem_euclid(360.0),
                         el_deg: if el <= 0.0 { cfg.elevation_mask_deg } else { el },
-                        ff_az_dps: a.az_rate,
-                        ff_el_dps: a.el_rate,
+                        ff_az_dps: if el <= 0.0 { 0.0 } else { a.az_rate },
+                        ff_el_dps: if el <= 0.0 { 0.0 } else { a.el_rate },
                     });
                 }
                 let cat = catalog.as_ref()?;
@@ -641,10 +789,24 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             });
             let mut pm_corr = (0.0, 0.0);
             let sp = sp.map(|mut s| {
-                if bias != (0.0, 0.0) {
+                if bias != (0.0, 0.0) || bias_it != 0.0 || bias_ct != 0.0 {
+                    // _apply_bias_to_target: az/el bias is a cross-el/el nudge;
+                    // in/cross-track projects onto the sky-velocity direction.
                     let cos_el = s.el_deg.to_radians().cos().max(0.087);
-                    s.az_deg = (s.az_deg + bias.0 / cos_el).rem_euclid(360.0);
-                    s.el_deg += bias.1;
+                    let mut crossel = bias.0;
+                    let mut elb = bias.1;
+                    if bias_it != 0.0 || bias_ct != 0.0 {
+                        let vx = s.ff_az_dps * cos_el;
+                        let vy = s.ff_el_dps;
+                        let norm = vx.hypot(vy);
+                        if norm > 1e-6 {
+                            let (ux, uy) = (vx / norm, vy / norm);
+                            crossel += bias_it * ux - bias_ct * uy;
+                            elb += bias_it * uy + bias_ct * ux;
+                        }
+                    }
+                    s.az_deg = (s.az_deg + crossel / cos_el).rem_euclid(360.0);
+                    s.el_deg += elb;
                 }
                 // Pointing-model pre-correction (control.apply_pointing_model):
                 // command = desired - error(desired), first-order inverse.
@@ -654,6 +816,18 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     pm_corr = (da, de);
                     s.az_deg = (s.az_deg - da).rem_euclid(360.0);
                     s.el_deg -= de;
+                }
+                // Eq residual model (apply_eq_pointing_model): correct in the
+                // mount (HA/Dec) frame through the existing geometric transform.
+                let (eq_on, eq_terms) = **shared.eq_pointing.load();
+                if eq_on && parse_mount_mode(&cur_mode_name) == MountMode::Eq {
+                    use skytracker_core::transforms::{mount_to_sky as m2s, sky_to_mount};
+                    let (h, d) = sky_to_mount(MountMode::Eq, s.az_deg, s.el_deg, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip);
+                    let (dh, dd) = skytracker_pointing::eq::error(&eq_terms, h, d, cfg.lat_deg);
+                    let (az2, el2) = m2s(MountMode::Eq, h - dh, d - dd, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip);
+                    pm_corr = (s.az_deg - az2, s.el_deg - el2);
+                    s.az_deg = az2.rem_euclid(360.0);
+                    s.el_deg = el2;
                 }
                 s
             });
@@ -703,8 +877,80 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 }
                 drop(i);
                 push_status(&mut status, format!("loop -> {}", mode_name(mode)));
-                apply_profile(mode, &loop_shared, &mut status);
+                {
+                    let key = profile_key(mode);
+                    if key != active_profile {
+                        let live = {
+                            let i = loop_shared.inputs.lock().unwrap();
+                            (i.azm_gains, i.alt_gains)
+                        };
+                        if let Some(old_key) = active_profile {
+                            profiles.insert(old_key.to_string(), live);
+                            save_gain_profile(&cfg.path, old_key, live.0, live.1, None);
+                        }
+                        if let Some(k) = key {
+                            if let Some(&(a, e)) = profiles.get(k) {
+                                let mut i = loop_shared.inputs.lock().unwrap();
+                                if i.azm_gains != a || i.alt_gains != e {
+                                    i.azm_gains = a;
+                                    i.alt_gains = e;
+                                    drop(i);
+                                    push_status(&mut status, format!("gains <- {k} profile"));
+                                }
+                            } else {
+                                profiles.insert(k.to_string(), live);
+                                save_gain_profile(&cfg.path, k, live.0, live.1, None);
+                                push_status(&mut status, format!("PID gains: seeded new {k} profile"));
+                            }
+                        }
+                        active_profile = key;
+                    }
+                }
             }
+        }
+        // LAUNCH override (joystick_controller launch_active): while armed, the
+        // launch is the target, PROGRAM is forced, other selections are dropped.
+        if let Some((lkey, _t0)) = (**shared.launch_armed.load()).clone() {
+            if target.as_deref() != Some(lkey.as_str()) {
+                target = Some(lkey.clone());
+                shared.selected.store(Arc::new(target.clone()));
+                push_status(&mut status, "LAUNCH: overriding target -> launch trajectory".into());
+            }
+            if mode != Mode::Program {
+                mode = Mode::Program;
+                stopped = false;
+                let mut i = loop_shared.inputs.lock().unwrap();
+                i.mode = mode;
+                i.stopped = false;
+                drop(i);
+                push_status(&mut status, "LAUNCH: mode -> PROGRAM".into());
+            }
+        }
+
+        // Park servicing (_service_park): wrap-aware convergence in the raw
+        // encoder frame, gentle goto re-issue, 1° tolerance, 90 s timeout.
+        if parking {
+            if park_state.is_none() {
+                park_state = Some((now, now));
+            }
+            if let Some((start, last_cmd)) = park_state.as_mut() {
+                let err_a = (cfg.offsets.0 - out.azm_raw + 180.0).rem_euclid(360.0) - 180.0;
+                let err_e = (cfg.offsets.1 - out.alt_raw + 180.0).rem_euclid(360.0) - 180.0;
+                if err_a.abs() <= 1.0 && err_e.abs() <= 1.0 {
+                    parking = false;
+                    park_state = None;
+                    push_status(&mut status, "Park complete".into());
+                } else if now - *start > 90.0 {
+                    parking = false;
+                    park_state = None;
+                    push_status(&mut status, "Park TIMED OUT after 90s — check the mount".into());
+                } else if now - *last_cmd >= 2.0 {
+                    loop_shared.commands.lock().unwrap().push_back(Command::GotoMount { azm_deg: cfg.offsets.0, alt_deg: cfg.offsets.1 });
+                    *last_cmd = now;
+                }
+            }
+        } else {
+            park_state = None;
         }
         for m in &out.status_msgs {
             if status.last() != Some(m) {
@@ -736,6 +982,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             [[i.azm_gains.0, i.azm_gains.1, i.azm_gains.2], [i.alt_gains.0, i.alt_gains.1, i.alt_gains.2]]
         };
 
+        let live_ff = {
+            let i = loop_shared.inputs.lock().unwrap();
+            (i.ff_azm_enabled, i.ff_alt_enabled, i.lead_time_sec, i.hotspot.star_filter)
+        };
         let (sky_az, sky_el) = mount_to_sky(&cfg, out.azm, out.alt);
         shared.mount.store(Arc::new(MountSnapshot {
             az: sky_az,
@@ -771,6 +1021,15 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             pointing_corr: pm_corr_last,
             joystick_tare: tare,
             stopped,
+            focus_rate: focus_last_rate,
+            focus_pos: (out.focus_frac * 16_777_216.0).round() as i64,
+            bias_frame: if bias_frame_ac { "alongcross".into() } else { "azel".into() },
+            bias_it,
+            bias_ct,
+            ff_azm: live_ff.0,
+            ff_alt: live_ff.1,
+            lead_time_s: live_ff.2,
+            star_filter: live_ff.3,
             joy_buttons,
             joy_left,
             joy_right,

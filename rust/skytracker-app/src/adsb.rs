@@ -130,7 +130,7 @@ fn run(shared: Arc<Shared>) {
         last_pub = Instant::now();
         aircraft.retain(|_, a| a.last_seen.elapsed() < stale);
         let now = crate::sky::now_unix();
-        let n_fit = cfg.adsb_fit_points.max(2);
+        let n_fit = shared.adsb_fit_points.load(std::sync::atomic::Ordering::Relaxed).max(2);
         let mut marks = Vec::new();
         for (icao, a) in &aircraft {
             if a.history.is_empty() {

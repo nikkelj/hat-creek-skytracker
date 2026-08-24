@@ -1228,6 +1228,7 @@ fn mode_color(mode: &str) -> Color32 {
         "RATE" => AMBER,
         "PROGRAM" | "HANDOFF" => ACCENT,
         "HOTSPOT" => GREEN,
+        "MTI" => VIOLET,
         _ => TEXT_2,
     }
 }
@@ -1246,7 +1247,7 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         });
     });
     ui.horizontal(|ui| {
-        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT"] {
+        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT", "MTI"] {
             if theme::mode_button(ui, mode, m.mode == mode, mode_color(mode)) {
                 let _ = tx.send(MountCmd::SetMode(mode.to_string()));
             }
@@ -1329,18 +1330,33 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             let _ = tx.send(MountCmd::Park);
         }
         let step = if m.bias_fine { 0.01 } else { 0.1 };
+        let ac = m.bias_frame == "alongcross";
+        let (hn, vn) = if ac { ("InTk", "XTk") } else { ("Az", "El") };
         for (l, dx, dy) in [("◀", -step, 0.0), ("▶", step, 0.0), ("▲", 0.0, step), ("▼", 0.0, -step)] {
-            if ui.small_button(l).on_hover_text(format!("operator bias {:+.2}° (gamepad D-pad; Share toggles fine/coarse)", if dx != 0.0 { dx } else { dy })).clicked() {
+            let axis = if dx != 0.0 { hn } else { vn };
+            if ui.small_button(l).on_hover_text(format!("operator bias {axis} {:+.2}° (gamepad D-pad; Share cycles the mode)", if dx != 0.0 { dx } else { dy })).clicked() {
                 let _ = tx.send(MountCmd::Bias { daz: dx, del: dy });
             }
         }
-        if ui.small_button(if m.bias_fine { "fine" } else { "coarse" }).clicked() {
-            let _ = tx.send(MountCmd::BiasFine(!m.bias_fine));
+        let mode_lbl = format!("{}·{}", if m.bias_fine { "fine" } else { "coarse" }, if ac { "trk" } else { "azel" });
+        if ui.small_button(mode_lbl).on_hover_text("bias mode: coarse/azel → fine/azel → coarse/along-cross-track → fine/along-cross-track (gamepad: Share)").clicked() {
+            let _ = tx.send(MountCmd::CycleBiasMode);
         }
-        if m.bias != (0.0, 0.0) && ui.small_button("bias 0").clicked() {
+        if (m.bias != (0.0, 0.0) || m.bias_it != 0.0 || m.bias_ct != 0.0) && ui.small_button("bias 0").clicked() {
             let _ = tx.send(MountCmd::BiasReset);
         }
+        // Per-axis feed-forward (render_pid_diagnostics FF buttons).
+        ui.separator();
+        if theme::mode_button(ui, "FFaz", m.ff_azm, GREEN) {
+            let _ = tx.send(MountCmd::SetFeedForward { az: !m.ff_azm, el: m.ff_alt });
+        }
+        if theme::mode_button(ui, "FFel", m.ff_alt, GREEN) {
+            let _ = tx.send(MountCmd::SetFeedForward { az: m.ff_azm, el: !m.ff_alt });
+        }
     });
+    if m.bias_it != 0.0 || m.bias_ct != 0.0 {
+        theme::kv_colored(ui, "bias trk", format!("in {:+.2}° / cross {:+.2}°", m.bias_it, m.bias_ct), AMBER);
+    }
     if let Some(t) = &m.autotune {
         ui.label(egui::RichText::new(t).font(theme::mono(10.5)).color(ACCENT));
     }
@@ -1368,6 +1384,17 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             st.gains_edit = Some(g);
             let _ = tx.send(MountCmd::SetGains { azm: (g[0][0], g[0][1], g[0][2]), alt: (g[1][0], g[1][1], g[1][2]) });
         }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("lead").font(theme::sans(10.0)).color(DIM));
+            let mut lead = m.lead_time_s;
+            if ui.add(egui::Slider::new(&mut lead, 0.0..=0.5).fixed_decimals(2).suffix(" s")).changed() {
+                let _ = tx.send(MountCmd::SetLeadTime(lead));
+            }
+            let mut sf = m.star_filter;
+            if ui.checkbox(&mut sf, egui::RichText::new("star filter").font(theme::sans(10.0)).color(TEXT_2)).on_hover_text("HOTSPOT: reject star-like near-zero-rate detections; off to deliberately track a star").changed() {
+                let _ = tx.send(MountCmd::SetStarFilter(sf));
+            }
+        });
         ui.horizontal(|ui| {
             if st.gains_edit.is_some() {
                 if ui.small_button("sync from loop").clicked() {
@@ -1453,6 +1480,14 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             }
             let a = shared.adsb.load();
             ui.label(egui::RichText::new(format!("{} · {} ac", a.status, a.n_aircraft)).font(theme::mono(10.0)).color(DIM));
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("fit points").font(theme::sans(10.0)).color(DIM));
+            let mut n = shared.adsb_fit_points.load(std::sync::atomic::Ordering::Relaxed) as i64;
+            if ui.add(egui::Slider::new(&mut n, 2..=20)).on_hover_text("ADS-B linear-fit depth: recent fixes used for the trajectory prediction").changed() {
+                shared.adsb_fit_points.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+                crate::mount::persist_config_key(&shared.config.path, "adsb_fit_points", serde_json::json!(n));
+            }
         });
     });
     ui.add_space(4.0);
@@ -1844,6 +1879,23 @@ pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_s
             }
         }
     }
+    // Focus motor (render_joystick_status focus rows): centre-zero commanded
+    // rate bar + live encoder read-back. L2 retracts, R2 extends.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("focus (L2-/R2+)").font(theme::mono(10.0)).color(TEXT_2));
+        let (fr, fp) = ui.allocate_painter(Vec2::new(100.0, 12.0), Sense::hover());
+        fp.rect(fr.rect, 2.0, theme::with_alpha(theme::BG, alpha), Stroke::new(1.0, wa(HAIRLINE)));
+        let cx = fr.rect.center().x;
+        fp.line_segment([Pos2::new(cx, fr.rect.top()), Pos2::new(cx, fr.rect.bottom())], Stroke::new(1.0, wa(HAIRLINE)));
+        if m.focus_rate != 0 {
+            let fill = (m.focus_rate as f32 / 9.0).clamp(-1.0, 1.0) * (fr.rect.width() / 2.0);
+            let col = if m.focus_rate > 0 { GREEN } else { AMBER };
+            let x0 = if fill >= 0.0 { cx } else { cx + fill };
+            fp.rect_filled(Rect::from_min_size(Pos2::new(x0, fr.rect.top() + 1.0), Vec2::new(fill.abs(), fr.rect.height() - 2.0)), 1.0, col);
+        }
+        ui.label(egui::RichText::new(format!("rate {:+}", m.focus_rate)).font(theme::mono(9.5)).color(if m.focus_rate > 0 { GREEN } else if m.focus_rate < 0 { AMBER } else { DIM }));
+        ui.label(egui::RichText::new(format!("pos {}", m.focus_pos)).font(theme::mono(9.5)).color(if connected { GREEN } else { DIM }));
+    });
     // Adaptive-rate gear ladder: green base gears, orange boost, grey outside RATE.
     let boosted = m.gear_ceiling > m.gear_base;
     ui.label(
@@ -1864,16 +1916,25 @@ pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_s
     ui.label(egui::RichText::new("hold the stick pinned to wind up the boost gears").font(theme::sans(9.0)).color(DIM));
     // Function legend, live-highlighted while a control is held.
     egui::Grid::new("joy_legend").num_columns(2).spacing([10.0, 1.0]).show(ui, |ui| {
-        let rows: [(&str, String, bool); 10] = [
+        let rows: [(&str, String, bool); 11] = [
             ("✕", "capture arm / save run".into(), btn(0)),
             ("○", "STOP → standby".into(), btn(1)),
             ("□", "tare rate stick".into(), btn(2)),
             ("△", "park".into(), btn(3)),
-            ("L1", "feed-forward toggle".into(), btn(9)),
+            ("L1", format!("feed-forward (az {} / el {})", if m.ff_azm { "on" } else { "off" }, if m.ff_alt { "on" } else { "off" }), btn(9)),
+            ("L2/R2", "focus motor".into(), m.focus_rate != 0),
             ("L3/R3", "cycle tracking mode".into(), btn(7) || btn(8)),
-            ("share", format!("bias step ({})", if m.bias_fine { "fine .01°" } else { "coarse .1°" }), btn(4)),
+            ("share", format!("bias mode ({}·{})", if m.bias_fine { "fine" } else { "coarse" }, if m.bias_frame == "alongcross" { "trk" } else { "azel" }), btn(4)),
             ("opts", format!("mount mode ({})", m.mount_mode), btn(6)),
-            ("d-pad", format!("bias {:+.2}° / {:+.2}°", m.bias.0, m.bias.1), btn(11) || btn(12) || btn(13) || btn(14)),
+            (
+                "d-pad",
+                if m.bias_frame == "alongcross" {
+                    format!("bias in/cross {:+.2}°/{:+.2}°", m.bias_it, m.bias_ct)
+                } else {
+                    format!("bias az/el {:+.2}°/{:+.2}°", m.bias.0, m.bias.1)
+                },
+                btn(11) || btn(12) || btn(13) || btn(14),
+            ),
             (if rate_stick_left { "L-stick" } else { "R-stick" }, "RATE slew (adaptive gearbox)".into(), false),
         ];
         for (k, v, active) in rows {

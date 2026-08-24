@@ -336,7 +336,16 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                     Some((az, el, d.name.clone()))
                 } else if key.starts_with("launch:") {
                     let l = launches.iter().find(|l| &l.key == key)?;
-                    let (az, el, _) = crate::launches::interp(l, jd_tt_to_unix(jd))?;
+                    // LAUNCH override: the armed T0 re-bases the file's clock
+                    // to the button press, so the rocket flies "now".
+                    let t = match (**shared.launch_armed.load()).clone() {
+                        Some((k, t0)) if &k == key => {
+                            let file_t0 = l.rows.first()?.0;
+                            file_t0 + (jd_tt_to_unix(jd) - t0)
+                        }
+                        _ => jd_tt_to_unix(jd),
+                    };
+                    let (az, el, _) = crate::launches::interp(l, t)?;
                     Some((az, el, l.name.clone()))
                 } else {
                     None

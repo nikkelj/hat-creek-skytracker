@@ -304,6 +304,10 @@ pub struct LoopState {
     standby_stopped: bool,
     prev_mode: Option<Mode>,
 
+    // Focus read-back (core_loop's low-cadence poll).
+    pub focus_poll_i: u32,
+    pub last_focus_frac: f64,
+
     // HOTSPOT lock state (ported from JoystickModeState).
     hotspot_gate_center: Option<(f64, f64)>,
     hotspot_acquired: bool,
@@ -358,6 +362,8 @@ impl LoopState {
             pid_last_update: None,
             standby_stopped: false,
             prev_mode: None,
+            focus_poll_i: 0,
+            last_focus_frac: 0.0,
             hotspot_gate_center: None,
             hotspot_acquired: false,
             hotspot_miss_count: 0,

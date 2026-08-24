@@ -865,6 +865,92 @@ pub fn stack_gray(frames: &[Gray], reference: usize, align: bool, settings: Stab
     Some((mean, n_stacked, n_rejected))
 }
 
+/// Garbage pre-cull content score (stacking.content_score, simple form):
+/// mean absolute deviation from the frame median at half resolution. Pure
+/// noise / blank sky collapses toward zero while a real target keeps a
+/// prominent deviation, so sharpness (which noise fools) never ranks junk in.
+pub fn content_score_gray(g: &Gray) -> f64 {
+    let s = g.downsample(2);
+    if s.data.is_empty() {
+        return 0.0;
+    }
+    let mut hist = [0u32; 256];
+    for &v in &s.data {
+        hist[v as usize] += 1;
+    }
+    let half = s.data.len() / 2;
+    let mut acc = 0usize;
+    let mut med = 0u8;
+    for (i, &c) in hist.iter().enumerate() {
+        acc += c as usize;
+        if acc > half {
+            med = i as u8;
+            break;
+        }
+    }
+    let m = med as f64;
+    s.data.iter().map(|&v| (v as f64 - m).abs()).sum::<f64>() / s.data.len() as f64
+}
+
+/// Intensity-weighted centroid of pixels above mean + 2σ
+/// (stacking.brightness_centroid); None when nothing clears the sky cut.
+pub fn brightness_centroid_gray(g: &Gray) -> Option<(f64, f64)> {
+    let n = g.data.len();
+    if n == 0 {
+        return None;
+    }
+    let (mut sum, mut sq) = (0.0f64, 0.0f64);
+    for &v in &g.data {
+        let f = v as f64;
+        sum += f;
+        sq += f * f;
+    }
+    let mean = sum / n as f64;
+    let std = (sq / n as f64 - mean * mean).max(0.0).sqrt();
+    let thr = mean + 2.0 * std;
+    let (mut wsum, mut sx, mut sy) = (0.0, 0.0, 0.0);
+    for y in 0..g.h {
+        for x in 0..g.w {
+            let wgt = g.data[y * g.w + x] as f64 - thr;
+            if wgt > 0.0 {
+                wsum += wgt;
+                sx += x as f64 * wgt;
+                sy += y as f64 * wgt;
+            }
+        }
+    }
+    if wsum <= 0.0 {
+        None
+    } else {
+        Some((sx / wsum, sy / wsum))
+    }
+}
+
+/// Fixed-size square crop centred on (cx, cy), off-frame area zero-padded
+/// (stacking.crop_centered): PIPP centring shifts the target to the middle
+/// so every cropped frame stacks without resizing.
+pub fn crop_centered_gray(g: &Gray, cx: f64, cy: f64, size: usize) -> Gray {
+    let size = size.max(2);
+    let mut out = Gray::new(size, size);
+    let sx0 = cx.round() as i64 - size as i64 / 2;
+    let sy0 = cy.round() as i64 - size as i64 / 2;
+    for oy in 0..size {
+        let sy = sy0 + oy as i64;
+        if sy < 0 || sy >= g.h as i64 {
+            continue;
+        }
+        let src_row = sy as usize * g.w;
+        for ox in 0..size {
+            let sx = sx0 + ox as i64;
+            if sx < 0 || sx >= g.w as i64 {
+                continue;
+            }
+            out.data[oy * size + ox] = g.data[src_row + sx as usize];
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Overlay baking for export (RGB u8): lines, arrows, boxes, 5x7 text
 // ---------------------------------------------------------------------------
@@ -1452,6 +1538,8 @@ pub struct ExportSpec {
     pub overlays: bool,
     pub annotations: Vec<Annotation>,
     pub fps: Option<f64>,
+    /// Source-pixel crop [x, y, w, h] baked into the export (pane zoom view).
+    pub crop: Option<[usize; 4]>,
 }
 
 fn frames_in_range(run: &RunInfo, slot: usize, t_start: f64, t_end: f64) -> Vec<(usize, FrameRef)> {
@@ -1491,10 +1579,38 @@ pub fn run_export(spec: &ExportSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &
         let p = &spec.params;
         let lut = build_lut(p.gamma, p.brightness, p.contrast);
         let first = load_gray(&frames[0].1.path)?;
-        let (w, h) = (first.w & !1, first.h & !1); // I420 needs even dims
+        // Optional view crop (source px), clamped to the frame; I420 needs even dims.
+        let crop = spec.crop.map(|[x, y, cw, ch]| {
+            let x = x.min(first.w.saturating_sub(2));
+            let y = y.min(first.h.saturating_sub(2));
+            let cw = cw.min(first.w - x) & !1;
+            let ch = ch.min(first.h - y) & !1;
+            [x, y, cw, ch]
+        });
+        let (w, h, ox, oy) = match crop {
+            Some([x, y, cw, ch]) => (cw, ch, x, y),
+            None => (first.w & !1, first.h & !1, 0, 0),
+        };
         if w < 2 || h < 2 {
             return Err("frame too small".into());
         }
+        // Annotations are normalized to the full frame: remap into crop space.
+        let annots: Vec<Annotation> = match crop {
+            Some([cx, cy, cw, ch]) => {
+                let (fw, fh) = (first.w as f64, first.h as f64);
+                let rx = |v: f64| (v * fw - cx as f64) / cw as f64;
+                let ry = |v: f64| (v * fh - cy as f64) / ch as f64;
+                spec.annotations
+                    .iter()
+                    .map(|a| match a {
+                        Annotation::Text { cam, x, y, text } => Annotation::Text { cam: *cam, x: rx(*x), y: ry(*y), text: text.clone() },
+                        Annotation::Arrow { cam, x0, y0, x1, y1 } => Annotation::Arrow { cam: *cam, x0: rx(*x0), y0: ry(*y0), x1: rx(*x1), y1: ry(*y1) },
+                        Annotation::Box { cam, x0, y0, x1, y1 } => Annotation::Box { cam: *cam, x0: rx(*x0), y0: ry(*y0), x1: rx(*x1), y1: ry(*y1) },
+                    })
+                    .collect()
+            }
+            None => spec.annotations.clone(),
+        };
         let fps = spec.fps.unwrap_or_else(|| infer_fps(&frames.iter().map(|f| f.1.t).collect::<Vec<_>>()));
         if let Some(dir) = spec.out_path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1524,18 +1640,18 @@ pub fn run_export(spec: &ExportSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &
             if p.sharpen.on {
                 proc = finish_gray(&proc, &p.sharpen);
             }
-            // Crop to even dims.
+            // Crop to the view rect / even dims.
             let mut rgb = Vec::with_capacity(w * h * 3);
             for y in 0..h {
                 for x in 0..w {
-                    let v = proc.data[y * proc.w + x];
+                    let v = proc.data.get((y + oy) * proc.w + x + ox).copied().unwrap_or(0);
                     rgb.extend_from_slice(&[v, v, v]);
                 }
             }
             if spec.overlays {
                 let vectors = compute_track_vectors(&run.trajectory, f.t, w as f64, h as f64);
                 let meta = build_meta_lines(run, cam_index, f.t, *orig_idx, run.cams[spec.slot].frames.len(), p.gamma, p.stabilize);
-                bake_overlays(&mut rgb, w, h, vectors.as_ref(), &meta, &spec.annotations, spec.slot);
+                bake_overlays(&mut rgb, w, h, vectors.as_ref(), &meta, &annots, spec.slot);
             }
             enc.write_rgb(&rgb).map_err(|e| e.to_string())?;
             written += 1;
@@ -1561,6 +1677,10 @@ pub struct StackSpec {
     pub keep_n: usize,
     pub stab: StabSettings,
     pub out_base: PathBuf,
+    /// PIPP-style centring (stacking.pipp_center_stack): recentre each kept
+    /// frame on the track target / brightest blob, crop to center_size².
+    pub centered: bool,
+    pub center_size: usize,
 }
 
 /// Lucky-imaging stack (stacking.stack_run, gray): grade frames in range by
@@ -1572,15 +1692,15 @@ pub fn run_stack(spec: &StackSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &At
         return Err("No frames in the selected range".into());
     }
     let total = frames.len();
-    // Grade.
-    let mut graded: Vec<(usize, f64)> = Vec::with_capacity(total);
+    // Grade: Laplacian sharpness + garbage pre-cull content score.
+    let mut graded: Vec<(usize, f64, f64)> = Vec::with_capacity(total);
     for (k, (i, f)) in frames.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
         if let Ok(g) = load_gray(&f.path) {
             let score = metrics::sharpness_laplacian(&g.to_f32());
-            graded.push((*i, score));
+            graded.push((*i, score, content_score_gray(&g)));
         }
         JobHandle::set(status, |s| {
             s.progress = 0.4 * (k + 1) as f32 / total as f32;
@@ -1590,16 +1710,40 @@ pub fn run_stack(spec: &StackSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &At
     if graded.is_empty() {
         return Err("no frame could be decoded".into());
     }
+    // Pre-cull empty/garbage frames (stacking.prefilter_garbage, simple form):
+    // drop content scores below 0.25x the median — sharpness is fooled by
+    // noise, so this runs before the ranking; the median guarantees survivors.
+    let mut cvals: Vec<f64> = graded.iter().map(|g| g.2).collect();
+    cvals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let floor = 0.25 * cvals[cvals.len() / 2];
+    let n_before = graded.len();
+    graded.retain(|g| g.2 >= floor);
+    let n_preculled = n_before - graded.len();
+    if graded.is_empty() {
+        return Err("all frames pre-culled as empty".into());
+    }
     graded.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let keep: Vec<usize> = graded.iter().take(spec.keep_n.max(1)).map(|g| g.0).collect();
     let cam = &spec.run.cams[spec.slot];
-    // Decode kept set (reference = sharpest, index 0).
+    // Decode kept set (reference = sharpest, index 0); optional PIPP centring.
     let mut imgs: Vec<Gray> = Vec::with_capacity(keep.len());
     for (k, &i) in keep.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        imgs.push(load_gray(&cam.frames[i].path)?);
+        let mut g = load_gray(&cam.frames[i].path)?;
+        if spec.centered {
+            // Track target when the trajectory carries pixel coords, else the
+            // brightest blob, else the geometric centre (blank frame guard).
+            let traj_px = spec.run.trajectory.interp(cam.frames[i].t).and_then(|s| {
+                (s.px.is_finite() && s.py.is_finite() && s.px >= 0.0 && s.py >= 0.0 && s.px < g.w as f64 && s.py < g.h as f64).then_some((s.px, s.py))
+            });
+            let (cx, cy) = traj_px
+                .or_else(|| brightness_centroid_gray(&g))
+                .unwrap_or((g.w as f64 / 2.0, g.h as f64 / 2.0));
+            g = crop_centered_gray(&g, cx, cy, spec.center_size.max(16));
+        }
+        imgs.push(g);
         JobHandle::set(status, |s| {
             s.progress = 0.4 + 0.2 * (k + 1) as f32 / keep.len() as f32;
             s.message = format!("Decoding best {}…", keep.len());
@@ -1632,7 +1776,8 @@ pub fn run_stack(spec: &StackSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &At
         .map_err(|e| e.to_string())?;
     JobHandle::set(status, |s| {
         s.progress = 1.0;
-        s.message = format!("Stacked {n_stacked}/{} ({n_rejected} rejected) -> {}", keep.len(), final_path.display());
+        let cull = if n_preculled > 0 { format!(", {n_preculled} pre-culled") } else { String::new() };
+        s.message = format!("Stacked {n_stacked}/{} ({n_rejected} rejected{cull}) -> {}", keep.len(), final_path.display());
     });
     Ok(final_path)
 }
@@ -1716,6 +1861,8 @@ pub struct ReplayState {
     scanned_dir: Option<PathBuf>,
     pub filter: String,
     pub favorites_only: bool,
+    /// Group the run list under per-target collapsible headers (off = flat list).
+    pub group_by_target: bool,
     // loaded run
     loaded: Option<LoadedRun>,
     // playback
@@ -1736,6 +1883,15 @@ pub struct ReplayState {
     pub sharpen: SharpenSettings,
     pub overlays: bool,
     pub stack_n: usize,
+    pub stack_centered: bool,
+    pub stack_center_size: usize,
+    // per-pane pixel zoom: a display transform (mousewheel about the cursor,
+    // drag pans, right-click / chip resets); overlays ride the same transform
+    pane_zoom: Vec<f32>,
+    pane_pan: Vec<Vec2>,
+    /// Visible source-pixel rect [x, y, w, h] per pane while zoomed (crop export).
+    pane_view: Vec<Option<[usize; 4]>>,
+    pub export_crop: bool,
     // annotation
     pub annot_mode: AnnotMode,
     annot_text: String,
@@ -1747,6 +1903,10 @@ pub struct ReplayState {
     last_job_ok: bool,
     req_gen: u64,
     rename_buf: String,
+    notes_buf: String,
+    tags_buf: String,
+    /// Armed by the first "delete run" click; disarms after 3 s.
+    delete_confirm: Option<Instant>,
 }
 
 impl Default for ReplayState {
@@ -1757,6 +1917,7 @@ impl Default for ReplayState {
             scanned_dir: None,
             filter: String::new(),
             favorites_only: false,
+            group_by_target: true,
             loaded: None,
             t: 0.0,
             playing: false,
@@ -1772,6 +1933,12 @@ impl Default for ReplayState {
             sharpen: SharpenSettings::default(),
             overlays: true,
             stack_n: 20,
+            stack_centered: false,
+            stack_center_size: 512,
+            pane_zoom: Vec::new(),
+            pane_pan: Vec::new(),
+            pane_view: Vec::new(),
+            export_crop: false,
             annot_mode: AnnotMode::None,
             annot_text: String::new(),
             annot_pending: None,
@@ -1781,6 +1948,9 @@ impl Default for ReplayState {
             last_job_ok: true,
             req_gen: 0,
             rename_buf: String::new(),
+            notes_buf: String::new(),
+            tags_buf: String::new(),
+            delete_confirm: None,
         }
     }
 }
@@ -1868,6 +2038,13 @@ impl ReplayState {
         self.annot_draft = None;
         self.annot_mode = AnnotMode::None;
         self.rename_buf = run.display_name();
+        self.notes_buf = run.sidecar.notes.clone();
+        self.tags_buf = run.sidecar.tags.join(", ");
+        self.pane_zoom = vec![1.0; n];
+        self.pane_pan = vec![Vec2::ZERO; n];
+        self.pane_view = vec![None; n];
+        self.export_crop = false;
+        self.delete_confirm = None;
         self.loaded = Some(LoadedRun {
             annotations: run.sidecar.annotations.clone(),
             sidecar: run.sidecar.clone(),
@@ -2010,6 +2187,7 @@ impl ReplayState {
             overlays: self.overlays,
             annotations: l.annotations.clone(),
             fps: None,
+            crop: if self.export_crop { self.pane_view.get(slot).copied().flatten() } else { None },
         };
         let handle = JobHandle::new("export");
         let status = handle.status.clone();
@@ -2043,7 +2221,7 @@ impl ReplayState {
         let cam_no = l.run.cams[slot].cam_index + 1;
         let base = Self::export_dir(captures_dir).join(format!("{}_cam{cam_no}_stack{}", l.run.folder, self.stack_n));
         let out_base = Self::unique_base(&base, "png");
-        let spec = StackSpec { run: l.run.clone(), slot, t_start: self.in_marker, t_end: self.out_marker, keep_n: self.stack_n.max(1), stab: self.stab, out_base };
+        let spec = StackSpec { run: l.run.clone(), slot, t_start: self.in_marker, t_end: self.out_marker, keep_n: self.stack_n.max(1), stab: self.stab, out_base, centered: self.stack_centered, center_size: self.stack_center_size };
         let handle = JobHandle::new("stack");
         let status = handle.status.clone();
         let cancel = handle.cancel.clone();
@@ -2089,6 +2267,20 @@ pub fn screen(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) {
     st.poll_scan();
     st.poll_job();
     st.tick_playback();
+    // Transport keys — only while no widget owns the keyboard (TextEdit focus).
+    if st.loaded.is_some() && ui.ctx().memory(|m| m.focused()).is_none() {
+        let (space, left, right) = ui.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+        if space {
+            st.playing = !st.playing;
+            st.last_tick = Instant::now();
+        }
+        if left {
+            st.step_frames(-1);
+        }
+        if right {
+            st.step_frames(1);
+        }
+    }
     if st.playing || st.job_running() || st.scan_rx.is_some() {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
@@ -2139,8 +2331,9 @@ fn library_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) {
     });
     ui.label(egui::RichText::new(captures_dir.display().to_string()).font(theme::mono(10.0)).color(theme::DIM));
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("filter").desired_width(140.0));
+        ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text("filter").desired_width(110.0));
         ui.checkbox(&mut st.favorites_only, egui::RichText::new("★ only").font(theme::sans(11.0)));
+        ui.checkbox(&mut st.group_by_target, egui::RichText::new("group").font(theme::sans(11.0))).on_hover_text("Group runs by target (off = flat list)");
     });
     ui.add_space(4.0);
     let Some(lib) = st.library.clone() else {
@@ -2155,14 +2348,16 @@ fn library_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) {
     let selected = st.loaded.as_ref().map(|l| l.lib_index);
     let mut clicked: Option<usize> = None;
     let mut toggled_fav: Option<usize> = None;
+    let visible: Vec<usize> = lib
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !(st.favorites_only && !r.sidecar.favorite))
+        .filter(|(_, r)| filter.is_empty() || r.folder.to_lowercase().contains(&filter) || r.display_name().to_lowercase().contains(&filter) || r.target.to_lowercase().contains(&filter))
+        .map(|(i, _)| i)
+        .collect();
+    let group_by_target = st.group_by_target;
     egui::ScrollArea::vertical().id_salt("replay_lib_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        for (i, r) in lib.iter().enumerate() {
-            if st.favorites_only && !r.sidecar.favorite {
-                continue;
-            }
-            if !filter.is_empty() && !r.folder.to_lowercase().contains(&filter) && !r.display_name().to_lowercase().contains(&filter) && !r.target.to_lowercase().contains(&filter) {
-                continue;
-            }
+        let mut card = |ui: &mut egui::Ui, i: usize, r: &RunInfo| {
             let is_sel = selected == Some(i);
             let fill = if is_sel { theme::with_alpha(theme::ACCENT, 40) } else { theme::RAISED };
             let stroke = if is_sel { Stroke::new(1.0, theme::ACCENT) } else { Stroke::new(1.0, theme::HAIRLINE) };
@@ -2206,6 +2401,33 @@ fn library_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) {
                 clicked = Some(i);
             }
             ui.add_space(3.0);
+        };
+        if group_by_target {
+            // Groups keep the newest-first run order; header order = first appearance.
+            let mut order: Vec<&str> = Vec::new();
+            let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+            for &i in &visible {
+                let key = lib[i].target.as_str();
+                groups.entry(key).or_insert_with(|| {
+                    order.push(key);
+                    Vec::new()
+                }).push(i);
+            }
+            for key in order {
+                let idxs = &groups[key];
+                egui::CollapsingHeader::new(egui::RichText::new(format!("{key}  ({})", idxs.len())).font(theme::sans(12.0)).strong())
+                    .id_salt(("replay_lib_group", key))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for &i in idxs {
+                            card(ui, i, &lib[i]);
+                        }
+                    });
+            }
+        } else {
+            for &i in &visible {
+                card(ui, i, &lib[i]);
+            }
         }
     });
     if let Some(i) = toggled_fav {
@@ -2279,10 +2501,67 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 3.0, Color32::BLACK);
-        l.pane_w[slot] = size.x.round() as usize;
+
+        // Per-pane pixel zoom: mousewheel about the cursor, drag pans (unless an
+        // annotation drag tool is armed), right-click / chip resets. A display
+        // transform: the image rect scales/offsets and every overlay rides it.
+        while st.pane_zoom.len() <= slot {
+            st.pane_zoom.push(1.0);
+            st.pane_pan.push(Vec2::ZERO);
+            st.pane_view.push(None);
+        }
+        if let Some(ptr) = resp.hover_pos() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                let old = st.pane_zoom[slot];
+                let new = (old * (scroll * 0.0022).exp()).clamp(1.0, 16.0);
+                if new != old {
+                    let cpos = rect.center() + st.pane_pan[slot];
+                    st.pane_pan[slot] = (ptr + (cpos - ptr) * (new / old)) - rect.center();
+                    st.pane_zoom[slot] = new;
+                }
+            }
+        }
+        let pan_allowed = !matches!(st.annot_mode, AnnotMode::Arrow | AnnotMode::Box);
+        if resp.dragged() && pan_allowed && st.pane_zoom[slot] > 1.001 {
+            st.pane_pan[slot] += resp.drag_delta();
+        }
+        if resp.secondary_clicked() {
+            st.pane_zoom[slot] = 1.0;
+        }
+        if st.pane_zoom[slot] <= 1.001 {
+            st.pane_zoom[slot] = 1.0;
+            st.pane_pan[slot] = Vec2::ZERO;
+        } else {
+            let lim = Vec2::new(rect.width(), rect.height()) * st.pane_zoom[slot] * 0.6;
+            st.pane_pan[slot] = st.pane_pan[slot].clamp(-lim, lim);
+        }
+        let zoom = st.pane_zoom[slot];
+        let img_rect = Rect::from_center_size(rect.center() + st.pane_pan[slot], size * zoom);
+        // Decode target follows the zoom so a paused zoomed view sharpens up.
+        l.pane_w[slot] = (size.x * zoom).round() as usize;
+        // Visible source-pixel rect (crop export) while zoomed.
+        st.pane_view[slot] = if zoom > 1.001 {
+            l.last_frame[slot]
+                .as_ref()
+                .filter(|f| f.full_w > 0 && f.full_h > 0)
+                .map(|f| {
+                    let vis = rect.intersect(img_rect);
+                    let fx = f.full_w as f32 / img_rect.width();
+                    let fy = f.full_h as f32 / img_rect.height();
+                    let x0 = (((vis.min.x - img_rect.min.x) * fx).floor().max(0.0)) as usize;
+                    let y0 = (((vis.min.y - img_rect.min.y) * fy).floor().max(0.0)) as usize;
+                    let x1 = (((vis.max.x - img_rect.min.x) * fx).ceil().max(0.0) as usize).min(f.full_w);
+                    let y1 = (((vis.max.y - img_rect.min.y) * fy).ceil().max(0.0) as usize).min(f.full_h);
+                    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+                })
+                .filter(|v| v[2] >= 2 && v[3] >= 2)
+        } else {
+            None
+        };
 
         if let Some(tex) = &l.textures[slot] {
-            painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.image(tex.id(), img_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         } else {
             let msg = match l.last_frame[slot].as_ref().and_then(|f| f.error.clone()) {
                 Some(e) => format!("decode error: {e}"),
@@ -2294,9 +2573,9 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         // Overlays: vectors, meta text, annotations, stab status.
         if let Some(f) = l.last_frame[slot].clone() {
             if st.overlays && f.error.is_none() {
-                let (pw, ph) = (rect.width() as f64, rect.height() as f64);
+                let (pw, ph) = (img_rect.width() as f64, img_rect.height() as f64);
                 if let Some(v) = compute_track_vectors(&l.run.trajectory, f.t, pw, ph) {
-                    let p = |q: [f64; 2]| Pos2::new(rect.min.x + q[0] as f32, rect.min.y + q[1] as f32);
+                    let p = |q: [f64; 2]| Pos2::new(img_rect.min.x + q[0] as f32, img_rect.min.y + q[1] as f32);
                     let (a, it) = (p(v.anchor), p(v.intrack));
                     painter.arrow(a, it - a, Stroke::new(1.5, theme::GREEN));
                     painter.line_segment([p(v.cross_p), p(v.cross_n)], Stroke::new(1.5, theme::ACCENT));
@@ -2312,7 +2591,7 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
                 }
                 let annot_col = theme::RED;
                 for a in l.annotations.iter().filter(|a| a.cam() == slot) {
-                    let p = |x: f64, y: f64| Pos2::new(rect.min.x + x as f32 * rect.width(), rect.min.y + y as f32 * rect.height());
+                    let p = |x: f64, y: f64| Pos2::new(img_rect.min.x + x as f32 * img_rect.width(), img_rect.min.y + y as f32 * img_rect.height());
                     match a {
                         Annotation::Text { x, y, text, .. } => {
                             painter.text(p(*x, *y), Align2::LEFT_BOTTOM, text, theme::sans(12.0), annot_col);
@@ -2338,7 +2617,7 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         // Draft annotation preview.
         if let Some((dc, x0, y0, x1, y1)) = st.annot_draft {
             if dc == slot {
-                let p = |x: f64, y: f64| Pos2::new(rect.min.x + x as f32 * rect.width(), rect.min.y + y as f32 * rect.height());
+                let p = |x: f64, y: f64| Pos2::new(img_rect.min.x + x as f32 * img_rect.width(), img_rect.min.y + y as f32 * img_rect.height());
                 match st.annot_mode {
                     AnnotMode::Box => {
                         painter.rect_stroke(Rect::from_two_pos(p(x0, y0), p(x1, y1)), 0.0, Stroke::new(1.5, theme::RED));
@@ -2351,7 +2630,7 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         }
         if let Some((pc, x, y)) = st.annot_pending {
             if pc == slot {
-                let p = Pos2::new(rect.min.x + x as f32 * rect.width(), rect.min.y + y as f32 * rect.height());
+                let p = Pos2::new(img_rect.min.x + x as f32 * img_rect.width(), img_rect.min.y + y as f32 * img_rect.height());
                 painter.circle_stroke(p, 5.0, Stroke::new(1.5, theme::RED));
             }
         }
@@ -2361,9 +2640,21 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         painter.rect_stroke(rect, 3.0, Stroke::new(if active { 1.5 } else { 1.0 }, if active { theme::ACCENT } else { theme::HAIRLINE }));
         let tag = format!("CAM {}", cam.cam_index + 1);
         painter.text(rect.right_top() + Vec2::new(-6.0, 6.0), Align2::RIGHT_TOP, tag, theme::mono(11.0), if active { theme::ACCENT } else { theme::TEXT_2 });
+        // Zoom reset chip (right-click does the same).
+        if zoom > 1.0 {
+            let br = Rect::from_min_size(rect.right_top() + Vec2::new(-92.0, 22.0), Vec2::new(84.0, 18.0));
+            let rb = ui.interact(br, ui.id().with(("replay_zoom_reset", slot)), Sense::click());
+            painter.rect(br, 4.0, theme::with_alpha(theme::RAISED, 230), Stroke::new(1.0, if rb.hovered() { theme::ACCENT } else { theme::HAIRLINE }));
+            painter.text(br.center(), Align2::CENTER_CENTER, format!("{zoom:.1}× · reset"), theme::mono(9.5), if rb.hovered() { theme::TEXT } else { theme::TEXT_2 });
+            if rb.clicked() {
+                st.pane_zoom[slot] = 1.0;
+                st.pane_pan[slot] = Vec2::ZERO;
+                st.pane_view[slot] = None;
+            }
+        }
 
-        // Interaction: select pane, annotation tools.
-        let norm = |p: Pos2| (((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0) as f64, ((p.y - rect.min.y) / rect.height()).clamp(0.0, 1.0) as f64);
+        // Interaction: select pane, annotation tools (image-normalized coords).
+        let norm = |p: Pos2| (((p.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0) as f64, ((p.y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0) as f64);
         if resp.clicked() {
             new_active = Some(slot);
             if st.annot_mode == AnnotMode::Text {
@@ -2555,6 +2846,63 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
     if st.loaded.is_none() {
         return;
     }
+    // Notes + tags -> postproc.json (saved when the field loses focus).
+    let mut save_meta = false;
+    let r = ui.add(egui::TextEdit::multiline(&mut st.notes_buf).hint_text("notes").desired_rows(2).desired_width(f32::INFINITY).font(theme::sans(11.5)));
+    save_meta |= r.lost_focus();
+    let r = ui.add(egui::TextEdit::singleline(&mut st.tags_buf).hint_text("tags (comma separated)").desired_width(f32::INFINITY).font(theme::sans(11.5)));
+    save_meta |= r.lost_focus();
+    if save_meta {
+        let tags: Vec<String> = st.tags_buf.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        let dirty = st.loaded.as_mut().map_or(false, |l| {
+            let d = l.sidecar.notes != st.notes_buf || l.sidecar.tags != tags;
+            if d {
+                l.sidecar.notes = st.notes_buf.clone();
+                l.sidecar.tags = tags;
+            }
+            d
+        });
+        if dirty {
+            st.save_sidecar();
+        }
+    }
+    // Delete run: two-step confirm, the armed state expires after 3 s.
+    let mut delete_now = false;
+    ui.horizontal(|ui| {
+        let armed = st.delete_confirm.map_or(false, |t| t.elapsed() < Duration::from_secs(3));
+        if !armed {
+            st.delete_confirm = None;
+        }
+        let label = if armed { "really delete?" } else { "delete run" };
+        if ui.button(egui::RichText::new(label).font(theme::sans(11.0)).color(theme::RED)).clicked() {
+            if armed {
+                delete_now = true;
+            } else {
+                st.delete_confirm = Some(Instant::now());
+            }
+        }
+        if armed {
+            ui.label(egui::RichText::new("removes the whole run folder").font(theme::sans(10.5)).color(theme::AMBER));
+            ui.ctx().request_repaint_after(Duration::from_millis(250)); // let the arm expire visibly
+        }
+    });
+    if delete_now {
+        let path = run.path.clone();
+        st.close_run();
+        st.delete_confirm = None;
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                st.last_job_msg = format!("deleted {}", path.display());
+                st.last_job_ok = true;
+            }
+            Err(e) => {
+                st.last_job_msg = format!("delete failed: {e}");
+                st.last_job_ok = false;
+            }
+        }
+        st.rescan(captures_dir);
+        return;
+    }
     ui.add_space(6.0);
 
     // Image adjust.
@@ -2691,13 +3039,25 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
 
     // Stack.
     theme::section(ui, "Stack (In → Out)");
+    let n_range = st.loaded.as_ref().map(|l| frames_in_range(&l.run, slot, st.in_marker, st.out_marker).len()).unwrap_or(0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("best N").color(theme::TEXT_2));
         ui.add(egui::DragValue::new(&mut st.stack_n).range(1..=2000).speed(1.0));
-        let n_range = st.loaded.as_ref().map(|l| frames_in_range(&l.run, slot, st.in_marker, st.out_marker).len()).unwrap_or(0);
         ui.label(egui::RichText::new(format!("of {n_range} in range")).font(theme::mono(10.5)).color(theme::DIM));
+        for (label, frac) in [("25%", 0.25), ("50%", 0.5)] {
+            if ui.small_button(label).on_hover_text(format!("best N = {label} of the frames in range")).clicked() {
+                st.stack_n = ((frac * n_range as f64).ceil() as usize).max(1);
+            }
+        }
     });
-    if ui.add_enabled(!st.job_running(), egui::Button::new(format!("Stack best {}", st.stack_n))).on_hover_text("Grade by Laplacian sharpness, keep the best N, align to the sharpest (flow), coverage-weighted mean → 16-bit master PNG + sharpened/stretched final PNG in exports/").clicked() {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut st.stack_centered, egui::RichText::new("centered").font(theme::sans(11.0))).on_hover_text("PIPP-style: recentre each frame on the track target / brightest blob and crop before aligning");
+        if st.stack_centered {
+            ui.add(egui::DragValue::new(&mut st.stack_center_size).range(64..=4096).speed(8.0));
+            ui.label(egui::RichText::new("px crop").font(theme::mono(10.5)).color(theme::DIM));
+        }
+    });
+    if ui.add_enabled(!st.job_running(), egui::Button::new(format!("Stack best {}", st.stack_n))).on_hover_text("Pre-cull empty frames (content score), grade by Laplacian sharpness, keep the best N, align to the sharpest (flow), coverage-weighted mean → 16-bit master PNG + sharpened/stretched final PNG in exports/").clicked() {
         st.start_stack(captures_dir);
     }
     ui.add_space(6.0);
@@ -2707,6 +3067,13 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
     let mp4_ok = cfg!(feature = "mp4-export");
     if !mp4_ok {
         ui.label(egui::RichText::new("not compiled in (feature mp4-export)").color(theme::RED));
+    }
+    // Crop-to-view: offered while the active pane holds a pixel zoom.
+    match st.pane_view.get(st.active_cam).copied().flatten() {
+        Some(v) => {
+            ui.checkbox(&mut st.export_crop, egui::RichText::new(format!("crop to view ({}×{} px)", v[2], v[3])).font(theme::sans(11.0))).on_hover_text("Bake the zoomed pane view into the export (annotations remapped)");
+        }
+        None => st.export_crop = false,
     }
     ui.horizontal(|ui| {
         if ui.add_enabled(mp4_ok && !st.job_running(), egui::Button::new("Export clip (In → Out)")).clicked() {
@@ -2953,6 +3320,41 @@ mod tests {
     }
 
     #[test]
+    fn precull_center_helpers() {
+        // Content: a bright blob scores far above flat frames.
+        let mut blob = Gray::new(64, 64);
+        for y in 28..36 {
+            for x in 28..36 {
+                blob.data[y * 64 + x] = 250;
+            }
+        }
+        let flat = Gray::new(64, 64);
+        assert!(content_score_gray(&blob) > 10.0 * (content_score_gray(&flat) + 1e-9));
+        // Centroid lands on the blob; a flat frame has no target.
+        let (cx, cy) = brightness_centroid_gray(&blob).unwrap();
+        assert!((cx - 31.5).abs() < 1.0 && (cy - 31.5).abs() < 1.0, "{cx} {cy}");
+        assert!(brightness_centroid_gray(&flat).is_none());
+        // Centred crop puts the blob centre on the output centre pixel, zero-padded.
+        let c = crop_centered_gray(&blob, cx, cy, 16);
+        assert_eq!((c.w, c.h), (16, 16));
+        assert!(c.data[8 * 16 + 8] == 250);
+        let edge = crop_centered_gray(&blob, 0.0, 0.0, 16);
+        assert_eq!(edge.data[0], 0); // off-frame area padded
+        // Centered stack through the job: output is center_size².
+        let root = synth_library();
+        let runs = scan_library(&root);
+        let sat = Arc::new(runs.into_iter().find(|r| r.target == "TESTSAT").unwrap());
+        let out_dir = root.join("exports");
+        let status = Arc::new(ArcSwap::from_pointee(JobStatus::default()));
+        let cancel = AtomicBool::new(false);
+        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 3, stab: StabSettings::default(), out_base: out_dir.join("stack_ctr"), centered: true, center_size: 48 };
+        let final_path = run_stack(&spec, &status, &cancel).unwrap();
+        let img = image::open(&final_path).unwrap();
+        assert_eq!((img.width(), img.height()), (48, 48));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn stabilizer_reduces_shift() {
         let base = textured(160, 120, 20, 20, 9);
         let shifted = textured(160, 120, 26, 17, 9); // +6, -3 px
@@ -2984,7 +3386,7 @@ mod tests {
         let status = Arc::new(ArcSwap::from_pointee(JobStatus::default()));
         let cancel = AtomicBool::new(false);
         // Stack best 4 of cam 1 over the whole run.
-        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 4, stab: StabSettings::default(), out_base: out_dir.join("stack_test") };
+        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 4, stab: StabSettings::default(), out_base: out_dir.join("stack_test"), centered: false, center_size: 512 };
         let final_path = run_stack(&spec, &status, &cancel).unwrap();
         assert!(final_path.exists() && out_dir.join("stack_test.png").exists());
         let master = image::open(out_dir.join("stack_test.png")).unwrap();
@@ -2998,7 +3400,7 @@ mod tests {
             params.stabilize = true;
             params.sharpen.on = true;
             let t_end = sat.cams[0].frames[4].t;
-            let spec = ExportSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end, out_path: out_dir.join("clip.mp4"), params, overlays: true, annotations: vec![Annotation::Text { cam: 0, x: 0.5, y: 0.5, text: "T".into() }], fps: None };
+            let spec = ExportSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end, out_path: out_dir.join("clip.mp4"), params, overlays: true, annotations: vec![Annotation::Text { cam: 0, x: 0.5, y: 0.5, text: "T".into() }], fps: None, crop: None };
             let p = run_export(&spec, &status, &cancel).unwrap();
             let len = std::fs::metadata(&p).unwrap().len();
             assert!(len > 500, "mp4 too small: {len}");

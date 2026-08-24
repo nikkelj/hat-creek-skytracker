@@ -549,47 +549,10 @@ impl eframe::App for App {
             }
             Screen::Mount3d => {
                 egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-                    let m = self.shared.mount.load();
-                    let cfg = &self.shared.config;
-                    let cam_fov = self.shared.cam(self.shared.hotspot_slot()).map(|c| c.fov_deg).unwrap_or(1.0);
-                    // Sky objects for the dome: bright stars, bodies, the
-                    // trackable satellites (dead-reckoned), the selection.
-                    let sky = self.shared.sky.load();
-                    let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
-                    let mask = cfg.elevation_mask_deg;
-                    let mut marks: Vec<mount3d::SkyMark> = Vec::with_capacity(1200);
-                    for s in sky.stars.iter().filter(|s| s.mag <= 4.5) {
-                        marks.push(mount3d::SkyMark { az: s.az, el: s.el, kind: mount3d::SkyKind::Star { mag: s.mag as f32 } });
-                    }
-                    for b in &sky.bodies {
-                        marks.push(mount3d::SkyMark { az: b.az, el: b.el, kind: mount3d::SkyKind::Body { name: b.name.clone() } });
-                    }
-                    for s in &sky.sats {
-                        let el = s.el + s.el_rate * age_s;
-                        if el < mask {
-                            continue;
-                        }
-                        let selected = self.ui.selected.as_deref() == Some(s.satnum.as_str());
-                        marks.push(mount3d::SkyMark {
-                            az: s.az + s.az_rate * age_s,
-                            el,
-                            kind: mount3d::SkyKind::Sat { selected, geo: s.range_km > 20_000.0, name: s.name.clone() },
-                        });
-                    }
-                    let pose = mount3d::MountPose {
-                        sky: &marks,
-                        az_deg: m.azm,
-                        el_deg: m.alt,
-                        mount_mode: &cfg.mount_mode,
-                        lat_deg: cfg.lat_deg,
-                        target: m.setpoint,
-                        tracking: matches!(m.mode.as_str(), "PROGRAM" | "HANDOFF" | "HOTSPOT"),
-                        fov_deg: cam_fov,
-                        az_limits: Some(cfg.azm_limit),
-                        el_limits: Some(cfg.alt_limit),
-                    };
-                    let size = ui.available_size();
-                    self.mount3d.ui(ui, size, &pose);
+                    // The screen reads its own snapshots (mount, sky, ADS-B,
+                    // passes, cameras, config) and mirrors sky-object clicks
+                    // through the shared selection + SelectTarget.
+                    self.mount3d.ui(ui, &self.shared, &mut self.ui, &self.tx);
                 });
             }
             Screen::Sim => {

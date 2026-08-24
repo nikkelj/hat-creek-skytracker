@@ -272,6 +272,19 @@ coverage circle). Every layout carries the **visible-satellites table**
 mousewheel over any camera view **pixel-zooms** about the cursor (drag to
 pan, reset button) independently of the hardware ROI.
 
+A four-agent parity scrub (2026-08-24) closed ~60 remaining gaps vs the
+Python app: RATE-mode axis-limit gating, a latching STOP, focus-motor
+drive + read-back on L2/R2, the LAUNCH T-0 override, four-state operator
+bias (az/el and in/cross-track, persisted), per-mode PID profile
+save-back, live lead-time / star-filter / per-axis feed-forward / ADS-B
+fit controls, the Eq residual pointing model, polar alignment (RA sweep +
+axis fit), continuous plate solving + one-star align, a visualization
+time scrub (pause + ±60 min, tracking stays live), sunlit/eclipsed arc
+coloring, capture runs with `trajectory.csv` + config snapshots, HW-sim
+serial fault + co-boresight offset injection, and a global tooltips
+toggle. The config `exposure` key is now correctly treated as
+**microseconds** (Python semantics) with a one-time migration.
+
 The mount panel carries a **KSP-style navball** (orthographic sky/ground
 ball with grid, cardinal letters, bezel, waterline boresight reticle, the
 target's arc + purple setpoint crosshair, ADS-B diamonds, HDG/PITCH box), a

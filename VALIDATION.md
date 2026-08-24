@@ -5,6 +5,60 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-24 — Parity scrub (4-agent audit) + tiers 0–3
+
+A four-agent audit compared every Python subsystem against the native app
+(control/joystick, skyplot/visuals, config keys, camera/align/replay/sim).
+~60 gaps found and worked through in priority tiers:
+
+- **Tier 0 (correctness):** the shared config key `exposure` is
+  **microseconds** in Python but was read/saved as ms by the native app — a
+  1000× corruption in both directions; fixed to µs + a one-time migration of
+  the ms-era values in config.json/config.example.json. RATE mode now gates
+  per-axis against the hardware limits (blocks outward slew, allows return).
+  STOP is a latch (Circle toggles, any mode-select releases) enforced through
+  Inputs.stopped every cycle. Capture runs write trajectory.csv (pass arc +
+  per-frame interpolated rows — native replays now get track overlays),
+  a config snapshot, auto-named folders (NAME_NORAD), and the armed ring is
+  capped by `buffer_size`. Solar-safety warning on selecting the Sun.
+  Defaults aligned to Python (axis limits, FF off, mask 0), string-typed
+  saves for Python's config editor.
+- **Tier 1a (rig controls):** focus motor (L2/R2 analog drive → ±9 rate,
+  ~1 Hz encoder read-back, UI bar), LAUNCH override (T0 re-based to the
+  button press, forces PROGRAM, pre-empts targets, T+ readout), 4-state bias
+  mode (coarse/fine × az-el/along-cross-track with velocity projection,
+  persisted), per-mode gain-profile save-back + seeding, live tunables
+  (lead time, star filter, per-axis FF, ADS-B fit points), Eq pointing model
+  applied in the HA/Dec frame, wrap-aware park servicing, MTI reachable.
+- **Tier 1b (alignment):** polar-align routine (RA sweep + fit_polar_axis →
+  base/tilt knob corrections), asymptotic settle (tol × cycles), retry
+  failed, quick refit (IA/IE), skip + MANUAL banner, continuous plate solve
+  (plate_solve_enabled), one-star "apply align" into alignment_azimuth,
+  prerequisite checklist.
+- **Tier 2 (tracking UX):** visualization-clock pause + ±60 min scrub (mount
+  stays live), sunlit/eclipsed arc coloring (skyplot + navball), celestial
+  ±45 min trajectory polylines, solved-boresight marker, below-horizon
+  bodies pinned to the rim, Pluto, GEO-triangle/MEO-hexagon markers,
+  rotated-rect camera FOV + 10× dashed copy, global tooltips toggle,
+  persisted display toggles, table name/altitude filters + clear, launch
+  selector list, passes TCA time + shift-click secondary sort, info-pane
+  RA/Dec + rates + below-horizon status, lim-mag readout.
+- **Tier 3a/3b:** camera frame timestamps, ROI 1/32, 0° rotation reset, PNG
+  capture option, 300-line status scrollback + Exit button; HW-sim master
+  switch, save-to-config, seed, cam2 co-boresight offset injection, serial
+  latency/garbage fault injection.
+
+**Deferred with intent (documented, not dropped):** ORB stabilizer method +
+alignment-point local warping in Replay (flow stabilizer covers the need),
+injected sim pointing-model/refraction, Eq-mode alignment *fitting* (the Eq
+residual model is applied but fits still run alt-az; Python-era eq fits are
+honored from config), local-timezone clock (needs a tz database).
+
+Autotest after each tier: HOTSPOT lock holds (err 0.007–0.02°), workspace
+tests green throughout.
+
+---
+
 ## 2026-08-23 — UI round 5: KSP navball, virtual controller, live PID, pixel zoom
 
 - **KSP-style navball** (port of joystick_panels.render_navball): true

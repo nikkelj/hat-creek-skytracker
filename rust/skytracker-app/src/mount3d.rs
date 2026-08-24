@@ -22,16 +22,19 @@
 //! | AltAzSide   | (north, horizon)  | AZM + 90 | 90 - ALT |
 //! | Eq          | (north, lat)      | AZM      | ALT      |
 //!
-//! `MountPose::az_deg` / `el_deg` are therefore the mount AXIS readouts
+//! The posed angles are therefore the mount AXIS readouts
 //! (AZM, ALT -- what the mount worker publishes), not sky az/el; the sky
 //! direction is derived through the chain and shown in the HUD.
 //!
 //! Interaction: drag = orbit (yaw/pitch around the mount head), wheel =
 //! zoom, double-click = reset view.
 
-use egui::{pos2, Align2, Color32, PointerButton, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2};
+use egui::{pos2, Align2, Color32, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
+use std::sync::Arc;
 
+use crate::state::{Config, MountCmd, Shared};
 use crate::theme;
+use crate::ui::UiState;
 
 // ---------------------------------------------------------------- constants
 
@@ -273,8 +276,9 @@ fn mount_pose(mode: ModeKind, lat_deg: f64, azm: f64, alt: f64) -> Pose {
 }
 
 /// Unit directions of the 4 FOV corners (pinhole), built on the tube's
-/// (axis2, up) frame. Order: (-w,-h), (+w,-h), (+w,+h), (-w,+h).
-fn fov_corner_dirs(boresight: V3, axis2: V3, fov_w_deg: f64, fov_h_deg: f64) -> [V3; 4] {
+/// (axis2, up) frame, then rolled about the boresight by the camera's
+/// alignment rotation. Order: (-w,-h), (+w,-h), (+w,+h), (-w,+h).
+fn fov_corner_dirs(boresight: V3, axis2: V3, fov_w_deg: f64, fov_h_deg: f64, roll_deg: f64) -> [V3; 4] {
     let b = boresight.normalized();
     let mut right = axis2 - b * axis2.dot(b);
     if right.norm() < 1e-9 {
@@ -284,7 +288,8 @@ fn fov_corner_dirs(boresight: V3, axis2: V3, fov_w_deg: f64, fov_h_deg: f64) -> 
     let up_t = b.cross(right);
     let tw = (fov_w_deg.to_radians() / 2.0).tan();
     let th = (fov_h_deg.to_radians() / 2.0).tan();
-    let c = |sx: f64, sy: f64| (b + right * (sx * tw) + up_t * (sy * th)).normalized();
+    let roll = M3::rot_about(b, roll_deg);
+    let c = |sx: f64, sy: f64| roll.mul_v(b + right * (sx * tw) + up_t * (sy * th)).normalized();
     [c(-1.0, -1.0), c(1.0, -1.0), c(1.0, 1.0), c(-1.0, 1.0)]
 }
 
@@ -449,17 +454,13 @@ struct Camera {
 const N_PLANES: usize = 5;
 
 impl Camera {
-    fn orbit(yaw_deg: f64, pitch_deg: f64, zoom: f64, rect: Rect) -> Camera {
-        let cam_dir = unit_from_azel(yaw_deg, pitch_deg.clamp(-89.0, 89.0));
-        let pos = HEAD + cam_dir * (BASE_DIST / zoom.max(1e-3));
-        let fwd = -cam_dir;
+    fn build(pos: V3, fwd: V3, focal: f64, rect: Rect) -> Camera {
         let mut right = fwd.cross(UP);
         if right.norm() < 1e-6 {
             right = EAST;
         }
         let right = right.normalized();
         let up = right.cross(fwd);
-        let focal = (0.9 * rect.height() as f64).max(1.0);
         let margin = 60.0;
         Camera {
             right,
@@ -472,6 +473,20 @@ impl Camera {
             kx: (rect.width() as f64 / 2.0 + margin) / focal,
             ky: (rect.height() as f64 * 0.52 + margin) / focal,
         }
+    }
+
+    fn orbit(yaw_deg: f64, pitch_deg: f64, zoom: f64, rect: Rect) -> Camera {
+        let cam_dir = unit_from_azel(yaw_deg, pitch_deg.clamp(-89.0, 89.0));
+        let pos = HEAD + cam_dir * (BASE_DIST / zoom.max(1e-3));
+        Camera::build(pos, -cam_dir, (0.9 * rect.height() as f64).max(1.0), rect)
+    }
+
+    /// First-person view from the operator's seat: eye at true height above
+    /// the ground, so foreground parallax matches what the operator sees;
+    /// "zoom" is a focal multiplier (the seat itself does not move).
+    fn operator(eye: V3, look_az: f64, look_el: f64, eye_zoom: f64, rect: Rect) -> Camera {
+        let fwd = unit_from_azel(look_az, look_el.clamp(-89.0, 89.0));
+        Camera::build(eye, fwd, (0.9 * rect.height() as f64 * eye_zoom).max(1.0), rect)
     }
 
     /// Signed "inside" distance of a camera-space point to clip plane `i`
@@ -573,59 +588,60 @@ fn sky_point(az: f64, el: f64) -> V3 {
 
 // -------------------------------------------------------------- public API
 
-/// Live inputs for one frame of the Mount 3D view.
-///
-/// `az_deg` / `el_deg` are the mount AXIS angles (AZM, ALT) as published by
-/// the mount worker, in the mount's own convention (AltAz: ALT 0 = zenith,
-/// el = 90 - ALT). `target` is a sky (az, el) direction; `fov_deg` is the
-/// camera's horizontal FOV (a 3:2 frame is drawn). Limits are in mount axis
-/// degrees: `(min, max)` allowed spans for AZM and ALT.
-/// A sky object painted on the dome.
-#[derive(Clone, Debug)]
-pub struct SkyMark {
-    pub az: f64,
-    pub el: f64,
-    pub kind: SkyKind,
-}
-
-#[derive(Clone, Debug)]
-pub enum SkyKind {
-    Star { mag: f32 },
-    Body { name: String },
-    Sat { selected: bool, geo: bool, name: String },
-}
-
-pub struct MountPose<'a> {
-    /// Stars / planets / satellites to paint on the dome (may be empty).
-    pub sky: &'a [SkyMark],
-    pub az_deg: f64,
-    pub el_deg: f64,
-    /// "AltAz" | "AltAzSide" | "Passthrough" | "Eq" (case/punctuation-insensitive).
-    pub mount_mode: &'a str,
-    pub lat_deg: f64,
-    /// Sky (az, el) of the selected/tracked target.
-    pub target: Option<(f64, f64)>,
-    pub tracking: bool,
-    pub fov_deg: f64,
-    pub az_limits: Option<(f64, f64)>,
-    pub el_limits: Option<(f64, f64)>,
-}
-
-/// Persistent orbit-view state (drag = orbit, wheel = zoom).
+/// Persistent view / interaction state for the Mount 3D screen. Scene
+/// inputs come straight from `Shared` snapshots each frame; the only state
+/// this mutates outside itself is the UI selection (mirrored to the mount
+/// worker, skyplot key formats) and persisted config keys (operator seat,
+/// layer toggles).
 pub struct Mount3dView {
-    /// Camera bearing from the mount head, degrees clockwise from north.
+    /// Orbit camera bearing from the mount head, degrees clockwise from north.
     pub yaw_deg: f32,
-    /// Camera elevation above the ground plane, degrees (-89..89).
+    /// Orbit camera elevation above the ground plane, degrees (-89..89).
     pub pitch_deg: f32,
     /// Orbit distance divisor (1 = 6 m from the head), clamped to 0.3..4.
     pub zoom: f32,
+    /// Operator (first-person) view instead of the orbit view.
+    operator: bool,
+    /// Operator look direction; `None` re-aims at the mount head next frame
+    /// (first entry and after every seat move).
+    look_az: Option<f64>,
+    look_el: f64,
+    /// Operator focal multiplier (the seat stays put; the zoom is optical).
+    eye_zoom: f32,
+    /// Pose source: live mount axes, or the manual AZM/ALT sliders.
+    follow_live: bool,
+    manual_azm: f64,
+    manual_alt: f64,
+    /// Operator seat (bearing deg, distance m, eye height m). Seeded from
+    /// config.raw once; later edits live here and persist through
+    /// persist_config_key, because Shared.config is immutable after startup.
+    seat: Option<(f64, f64, f64)>,
     geom_key: Option<(ModeKind, u64)>,
     geom: Vec<Part>,
+    /// Unreachable-sky sample directions, cached on the shaping config.
+    keepout_key: Option<String>,
+    keepout: Vec<V3>,
 }
 
 impl Default for Mount3dView {
     fn default() -> Self {
-        Mount3dView { yaw_deg: 150.0, pitch_deg: 18.0, zoom: 1.0, geom_key: None, geom: Vec::new() }
+        Mount3dView {
+            yaw_deg: 150.0,
+            pitch_deg: 18.0,
+            zoom: 1.0,
+            operator: false,
+            look_az: None,
+            look_el: 0.0,
+            eye_zoom: 1.0,
+            follow_live: true,
+            manual_azm: 0.0,
+            manual_alt: 0.0,
+            seat: None,
+            geom_key: None,
+            geom: Vec::new(),
+            keepout_key: None,
+            keepout: Vec::new(),
+        }
     }
 }
 
@@ -647,9 +663,150 @@ impl Mount3dView {
         &self.geom
     }
 
-    /// Draw the view into `size` points of the current `ui` and handle the
-    /// orbit/zoom interaction. Returns the canvas response.
-    pub fn ui(&mut self, ui: &mut Ui, size: Vec2, pose: &MountPose) -> Response {
+    /// Seat (bearing deg, distance m, eye height m), seeded from config.raw
+    /// on first use.
+    fn seat_cfg(&mut self, cfg: &Config) -> (f64, f64, f64) {
+        *self.seat.get_or_insert_with(|| {
+            let g = |key: &str, d: f64| {
+                let v = &cfg.raw[key];
+                v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(d)
+            };
+            (g("mount3d_observer_bearing_deg", 180.0), g("mount3d_observer_distance_m", 5.0), g("mount3d_eye_height_m", 1.7))
+        })
+    }
+
+    /// Unit directions of unreachable sky — no in-limits mount-axis solution
+    /// through any meridian flip — sampled coarsely (az 10°, el 8°): the
+    /// dome mirror of the skyplot's keepout wash (ui::keepout_image). Cached
+    /// until the shaping config changes.
+    fn keepout_dirs(&mut self, cfg: &Config, mode_str: &str) -> &[V3] {
+        use skytracker_core::transforms::{sky_to_mount, MountMode};
+        let key = format!(
+            "{mode_str}|{}|{:?}|{:?}|{}|{}|{}",
+            cfg.altaz_side_flip, cfg.azm_limit, cfg.alt_limit, cfg.alignment_az, cfg.alignment_el, cfg.lat_deg
+        );
+        if self.keepout_key.as_deref() != Some(key.as_str()) {
+            let mode = crate::mount::parse_mount_mode(mode_str);
+            // AltAz-like modes may reach a direction through the flip solution.
+            let flips: &[bool] = if matches!(mode, MountMode::AltAz | MountMode::Passthrough) { &[false, true] } else { &[false] };
+            let (azm_min, azm_max) = cfg.azm_limit;
+            let (alt_min, alt_max) = cfg.alt_limit;
+            let mut out = Vec::new();
+            for el_i in (3..90).step_by(8) {
+                for az_i in (0..360).step_by(10) {
+                    let (az, el) = (az_i as f64, el_i as f64);
+                    let reachable = flips.iter().any(|&flip| {
+                        let (a, e) = if flip { ((az + 180.0).rem_euclid(360.0), 180.0 - el) } else { (az, el) };
+                        let (azm, alt) = sky_to_mount(mode, a, e, cfg.alignment_az, cfg.alignment_el, cfg.altaz_side_flip);
+                        azm_min <= azm && azm <= azm_max && alt_min <= alt && alt <= alt_max
+                    });
+                    if !reachable {
+                        out.push(unit_from_azel(az, el));
+                    }
+                }
+            }
+            self.keepout = out;
+            self.keepout_key = Some(key);
+        }
+        &self.keepout
+    }
+
+    /// Draw the screen: a control row (view / pose source / sky layers /
+    /// operator seat) and the 3D canvas below it. Scene inputs come from
+    /// `shared` snapshots; sky-object clicks select through `st.selected` +
+    /// `MountCmd::SelectTarget` with the skyplot's key formats.
+    pub fn ui(&mut self, ui: &mut Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &crossbeam_channel::Sender<MountCmd>) {
+        let cfg = &shared.config;
+        let m = shared.mount.load();
+        let sky = shared.sky.load();
+        let adsb = shared.adsb.load();
+        let passes = shared.passes.load();
+        // Live mount mode (Options button cycles it at runtime), not the boot config.
+        let mode_str = if m.mount_mode.is_empty() { cfg.mount_mode.clone() } else { m.mount_mode.clone() };
+        let mode = ModeKind::parse(&mode_str);
+        let live_ok = self.follow_live && m.connected;
+        let (mut brg, mut dist, mut eye_h) = self.seat_cfg(cfg);
+
+        // ---- control row -------------------------------------------------
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.operator, if self.operator { "VIEW: OPERATOR" } else { "VIEW: ORBIT" })
+                .on_hover_text("toggle orbit / operator (first-person) view")
+                .clicked()
+            {
+                self.operator = !self.operator;
+                self.look_az = None; // re-aim at the mount on entry
+            }
+            if ui
+                .selectable_label(self.follow_live, if self.follow_live { "FOLLOW LIVE" } else { "MANUAL POSE" })
+                .on_hover_text("follow the live mount axes, or pose the model with the sliders")
+                .clicked()
+            {
+                self.follow_live = !self.follow_live;
+            }
+            ui.separator();
+            // Sky-layer toggles: the same UiState flags (and persisted config
+            // keys) as the Track screen, so the two views always agree.
+            let before = (st.show_stars, st.show_sats, st.show_aircraft, st.show_messier, st.show_ngc);
+            ui.checkbox(&mut st.show_stars, "stars");
+            ui.checkbox(&mut st.show_sats, "sats");
+            ui.checkbox(&mut st.show_aircraft, "aircraft");
+            ui.checkbox(&mut st.show_messier, "M");
+            ui.checkbox(&mut st.show_ngc, "NGC");
+            if (st.show_stars, st.show_sats, st.show_aircraft, st.show_messier, st.show_ngc) != before {
+                for (key, v) in [
+                    ("starfield_enabled", st.show_stars),
+                    ("satellites_enabled", st.show_sats),
+                    ("aircraft_enabled", st.show_aircraft),
+                    ("messier_enabled", st.show_messier),
+                    ("ngc_enabled", st.show_ngc),
+                ] {
+                    crate::mount::persist_config_key(&cfg.path, key, serde_json::json!(v));
+                }
+            }
+            ui.separator();
+            // Operator-seat controls (always visible; they also move the marker).
+            ui.label(egui::RichText::new(format!("seat {brg:.0}° · {dist:.2} m · eye {eye_h:.2} m")).font(theme::mono(10.5)).color(theme::TEXT_2));
+            let mut changed = false;
+            for (label, delta) in [("brg −", -15.0), ("brg +", 15.0)] {
+                if ui.small_button(label).clicked() {
+                    brg = (brg + delta).rem_euclid(360.0);
+                    changed = true;
+                }
+            }
+            for (label, delta) in [("dist −", -0.25), ("dist +", 0.25)] {
+                if ui.small_button(label).clicked() {
+                    dist = (dist + delta).clamp(0.5, 15.0);
+                    changed = true;
+                }
+            }
+            for (label, delta) in [("eye −", -0.1), ("eye +", 0.1)] {
+                if ui.small_button(label).clicked() {
+                    eye_h = (eye_h + delta).clamp(0.2, 2.5);
+                    changed = true;
+                }
+            }
+            if changed {
+                self.seat = Some((brg, dist, eye_h));
+                self.look_az = None; // seat moved: re-aim the operator view
+                for (key, v) in [
+                    ("mount3d_observer_bearing_deg", brg),
+                    ("mount3d_observer_distance_m", dist),
+                    ("mount3d_eye_height_m", eye_h),
+                ] {
+                    crate::mount::persist_config_key(&cfg.path, key, serde_json::json!(v));
+                }
+            }
+            // Manual pose sliders (drive the model whenever live isn't).
+            if !live_ok {
+                ui.separator();
+                ui.spacing_mut().slider_width = 130.0;
+                ui.add(egui::Slider::new(&mut self.manual_azm, 0.0..=360.0).text("AZM").fixed_decimals(1));
+                ui.add(egui::Slider::new(&mut self.manual_alt, -90.0..=270.0).text("ALT").fixed_decimals(1));
+            }
+        });
+
+        let size = ui.available_size();
         let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
         let rect = response.rect;
         let painter = painter.with_clip_rect(rect);
@@ -657,14 +814,26 @@ impl Mount3dView {
         // ---- interaction -------------------------------------------------
         if response.dragged_by(PointerButton::Primary) {
             let d = response.drag_delta();
-            // Drag right -> the scene turns with the hand (yaw increases).
-            self.yaw_deg = (self.yaw_deg + d.x * 0.4).rem_euclid(360.0);
-            self.pitch_deg = (self.pitch_deg + d.y * 0.4).clamp(-89.0, 89.0);
+            if self.operator {
+                // Look around from the seat (Python's look-drag rates).
+                if let Some(la) = self.look_az {
+                    self.look_az = Some((la + d.x as f64 * 0.15).rem_euclid(360.0));
+                }
+                self.look_el = (self.look_el - d.y as f64 * 0.15).clamp(-89.0, 89.0);
+            } else {
+                // Drag right -> the scene turns with the hand (yaw increases).
+                self.yaw_deg = (self.yaw_deg + d.x * 0.4).rem_euclid(360.0);
+                self.pitch_deg = (self.pitch_deg + d.y * 0.4).clamp(-89.0, 89.0);
+            }
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll != 0.0 {
-                self.zoom = (self.zoom * 1.15f32.powf(scroll / 50.0)).clamp(0.3, 4.0);
+                if self.operator {
+                    self.eye_zoom = (self.eye_zoom * 1.15f32.powf(scroll / 50.0)).clamp(0.5, 3.0);
+                } else {
+                    self.zoom = (self.zoom * 1.15f32.powf(scroll / 50.0)).clamp(0.3, 4.0);
+                }
             }
         }
         if response.double_clicked() {
@@ -672,16 +841,31 @@ impl Mount3dView {
             self.yaw_deg = d.yaw_deg;
             self.pitch_deg = d.pitch_deg;
             self.zoom = d.zoom;
+            self.eye_zoom = d.eye_zoom;
+            self.look_az = None;
         }
         let cursor = if response.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab };
         let response = response.on_hover_cursor(cursor);
 
         // ---- scene inputs ------------------------------------------------
-        let mode = ModeKind::parse(pose.mount_mode);
-        let cam = Camera::orbit(self.yaw_deg as f64, self.pitch_deg as f64, self.zoom as f64, rect);
-        let mp = mount_pose(mode, pose.lat_deg, pose.az_deg, pose.el_deg);
+        let (azm, alt) = if live_ok { (m.azm, m.alt) } else { (self.manual_azm, self.manual_alt) };
+        let seat_ground = unit_from_azel(brg, 0.0) * dist;
+        let cam = if self.operator {
+            let eye = v3(seat_ground.x, seat_ground.y, eye_h);
+            if self.look_az.is_none() {
+                let (a, e) = azel_from_unit((HEAD - eye).normalized());
+                self.look_az = Some(a);
+                self.look_el = e;
+            }
+            Camera::operator(eye, self.look_az.unwrap_or(0.0), self.look_el, self.eye_zoom as f64, rect)
+        } else {
+            Camera::orbit(self.yaw_deg as f64, self.pitch_deg as f64, self.zoom as f64, rect)
+        };
+        let mp = mount_pose(mode, cfg.lat_deg, azm, alt);
         let ota_origin = HEAD + mp.axis2 * OTA_ARM_OFFSET;
         let (sky_az, sky_el) = azel_from_unit(mp.boresight);
+        let sel = st.selected.clone();
+        let tracking = matches!(m.mode.as_str(), "PROGRAM" | "HANDOFF" | "HOTSPOT");
 
         // ---- ground ------------------------------------------------------
         painter.rect_filled(rect, 4.0, theme::BG);
@@ -737,63 +921,218 @@ impl Mount3dView {
             }
         };
         dome_ring(0.0, Stroke::new(1.0, theme::with_alpha(theme::TEXT_2, 120)));
+        // Straight ahead of the camera: dome-label anchor for either view.
+        let ahead_az = if self.operator { self.look_az.unwrap_or(0.0) } else { self.yaw_deg as f64 + 180.0 };
         for el in [30.0, 60.0] {
             dome_ring(el, hair(230));
             // Label on the far side of the dome (straight ahead of the camera).
-            if let Some(p) = cam.project(sky_point(self.yaw_deg as f64 + 180.0, el)) {
+            if let Some(p) = cam.project(sky_point(ahead_az, el)) {
                 painter.text(p + Vec2::new(0.0, -3.0), Align2::CENTER_BOTTOM, format!("{el:.0}°"), theme::mono(10.0), theme::DIM);
+            }
+        }
+        // Elevation-mask ring (the skyplot's red mask circle, on the dome).
+        if cfg.elevation_mask_deg > 0.5 {
+            dome_ring(cfg.elevation_mask_deg, Stroke::new(1.2, theme::with_alpha(theme::RED, 160)));
+        }
+
+        // ---- keepout tint: translucent red dots over unreachable sky ------
+        {
+            let ko = Color32::from_rgba_unmultiplied(255, 70, 70, 46);
+            for d in self.keepout_dirs(cfg, &mode_str) {
+                if let Some(p) = cam.project(HEAD + *d * R_SKY) {
+                    painter.circle_filled(p, 2.5, ko);
+                }
             }
         }
 
         // ---- sky objects on the dome ---------------------------------------
-        for m in pose.sky {
-            if m.el < -0.5 {
+        // Every drawn mark that is selectable lands in `clicks` (screen pos +
+        // skyplot selection key) for the hit test at the end of the frame.
+        let mut clicks: Vec<(Pos2, String)> = Vec::new();
+        let is_sel = |key: &str| sel.as_deref() == Some(key);
+        let sel_ring = |p: Pos2| painter.circle_stroke(p, 8.0, Stroke::new(1.4, theme::ACCENT));
+        let age_s = ((crate::sky::now_jd_tt() - sky.jd_tt) * 86400.0).clamp(0.0, 5.0);
+        let mask = cfg.elevation_mask_deg;
+        if st.show_stars {
+            for s in sky.stars.iter().filter(|s| s.el > -0.5 && s.mag <= 4.5) {
+                let Some(p) = cam.project(sky_point(s.az, s.el)) else { continue };
+                let r = (2.4 - s.mag as f32 * 0.4).clamp(0.7, 2.4);
+                let g = (205.0 - s.mag * 18.0).clamp(90.0, 220.0) as u8;
+                painter.circle_filled(p, r, Color32::from_rgb(g, g, (g as u16 + 12).min(255) as u8));
+                // Only the IAU-named stars are click-selectable (skyplot parity).
+                if let Some(name) = sky.star_names.get(&s.hip) {
+                    let key = format!("star:HIP{}", s.hip);
+                    if is_sel(&key) {
+                        sel_ring(p);
+                        painter.text(p + Vec2::new(11.0, 0.0), Align2::LEFT_CENTER, name, theme::sans(10.5), theme::TEXT);
+                    }
+                    clicks.push((p, key));
+                }
+            }
+        }
+        for b in &sky.bodies {
+            if b.el < -0.5 {
                 continue;
             }
-            let Some(p) = cam.project(sky_point(m.az, m.el)) else { continue };
-            match &m.kind {
-                SkyKind::Star { mag } => {
-                    let r = (2.4 - mag * 0.4).clamp(0.7, 2.4);
-                    let g = (205.0 - mag * 18.0).clamp(90.0, 220.0) as u8;
-                    painter.circle_filled(p, r, Color32::from_rgb(g, g, (g as u16 + 12).min(255) as u8));
+            let Some(p) = cam.project(sky_point(b.az, b.el)) else { continue };
+            let (col, r) = match b.name.as_str() {
+                "sun" => (Color32::from_rgb(255, 225, 130), 5.5),
+                "moon" => (Color32::from_rgb(215, 218, 228), 4.5),
+                _ => (Color32::from_rgb(235, 205, 140), 3.0),
+            };
+            painter.circle_filled(p, r, col);
+            painter.text(p + Vec2::new(7.0, -5.0), Align2::LEFT_CENTER, &b.name, theme::sans(10.5), theme::with_alpha(col, 220));
+            let key = format!("body:{}", b.name);
+            if is_sel(&key) {
+                sel_ring(p);
+            }
+            clicks.push((p, key));
+        }
+        if st.show_sats {
+            for s in &sky.sats {
+                // Dead-reckoned forward with the published rates, like the skyplot.
+                let el = s.el + s.el_rate * age_s;
+                if el < mask {
+                    continue;
                 }
-                SkyKind::Body { name } => {
-                    let (col, r) = match name.as_str() {
-                        "sun" => (Color32::from_rgb(255, 225, 130), 5.5),
-                        "moon" => (Color32::from_rgb(215, 218, 228), 4.5),
-                        _ => (Color32::from_rgb(235, 205, 140), 3.0),
-                    };
-                    painter.circle_filled(p, r, col);
-                    painter.text(p + Vec2::new(7.0, -5.0), Align2::LEFT_CENTER, name, theme::sans(10.5), theme::with_alpha(col, 220));
+                let geo = s.range_km > 20_000.0;
+                let meo = !geo && s.range_km > 3_000.0;
+                if (geo && !st.show_geo) || (meo && !st.show_meo) {
+                    continue;
                 }
-                SkyKind::Sat { selected, geo, name } => {
-                    let col = if *geo { theme::VIOLET } else { Color32::from_rgb(255, 236, 200) };
-                    painter.circle_filled(p, if *selected { 3.0 } else { 2.0 }, if *selected { theme::ACCENT } else { theme::with_alpha(col, 200) });
-                    if *selected {
-                        painter.circle_stroke(p, 8.0, Stroke::new(1.4, theme::ACCENT));
-                        painter.text(p + Vec2::new(11.0, 0.0), Align2::LEFT_CENTER, name, theme::sans(11.0), theme::TEXT);
+                let az = s.az + s.az_rate * age_s;
+                let Some(p) = cam.project(sky_point(az, el)) else { continue };
+                let selected = is_sel(&s.satnum);
+                let col = if geo { theme::VIOLET } else { Color32::from_rgb(255, 236, 200) };
+                painter.circle_filled(p, if selected { 3.0 } else { 2.0 }, if selected { theme::ACCENT } else { theme::with_alpha(col, 200) });
+                if selected {
+                    sel_ring(p);
+                    painter.text(p + Vec2::new(11.0, 0.0), Align2::LEFT_CENTER, &s.name, theme::sans(11.0), theme::TEXT);
+                }
+                clicks.push((p, s.satnum.clone()));
+            }
+        }
+        if st.show_aircraft {
+            let now_u = crate::sky::now_unix();
+            let orange = Color32::from_rgb(255, 165, 80);
+            for a in &adsb.aircraft {
+                let age = (now_u - a.fit_t_unix).clamp(0.0, 120.0);
+                let (az, el) = (a.fit_az + a.az_rate * age, a.fit_el + a.el_rate * age);
+                if el < 0.0 {
+                    continue;
+                }
+                let Some(p) = cam.project(sky_point(az, el)) else { continue };
+                let key = format!("adsb:{}", a.icao);
+                let selected = is_sel(&key);
+                let d = if selected { 5.0 } else { 4.0 };
+                painter.add(Shape::convex_polygon(
+                    vec![p + Vec2::new(0.0, -d), p + Vec2::new(d, 0.0), p + Vec2::new(0.0, d), p + Vec2::new(-d, 0.0)],
+                    theme::with_alpha(orange, 220),
+                    Stroke::new(0.8, orange),
+                ));
+                if selected {
+                    sel_ring(p);
+                    painter.text(p + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, &a.label, theme::sans(10.5), theme::TEXT);
+                }
+                clicks.push((p, key));
+            }
+        }
+        if st.show_messier || st.show_ngc {
+            for d in &sky.dsos {
+                if d.el < 0.0 || (d.messier && !st.show_messier) || (!d.messier && !st.show_ngc) {
+                    continue;
+                }
+                let Some(p) = cam.project(sky_point(d.az, d.el)) else { continue };
+                let selected = is_sel(&d.key);
+                let vio = theme::with_alpha(theme::VIOLET, 190);
+                painter.line_segment([p + Vec2::new(-3.5, 0.0), p + Vec2::new(3.5, 0.0)], Stroke::new(1.0, vio));
+                painter.line_segment([p + Vec2::new(0.0, -3.5), p + Vec2::new(0.0, 3.5)], Stroke::new(1.0, vio));
+                if selected {
+                    sel_ring(p);
+                    painter.text(p + Vec2::new(9.0, 0.0), Align2::LEFT_CENTER, &d.name, theme::sans(10.0), theme::VIOLET);
+                }
+                clicks.push((p, d.key.clone()));
+            }
+        }
+
+        // ---- selected-target trajectory on the dome ------------------------
+        // Satellite arc (passes worker): grey past, yellow sunlit future,
+        // red eclipsed future — the skyplot's arc colouring on the dome.
+        if let Some(sn) = passes.arc_satnum.as_deref() {
+            if sel.as_deref() == Some(sn) && !passes.arc.is_empty() {
+                let mut prev: Option<V3> = None;
+                for a in &passes.arc {
+                    if a.el < -1.0 {
+                        prev = None;
+                        continue;
                     }
+                    let q = sky_point(a.az, a.el);
+                    if let Some(pq) = prev {
+                        let col = if a.t_rel_s <= 0.0 {
+                            theme::with_alpha(Color32::from_rgb(130, 130, 130), 110)
+                        } else if a.sunlit {
+                            theme::with_alpha(Color32::from_rgb(235, 220, 60), 200)
+                        } else {
+                            theme::with_alpha(Color32::from_rgb(240, 90, 90), 200)
+                        };
+                        if let Some(seg) = cam.segment(pq, q) {
+                            painter.line_segment(seg, Stroke::new(1.5, col));
+                        }
+                    }
+                    prev = Some(q);
+                }
+            }
+        }
+        // Non-satellite selection's sliding window (sky worker): violet
+        // future / grey past, like the skyplot.
+        if let Some(t) = sky.target.as_ref() {
+            if sel.as_deref() == Some(t.key.as_str()) && !sky.target_arc.is_empty() {
+                let mut prev: Option<V3> = None;
+                for a in &sky.target_arc {
+                    if a.el < -1.0 {
+                        prev = None;
+                        continue;
+                    }
+                    let q = sky_point(a.az, a.el);
+                    if let Some(pq) = prev {
+                        let col = if a.t_rel_s <= 0.0 { theme::with_alpha(Color32::from_rgb(130, 130, 130), 110) } else { theme::with_alpha(theme::VIOLET, 200) };
+                        if let Some(seg) = cam.segment(pq, q) {
+                            painter.line_segment(seg, Stroke::new(1.4, col));
+                        }
+                    }
+                    prev = Some(q);
                 }
             }
         }
 
         // ---- soft-limit rings ----------------------------------------------
         // Axis 1: ring around the azimuth tube; forbidden AZM span in red.
-        if let Some((lo, hi)) = pose.az_limits {
+        {
+            let (lo, hi) = cfg.azm_limit;
             let c1 = HEAD - mp.p * 0.42;
             let ring = |a: f64| c1 + M3::rot_about(mp.p, -a).mul_v(mp.home_axis2) * 0.5;
             draw_limit_ring(&painter, &cam, &ring, lo, hi);
         }
         // Axis 2: ring around the tube's swing at the current AZM.
-        if let Some((lo, hi)) = pose.el_limits {
-            let ring = |t: f64| ota_origin + mount_pose(mode, pose.lat_deg, pose.az_deg, t).boresight * 0.8;
+        {
+            let (lo, hi) = cfg.alt_limit;
+            let ring = |t: f64| ota_origin + mount_pose(mode, cfg.lat_deg, azm, t).boresight * 0.8;
             draw_limit_ring(&painter, &cam, &ring, lo, hi);
+        }
+
+        // ---- operator seat marker (orbit view only) ------------------------
+        if !self.operator {
+            let seat_col = Color32::from_rgb(240, 210, 90);
+            if let Some(p) = cam.project(v3(seat_ground.x, seat_ground.y, 0.25)) {
+                painter.circle_filled(p, 4.5, seat_col);
+                painter.text(p + Vec2::new(0.0, 7.0), Align2::CENTER_TOP, "operator", theme::sans(10.0), seat_col);
+            }
         }
 
         // ---- mount model (painter's algorithm) -----------------------------
         let light = v3(0.35, 0.5, 0.79).normalized();
         let mut faces: Vec<FaceDraw> = Vec::new();
-        for part in self.geometry(mode, pose.lat_deg) {
+        for part in self.geometry(mode, cfg.lat_deg) {
             let verts: Vec<V3> = part.verts.iter().map(|&v| pose_vertex(v, part.stage, &mp)).collect();
             for face in &part.faces {
                 if face.len() < 3 || face.iter().any(|&i| cam.depth(verts[i]) <= NEAR) {
@@ -826,31 +1165,47 @@ impl Mount3dView {
         if let Some(p) = cam.project(bore_far) {
             painter.circle_stroke(p, 3.5, Stroke::new(1.2, theme::AMBER));
         }
-        if pose.fov_deg > 0.0 {
-            let apex = ota_origin + mp.boresight * (OTA_LEN * 0.56);
-            let corners = fov_corner_dirs(mp.boresight, mp.axis2, pose.fov_deg, pose.fov_deg * 2.0 / 3.0);
-            let far: Vec<V3> = corners.iter().map(|&c| apex + c * (R_SKY * 0.97)).collect();
+        // One cone per connected mount-borne camera, colour-matched to the
+        // skyplot footprints (ui::CAM_COLORS), honouring each camera's
+        // alignment rotation. The zenith-fixed fisheye bubble is not on the
+        // mount, so it gets no cone.
+        let apex = ota_origin + mp.boresight * (OTA_LEN * 0.56);
+        for (i, c) in shared.cams.iter().enumerate() {
+            let guard = c.load();
+            let Some(snap) = guard.as_ref() else { continue };
+            if !snap.connected || snap.fisheye {
+                continue;
+            }
+            let fov_w = snap.fov_deg;
+            let fov_h = snap.deg_per_px * snap.height as f64;
+            if fov_w <= 0.0 || fov_h <= 0.0 {
+                continue;
+            }
+            let rot = shared.cam_settings[i].load().rotation_deg;
+            let col = crate::ui::CAM_COLORS[i % crate::ui::CAM_COLORS.len()];
+            let corners = fov_corner_dirs(mp.boresight, mp.axis2, fov_w, fov_h, rot);
+            let far: Vec<V3> = corners.iter().map(|&cn| apex + cn * (R_SKY * 0.97)).collect();
             // Faint glass fill on the side faces, hairline edges, far frame.
-            for i in 0..4 {
-                let tri = cam.polygon(&[apex, far[i], far[(i + 1) % 4]]);
+            for k in 0..4 {
+                let tri = cam.polygon(&[apex, far[k], far[(k + 1) % 4]]);
                 if tri.len() >= 3 {
-                    painter.add(Shape::convex_polygon(tri, theme::with_alpha(theme::AMBER, 6), Stroke::NONE));
+                    painter.add(Shape::convex_polygon(tri, theme::with_alpha(col, 6), Stroke::NONE));
                 }
-                if let Some(seg) = cam.segment(apex, far[i]) {
-                    painter.line_segment(seg, Stroke::new(0.8, theme::with_alpha(theme::AMBER, 70)));
+                if let Some(seg) = cam.segment(apex, far[k]) {
+                    painter.line_segment(seg, Stroke::new(0.8, theme::with_alpha(col, 70)));
                 }
             }
             let quad = cam.polygon(&far);
             if quad.len() >= 3 {
-                painter.add(Shape::closed_line(quad, Stroke::new(1.0, theme::with_alpha(theme::AMBER, 150))));
+                painter.add(Shape::closed_line(quad, Stroke::new(1.0, theme::with_alpha(col, 150))));
             }
         }
 
-        // ---- target direction -------------------------------------------------
+        // ---- target direction (setpoint reticle) ------------------------------
         let mut sep_deg: Option<f64> = None;
-        if let Some((taz, tel)) = pose.target {
+        if let Some((taz, tel)) = m.setpoint {
             let tdir = unit_from_azel(taz, tel);
-            let col = if pose.tracking { theme::GREEN } else { theme::TEXT_2 };
+            let col = if tracking { theme::GREEN } else { theme::TEXT_2 };
             let tfar = HEAD + tdir * R_SKY;
             if let Some(seg) = cam.segment(ota_origin, tfar) {
                 painter.extend(Shape::dashed_line(&seg, Stroke::new(1.0, theme::with_alpha(col, 190)), 7.0, 5.0));
@@ -896,12 +1251,24 @@ impl Mount3dView {
             hud_rect = hud_rect.union(r);
             r.height() + 3.0
         };
-        let header = if pose.tracking { format!("MOUNT · {}  ·  TRACKING", mode.label()) } else { format!("MOUNT · {}", mode.label()) };
-        y += line(y, header, theme::sans(10.5), if pose.tracking { theme::GREEN } else { theme::DIM });
-        y += line(y, format!("AZM {:8.2}°   ALT {:8.2}°", pose.az_deg, pose.el_deg), theme::mono(12.5), theme::TEXT);
+        // "(FLIPPED)" flags the AltAz-Side index-home mirror (altaz_side_flip).
+        let flipped = mode == ModeKind::AltAzSide && cfg.altaz_side_flip;
+        let header = format!(
+            "MOUNT · {}{}{}",
+            mode.label(),
+            if flipped { " (FLIPPED)" } else { "" },
+            if tracking { "  ·  TRACKING" } else { "" }
+        );
+        y += line(y, header, theme::sans(10.5), if tracking { theme::GREEN } else { theme::DIM });
+        y += line(
+            y,
+            format!("AZM {:8.2}°   ALT {:8.2}°   {}", azm, alt, if live_ok { "LIVE" } else { "MANUAL" }),
+            theme::mono(12.5),
+            if live_ok { theme::TEXT } else { theme::AMBER },
+        );
         y += line(y, format!("sky az {:7.2}°  el {:6.2}°", sky_az, sky_el), theme::mono(11.0), theme::TEXT_2);
-        if let (Some((taz, tel)), Some(sep)) = (pose.target, sep_deg) {
-            let col = if pose.tracking { theme::GREEN } else { theme::TEXT_2 };
+        if let (Some((taz, tel)), Some(sep)) = (m.setpoint, sep_deg) {
+            let col = if tracking { theme::GREEN } else { theme::TEXT_2 };
             line(y, format!("target {:7.2}°  {:6.2}°   Δ {:.2}°", taz.rem_euclid(360.0), tel, sep), theme::mono(11.0), col);
         }
         if hud_rect.is_positive() {
@@ -914,16 +1281,40 @@ impl Mount3dView {
         let r1 = painter.text(pos2(lx + 11.0, by), Align2::LEFT_BOTTOM, "axis 1", theme::sans(10.5), theme::DIM);
         painter.circle_filled(pos2(r1.max.x + 12.0, by - 6.0), 3.0, theme::VIOLET);
         let r2 = painter.text(pos2(r1.max.x + 19.0, by), Align2::LEFT_BOTTOM, "axis 2", theme::sans(10.5), theme::DIM);
+        let view_txt = if self.operator {
+            format!("look {:.0}° / {:+.0}°  ×{:.2}", self.look_az.unwrap_or(0.0), self.look_el, self.eye_zoom)
+        } else {
+            format!("view {:.0}° / {:+.0}°  ×{:.2}", self.yaw_deg, self.pitch_deg, self.zoom)
+        };
+        painter.text(pos2(r2.max.x + 16.0, by), Align2::LEFT_BOTTOM, view_txt, theme::mono(10.0), theme::DIM);
         painter.text(
-            pos2(r2.max.x + 16.0, by),
-            Align2::LEFT_BOTTOM,
-            format!("view {:.0}° / {:+.0}°  ×{:.2}", self.yaw_deg, self.pitch_deg, self.zoom),
-            theme::mono(10.0),
+            pos2(rect.max.x - pad, by),
+            Align2::RIGHT_BOTTOM,
+            "drag · orbit/look    wheel · zoom    click · select    dbl-click · reset",
+            theme::sans(10.5),
             theme::DIM,
         );
-        painter.text(pos2(rect.max.x - pad, by), Align2::RIGHT_BOTTOM, "drag · orbit    wheel · zoom    dbl-click · reset", theme::sans(10.5), theme::DIM);
 
-        response
+        // ---- click-to-select ---------------------------------------------------
+        // Nearest mark within 10 px; clicking the selection again clears it
+        // (the Python toggle semantics). Drags never reach here — egui only
+        // reports a click when the pointer didn't move.
+        if response.clicked() {
+            if let Some(ptr) = response.interact_pointer_pos() {
+                let mut best: Option<(f32, &String)> = None;
+                for (p, key) in &clicks {
+                    let d = p.distance(ptr);
+                    if d <= 10.0 && best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, key));
+                    }
+                }
+                if let Some((_, key)) = best {
+                    let new_sel = if sel.as_deref() == Some(key.as_str()) { None } else { Some(key.clone()) };
+                    st.selected = new_sel.clone();
+                    let _ = tx.send(MountCmd::SelectTarget(new_sel));
+                }
+            }
+        }
     }
 }
 
@@ -1094,9 +1485,13 @@ mod tests {
         let a2 = unit_from_azel(130.0, 0.0);
         let (w, h) = (6.0f64, 4.0f64);
         let expect = ((w / 2.0).to_radians().tan().hypot((h / 2.0).to_radians().tan())).atan().to_degrees();
-        for c in fov_corner_dirs(b, a2, w, h) {
-            let ang = c.dot(b).clamp(-1.0, 1.0).acos().to_degrees();
-            assert!((ang - expect).abs() < 1e-9);
+        // The camera roll spins the corners about the boresight; the corner
+        // half-angle is invariant under it.
+        for roll in [0.0, 37.0, -120.0] {
+            for c in fov_corner_dirs(b, a2, w, h, roll) {
+                let ang = c.dot(b).clamp(-1.0, 1.0).acos().to_degrees();
+                assert!((ang - expect).abs() < 1e-9);
+            }
         }
     }
 

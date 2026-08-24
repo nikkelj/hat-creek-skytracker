@@ -1351,6 +1351,18 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
         theme::mono(10.0),
         theme::with_alpha(TEXT_2, 200),
     );
+    // Exposure-midpoint UTC of the displayed frame (camera_manager readout).
+    if cam.utc_midpoint_s > 0.0 {
+        let (_, _, _, hh, mm, ss) = crate::sky::civil_from_unix(cam.utc_midpoint_s);
+        let frac = ((cam.utc_midpoint_s - cam.utc_midpoint_s.floor()) * 1000.0) as i64;
+        p.text(
+            r.rect.left_top() + Vec2::new(6.0, 19.0),
+            Align2::LEFT_TOP,
+            format!("{hh:02}:{mm:02}:{ss:02}.{frac:03}Z mid-exposure"),
+            theme::mono(9.0),
+            theme::with_alpha(DIM, 220),
+        );
+    }
     if cam.deep_stars > 0 {
         p.text(r.rect.right_bottom() + Vec2::new(-6.0, -6.0), Align2::RIGHT_BOTTOM, format!("{} Tycho stars", cam.deep_stars), theme::mono(9.5), DIM);
     }
@@ -1626,6 +1638,13 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
     });
     ui.add_space(4.0);
     theme::section(ui, "log");
+    egui::CollapsingHeader::new(egui::RichText::new(format!("history · {}", m.status.len())).font(theme::sans(10.0)).color(DIM)).id_salt("statuslog").default_open(false).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("statuslog_scroll").max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
+            for s in m.status.iter() {
+                ui.label(egui::RichText::new(s).font(theme::mono(9.5)).color(TEXT_2));
+            }
+        });
+    });
     for s in m.status.iter().rev().take(6) {
         ui.label(egui::RichText::new(s).font(theme::mono(10.5)).color(TEXT_2));
     }

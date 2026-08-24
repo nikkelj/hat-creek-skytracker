@@ -190,6 +190,7 @@ struct SimRenderer {
     /// Exposure/gain scale relative to the slot's config defaults.
     base_gain: f64,
     base_exposure: f64,
+    slot: usize,
 }
 
 impl SimRenderer {
@@ -212,8 +213,18 @@ impl SimRenderer {
         // True boresight = reported pose + misalignment + periodic error (or the zenith).
         let t = self.t0.elapsed().as_secs_f64();
         let pe = if sim.pe_period_s > 0.0 { sim.pe_amplitude_deg * (t / sim.pe_period_s * std::f64::consts::TAU).sin() } else { 0.0 };
-        let (bore_az, bore_el) = if self.fixed_zenith { (0.0, 90.0) } else { (mount.az + sim.misalign_az_deg + pe, mount.el + sim.misalign_el_deg) };
+        let (mut bore_az, mut bore_el) = if self.fixed_zenith { (0.0, 90.0) } else { (mount.az + sim.misalign_az_deg + pe, mount.el + sim.misalign_el_deg) };
         self.proj.rotation_deg = settings.rotation_deg;
+        // Camera-2 co-boresight offset injection (hw_sim cam2_offset_*):
+        // pixel shift expressed as a sky offset at this plate scale + a
+        // rotation delta, exercised by the combined-view calibration.
+        if self.slot == 1 && !self.fixed_zenith && (sim.cam2_dx_px != 0.0 || sim.cam2_dy_px != 0.0 || sim.cam2_rot_deg != 0.0) {
+            let deg_per_px = ((self.proj.pixel_um * 1e-3) / self.proj.focal_mm).to_degrees();
+            let cos_el = bore_el.to_radians().cos().max(0.087);
+            bore_az += sim.cam2_dx_px * deg_per_px / cos_el;
+            bore_el += sim.cam2_dy_px * deg_per_px;
+            self.proj.rotation_deg += sim.cam2_rot_deg;
+        }
 
         let mut deep_n = 0;
         if self.fixed_zenith {
@@ -411,14 +422,30 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         let slot2 = slot;
                         let done = Arc::new(Mutex::new(None::<String>));
                         dump_result = Some(done.clone());
+                        let png = cfg.image_format == "png";
                         std::thread::Builder::new().name(format!("capture-dump{}", slot + 1)).spawn(move || {
                             let res = match rec.disarm_and_dump(&dir) {
                                 Ok((n, times)) => {
                                     for (i, t) in times.iter().enumerate() {
                                         let (y, mo, d, hh, mm, ss) = crate::sky::civil_from_unix(*t);
                                         let frac = ((t - t.floor()) * 1e6).round() as i64;
-                                        let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.bmp", slot2 + 1));
-                                        let _ = std::fs::rename(dir.join(format!("frame_{i:05}.bmp")), new);
+                                        let src = dir.join(format!("frame_{i:05}.bmp"));
+                                        if png {
+                                            // image_format=png: re-encode the BMP (Python capture PNG option).
+                                            let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.png", slot2 + 1));
+                                            match image::open(&src) {
+                                                Ok(img) => {
+                                                    let _ = img.save(&new);
+                                                    let _ = std::fs::remove_file(&src);
+                                                }
+                                                Err(_) => {
+                                                    let _ = std::fs::rename(&src, new.with_extension("bmp"));
+                                                }
+                                            }
+                                        } else {
+                                            let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.bmp", slot2 + 1));
+                                            let _ = std::fs::rename(&src, new);
+                                        }
                                     }
                                     let meta = serde_json::json!({
                                         "target": cn, "camera": format!("camera{}", slot2 + 1), "name": cname, "role": crole,
@@ -521,6 +548,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         geom: clone_geom(&geom),
                         t0: Instant::now(),
                         fixed_zenith: cam_cfg.fixed_zenith(),
+                        slot,
                         base_gain: cam_cfg.gain as f64,
                         base_exposure: cam_cfg.exposure_us as f64,
                     };

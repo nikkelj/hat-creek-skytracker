@@ -133,6 +133,13 @@ pub struct SimSettings {
     pub star_limit_mag: f64,
     pub use_deep_catalog: bool,
     pub seed: u64,
+    /// Camera-2 boresight offset injection (co-boresight testing).
+    pub cam2_rot_deg: f64,
+    pub cam2_dx_px: f64,
+    pub cam2_dy_px: f64,
+    /// Serial-layer fault injection: reply latency + garbage-byte probability.
+    pub serial_latency_s: f64,
+    pub serial_garbage_prob: f64,
 }
 
 impl Default for SimSettings {
@@ -151,6 +158,11 @@ impl Default for SimSettings {
             star_limit_mag: 10.0,
             use_deep_catalog: true,
             seed: 1234,
+            cam2_rot_deg: 0.0,
+            cam2_dx_px: 0.0,
+            cam2_dy_px: 0.0,
+            serial_latency_s: 0.0,
+            serial_garbage_prob: 0.0,
         }
     }
 }
@@ -206,6 +218,8 @@ pub struct Config {
     pub captures_dir: String,
     /// Armed-capture ring depth in frames (Python `buffer_size`).
     pub capture_buffer_frames: usize,
+    /// Capture file format: "bmp" (default) or "png" (Python `image_format`).
+    pub image_format: String,
     pub tetra3_db_dir: String,
     pub alignment_points: usize,
     pub alignment_settle_s: f64,
@@ -377,6 +391,11 @@ impl Config {
             star_limit_mag: num(&sc["sim_star_limit_mag"], sd.star_limit_mag),
             use_deep_catalog: boolean(&sc["sim_use_deep_catalog"], sd.use_deep_catalog),
             seed: num(&sc["seed"], 1234.0) as u64,
+            cam2_rot_deg: num(&sc["cam2_offset_rotation_deg"], 0.0),
+            cam2_dx_px: num(&sc["cam2_offset_x_px"], 0.0),
+            cam2_dy_px: num(&sc["cam2_offset_y_px"], 0.0),
+            serial_latency_s: num(&sc["sim_serial_latency_s"], 0.0),
+            serial_garbage_prob: num(&sc["sim_serial_garbage_prob"], 0.0),
         };
         Config {
             path: path.to_path_buf(),
@@ -424,6 +443,7 @@ impl Config {
             asi_dll: s("asi_dll", "ASICamera2.dll"),
             captures_dir: s("captures_dir", "data"),
             capture_buffer_frames: f("buffer_size", 1000.0).max(1.0) as usize,
+            image_format: s("image_format", "bmp").to_lowercase(),
             tetra3_db_dir: s("tetra3_db_dir", ""),
             alignment_points: f("alignment_points", 12.0) as usize,
             alignment_settle_s: f("alignment_settle_sec", 2.0),
@@ -628,6 +648,11 @@ impl Config {
         sc.insert("sim_star_limit_mag".into(), json!(s.star_limit_mag));
         sc.insert("sim_use_deep_catalog".into(), json!(s.use_deep_catalog));
         sc.insert("seed".into(), json!(s.seed));
+        sc.insert("cam2_offset_rotation_deg".into(), json!(s.cam2_rot_deg));
+        sc.insert("cam2_offset_x_px".into(), json!(s.cam2_dx_px));
+        sc.insert("cam2_offset_y_px".into(), json!(s.cam2_dy_px));
+        sc.insert("sim_serial_latency_s".into(), json!(s.serial_latency_s));
+        sc.insert("sim_serial_garbage_prob".into(), json!(s.serial_garbage_prob));
         let text = serde_json::to_string_pretty(&raw)?;
         std::fs::write(&self.path, text)
     }

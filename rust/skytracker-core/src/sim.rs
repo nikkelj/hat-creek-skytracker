@@ -147,6 +147,10 @@ pub struct SimNoise {
     /// Dead band on direction reversal (deg): the first `backlash_deg` of
     /// travel after a sign change produces no true motion.
     pub backlash_deg: f64,
+    /// Serial-layer fault injection: extra reply latency (s) and the
+    /// per-reply probability of a corrupted byte (hw_sim serial faults).
+    pub serial_latency_s: f64,
+    pub serial_garbage_prob: f64,
 }
 
 pub struct SimResponder {
@@ -173,6 +177,13 @@ pub struct SimResponder {
 }
 
 impl SimResponder {
+    /// Uniform [0,1) draw from the responder's noise RNG (fault injection).
+    pub fn rng_uniform(&mut self) -> f64 {
+        self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.rng >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+
     pub fn new_wall(az0_deg: f64, el0_deg: f64) -> Self {
         Self {
             az_true_deg: az0_deg,
@@ -367,7 +378,22 @@ impl LoopbackTransport {
 
 impl Transport for LoopbackTransport {
     fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
-        let resp = self.responder.respond(data);
+        let mut resp = self.responder.respond(data);
+        // Serial fault injection (hw_sim): latency delays the reply, garbage
+        // corrupts one byte — exercising the loop's short-read / bad-frame
+        // handling without hardware.
+        let (lat, garb) = {
+            let n = self.responder.noise.lock().unwrap();
+            (n.serial_latency_s, n.serial_garbage_prob)
+        };
+        if lat > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(lat.min(0.5)));
+        }
+        if garb > 0.0 && !resp.is_empty() && self.responder.rng_uniform() < garb {
+            let len = resp.len();
+            let i = ((self.responder.rng_uniform() * len as f64) as usize).min(len - 1);
+            resp[i] ^= 0x5a;
+        }
         self.buf.extend(resp);
         Ok(())
     }

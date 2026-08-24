@@ -352,6 +352,29 @@ pub fn sim_screen(ui: &mut egui::Ui, shared: &Arc<Shared>) {
     let cur = shared.sim.load();
     let mut s: SimSettings = (**cur).clone();
     let mut changed = false;
+    // Master sim switch (hw_sim "Simulation: ON/OFF"): transport + camera
+    // source are worker-spawn-time choices, so this persists and asks for a
+    // restart rather than pretending to hot-swap hardware.
+    ui.horizontal(|ui| {
+        let sim_on = shared.config.mount_transport.eq_ignore_ascii_case("sim") && shared.config.camera_source.eq_ignore_ascii_case("sim");
+        if theme::mode_button(ui, if sim_on { "SIMULATION ON" } else { "SIMULATION OFF" }, sim_on, if sim_on { GREEN } else { DIM }) {
+            let (mt, cs) = if sim_on { ("serial", "asi") } else { ("sim", "sim") };
+            crate::mount::persist_config_key(&shared.config.path, "mount_transport", serde_json::json!(mt));
+            crate::mount::persist_config_key(&shared.config.path, "camera_source", serde_json::json!(cs));
+        }
+        ui.label(RichText::new("switching persists mount_transport + camera_source — restart the app to apply").font(theme::sans(10.0)).color(DIM));
+        let m = shared.mount.load();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(match &m.target {
+                    Some(t) => format!("target {t} · az {:.2}° el {:.2}° · {}", m.az, m.el, m.mode),
+                    None => format!("no target · az {:.2}° el {:.2}° · {}", m.az, m.el, m.mode),
+                })
+                .font(theme::mono(10.5))
+                .color(TEXT_2),
+            );
+        });
+    });
     ui.columns(2, |cols| {
         let ui = &mut cols[0];
         theme::section(ui, "simulated mount");
@@ -397,12 +420,42 @@ pub fn sim_screen(ui: &mut egui::Ui, shared: &Arc<Shared>) {
             ui.label(RichText::new("Tycho deep catalogue").color(TEXT_2));
             changed |= ui.checkbox(&mut s.use_deep_catalog, "").changed();
             ui.end_row();
+            ui.label(RichText::new("rng seed").color(TEXT_2));
+            let mut seed = s.seed as i64;
+            if ui.add(egui::DragValue::new(&mut seed).speed(1)).changed() {
+                s.seed = seed.max(0) as u64;
+                changed = true;
+            }
+            ui.end_row();
+            ui.label(RichText::new("cam2 offset x / y px").color(TEXT_2));
+            ui.horizontal(|ui| {
+                changed |= ui.add(egui::DragValue::new(&mut s.cam2_dx_px).speed(0.5)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut s.cam2_dy_px).speed(0.5)).changed();
+                changed |= ui.add(egui::DragValue::new(&mut s.cam2_rot_deg).speed(0.1).suffix("° rot")).changed();
+            });
+            ui.end_row();
+            ui.label(RichText::new("serial latency").color(TEXT_2));
+            changed |= ui.add(egui::Slider::new(&mut s.serial_latency_s, 0.0..=0.25).suffix(" s").fixed_decimals(3)).changed();
+            ui.end_row();
+            ui.label(RichText::new("serial garbage prob").color(TEXT_2));
+            changed |= ui.add(egui::Slider::new(&mut s.serial_garbage_prob, 0.0..=0.2).fixed_decimals(3)).changed();
+            ui.end_row();
         });
         ui.add_space(8.0);
-        if ui.button("reset to config.json").clicked() {
-            s = shared.config.sim.clone();
-            changed = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("reset to config.json").clicked() {
+                s = shared.config.sim.clone();
+                changed = true;
+            }
+            if ui.button("save to config.json").on_hover_text("persist these sim settings (sim_config)").clicked() {
+                let mut c = shared.config.clone();
+                c.sim = s.clone();
+                match c.save() {
+                    Ok(()) => {}
+                    Err(e) => eprintln!("sim save failed: {e}"),
+                }
+            }
+        });
         let ui = &mut cols[1];
         theme::section(ui, "what the sim does");
         for line in [
@@ -644,7 +697,7 @@ impl Default for CamerasState {
     }
 }
 
-const ROI_FRACS: [(f64, &str); 5] = [(1.0, "1.0"), (0.5, ".5"), (0.25, ".25"), (0.125, ".125"), (0.0625, ".063")];
+const ROI_FRACS: [(f64, &str); 6] = [(1.0, "1.0"), (0.5, ".5"), (0.25, ".25"), (0.125, ".125"), (0.0625, ".063"), (0.03125, ".031")];
 
 pub fn cameras_screen(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, cs: &mut CamerasState, tx_cam: &crossbeam_channel::Sender<CamCmd>, tx_fw: &crossbeam_channel::Sender<FwCmd>) {
     let n = shared.cams.len();
@@ -802,7 +855,12 @@ fn camera_controls(ui: &mut egui::Ui, shared: &Arc<Shared>, i: usize, tx_cam: &c
             });
             ui.end_row();
             ui.label(RichText::new("rotation °").color(TEXT_2));
-            ui.add(egui::Slider::new(&mut s.rotation_deg, -180.0..=180.0).fixed_decimals(1));
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut s.rotation_deg, -180.0..=180.0).fixed_decimals(1));
+                if ui.small_button("0°").on_hover_text("recenter rotation").clicked() {
+                    s.rotation_deg = 0.0;
+                }
+            });
             ui.end_row();
             ui.label(RichText::new("ROI").color(TEXT_2));
             ui.horizontal(|ui| {

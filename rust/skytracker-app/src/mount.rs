@@ -205,8 +205,10 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut target: Option<String> = None;
     let mut status: Vec<String> = notes;
     let push_status = |status: &mut Vec<String>, s: String| {
+        // 300-message scrollback (Python keeps 500) — the UI shows the tail
+        // inline and the full list in a scrollable rollup.
         status.push(s);
-        if status.len() > 8 {
+        if status.len() > 300 {
             status.remove(0);
         }
     };
@@ -538,7 +540,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
         // Live sim imperfections from the Sim screen.
         if let Some(n) = &sim_noise {
             let s = shared.sim.load();
-            let want = skytracker_core::sim::SimNoise { encoder_deg: s.encoder_noise_deg, rate_dps: s.rate_noise_dps, backlash_deg: s.backlash_deg };
+            let want = skytracker_core::sim::SimNoise { encoder_deg: s.encoder_noise_deg, rate_dps: s.rate_noise_dps, backlash_deg: s.backlash_deg, serial_latency_s: s.serial_latency_s, serial_garbage_prob: s.serial_garbage_prob };
             let mut g = n.lock().unwrap();
             if *g != want {
                 *g = want;

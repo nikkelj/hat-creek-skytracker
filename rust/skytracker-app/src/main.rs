@@ -176,6 +176,9 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(4.0);
+                    if ui.add(egui::Button::new(egui::RichText::new("✕").font(theme::sans(12.0)).color(TEXT_2)).stroke(egui::Stroke::NONE).fill(egui::Color32::TRANSPARENT)).on_hover_text("exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                     ui.label(egui::RichText::new(format!("{ui_fps:5.1} Hz")).font(theme::mono(10.5)).color(DIM));
                     ui.label(egui::RichText::new(format!("up {:.0} s", self.started.elapsed().as_secs_f64())).font(theme::mono(10.5)).color(DIM));
                     let m = self.shared.mount.load();

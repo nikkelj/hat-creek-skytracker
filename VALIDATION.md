@@ -5,6 +5,33 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-26 — HOTSPOT bare star tracking fixed; sync home
+
+- **Root cause of the "bouncing" HOTSPOT**: the star filter's bare branch
+  (no trajectory) rejected any detection slower than the 0.15°/s rate gate
+  — i.e. every star. Each star got locked during the 0.35 s rate-baseline
+  warm-up (jerking the mount toward it), then rejected, correction decayed,
+  gate grew, re-locked… a limit cycle. With a satellite selected but not in
+  frame, the trajectory feed-forward additionally kept sweeping the sky.
+- **Fixes**: (1) the star-like rate reject now only runs against a setpoint
+  — tracking bare, a star IS the target; (2) initial acquisition hunts near
+  the reticle first (18% of frame, growing on misses) instead of taking the
+  globally brightest corner blob — "lock the NEAREST star"; (3) bare-target
+  lock uses a tight gate (≤45 px) so a rival star of similar brightness
+  can't steal the lock (the brightest-in-gate flip-flop seen in soak).
+- **Verified**: new SKYTRACKER_AUTOTEST_BARE=1 mode engages HOTSPOT with no
+  target parked on the star field — 20 s soak holds one star continuously
+  (errors 0.002–0.01°, boresight creeping at sidereal rate); two new core
+  tests (nearest-to-center acquisition, star lock with filter ON); the
+  satellite HANDOFF→HOTSPOT autotest is unchanged (err 0.02°, solid lock).
+- **Sync home** button (mount panel): with the mount physically on its
+  index marks, tares az/alt — offsets := current raw encoders (persisted),
+  so the indices read 0/0 and PARK returns to them.
+- The ISS pass test's 3-min lower duration bound tripped on a real 122 s
+  grazing pass — loosened to 45 s (the test runs against the live clock).
+
+---
+
 ## 2026-08-26 — Capture spool, blob stabilization, Starlink ephemerides
 
 - **Capture** streams to disk as it records (bounded queue → writer thread):

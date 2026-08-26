@@ -518,3 +518,59 @@ fn hotspot_rides_trajectory_feed_forward() {
         o2.azm_pid_output * 360.0
     );
 }
+
+/// Two overlapping-brightness blobs: with no gate history the tracker must
+/// take the one near the reticle, not the globally brightest corner blob.
+#[test]
+fn hotspot_bare_acquires_nearest_to_center() {
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Hotspot;
+    let (w, h) = (256usize, 200usize);
+    // Bright corner star + dimmer (still solid SNR) star near center.
+    let mut data = vec![10.0f32; w * h];
+    let mut splat = |cx: f64, cy: f64, amp: f64| {
+        for y in 0..h {
+            for x in 0..w {
+                let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+                data[y * w + x] += (amp * (-(r2) / (2.0 * 9.0)).exp()) as f32;
+            }
+        }
+    };
+    splat(20.0, 20.0, 220.0);
+    splat(120.0, 108.0, 120.0);
+    let f = Frame { data: Arc::new(data), h, w, seq: 1, time: 0.0 };
+    let o = s.step(&i, Some(&f), 50.0, 45.0, 100.0);
+    assert!(o.hotspot_acquired, "{}", o.hotspot_status);
+    let (cx, cy) = o.hotspot_centroid.unwrap();
+    assert!(
+        (cx - 120.0).abs() < 4.0 && (cy - 108.0).abs() < 4.0,
+        "locked ({cx:.1},{cy:.1}) — should be the near-center star, not the corner one"
+    );
+}
+
+/// Tracking bare with the star filter ON, a sidereal-slow star must stay
+/// locked indefinitely — the old bare branch rejected it once the rate
+/// baseline warmed up, giving a lock/reject/decay limit cycle.
+#[test]
+fn hotspot_bare_star_stays_locked_with_filter_on() {
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Hotspot;
+    i.hotspot.star_filter = true;
+    let (w, h) = (256usize, 200usize);
+    let mut locked = 0;
+    for k in 0..80u64 {
+        let t = k as f64 * 0.1;
+        // Sidereal-ish drift: ~0.2 px/s at this plate scale.
+        let mut f = blob_frame(w, h, 128.0 + 12.0 + 0.02 * k as f64, 100.0 - 8.0);
+        f.seq = k + 1;
+        f.time = t;
+        let o = s.step(&i, Some(&f), 50.0, 45.0, 100.0 + t);
+        assert_ne!(o.hotspot_status, "star-reject", "cycle {k}: bare tracking must accept a star");
+        if o.hotspot_acquired {
+            locked += 1;
+        }
+    }
+    assert!(locked >= 78, "star lock held only {locked}/80 cycles");
+}

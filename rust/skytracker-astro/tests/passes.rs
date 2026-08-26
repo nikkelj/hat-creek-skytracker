@@ -98,9 +98,12 @@ fn iss_24h_plausible_passes() {
         assert!(p.aos_jd_tt >= prev_aos, "passes not sorted by AOS");
         prev_aos = p.aos_jd_tt;
         assert!(p.aos_jd_tt < p.tca_jd_tt && p.tca_jd_tt < p.los_jd_tt, "AOS<TCA<LOS");
+        // Grazing passes barely clearing the mask can be well under 3 min
+        // (a real 122 s one showed up 2026-08-26) — this test runs against
+        // the live clock, so bound only what geometry guarantees.
         assert!(
-            p.duration_s > 180.0 && p.duration_s < 900.0,
-            "duration {} s out of 3..15 min",
+            p.duration_s > 45.0 && p.duration_s < 900.0,
+            "duration {} s out of 45 s..15 min",
             p.duration_s
         );
         assert!(p.tca_el > params.min_el_deg, "tca_el {} <= mask", p.tca_el);

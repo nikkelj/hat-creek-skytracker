@@ -1061,6 +1061,10 @@ pub enum MountCmd {
     SetLeadTime(f64),
     SetStarFilter(bool),
     SetFeedForward { az: bool, el: bool },
+    /// Sync home: the mount is physically on its index marks — set the
+    /// axis offsets to the current raw encoder readings so the indices
+    /// become mount 0/0 (and the park target).
+    SyncHome,
     /// Live alignment-offset update (instantaneous align): degrees.
     SetAlignmentOffsets { az: f64, el: f64 },
     /// Raw mount-axis goto (polar-align RA sweep).

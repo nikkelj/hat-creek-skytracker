@@ -406,6 +406,20 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     persist_config_key(&cfg.path, "hotspot_star_filter_enabled", serde_json::json!(on));
                     push_status(&mut status, format!("hotspot star filter {}", if on { "ON" } else { "OFF" }));
                 }
+                MountCmd::SyncHome => {
+                    // Tare az/alt on the physical indices: offsets := raw
+                    // encoders here, so working position (raw − offset)
+                    // reads 0/0 at the marks and PARK returns to them.
+                    let (ra, re) = {
+                        let o = loop_shared.outputs.lock().unwrap();
+                        (o.azm_raw, o.alt_raw)
+                    };
+                    cfg.offsets = (ra, re);
+                    loop_shared.inputs.lock().unwrap().offsets = (ra, re);
+                    persist_config_key(&cfg.path, "azm_offset", serde_json::json!(format!("{ra}")));
+                    persist_config_key(&cfg.path, "alt_offset", serde_json::json!(format!("{re}")));
+                    push_status(&mut status, format!("HOME SYNCED: offsets = raw {ra:.3}° / {re:.3}° (indices are now 0/0)"));
+                }
                 MountCmd::SetAlignmentOffsets { az, el } => {
                     cfg.alignment_az = az;
                     cfg.alignment_el = el;

@@ -1512,6 +1512,9 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         if ui.small_button("park").on_hover_text("drive both axes to the configured offsets (gamepad: Triangle)").clicked() {
             let _ = tx.send(MountCmd::Park);
         }
+        if ui.small_button("sync home").on_hover_text("place the mount on its physical index marks FIRST, then click: tares az/alt so the indices read 0/0 (sets azm/alt offsets to the current raw encoders, persisted; PARK returns here)").clicked() {
+            let _ = tx.send(MountCmd::SyncHome);
+        }
         let step = if m.bias_fine { 0.01 } else { 0.1 };
         let ac = m.bias_frame == "alongcross";
         let (hn, vn) = if ac { ("InTk", "XTk") } else { ("Az", "El") };

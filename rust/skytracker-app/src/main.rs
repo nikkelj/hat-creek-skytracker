@@ -295,7 +295,14 @@ impl eframe::App for App {
             if !at.armed && t > 4.0 {
                 // SKYTRACKER_AUTOTEST_TARGET=body:moon|star:HIP32349|dso:M031|adsb:<icao>
                 // tracks that key in PROGRAM instead of a satellite in HANDOFF.
-                if let Ok(key) = std::env::var("SKYTRACKER_AUTOTEST_TARGET") {
+                if std::env::var("SKYTRACKER_AUTOTEST_BARE").is_ok() {
+                    // Bare HOTSPOT: no target selected — the tracker must lock
+                    // the nearest star and hold it (the star-filter fix).
+                    let _ = self.tx.send(MountCmd::SelectTarget(None));
+                    let _ = self.tx.send(MountCmd::SetMode("HOTSPOT".into()));
+                    eprintln!("autotest: BARE HOTSPOT (no target) at t={t:.1}s — expecting a star lock");
+                    at.armed = true;
+                } else if let Ok(key) = std::env::var("SKYTRACKER_AUTOTEST_TARGET") {
                     self.ui.selected = Some(key.clone());
                     let _ = self.tx.send(MountCmd::SelectTarget(Some(key.clone())));
                     let _ = self.tx.send(MountCmd::SetMode("PROGRAM".into()));

@@ -910,6 +910,17 @@ impl LoopState {
         // legitimate correction sweeps a large pixel distance between frames),
         // and GROWS on consecutive misses so residual prediction error or
         // target motion can't strand it while the target is still in frame.
+        let acq_gate = if self.hotspot_gate_center.is_none() {
+            // Unacquired: search near the boresight first ("lock the nearest
+            // star", and a HANDOFF-verified target is center-steered anyway),
+            // widening on misses until the whole frame is in play.
+            frame.map(|f| {
+                let growth = 1.4f64.powi(self.hotspot_miss_count.min(10) as i32).min(4.0);
+                (f.w as f64 / 2.0, f.h as f64 / 2.0, 0.18 * f.w.min(f.h) as f64 * growth)
+            })
+        } else {
+            None
+        };
         let gate = self.hotspot_gate_center.map(|(cx, cy)| {
             // Predict with the CORRECTION rates, not the total command: the
             // trajectory feed-forward moves the boresight WITH the target
@@ -940,8 +951,15 @@ impl LoopState {
                 gy += pdy;
             }
             let growth = 1.5f64.powi(self.hotspot_miss_count.min(8) as i32).min(4.0);
-            (gx, gy, hp.gate_radius * growth)
+            // Bare targets are sidereal-slow: a tight gate keeps a rival star
+            // of similar brightness from stealing the lock (brightest-in-gate
+            // flip-flops between two ~equal stars inside a wide gate). Misses
+            // still grow it for recovery; trajectory targets keep the full
+            // configured gate — they genuinely sweep pixels between frames.
+            let base_r = if inputs.setpoint.is_none() { hp.gate_radius.min(45.0) } else { hp.gate_radius };
+            (gx, gy, base_r * growth)
         });
+        let gate = gate.or(acq_gate);
         let detection = detect_in_frame(frame, &hp, gate);
 
         // Star-rejection rate gate: a detection whose implied sky rate doesn't
@@ -955,9 +973,17 @@ impl LoopState {
             Some(d) => {
                 // Candidates are stamped with the frame midpoint so the
                 // filter's implied rates measure image-to-image motion.
-                if self
-                    .detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, frame_time)
-                    == Some(false)
+                // Tracking BARE (no trajectory), a star IS the target —
+                // manual HOTSPOT with nothing selected means "lock the
+                // nearest star" — so the star-like rate reject only runs
+                // against a setpoint. (The old bare branch rejected anything
+                // slower than the rate gate: every star got locked during the
+                // baseline warm-up, then rejected, decayed and re-locked — a
+                // limit cycle that looked like bouncing.)
+                if inputs.setpoint.is_some()
+                    && self
+                        .detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, frame_time)
+                        == Some(false)
                 {
                     out.hotspot_status = "star-reject";
                     None

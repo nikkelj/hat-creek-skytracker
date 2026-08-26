@@ -857,8 +857,11 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         painter.galley(card.min + Vec2::new(8.0, 5.0), galley, TEXT);
         st.hover = Some(satnum.clone());
         if resp.clicked() {
-            st.selected = Some(satnum.clone());
-            let _ = tx.send(MountCmd::SelectTarget(Some(satnum)));
+            // Clicking the current selection clears it (toggle semantics,
+            // matching the Mount 3D view and the launch selector).
+            let key = if st.selected.as_deref() == Some(satnum.as_str()) { None } else { Some(satnum) };
+            st.selected = key.clone();
+            let _ = tx.send(MountCmd::SelectTarget(key));
         }
     } else if resp.clicked() && !zoom_btn_hovered && resp.hover_pos().map_or(false, |p| p.distance(center) > radius) {
         st.selected = None;

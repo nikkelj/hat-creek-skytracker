@@ -19,6 +19,7 @@ mod generated_tables;
 pub mod passes;
 pub mod sgp4_pass;
 pub mod spk;
+pub mod starlink;
 pub mod stars;
 pub mod time;
 pub mod tle;

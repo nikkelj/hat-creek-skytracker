@@ -1444,6 +1444,36 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             }
         };
         theme::kv_colored(ui, "target", tname, if m.target.is_some() { ACCENT } else { DIM });
+        // Starlink ephemeris switch: maneuvering sats where the TLE is stale.
+        if let Some(sn) = m.target.as_ref().filter(|t| !t.contains(':')) {
+            let ephs = shared.ephemerides.load();
+            let man = shared.starlink_manifest.load();
+            let now = crate::sky::now_unix();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("ephemeris").font(theme::sans(10.5)).color(TEXT_2));
+                if let Some(eph) = ephs.get(sn) {
+                    let left_h = (eph.stop_unix - now) / 3600.0;
+                    if left_h > 0.0 && now >= eph.start_unix {
+                        theme::tag(ui, &format!("EPHEMERIS · {left_h:.0} h left"), GREEN);
+                    } else {
+                        theme::tag(ui, "EPHEMERIS EXPIRED — TLE", AMBER);
+                    }
+                    if ui.small_button("refresh").on_hover_text("re-fetch the latest ephemeris for this satellite").clicked() {
+                        shared.ephem_request.store(Arc::new(Some(sn.clone())));
+                    }
+                } else if man.as_ref().as_ref().map_or(false, |m2| m2.contains_key(sn)) {
+                    if ui.small_button("use ephemeris").on_hover_text("download this satellite's Starlink public ephemeris (~2 MB) and track from it instead of the TLE — survives maneuvers").clicked() {
+                        shared.ephem_request.store(Arc::new(Some(sn.clone())));
+                    }
+                } else {
+                    ui.label(egui::RichText::new("TLE (not in the Starlink manifest)").font(theme::mono(9.5)).color(DIM));
+                }
+            });
+            let status = shared.ephem_status.load();
+            if !status.is_empty() {
+                ui.label(egui::RichText::new(status.as_str()).font(theme::mono(9.5)).color(DIM));
+            }
+        }
         if let Some((a, e)) = m.setpoint {
             theme::kv(ui, "setpoint", format!("{a:8.3}° / {e:7.3}°"));
         }

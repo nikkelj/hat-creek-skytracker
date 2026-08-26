@@ -24,6 +24,7 @@ mod passes_bridge;
 mod replay;
 mod screens;
 mod sky;
+mod starlink;
 mod state;
 mod theme;
 mod ui;
@@ -750,6 +751,7 @@ fn main() -> eframe::Result<()> {
     let (tx_fw, rx_fw) = crossbeam_channel::unbounded::<state::FwCmd>();
 
     sky::spawn(shared.clone(), root.clone());
+    starlink::spawn(shared.clone(), root.clone());
     mount::spawn(shared.clone(), rx, root.clone(), tx_cam.clone());
     camera::spawn(shared.clone(), rx_cam, root.clone());
     adsb::spawn(shared.clone());

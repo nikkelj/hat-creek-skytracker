@@ -783,6 +783,26 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                         ff_el_dps: if el <= 0.0 { 0.0 } else { a.el_rate },
                     });
                 }
+                // Ephemeris override (Starlink public ephemerides): maneuvering
+                // birds where the TLE is hours-stale. Falls through to the TLE
+                // outside the ephemeris span.
+                if let Some(eph) = shared.ephemerides.load().get(sn) {
+                    let t = crate::sky::now_unix();
+                    let jd_tt = crate::sky::now_jd_tt();
+                    if let (Some(p0), Some(pm), Some(pp)) = (
+                        skytracker_astro::starlink::position_at(eph, t),
+                        skytracker_astro::starlink::position_at(eph, t - 0.5),
+                        skytracker_astro::starlink::position_at(eph, t + 0.5),
+                    ) {
+                        let ctx = skytracker_astro::apparent::FrameContext::new(jd_tt);
+                        let (alt, az, _) = ctx.altaz_range_of_position(&p0, &geom);
+                        let (a_m, z_m, _) = ctx.altaz_range_of_position(&pm, &geom);
+                        let (a_p, z_p, _) = ctx.altaz_range_of_position(&pp, &geom);
+                        let el = if alt <= 0.0 { cfg.elevation_mask_deg } else { alt };
+                        let (ff_az, ff_el) = if alt <= 0.0 { (0.0, 0.0) } else { (sgp4_pass::unwrap_az_diff(z_p - z_m), a_p - a_m) };
+                        return Some(Setpoint { az_deg: az, el_deg: el, ff_az_dps: ff_az, ff_el_dps: ff_el });
+                    }
+                }
                 let cat = catalog.as_ref()?;
                 let sat = cat.get(sn)?;
                 let jd_tt = crate::sky::now_jd_tt();

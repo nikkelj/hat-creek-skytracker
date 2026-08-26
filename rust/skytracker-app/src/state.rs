@@ -1152,6 +1152,12 @@ pub struct Shared {
     /// mount keeps tracking live — only the sky/passes rendering scrubs.
     pub time_offset_s: ArcSwap<f64>,
     pub time_paused: ArcSwap<Option<f64>>,
+    /// Starlink public ephemerides: manifest (NORAD -> (filename, name)),
+    /// loaded tracks, the one-shot fetch request, and a status line.
+    pub starlink_manifest: ArcSwap<Option<Arc<std::collections::HashMap<String, (String, String)>>>>,
+    pub ephemerides: ArcSwap<std::collections::HashMap<String, Arc<skytracker_astro::starlink::Ephemeris>>>,
+    pub ephem_request: ArcSwap<Option<String>>,
+    pub ephem_status: ArcSwap<String>,
     /// Launch override: LAUNCH button re-bases the selected trajectory's T0
     /// to "now" and pre-empts every other target until aborted.
     pub launch_armed: ArcSwap<Option<(String, f64)>>,
@@ -1205,6 +1211,10 @@ impl Shared {
             eq_pointing: ArcSwap::from_pointee(eq0),
             adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
             launch_armed: ArcSwap::from_pointee(None),
+            starlink_manifest: ArcSwap::from_pointee(None),
+            ephemerides: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            ephem_request: ArcSwap::from_pointee(None),
+            ephem_status: ArcSwap::from_pointee(String::new()),
             time_offset_s: ArcSwap::from_pointee(0.0),
             time_paused: ArcSwap::from_pointee(None),
             mount_mode: ArcSwap::from_pointee(mount_mode0),

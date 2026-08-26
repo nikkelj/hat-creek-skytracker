@@ -5,6 +5,33 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-26 — Capture spool, blob stabilization, Starlink ephemerides
+
+- **Capture** streams to disk as it records (bounded queue → writer thread):
+  5+ minute collections are disk-bound, not RAM-bound. Disk-behind drops the
+  newest frame and counts it (REC tag + run_cameraN.json `dropped`) — never
+  ring-drops buffered frames. Mono → 8-bit palette BMP (3× smaller,
+  pixel-exact round trip). Measured on this machine: **774 frames/s,
+  905 MB/s** sustained at 1248×936 — 8× headroom over the 98 fps sim.
+- **Replay stabilization**: default mode is now **blob** — lock the most
+  blobby bright object (smoothed peak + background-subtracted sub-pixel
+  centroid) to its reference position; the flow tracker latched onto stars
+  and let the target slide. Falls back to flow when no blob exists. New
+  "track via cam N" measures the target's motion on another camera and
+  applies it through the plate-scale ratio. blob_lock test pins the warp
+  sign convention.
+- **Starlink public ephemerides**: MANIFEST.txt (11k satellites) fetched at
+  startup; a "use ephemeris" button on a selected Starlink satellite
+  downloads its ~2 MB MEME file (cached, old versions swept) and the mount
+  setpoint, skyplot mark and arc all switch to cubic-Hermite interpolation
+  of the J2000 state vectors (MEME→TOD→ITRS→ENU via FrameContext) —
+  surviving maneuvers that make TLEs useless. Expires back to TLE after the
+  ~72 h span (tag shows hours left). **Cross-check**: ephemeris vs TLE for
+  STARLINK-30814 agreed 0.19–0.93° over 5.5 h — the expected TLE-staleness
+  envelope (worst at closest range), confirming the frame chain.
+
+---
+
 ## 2026-08-24 — Parity scrub (4-agent audit) + tiers 0–3
 
 A four-agent audit compared every Python subsystem against the native app

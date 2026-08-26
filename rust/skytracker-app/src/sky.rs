@@ -254,6 +254,33 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
                 });
             }
         }
+        // Ephemeris-tracked satellites: replace the TLE mark position so the
+        // skyplot dot matches the maneuver-corrected arc and setpoint.
+        {
+            let ephs = shared.ephemerides.load();
+            if !ephs.is_empty() {
+                let t_now = jd_tt_to_unix(jd_tt);
+                let ctx = skytracker_astro::apparent::FrameContext::new(jd_tt);
+                for m in sats.iter_mut() {
+                    if let Some(eph) = ephs.get(&m.satnum) {
+                        if let (Some(p0), Some(pm), Some(pp)) = (
+                            skytracker_astro::starlink::position_at(eph, t_now),
+                            skytracker_astro::starlink::position_at(eph, t_now - 0.5),
+                            skytracker_astro::starlink::position_at(eph, t_now + 0.5),
+                        ) {
+                            let (alt, az, rng) = ctx.altaz_range_of_position(&p0, &geom);
+                            let (a_m, z_m, _) = ctx.altaz_range_of_position(&pm, &geom);
+                            let (a_p, z_p, _) = ctx.altaz_range_of_position(&pp, &geom);
+                            m.az = az;
+                            m.el = alt;
+                            m.range_km = rng;
+                            m.az_rate = sgp4_pass::unwrap_az_diff(z_p - z_m);
+                            m.el_rate = a_p - a_m;
+                        }
+                    }
+                }
+            }
+        }
         sats.sort_by(|a, b| b.el.partial_cmp(&a.el).unwrap());
 
         // Bodies.
@@ -408,10 +435,27 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
             last_passes = Instant::now();
         }
 
-        // Selected satellite's track, -10..+10 min at 5 s steps.
+        // Selected satellite's track, -10..+10 min at 5 s steps. A loaded
+        // Starlink ephemeris replaces the TLE (post-maneuver truth).
         let selected = shared.selected.load();
         let mut arc = Vec::new();
-        if let (Some(sn), Some(cat)) = (selected.as_ref().as_ref(), engine.tles.as_ref()) {
+        let eph_sel = selected.as_ref().as_ref().and_then(|sn| shared.ephemerides.load().get(sn).cloned());
+        if let Some(eph) = &eph_sel {
+            let t_now = jd_tt_to_unix(jd_tt);
+            let ctx_step = 30.0; // one FrameContext per 30 s of arc is plenty
+            let mut t = -600.0f64;
+            while t <= 600.0 {
+                if let Some(p) = skytracker_astro::starlink::position_at(eph, t_now + t) {
+                    let ctx = skytracker_astro::apparent::FrameContext::new(jd_tt + t / 86400.0);
+                    let (alt, az, _) = ctx.altaz_range_of_position(&p, &geom);
+                    if alt > -3.0 {
+                        arc.push(ArcPoint { t_rel_s: t, az, el: alt, sunlit: true });
+                    }
+                }
+                t += ctx_step;
+            }
+        }
+        if let (true, Some(sn), Some(cat)) = (arc.is_empty(), selected.as_ref().as_ref(), engine.tles.as_ref()) {
             if let Some(sat) = cat.get(sn) {
                 let mut t = -600.0;
                 while t <= 600.0 {

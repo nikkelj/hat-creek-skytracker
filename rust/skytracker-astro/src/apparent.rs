@@ -68,6 +68,22 @@ impl FrameContext {
 
     /// ICRS direction vector -> topocentric (alt_deg, az_deg):
     /// d_ITRS = rot_z(-gast) . M . d_ICRS, then the observer's ENU basis.
+    /// Topocentric (alt, az, range_km) of a geocentric POSITION vector (km,
+    /// ICRS/J2000 axes): rotate to ITRS, subtract the observer, project onto
+    /// ENU. The workhorse for ephemeris-file tracking (Starlink MEME states).
+    pub fn altaz_range_of_position(&self, r_icrs_km: &Vec3, geom: &ObserverGeometry) -> (f64, f64, f64) {
+        let rz = rot_z(-self.gast_rad);
+        let itrs = frames::mat_vec(&rz, &frames::mat_vec(&self.m, r_icrs_km));
+        let d = [itrs[0] - geom.pos_km[0], itrs[1] - geom.pos_km[1], itrs[2] - geom.pos_km[2]];
+        let e = dot(&d, &geom.east);
+        let n = dot(&d, &geom.north);
+        let u = dot(&d, &geom.up);
+        let r = norm(&d);
+        let alt = (u / r).clamp(-1.0, 1.0).asin().to_degrees();
+        let az = e.atan2(n).to_degrees().rem_euclid(360.0);
+        (alt, az, r)
+    }
+
     pub fn altaz_from_icrs(&self, p_icrs: &Vec3, geom: &ObserverGeometry) -> (f64, f64) {
         let rz = rot_z(-self.gast_rad);
         let d_itrs = frames::mat_vec(&rz, &frames::mat_vec(&self.m, p_icrs));

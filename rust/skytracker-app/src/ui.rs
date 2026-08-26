@@ -1348,7 +1348,8 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
     }
     if cam.armed {
         p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, RED);
-        p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, format!("REC {}", cam.armed_frames), theme::mono(10.5), RED);
+        let rec_txt = if cam.armed_dropped > 0 { format!("REC {}  drop {}", cam.armed_frames, cam.armed_dropped) } else { format!("REC {}", cam.armed_frames) };
+        p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, rec_txt, theme::mono(10.5), RED);
     }
     p.text(
         r.rect.left_top() + Vec2::new(6.0, 6.0),

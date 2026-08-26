@@ -352,6 +352,9 @@ pub struct CamFrames {
     /// 0-based camera index (Camera1_ -> 0).
     pub cam_index: usize,
     pub frames: Vec<FrameRef>,
+    /// FOV width (deg) from run_cameraN.json (0 when absent) — the
+    /// plate-scale basis for linked-camera stabilization.
+    pub fov_deg: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -531,7 +534,17 @@ impl RunInfo {
         if cams.is_empty() {
             return None;
         }
-        let mut cams: Vec<CamFrames> = cams.into_iter().map(|(cam_index, frames)| CamFrames { cam_index, frames }).collect();
+        let mut cams: Vec<CamFrames> = cams
+            .into_iter()
+            .map(|(cam_index, frames)| {
+                let fov_deg = std::fs::read_to_string(path.join(format!("run_camera{}.json", cam_index + 1)))
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v["fov_deg"].as_f64())
+                    .unwrap_or(0.0);
+                CamFrames { cam_index, frames, fov_deg }
+            })
+            .collect();
         for c in cams.iter_mut() {
             c.frames.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -713,6 +726,9 @@ pub fn reduce_for(full_w: usize, pane_w: usize) -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StabSettings {
+    /// Track the dominant compact bright blob (the target) instead of
+    /// star-field optical flow — the right anchor for satellite runs.
+    pub blob: bool,
     pub max_features: usize,
     pub ransac_threshold: f64,
     pub min_inliers: usize,
@@ -721,7 +737,7 @@ pub struct StabSettings {
 
 impl Default for StabSettings {
     fn default() -> Self {
-        StabSettings { max_features: 600, ransac_threshold: 3.0, min_inliers: 8, min_inlier_ratio: 0.4 }
+        StabSettings { blob: true, max_features: 600, ransac_threshold: 3.0, min_inliers: 8, min_inlier_ratio: 0.4 }
     }
 }
 
@@ -745,6 +761,60 @@ pub struct StabInfo {
     pub m: Option<[[f64; 3]; 2]>,
 }
 
+/// Centre of the most blobby bright object: 3×3-smoothed peak (kills hot
+/// pixels; compact blobs win over faint texture) refined by a background-
+/// subtracted intensity centroid in a window around the peak. None when
+/// nothing clears the background meaningfully.
+pub fn blob_center(g: &Gray) -> Option<(f64, f64)> {
+    if g.w < 16 || g.h < 16 {
+        return None;
+    }
+    let mut sum = 0u64;
+    for &v in &g.data {
+        sum += v as u64;
+    }
+    let bg = sum as f64 / g.data.len() as f64;
+    // 3x3 sum via a row-sliding accumulator; track the brightest cell.
+    let mut best = (0usize, 0usize, 0u32);
+    for y in 1..g.h - 1 {
+        for x in 1..g.w - 1 {
+            let mut a = 0u32;
+            for dy in 0..3 {
+                let i = (y - 1 + dy) * g.w + (x - 1);
+                a += g.data[i] as u32 + g.data[i + 1] as u32 + g.data[i + 2] as u32;
+            }
+            if a > best.2 {
+                best = (x, y, a);
+            }
+        }
+    }
+    let peak = best.2 as f64 / 9.0;
+    if peak < bg + 10.0 {
+        return None;
+    }
+    // Sub-pixel centroid around the peak; threshold midway to background so
+    // nearby faint stars don't tug the estimate.
+    let r = (g.w.min(g.h) / 12).clamp(6, 40);
+    let thr = bg + (peak - bg) * 0.25;
+    let (x0, x1) = (best.0.saturating_sub(r), (best.0 + r).min(g.w - 1));
+    let (y0, y1) = (best.1.saturating_sub(r), (best.1 + r).min(g.h - 1));
+    let (mut m, mut mx, mut my) = (0.0f64, 0.0f64, 0.0f64);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let v = g.data[y * g.w + x] as f64 - thr;
+            if v > 0.0 {
+                m += v;
+                mx += v * x as f64;
+                my += v * y as f64;
+            }
+        }
+    }
+    if m <= 0.0 {
+        return Some((best.0 as f64, best.1 as f64));
+    }
+    Some((mx / m, my / m))
+}
+
 /// Single-anchor flow stabilizer (stabilizer.Stabilizer method="flow" over
 /// the Rust engine): features on the reference, LK + RANSAC similarity per
 /// frame, warp onto the reference with black borders.
@@ -752,13 +822,17 @@ pub struct Stabilizer {
     settings: StabSettings,
     ref_gray: ImageF32,
     ref_points: Vec<[f32; 2]>,
+    ref_blob: Option<(f64, f64)>,
 }
 
 impl Stabilizer {
     pub fn new(reference: &Gray, settings: StabSettings) -> Self {
         let ref_gray = reference.to_f32();
+        // Flow features are kept even in blob mode: scenes without a
+        // dominant blob (star fields, texture) fall back to flow.
         let ref_points = detect_reference_points(&ref_gray, settings.max_features);
-        Stabilizer { settings, ref_gray, ref_points }
+        let ref_blob = if settings.blob { blob_center(reference) } else { None };
+        Stabilizer { settings, ref_gray, ref_points, ref_blob }
     }
 
     pub fn estimate(&self, cur: &ImageF32) -> StabInfo {
@@ -766,10 +840,32 @@ impl Stabilizer {
         StabInfo { ok: est.m.is_some(), inliers: est.num_inliers, reason: est.reject_reason, m: est.m }
     }
 
+    /// Blob mode: pure translation locking the dominant bright blob onto its
+    /// reference position (stabilizer "target" anchor).
+    fn estimate_blob(&self, frame: &Gray) -> StabInfo {
+        match (self.ref_blob, blob_center(frame)) {
+            (Some((rx, ry)), Some((cx, cy))) => StabInfo {
+                ok: true,
+                inliers: 1,
+                reason: None,
+                // warp_affine convention pinned by the blob_lock test:
+                // forward mapping, so t = ref − cur pulls the blob back.
+                m: Some([[1.0, 0.0, rx - cx], [0.0, 1.0, ry - cy]]),
+            },
+            (None, _) => StabInfo { ok: false, inliers: 0, reason: Some("no blob in reference".into()), m: None },
+            (_, None) => StabInfo { ok: false, inliers: 0, reason: Some("no blob in frame".into()), m: None },
+        }
+    }
+
     /// Warp `frame` onto the reference; passthrough (identity) when rejected.
     pub fn stabilize(&self, frame: &Gray) -> (Gray, StabInfo) {
         let cur = frame.to_f32();
-        let info = self.estimate(&cur);
+        let info = if self.settings.blob {
+            let bi = self.estimate_blob(frame);
+            if bi.ok { bi } else { self.estimate(&cur) }
+        } else {
+            self.estimate(&cur)
+        };
         match info.m {
             Some(m) => {
                 let mf = [[m[0][0] as f32, m[0][1] as f32, m[0][2] as f32], [m[1][0] as f32, m[1][1] as f32, m[1][2] as f32]];
@@ -1123,13 +1219,16 @@ pub struct ProcParams {
     pub contrast: f64,
     pub stabilize: bool,
     pub stab: StabSettings,
+    /// Measure stabilization on another camera's frames (slot index) and
+    /// apply it here through the plate-scale ratio (blob mode only).
+    pub stab_link: Option<usize>,
     pub reference_idx: usize,
     pub sharpen: SharpenSettings,
 }
 
 impl Default for ProcParams {
     fn default() -> Self {
-        ProcParams { gamma: 1.0, brightness: 0.0, contrast: 1.0, stabilize: false, stab: StabSettings::default(), reference_idx: 0, sharpen: SharpenSettings::default() }
+        ProcParams { gamma: 1.0, brightness: 0.0, contrast: 1.0, stabilize: false, stab: StabSettings::default(), stab_link: None, reference_idx: 0, sharpen: SharpenSettings::default() }
     }
 }
 
@@ -1334,7 +1433,7 @@ struct StabCache {
     stab: Stabilizer,
 }
 
-fn spawn_cam_worker(slot: usize, cam: Arc<CamFrames>, ctx: Option<egui::Context>) -> CamWorker {
+fn spawn_cam_worker(slot: usize, cam: Arc<CamFrames>, all: Vec<Arc<CamFrames>>, ctx: Option<egui::Context>) -> CamWorker {
     let (tx, rx) = crossbeam_channel::unbounded::<FrameRequest>();
     let out: Arc<ArcSwapOption<ProcessedFrame>> = Arc::new(ArcSwapOption::from(None));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1345,15 +1444,19 @@ fn spawn_cam_worker(slot: usize, cam: Arc<CamFrames>, ctx: Option<egui::Context>
     let proxy2 = proxy.clone();
     let handle = std::thread::Builder::new()
         .name(format!("replay-cam{}", cam.cam_index + 1))
-        .spawn(move || cam_worker_loop(slot, cam, rx, out2, stop2, ctx, proxy2))
+        .spawn(move || cam_worker_loop(slot, cam, all, rx, out2, stop2, ctx, proxy2))
         .ok();
     CamWorker { tx, out, stop, handle, proxy }
 }
 
-fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>, out: Arc<ArcSwapOption<ProcessedFrame>>, stop: Arc<AtomicBool>, ctx: Option<egui::Context>, proxy: Arc<Proxy>) {
+fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, all: Vec<Arc<CamFrames>>, rx: Receiver<FrameRequest>, out: Arc<ArcSwapOption<ProcessedFrame>>, stop: Arc<AtomicBool>, ctx: Option<egui::Context>, proxy: Arc<Proxy>) {
     let frames = &cam.frames;
     let mut cache = DecodeCache::new();
     let mut stab_cache: Option<StabCache> = None;
+    // Linked-camera stabilization: source-cam decode cache + ref blob.
+    let mut link_cache = DecodeCache::new();
+    let mut link_ref: Option<((usize, usize, usize), Option<(f64, f64)>)> = None;
+    let mut link_fw: Option<usize> = None;
     let mut full_shape: Option<(usize, usize)> = None;
     let mut last: Option<FrameRequest> = None;
     let mut seq: u64 = 0;
@@ -1432,7 +1535,61 @@ fn cam_worker_loop(slot: usize, cam: Arc<CamFrames>, rx: Receiver<FrameRequest>,
         let lut = build_lut(p.gamma, p.brightness, p.contrast);
         let mut proc = if is_default_params(p.gamma, p.brightness, p.contrast) { (*raw).clone() } else { raw.apply_lut(&lut) };
         let mut stab_info = None;
-        if p.stabilize {
+        let link_src = p.stab_link.filter(|s| *s != slot && *s < all.len() && !all[*s].frames.is_empty() && p.stab.blob);
+        if let (true, Some(src_slot)) = (p.stabilize, link_src) {
+            // Linked-camera blob stabilization: measure the target's motion on
+            // the source camera (e.g. the wide guide cam where the target is
+            // bright), scale through the plate-scale ratio, apply here.
+            let src = &all[src_slot];
+            let sfw = match link_fw {
+                Some(w) => w,
+                None => {
+                    let w = link_cache.get(&src.frames, 0, 1, &Proxy::new(src.frames.len())).map(|g| g.w).unwrap_or(0);
+                    link_fw = Some(w);
+                    w
+                }
+            };
+            let dummy = Proxy::new(src.frames.len());
+            let sreduce = if sfw > 0 { reduce_for(sfw, 640) } else { 1 };
+            let nearest = |t: f64| -> usize {
+                let i = src.frames.partition_point(|f| f.t < t);
+                if i == 0 {
+                    0
+                } else if i >= src.frames.len() {
+                    src.frames.len() - 1
+                } else if (src.frames[i].t - t).abs() < (t - src.frames[i - 1].t).abs() {
+                    i
+                } else {
+                    i - 1
+                }
+            };
+            let ref_idx = p.reference_idx.min(frames.len() - 1);
+            let sref = nearest(frames[ref_idx].t);
+            let key = (src_slot, sref, sreduce);
+            if link_ref.as_ref().map_or(true, |(k, _)| *k != key) {
+                let rb = link_cache.get(&src.frames, sref, sreduce, &dummy).ok().and_then(|g| blob_center(&g));
+                link_ref = Some((key, rb));
+            }
+            let scur = nearest(frames[idx].t);
+            let cb = link_cache.get(&src.frames, scur, sreduce, &dummy).ok().and_then(|g| blob_center(&g));
+            stab_info = match (link_ref.as_ref().and_then(|(_, b)| *b), cb) {
+                (Some((rx, ry)), Some((cx, cy))) if sfw > 0 => {
+                    // src reduced px -> src full px -> deg -> own full px -> own processed px
+                    let degpp_src = if src.fov_deg > 0.0 { src.fov_deg / sfw as f64 } else { 0.0 };
+                    let degpp_own = if cam.fov_deg > 0.0 { cam.fov_deg / fw as f64 } else { 0.0 };
+                    let scale = if degpp_src > 0.0 && degpp_own > 0.0 { degpp_src / degpp_own } else { 1.0 };
+                    let tx = (rx - cx) * sreduce as f64 * scale / reduce as f64;
+                    let ty = (ry - cy) * sreduce as f64 * scale / reduce as f64;
+                    let m = [[1.0, 0.0, tx], [0.0, 1.0, ty]];
+                    let mf = [[1.0f32, 0.0, tx as f32], [0.0, 1.0, ty as f32]];
+                    let cur = proc.to_f32();
+                    let warped = warp_affine(&cur, &mf, proc.w, proc.h, Border::Constant(0.0));
+                    proc = Gray::from_f32(&warped, 1.0);
+                    Some(StabInfo { ok: true, inliers: 1, reason: None, m: Some(m) })
+                }
+                _ => Some(StabInfo { ok: false, inliers: 0, reason: Some("link: no blob on source cam".into()), m: None }),
+            };
+        } else if p.stabilize {
             let ref_idx = p.reference_idx.min(frames.len() - 1);
             let key = (ref_idx, reduce, lut, p.stab);
             let fresh = stab_cache.as_ref().map_or(true, |c| c.key != key);
@@ -1841,7 +1998,7 @@ fn is_cloud_placeholder(path: &Path) -> bool {
     false
 }
 
-fn make_params(stabilize: bool, stab: StabSettings, sharpen: SharpenSettings, l: &LoadedRun, slot: usize) -> ProcParams {
+fn make_params(stabilize: bool, stab: StabSettings, stab_link: Option<usize>, sharpen: SharpenSettings, l: &LoadedRun, slot: usize) -> ProcParams {
     let a = l.adjust.get(slot).copied().unwrap_or_default();
     ProcParams {
         gamma: a.gamma,
@@ -1849,6 +2006,7 @@ fn make_params(stabilize: bool, stab: StabSettings, sharpen: SharpenSettings, l:
         contrast: a.contrast,
         stabilize,
         stab,
+        stab_link: stab_link.filter(|s| *s != slot),
         reference_idx: l.reference_idx.get(slot).copied().unwrap_or(0),
         sharpen,
     }
@@ -1880,6 +2038,8 @@ pub struct ReplayState {
     pub active_cam: usize,
     pub stabilize: bool,
     pub stab: StabSettings,
+    /// Linked-camera stabilization source (slot), None = the pane's own cam.
+    pub stab_link: Option<usize>,
     pub sharpen: SharpenSettings,
     pub overlays: bool,
     pub stack_n: usize,
@@ -1930,6 +2090,7 @@ impl Default for ReplayState {
             active_cam: 0,
             stabilize: false,
             stab: StabSettings::default(),
+            stab_link: None,
             sharpen: SharpenSettings::default(),
             overlays: true,
             stack_n: 20,
@@ -2025,7 +2186,8 @@ impl ReplayState {
         let Some(info) = lib.get(lib_index) else { return };
         let run = Arc::new(info.clone());
         let n = run.cams.len();
-        let workers: Vec<CamWorker> = run.cams.iter().enumerate().map(|(slot, cam)| spawn_cam_worker(slot, Arc::new(cam.clone()), ctx.clone())).collect();
+        let all: Vec<Arc<CamFrames>> = run.cams.iter().map(|c| Arc::new(c.clone())).collect();
+        let workers: Vec<CamWorker> = all.iter().enumerate().map(|(slot, cam)| spawn_cam_worker(slot, cam.clone(), all.clone(), ctx.clone())).collect();
         let t0 = run.t0().unwrap_or(0.0);
         let t1 = run.t1().unwrap_or(t0);
         let cloud_only = run.cams.iter().filter_map(|c| c.frames.get(c.frames.len() / 2)).any(|f| is_cloud_placeholder(&f.path));
@@ -2143,7 +2305,7 @@ impl ReplayState {
     }
 
     fn proc_params(&self, l: &LoadedRun, slot: usize) -> ProcParams {
-        make_params(self.stabilize, self.stab, self.sharpen, l, slot)
+        make_params(self.stabilize, self.stab, self.stab_link, self.sharpen, l, slot)
     }
 
     fn export_dir(captures_dir: &Path) -> PathBuf {
@@ -2715,7 +2877,7 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
     // Requests: one per pane when the target frame or params changed.
     for slot in 0..n {
         let Some(idx) = l.run.frame_index_at(slot, st.t) else { continue };
-        let params = make_params(st.stabilize, st.stab, st.sharpen, l, slot);
+        let params = make_params(st.stabilize, st.stab, st.stab_link, st.sharpen, l, slot);
         let pane_w = l.pane_w[slot];
         let same = l.last_sent[slot].as_ref().map_or(false, |(i, w, p, pl)| *i == idx && *w == pane_w && *p == params && *pl == st.playing);
         if !same {
@@ -2959,7 +3121,36 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
     });
     if st.stabilize {
         let ref_idx = st.loaded.as_ref().map(|l| l.reference_idx[slot]).unwrap_or(0);
-        ui.label(egui::RichText::new(format!("flow method · reference frame {}", ref_idx + 1)).font(theme::mono(10.5)).color(theme::DIM));
+        ui.horizontal(|ui| {
+            // Blob = lock the dominant bright object (the target); flow = the
+            // old star-field optical-flow anchor.
+            for (b, label) in [(true, "blob"), (false, "flow")] {
+                if theme::mode_button(ui, label, st.stab.blob == b, theme::ACCENT) {
+                    st.stab.blob = b;
+                }
+            }
+            ui.label(egui::RichText::new(format!("reference frame {}", ref_idx + 1)).font(theme::mono(10.5)).color(theme::DIM));
+        });
+        let cams: Vec<(usize, usize)> = st.loaded.as_ref().map(|l| l.run.cams.iter().enumerate().map(|(s, c)| (s, c.cam_index)).collect()).unwrap_or_default();
+        if st.stab.blob && cams.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("track via").color(theme::TEXT_2));
+                let sel_txt = match st.stab_link {
+                    Some(s) if s != slot => format!("cam {}", cams.iter().find(|(sl, _)| *sl == s).map(|(_, c)| c + 1).unwrap_or(s + 1)),
+                    _ => "this cam".into(),
+                };
+                egui::ComboBox::from_id_salt("stab_link").selected_text(sel_txt).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut st.stab_link, None, "this cam");
+                    for (s, ci) in &cams {
+                        if *s != slot {
+                            ui.selectable_value(&mut st.stab_link, Some(*s), format!("cam {}", ci + 1));
+                        }
+                    }
+                });
+                ui.label(egui::RichText::new("measure the target's motion on that camera, apply here via the plate-scale ratio").font(theme::sans(9.5)).color(theme::DIM));
+            });
+        }
+        if !st.stab.blob {
         egui::Grid::new("replay_stab_grid").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
             ui.label(egui::RichText::new("max features").color(theme::TEXT_2));
             ui.add(egui::DragValue::new(&mut st.stab.max_features).range(50..=3000).speed(10.0));
@@ -2974,6 +3165,7 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
             ui.add(egui::DragValue::new(&mut st.stab.min_inlier_ratio).range(0.0..=1.0).speed(0.01).fixed_decimals(2));
             ui.end_row();
         });
+        }
     }
     ui.add_space(6.0);
 
@@ -3317,6 +3509,36 @@ mod tests {
         // Unaligned average of identical frames is exactly the frame too.
         let (mean2, ..) = stack_gray(&frames, 0, false, StabSettings::default()).unwrap();
         assert!(mean2.iter().zip(f.data.iter()).all(|(a, b)| (a - *b as f64).abs() < 1e-9));
+    }
+
+    #[test]
+    fn blob_lock_pins_the_target() {
+        // Blob at (20,20) in the reference, (26,24) in the frame: after
+        // blob-mode stabilization the blob must land back on (20,20) — this
+        // pins the warp_affine sign convention.
+        let blob = |cx: usize, cy: usize| -> Gray {
+            let (w, h) = (96usize, 80usize);
+            let mut d = vec![8u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = x as f64 - cx as f64;
+                    let dy = y as f64 - cy as f64;
+                    let v = 220.0 * (-(dx * dx + dy * dy) / 8.0).exp();
+                    d[y * w + x] = (8.0 + v).min(255.0) as u8;
+                }
+            }
+            Gray { w, h, data: d }
+        };
+        let refe = blob(20, 20);
+        let cur = blob(26, 24);
+        let (rc, cc) = (blob_center(&refe).unwrap(), blob_center(&cur).unwrap());
+        assert!((rc.0 - 20.0).abs() < 0.5 && (rc.1 - 20.0).abs() < 0.5, "ref centroid {rc:?}");
+        assert!((cc.0 - 26.0).abs() < 0.5 && (cc.1 - 24.0).abs() < 0.5, "cur centroid {cc:?}");
+        let stab = Stabilizer::new(&refe, StabSettings::default());
+        let (warped, info) = stab.stabilize(&cur);
+        assert!(info.ok);
+        let wc = blob_center(&warped).unwrap();
+        assert!((wc.0 - 20.0).abs() < 1.0 && (wc.1 - 20.0).abs() < 1.0, "warped centroid {wc:?} should be back at (20,20)");
     }
 
     #[test]

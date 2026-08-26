@@ -945,6 +945,8 @@ pub struct CamSnapshot {
     pub connected: bool,
     pub armed: bool,
     pub armed_frames: usize,
+    /// Frames skipped because the spool queue was full (disk behind).
+    pub armed_dropped: usize,
     pub last_dump: Option<String>,
     pub deep_stars: usize,
     pub hw_index: usize,

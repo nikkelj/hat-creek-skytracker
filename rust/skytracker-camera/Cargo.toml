@@ -15,3 +15,6 @@ crate-type = ["rlib"]
 libloading = "0.8"
 # Parallel BMP dump workers for armed-capture flushes.
 rayon = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp"] }

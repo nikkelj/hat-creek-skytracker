@@ -347,7 +347,15 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
     let observer = skytracker_astro::sgp4_pass::Observer { lat_deg: cfg.lat_deg, lon_deg: cfg.lon_deg, elevation_m: cfg.alt_m };
     let geom = observer.geometry();
     let recorder = Arc::new(CaptureRecorder::new());
-    recorder.set_capacity(cfg.capture_buffer_frames);
+    // Sweep stale spool dirs left by a crashed/killed previous run.
+    if let Ok(rd) = std::fs::read_dir(root.join(&cfg.captures_dir)) {
+        let prefix = format!(".spool_cam{}_", slot + 1);
+        for e in rd.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
     let period = Duration::from_secs_f64(1.0 / CAM_FPS);
     let core = shared.core.clone();
     let is_hotspot_cam = slot == shared.hotspot_slot();
@@ -377,12 +385,24 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
             match cmd {
                 CamCmd::Arm => {
                     if connected {
-                        recorder.arm();
-                        armed_frames = 0;
+                        let spool = root.join(&cfg.captures_dir).join(format!(".spool_cam{}_{}", slot + 1, crate::sky::utc_stamp_compact()));
+                        match recorder.arm_spool(&spool, cfg.capture_buffer_frames) {
+                            Ok(()) => armed_frames = 0,
+                            Err(e) => last_dump = Some(format!("arm failed: {e}")),
+                        }
                     }
                 }
                 CamCmd::Disarm => {
-                    let _ = recorder.disarm_and_dump(&std::env::temp_dir().join("skytracker_discard"));
+                    // Discard: finish the spool off-thread and delete it.
+                    if recorder.is_armed() {
+                        recorder.disarm();
+                        let rec = recorder.clone();
+                        std::thread::Builder::new().name("capture-discard".into()).spawn(move || {
+                            if let Ok((dir, _, _)) = rec.finish() {
+                                let _ = std::fs::remove_dir_all(dir);
+                            }
+                        }).ok();
+                    }
                     armed_frames = 0;
                 }
                 CamCmd::Dump { name } => {
@@ -423,13 +443,19 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         let done = Arc::new(Mutex::new(None::<String>));
                         dump_result = Some(done.clone());
                         let png = cfg.image_format == "png";
+                        recorder.disarm();
                         std::thread::Builder::new().name(format!("capture-dump{}", slot + 1)).spawn(move || {
-                            let res = match rec.disarm_and_dump(&dir) {
-                                Ok((n, times)) => {
+                            // Most frames are already on disk in the spool dir;
+                            // finish() only flushes the in-RAM tail, then the
+                            // files move (same-volume rename) into the run dir.
+                            let res = match rec.finish() {
+                                Ok((spool_dir, times, dropped)) => {
+                                    let n = times.len();
+                                    let _ = std::fs::create_dir_all(&dir);
                                     for (i, t) in times.iter().enumerate() {
                                         let (y, mo, d, hh, mm, ss) = crate::sky::civil_from_unix(*t);
                                         let frac = ((t - t.floor()) * 1e6).round() as i64;
-                                        let src = dir.join(format!("frame_{i:05}.bmp"));
+                                        let src = spool_dir.join(format!("frame_{i:05}.bmp"));
                                         if png {
                                             // image_format=png: re-encode the BMP (Python capture PNG option).
                                             let new = dir.join(format!("Camera{}_{i:06}__{y:04}_{mo:02}_{d:02}_{hh:02}_{mm:02}_{ss:02}.{frac:06}Z.png", slot2 + 1));
@@ -447,9 +473,11 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                                             let _ = std::fs::rename(&src, new);
                                         }
                                     }
+                                    let _ = std::fs::remove_dir_all(&spool_dir);
                                     let meta = serde_json::json!({
                                         "target": cn, "camera": format!("camera{}", slot2 + 1), "name": cname, "role": crole,
                                         "source": src2, "width": w2, "height": h2, "fov_deg": fov2, "frames": n,
+                                        "dropped": dropped,
                                         "start_unix": times.first().copied().unwrap_or(0.0), "end_unix": times.last().copied().unwrap_or(0.0),
                                     });
                                     let _ = std::fs::write(dir.join(format!("run_camera{}.json", slot2 + 1)), serde_json::to_string_pretty(&meta).unwrap());
@@ -463,7 +491,11 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                                     if dir.read_dir().map(|mut d| !d.any(|e| e.as_ref().map(|e| e.file_name().to_string_lossy().starts_with("config_")).unwrap_or(false))).unwrap_or(false) {
                                         let _ = std::fs::copy(&config_path, cfg_copy);
                                     }
-                                    format!("{n} frames -> {}", dir.display())
+                                    if dropped > 0 {
+                                        format!("{n} frames -> {} ({dropped} dropped: disk slower than capture)", dir.display())
+                                    } else {
+                                        format!("{n} frames -> {}", dir.display())
+                                    }
                                 }
                                 Err(e) => format!("dump failed: {e}"),
                             };
@@ -580,6 +612,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                     connected: false,
                     armed: false,
                     armed_frames: 0,
+                    armed_dropped: 0,
                     last_dump: last_dump.clone(),
                     deep_stars: 0,
                     hw_index,
@@ -662,6 +695,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         connected: true,
                         armed: recorder.is_armed(),
                         armed_frames,
+                        armed_dropped: recorder.dropped(),
                         last_dump: last_dump.clone(),
                         deep_stars: deep_n,
                         hw_index,

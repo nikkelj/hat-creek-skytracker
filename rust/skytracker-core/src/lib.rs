@@ -10,6 +10,7 @@
 pub mod autotune;
 pub mod controller;
 pub mod core_loop;
+pub mod feature_track;
 pub mod hotspot;
 pub mod pid;
 pub mod protocol;

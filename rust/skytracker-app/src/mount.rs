@@ -44,6 +44,7 @@ pub fn mode_name(m: Mode) -> &'static str {
         Mode::Handoff => "HANDOFF",
         Mode::Hotspot => "HOTSPOT",
         Mode::Mti => "MTI",
+        Mode::Feature => "FEATURE",
     }
 }
 
@@ -272,6 +273,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                         "HANDOFF" => Mode::Handoff,
                         "HOTSPOT" => Mode::Hotspot,
                         "MTI" => Mode::Mti,
+                        "FEATURE" => Mode::Feature,
                         _ => Mode::Standby,
                     };
                     let mut i = loop_shared.inputs.lock().unwrap();
@@ -405,6 +407,19 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     loop_shared.inputs.lock().unwrap().hotspot.star_filter = on;
                     persist_config_key(&cfg.path, "hotspot_star_filter_enabled", serde_json::json!(on));
                     push_status(&mut status, format!("hotspot star filter {}", if on { "ON" } else { "OFF" }));
+                }
+                MountCmd::FeatureGrab { x, y, half } => {
+                    // Grab implies intent: switch the loop to FEATURE too.
+                    mode = Mode::Feature;
+                    stopped = false;
+                    let mut i = loop_shared.inputs.lock().unwrap();
+                    i.mode = mode;
+                    i.stopped = false;
+                    i.setpoint = None;
+                    i.feature_grab = Some((x, y, half));
+                    i.feature_grab_seq += 1;
+                    drop(i);
+                    push_status(&mut status, format!("FEATURE: grabbing template at ({x:.0},{y:.0}) ±{half}px"));
                 }
                 MountCmd::SyncHome => {
                     // Tare az/alt on the physical indices: offsets := raw
@@ -958,6 +973,22 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 }
             }
         }
+        // FEATURE grab from a camera-view click: switch to FEATURE + hand the
+        // template box to the loop (one-shot).
+        if let Some((gx, gy, ghalf)) = (**shared.feature_grab_request.load()).clone() {
+            shared.feature_grab_request.store(Arc::new(None));
+            mode = Mode::Feature;
+            stopped = false;
+            let mut i = loop_shared.inputs.lock().unwrap();
+            i.mode = mode;
+            i.stopped = false;
+            i.setpoint = None;
+            i.feature_grab = Some((gx, gy, ghalf));
+            i.feature_grab_seq += 1;
+            drop(i);
+            push_status(&mut status, format!("FEATURE: grabbing template at ({gx:.0},{gy:.0}) ±{ghalf}px"));
+        }
+
         // LAUNCH override (joystick_controller launch_active): while armed, the
         // launch is the target, PROGRAM is forced, other selections are dropped.
         if let Some((lkey, _t0)) = (**shared.launch_armed.load()).clone() {
@@ -1059,6 +1090,8 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             hotspot_status: out.hotspot_status.clone(),
             hotspot_snr: out.hotspot_snr,
             hotspot_centroid: out.hotspot_centroid,
+            feature_score: out.feature_score,
+            feature_box: out.feature_box,
             handoff_count: out.handoff_detection_count,
             gains,
             autotune: autotune_text,

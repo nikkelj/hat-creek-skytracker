@@ -10,6 +10,7 @@
 //! Inputs the loop cannot own (joystick axes, camera frames, skyfield setpoint)
 //! are pushed in by Python as plain Rust data; see `Inputs` / `Frame`.
 
+use crate::feature_track::FeatureTracker;
 use crate::hotspot::{self, Detection};
 use crate::pid::PidController;
 use crate::transforms::{self, MountMode};
@@ -22,6 +23,9 @@ pub enum Mode {
     Handoff,
     Hotspot,
     Mti,
+    /// Feature/template tracker: follow an operator-grabbed patch of an
+    /// extended target (close-range rocket) — no trajectory, pure optical.
+    Feature,
 }
 
 /// Sky-frame target pushed by Python (from skyfield). Feed-forward rates are
@@ -104,6 +108,11 @@ pub struct Inputs {
 
     // HOTSPOT
     pub hotspot: HotspotParams,
+
+    /// FEATURE-mode grab request: (frame x, frame y, template half-size px).
+    /// `feature_grab_seq` bumps once per request; the loop consumes it once.
+    pub feature_grab: Option<(f64, f64, usize)>,
+    pub feature_grab_seq: u64,
 }
 
 impl Default for Inputs {
@@ -145,6 +154,8 @@ impl Default for Inputs {
                 star_filter: false,
                 rate_gate_dps: 0.15,
             },
+            feature_grab: None,
+            feature_grab_seq: 0,
         }
     }
 }
@@ -173,6 +184,10 @@ pub struct StepOutput {
 
     pub azm_error: f64,
     pub alt_error: f64,
+
+    /// FEATURE mode: last match score and the tracked box (cx, cy, half px).
+    pub feature_score: f64,
+    pub feature_box: Option<(f64, f64, f64)>,
     pub azm_pid_output: f64,
     pub alt_pid_output: f64,
 
@@ -308,6 +323,22 @@ pub struct LoopState {
     pub focus_poll_i: u32,
     pub last_focus_frac: f64,
 
+    // FEATURE-mode tracker state.
+    feature: Option<FeatureTracker>,
+    feature_grab_seen: u64,
+    feature_miss: u32,
+    feature_last_det: Option<f64>,
+    feature_corr_dps: (f64, f64),
+    feature_last_seq: Option<u64>,
+    feature_interval: f64,
+    feature_last_fresh: f64,
+    // Self-derived velocity feed-forward: the target's angular rate estimated
+    // from our own commanded rate + the error's growth rate (a launch has no
+    // trajectory to ride, so the tracker supplies its own).
+    feature_prev_err: Option<(f64, f64, f64)>,
+    feature_ff_dps: (f64, f64),
+    feature_cmd_dps: (f64, f64),
+
     // HOTSPOT lock state (ported from JoystickModeState).
     hotspot_gate_center: Option<(f64, f64)>,
     hotspot_acquired: bool,
@@ -364,6 +395,17 @@ impl LoopState {
             prev_mode: None,
             focus_poll_i: 0,
             last_focus_frac: 0.0,
+            feature: None,
+            feature_grab_seen: 0,
+            feature_miss: 0,
+            feature_last_det: None,
+            feature_corr_dps: (0.0, 0.0),
+            feature_last_seq: None,
+            feature_interval: 0.2,
+            feature_last_fresh: 0.0,
+            feature_prev_err: None,
+            feature_ff_dps: (0.0, 0.0),
+            feature_cmd_dps: (0.0, 0.0),
             hotspot_gate_center: None,
             hotspot_acquired: false,
             hotspot_miss_count: 0,
@@ -491,6 +533,7 @@ impl LoopState {
             }
             // MTI: stub, as in Python.
             Mode::Mti => {}
+            Mode::Feature => self.step_feature(inputs, frame, current_azm, current_alt, now, &mut out),
         }
 
         out
@@ -835,6 +878,185 @@ impl LoopState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// FEATURE: follow an operator-grabbed template of an extended target
+    /// (close-range rocket) purely optically — grab pre-launch, the PID nulls
+    /// the patch's pixel error through ignition and ascent. No trajectory,
+    /// no handoff; on loss it zeroes and waits for a re-grab.
+    fn step_feature(
+        &mut self,
+        inputs: &Inputs,
+        frame: Option<&Frame>,
+        current_azm: f64,
+        current_alt: f64,
+        now: f64,
+        out: &mut StepOutput,
+    ) {
+        let hp = inputs.hotspot; // shared optics geometry + rate caps
+
+        // Safety limits, same stance as HOTSPOT.
+        let (azm_min, azm_max) = inputs.azm_limit;
+        let (alt_min, alt_max) = inputs.alt_limit;
+        if !(azm_min <= current_azm && current_azm <= azm_max && alt_min <= current_alt && current_alt <= alt_max) {
+            out.azm_rate_cmd = Some(0);
+            out.alt_rate_cmd = Some(0);
+            out.requested_mode = Some(Mode::Standby);
+            out.hotspot_status = "limit";
+            out.status_msg = Some("FEATURE: mount at safety limit - switched to STANDBY".to_string());
+            self.feature = None;
+            return;
+        }
+
+        // One-shot grab request.
+        if inputs.feature_grab_seq != self.feature_grab_seen {
+            self.feature_grab_seen = inputs.feature_grab_seq;
+            if let (Some(f), Some((cx, cy, half))) = (frame, inputs.feature_grab) {
+                self.feature = FeatureTracker::init(&f.data, f.w, f.h, cx, cy, half);
+                self.feature_miss = 0;
+                self.feature_corr_dps = (0.0, 0.0);
+                self.feature_ff_dps = (0.0, 0.0);
+                self.feature_cmd_dps = (0.0, 0.0);
+                self.feature_prev_err = None;
+                self.feature_last_det = Some(now);
+                out.status_msg = Some(match &self.feature {
+                    Some(t) => format!("FEATURE: template grabbed at ({cx:.0},{cy:.0}) ±{} px", t.half()),
+                    None => "FEATURE: grab failed (box off-frame or textureless)".to_string(),
+                });
+            }
+        }
+        if self.feature.is_none() {
+            out.azm_rate_cmd = Some(0);
+            out.alt_rate_cmd = Some(0);
+            out.hotspot_status = "no template";
+            return;
+        }
+
+        // Stale-frame gate (same reasoning as HOTSPOT).
+        let frame_is_stale = matches!((frame, self.feature_last_seq), (Some(f), Some(last)) if f.seq == last);
+        if let Some(f) = frame {
+            if !frame_is_stale {
+                self.feature_last_seq = Some(f.seq);
+            }
+        }
+        let frame = if frame_is_stale { None } else { frame };
+        let frame_time = frame.map(|f| f.time).unwrap_or(now);
+        if frame.is_some() {
+            if self.feature_last_fresh > 0.0 {
+                let iv = frame_time - self.feature_last_fresh;
+                if iv > 0.0 {
+                    self.feature_interval = iv.clamp(0.05, 2.0);
+                }
+            }
+            self.feature_last_fresh = frame_time;
+        }
+
+        let el_sky = sky_el_of(inputs, current_azm, current_alt);
+        // Search widens on misses (launch jerk / brief plume washout).
+        let search = (32.0 * 1.5f64.powi(self.feature_miss.min(6) as i32)).min(120.0) as usize;
+        let m = {
+            let tr = self.feature.as_mut().unwrap();
+            frame.and_then(|f| tr.track(&f.data, f.w, f.h, search, 0.45))
+        };
+        let half = self.feature.as_ref().map(|t| t.half() as f64).unwrap_or(0.0);
+
+        if let Some(mm) = m {
+            let (h, w) = frame.map(|f| (f.h, f.w)).unwrap_or((0, 0));
+            let dx = mm.cx - (w as f64 / 2.0);
+            let dy = mm.cy - (h as f64 / 2.0);
+            let (az_error, el_error) = hotspot::pixel_offset_to_angles(
+                dx, dy, hp.pixel_size_um, hp.focal_length_mm, hp.rotation_deg, el_sky, hp.x_sign, hp.y_sign, true,
+            );
+            let (az_error, el_error) = sky_delta_to_axis(inputs, current_azm, current_alt, az_error, el_error);
+
+            // Velocity feed-forward: target rate = our commanded boresight
+            // rate + the measured error growth, low-passed (τ 0.5 s). A pure
+            // P correction against an accelerating rocket carries a velocity
+            // lag of rate/(P·360) — the FF absorbs the velocity so the PID
+            // only handles the residual.
+            if let Some((t_prev, az_prev, el_prev)) = self.feature_prev_err {
+                let dt_m = (frame_time - t_prev).clamp(1e-3, 2.0);
+                let tgt = (
+                    self.feature_cmd_dps.0 + (az_error - az_prev) / dt_m,
+                    self.feature_cmd_dps.1 + (el_error - el_prev) / dt_m,
+                );
+                let a = (dt_m / 0.5).min(1.0);
+                let lim = 2.0 * hp.max_rate_dps;
+                self.feature_ff_dps.0 = (self.feature_ff_dps.0 + a * (tgt.0 - self.feature_ff_dps.0)).clamp(-lim, lim);
+                self.feature_ff_dps.1 = (self.feature_ff_dps.1 + a * (tgt.1 - self.feature_ff_dps.1)).clamp(-lim, lim);
+            }
+            self.feature_prev_err = Some((frame_time, az_error, el_error));
+
+            self.azm_pid.update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);
+            self.alt_pid.update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
+            self.azm_pid.set_output_filter_tau(inputs.output_filter_tau);
+            self.alt_pid.set_output_filter_tau(inputs.output_filter_tau);
+            self.azm_pid.set_feed_forward_rate(0.0);
+            self.alt_pid.set_feed_forward_rate(0.0);
+            let dt = self.dt(now);
+            let (az_out, _) = self.azm_pid.compute_pid_output(az_error, dt, Some(current_azm));
+            let (al_out, _) = self.alt_pid.compute_pid_output(el_error, dt, Some(current_alt));
+            // Same correction cap as HOTSPOT: never outrun the measurements.
+            let interval = self.feature_interval.max(0.05);
+            let cap_az = (hp.max_rate_dps / 360.0).min(0.9 * az_error.abs() / interval / 360.0);
+            let cap_al = (hp.max_rate_dps / 360.0).min(0.9 * el_error.abs() / interval / 360.0);
+            let az_corr = az_out.clamp(-cap_az, cap_az);
+            let al_corr = al_out.clamp(-cap_al, cap_al);
+            let az_total = self.feature_ff_dps.0 / 360.0 + az_corr;
+            let al_total = self.feature_ff_dps.1 / 360.0 + al_corr;
+            self.feature_corr_dps = (az_corr * 360.0, al_corr * 360.0);
+            self.feature_cmd_dps = (az_total * 360.0, al_total * 360.0);
+            self.feature_miss = 0;
+            self.feature_last_det = Some(now);
+
+            out.azm_error = az_error;
+            out.alt_error = el_error;
+            out.azm_pid_output = az_total;
+            out.alt_pid_output = al_total;
+            out.hotspot_acquired = true;
+            out.hotspot_status = "locked";
+            out.hotspot_snr = mm.score * 10.0; // score 0..1 on the SNR readout scale
+            out.hotspot_centroid = Some((mm.cx, mm.cy));
+            out.feature_score = mm.score;
+            out.feature_box = Some((mm.cx, mm.cy, half));
+            out.azm_rate_cmd = Some(hotspot_discrete_step(az_total));
+            out.alt_rate_cmd = Some(hotspot_discrete_step(al_total));
+            return;
+        }
+
+        // Miss: bleed the correction, keep looking; loss (3× coast) zeroes and
+        // waits for a re-grab — near the ground there is nothing to fall back to.
+        if !frame_is_stale && frame.is_some() {
+            self.feature_miss += 1;
+            let (mut a, mut e) = self.feature_corr_dps;
+            a *= 0.5;
+            e *= 0.5;
+            if a.abs() < 0.02 {
+                a = 0.0;
+            }
+            if e.abs() < 0.02 {
+                e = 0.0;
+            }
+            self.feature_corr_dps = (a, e);
+        }
+        let lost = self.feature_last_det.map_or(true, |t| now - t > (3.0 * hp.coast_time_s).max(2.0));
+        if lost {
+            self.feature_corr_dps = (0.0, 0.0);
+            self.feature_ff_dps = (0.0, 0.0);
+            self.feature_cmd_dps = (0.0, 0.0);
+            out.hotspot_status = "lost — re-grab";
+        } else {
+            out.hotspot_status = "searching";
+        }
+        // Coast on the velocity estimate while the correction bleeds off —
+        // a brief plume washout must not stop a fast-climbing target.
+        let (a, e) = (self.feature_ff_dps.0 + self.feature_corr_dps.0, self.feature_ff_dps.1 + self.feature_corr_dps.1);
+        self.feature_cmd_dps = (a, e);
+        out.azm_pid_output = a / 360.0;
+        out.alt_pid_output = e / 360.0;
+        out.feature_box = self.feature.as_ref().map(|t| (t.cx, t.cy, half));
+        out.azm_rate_cmd = Some(hotspot_discrete_step(a / 360.0));
+        out.alt_rate_cmd = Some(hotspot_discrete_step(e / 360.0));
+    }
+
     fn step_hotspot(
         &mut self,
         inputs: &Inputs,

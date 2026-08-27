@@ -50,6 +50,9 @@ pub struct Outputs {
     pub hotspot_status: String,
     pub hotspot_snr: f64,
     pub hotspot_centroid: Option<(f64, f64)>,
+    /// FEATURE mode: match score (0..1) and tracked box (cx, cy, half px).
+    pub feature_score: f64,
+    pub feature_box: Option<(f64, f64, f64)>,
     /// HANDOFF's consecutive-detection progress (0 outside HANDOFF), so the
     /// UI can show "detecting n/m" instead of a static "armed".
     pub handoff_detection_count: u32,
@@ -266,6 +269,8 @@ pub fn run_cycle<T: Transport>(
     }
     o.hotspot_snr = out.hotspot_snr;
     o.hotspot_centroid = out.hotspot_centroid;
+    o.feature_score = out.feature_score;
+    o.feature_box = out.feature_box;
     o.handoff_detection_count = out.handoff_detection_count;
     // Latch loop-originated mode requests instead of overwriting each cycle:
     // a request is produced on exactly ONE cycle (e.g. HANDOFF's 5th

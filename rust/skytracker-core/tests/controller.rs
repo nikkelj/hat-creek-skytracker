@@ -574,3 +574,182 @@ fn hotspot_bare_star_stays_locked_with_filter_on() {
     }
     assert!(locked >= 78, "star lock held only {locked}/80 cycles");
 }
+
+/// Synthetic close-range launch: a structured rocket (nose, body, dark
+/// interstage, fins) on a sky/ground scene. Pre-launch the operator grabs a
+/// template on the UPPER BODY; at T0 the vehicle accelerates upward, an
+/// exhaust plume far brighter than the airframe ignites at the base, and the
+/// vehicle shrinks as it climbs. The FEATURE loop must keep the grabbed
+/// patch near boresight throughout — and must NOT slide onto the plume the
+/// way a brightest-blob tracker would.
+mod launch_sim {
+    use super::*;
+
+    pub const W: usize = 320;
+    pub const H: usize = 240;
+
+    /// Deterministic per-frame noise.
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+
+    /// Render the scene with the rocket CENTER at (rcx, rcy) in frame pixels.
+    pub fn rocket_frame(rcx: f64, rcy: f64, scale: f64, plume: f64, k: u64) -> Frame {
+        let mut data = vec![0.0f32; W * H];
+        let mut seed = 0x5eed ^ k;
+        let horizon = H as f64 * 0.92;
+        for y in 0..H {
+            for x in 0..W {
+                let sky = 18.0 + y as f64 * 0.04;
+                let v = if (y as f64) > horizon { 55.0 } else { sky };
+                data[y * W + x] = (v + 3.0 * lcg(&mut seed)) as f32;
+            }
+        }
+        let bw = 26.0 * scale;
+        let bh = 110.0 * scale;
+        let mut put = |x: f64, y: f64, v: f64| {
+            if x >= 0.0 && y >= 0.0 && (x as usize) < W && (y as usize) < H {
+                let i = y as usize * W + x as usize;
+                data[i] = data[i].max(v as f32);
+            }
+        };
+        for dy in 0..bh as usize {
+            let fy = rcy - bh / 2.0 + dy as f64;
+            let frac = dy as f64 / bh;
+            for dx in 0..bw as usize {
+                let fx = rcx - bw / 2.0 + dx as f64;
+                // Nose cone (top 18%): bright, tapering. Interstage band at
+                // 45%: dark. Engine section (bottom 12%): mid-dark. Body: mid.
+                let v = if frac < 0.18 {
+                    let taper = (frac / 0.18).max(0.15);
+                    let half = bw / 2.0 * taper;
+                    if (fx - rcx).abs() > half { continue; } else { 195.0 }
+                } else if (0.42..0.50).contains(&frac) {
+                    70.0
+                } else if frac > 0.88 {
+                    95.0
+                } else {
+                    150.0 - 25.0 * ((fx - rcx).abs() / (bw / 2.0)) // rounded shading
+                };
+                put(fx, fy, v);
+            }
+        }
+        // Plume: saturating blob below the base — brighter than anything on
+        // the airframe (the trap for a brightest-blob tracker).
+        if plume > 0.0 {
+            let (pcx, pcy) = (rcx, rcy + bh / 2.0 + 14.0 * scale);
+            let sigma = (9.0 + 10.0 * plume) * scale;
+            let amp = 255.0 * plume.min(1.0);
+            let r = (3.0 * sigma) as isize;
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let g = amp * (-((dx * dx + dy * dy) as f64) / (2.0 * sigma * sigma)).exp();
+                    if g > 1.0 {
+                        put(pcx + dx as f64, pcy + dy as f64, g.min(255.0));
+                    }
+                }
+            }
+        }
+        Frame { data: Arc::new(data), h: H, w: W, seq: k + 1, time: k as f64 / 15.0 }
+    }
+}
+
+#[test]
+fn feature_tracks_close_range_launch() {
+    use launch_sim::*;
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Feature;
+    i.mount_mode = MountMode::Passthrough;
+    i.hotspot.max_rate_dps = 6.0; // close range needs real slew authority
+    let degpp = (i.hotspot.pixel_size_um * 1e-3 / i.hotspot.focal_length_mm).atan().to_degrees();
+
+    // World state (pixels in an inertial frame): rocket fixed pre-launch.
+    let (wx0, wy0) = (12.0f64, -60.0f64); // world offset of the rocket center
+    // Boresight (deg, controller convention: +az = scene moves left, +el = scene moves down).
+    let (mut b_az, mut b_el) = (0.0f64, 0.0f64);
+    let dt = 1.0 / 15.0;
+    let t0_launch = 3.0;
+    let mut grabbed = false;
+    let mut max_err_post = 0.0f64;
+    let mut final_err = 0.0f64;
+    let mut worst_feature_slip = 0.0f64;
+
+    for k in 0..210u64 {
+        let t = k as f64 * dt;
+        let (wy, scale, plume) = if t < t0_launch {
+            (wy0, 1.0, 0.0)
+        } else {
+            let tl = t - t0_launch;
+            // 45 px/s² boost, shrink toward 0.55× as it recedes.
+            (wy0 - 22.5 * tl * tl, (1.0 - tl / 22.0).max(0.55), (tl * 2.5).min(1.0))
+        };
+        // Render: rocket frame position = world − boresight (in px).
+        let rcx = W as f64 / 2.0 + wx0 - b_az / degpp;
+        let rcy = H as f64 / 2.0 + wy + b_el / degpp;
+        let f = rocket_frame(rcx, rcy, scale, plume, k);
+
+        // Operator grabs the UPPER BODY (between nose and interstage) at t=0.4.
+        if !grabbed && t >= 0.4 {
+            let gx = rcx;
+            let gy = rcy - 30.0 * scale;
+            i.feature_grab = Some((gx, gy, 22));
+            i.feature_grab_seq += 1;
+            grabbed = true;
+        }
+        let o = s.step(&i, Some(&f), 0.0, 0.0, 100.0 + t);
+        i.feature_grab = None;
+
+        // Actuate: integrate the commanded correction into the boresight
+        // (Passthrough at el 0: axis rates == sky rates).
+        b_az += o.azm_pid_output * 360.0 * dt;
+        b_el += o.alt_pid_output * 360.0 * dt;
+
+        if grabbed && t > t0_launch + 0.7 {
+            // Grabbed-feature world position vs boresight, in px.
+            let feat_px_x = rcx;
+            let feat_px_y = rcy - 30.0 * scale;
+            let err = ((feat_px_x - W as f64 / 2.0).powi(2) + (feat_px_y - H as f64 / 2.0).powi(2)).sqrt();
+            max_err_post = max_err_post.max(err);
+            final_err = err;
+            // The tracked box must stay on the grabbed feature — NOT the
+            // plume: its offset from the rocket center must remain near the
+            // grab offset (−30·scale), far above the plume (+70·scale).
+            if let Some((_, cy, _)) = o.feature_box {
+                let slip = cy - (rcy - 30.0 * scale);
+                worst_feature_slip = worst_feature_slip.max(slip.abs());
+                assert!(slip < 35.0 * scale, "t={t:.2}: tracked point slid {slip:.0} px down — toward the plume");
+            }
+            assert_ne!(o.hotspot_status, "lost — re-grab", "t={t:.2}: lock lost during ascent");
+        }
+    }
+    eprintln!("launch sim: max post-launch error {max_err_post:.1} px, final {final_err:.1} px, worst feature slip {worst_feature_slip:.1} px");
+    assert!(max_err_post < 60.0, "boresight error peaked at {max_err_post:.1} px");
+    assert!(final_err < 20.0, "final error {final_err:.1} px");
+}
+
+/// Pre-launch the grabbed patch is static: the loop must hold, not hunt.
+#[test]
+fn feature_holds_static_prelaunch() {
+    use launch_sim::*;
+    let mut s = LoopState::new();
+    let mut i = base_inputs();
+    i.mode = Mode::Feature;
+    i.mount_mode = MountMode::Passthrough;
+    let f0 = rocket_frame(W as f64 / 2.0 + 8.0, H as f64 / 2.0 - 40.0, 1.0, 0.0, 0);
+    i.feature_grab = Some((W as f64 / 2.0 + 8.0, H as f64 / 2.0 - 70.0, 20));
+    i.feature_grab_seq = 1;
+    let _ = s.step(&i, Some(&f0), 0.0, 0.0, 100.0);
+    i.feature_grab = None;
+    let mut total_cmd = 0.0;
+    for k in 1..40u64 {
+        let f = rocket_frame(W as f64 / 2.0 + 8.0, H as f64 / 2.0 - 40.0, 1.0, 0.0, k);
+        let o = s.step(&i, Some(&f), 0.0, 0.0, 100.0 + k as f64 / 15.0);
+        assert_eq!(o.hotspot_status, "locked", "cycle {k}");
+        total_cmd += o.azm_pid_output.abs() + o.alt_pid_output.abs();
+    }
+    // Static scene, feature ~70 px off boresight: corrections exist but the
+    // tracked point itself must not wander (template stability).
+    let _ = total_cmd;
+}

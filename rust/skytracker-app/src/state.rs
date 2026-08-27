@@ -884,6 +884,9 @@ pub struct MountSnapshot {
     pub hotspot_status: String,
     pub hotspot_snr: f64,
     pub hotspot_centroid: Option<(f64, f64)>,
+    /// FEATURE mode: last ZNCC score (0..1) and tracked box (cx, cy, half px).
+    pub feature_score: f64,
+    pub feature_box: Option<(f64, f64, f64)>,
     pub handoff_count: u32,
     pub gains: [[f64; 3]; 2],
     pub autotune: Option<String>,
@@ -1061,6 +1064,9 @@ pub enum MountCmd {
     SetLeadTime(f64),
     SetStarFilter(bool),
     SetFeedForward { az: bool, el: bool },
+    /// FEATURE mode: grab a template at (x, y) frame px, half-size px.
+    /// Switches the loop to FEATURE (grab pre-launch, follow through ascent).
+    FeatureGrab { x: f64, y: f64, half: usize },
     /// Sync home: the mount is physically on its index marks — set the
     /// axis offsets to the current raw encoder readings so the indices
     /// become mount 0/0 (and the park target).
@@ -1162,6 +1168,8 @@ pub struct Shared {
     pub ephemerides: ArcSwap<std::collections::HashMap<String, Arc<skytracker_astro::starlink::Ephemeris>>>,
     pub ephem_request: ArcSwap<Option<String>>,
     pub ephem_status: ArcSwap<String>,
+    /// FEATURE grab request from a camera-view click: (frame x, y, half px).
+    pub feature_grab_request: ArcSwap<Option<(f64, f64, usize)>>,
     /// Launch override: LAUNCH button re-bases the selected trajectory's T0
     /// to "now" and pre-empts every other target until aborted.
     pub launch_armed: ArcSwap<Option<(String, f64)>>,
@@ -1215,6 +1223,7 @@ impl Shared {
             eq_pointing: ArcSwap::from_pointee(eq0),
             adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
             launch_armed: ArcSwap::from_pointee(None),
+            feature_grab_request: ArcSwap::from_pointee(None),
             starlink_manifest: ArcSwap::from_pointee(None),
             ephemerides: ArcSwap::from_pointee(std::collections::HashMap::new()),
             ephem_request: ArcSwap::from_pointee(None),

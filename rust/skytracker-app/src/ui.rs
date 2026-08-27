@@ -72,6 +72,8 @@ pub struct UiState {
     pub table_sort2: Option<(usize, bool)>,
     /// Tabs-layout bottom (visible-now) panel height — ours, not egui's.
     pub tabs_table_h: f32,
+    /// FEATURE-mode template half-size (px) for click-to-grab.
+    pub feature_half: usize,
 }
 
 impl Default for UiState {
@@ -127,6 +129,7 @@ impl Default for UiState {
             alt_max_km: String::new(),
             table_sort2: None,
             tabs_table_h: 230.0,
+            feature_half: 32,
         }
     }
 }
@@ -1311,6 +1314,34 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
         let rc = Pos2::new(img_rect.left() + img_rect.width() * settings.roi_cx as f32, img_rect.top() + img_rect.height() * settings.roi_cy as f32);
         p.rect_stroke(Rect::from_center_size(rc, Vec2::new(rw, rh)), 0.0, Stroke::new(1.0, GREEN));
     }
+    // FEATURE mode: click the hotspot feed to grab a template there; the
+    // tracked box + score render as the overlay.
+    if slot == shared.hotspot_slot() && mount.mode == "FEATURE" {
+        let click = ui.interact(r.rect, ui.id().with(("feature_grab", slot)), Sense::click());
+        if click.clicked() {
+            if let Some(p2) = click.interact_pointer_pos() {
+                let fx = ((p2.x - img_rect.left()) / sx) as f64;
+                let fy = ((p2.y - img_rect.top()) / sy) as f64;
+                if fx >= 0.0 && fy >= 0.0 && fx < cam.width as f64 && fy < cam.height as f64 {
+                    shared.feature_grab_request.store(Arc::new(Some((fx, fy, st.feature_half))));
+                }
+            }
+        }
+        if let Some((bx, by, bh2)) = mount.feature_box {
+            let p0 = to_screen(bx - bh2, by - bh2);
+            let p1 = to_screen(bx + bh2, by + bh2);
+            let col = if mount.hotspot_acquired { GREEN } else { AMBER };
+            p.rect_stroke(Rect::from_two_pos(p0, p1), 2.0, Stroke::new(1.4, col));
+            p.text(p1 + Vec2::new(4.0, 0.0), Align2::LEFT_BOTTOM, format!("{:.2}", mount.feature_score), theme::mono(10.0), col);
+        }
+        p.text(
+            r.rect.left_bottom() + Vec2::new(6.0, -6.0),
+            Align2::LEFT_BOTTOM,
+            format!("FEATURE  {}  · click to (re)grab ±{} px", mount.hotspot_status, st.feature_half),
+            theme::mono(10.5),
+            if mount.hotspot_acquired { GREEN } else { AMBER },
+        );
+    }
     // Hotspot overlay (only on the hotspot camera).
     if slot == shared.hotspot_slot() && (mount.mode == "HOTSPOT" || mount.mode == "HANDOFF") {
         let gate = shared.config.hotspot_gate_radius as f32 * sx;
@@ -1382,6 +1413,7 @@ fn mode_color(mode: &str) -> Color32 {
         "PROGRAM" | "HANDOFF" => ACCENT,
         "HOTSPOT" => GREEN,
         "MTI" => VIOLET,
+        "FEATURE" => Color32::from_rgb(96, 200, 235),
         _ => TEXT_2,
     }
 }
@@ -1400,7 +1432,7 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         });
     });
     ui.horizontal(|ui| {
-        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT", "MTI"] {
+        for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT", "FEATURE", "MTI"] {
             if theme::mode_button(ui, mode, m.mode == mode, mode_color(mode)) {
                 let _ = tx.send(MountCmd::SetMode(mode.to_string()));
             }
@@ -1542,6 +1574,20 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
     });
     if m.bias_it != 0.0 || m.bias_ct != 0.0 {
         theme::kv_colored(ui, "bias trk", format!("in {:+.2}° / cross {:+.2}°", m.bias_it, m.bias_ct), AMBER);
+    }
+    if m.mode == "FEATURE" {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("grab ±px").font(theme::sans(10.0)).color(DIM));
+            let mut h2 = st.feature_half as i64;
+            if ui.add(egui::DragValue::new(&mut h2).range(12..=96)).on_hover_text("template half-size for the next click-to-grab on the camera feed").changed() {
+                st.feature_half = h2 as usize;
+            }
+            ui.label(
+                egui::RichText::new(format!("{} · score {:.2}", m.hotspot_status, m.feature_score))
+                    .font(theme::mono(10.0))
+                    .color(if m.hotspot_acquired { GREEN } else { AMBER }),
+            );
+        });
     }
     if let Some(t) = &m.autotune {
         ui.label(egui::RichText::new(t).font(theme::mono(10.5)).color(ACCENT));

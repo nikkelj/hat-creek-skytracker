@@ -5,6 +5,34 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-26 — FEATURE mode: template tracker for close-range launches
+
+- New **FEATURE** loop mode (skytracker-core::feature_track): click the
+  camera feed to grab a template patch of the vehicle pre-launch (±12–96 px,
+  textureless grabs rejected); the loop follows that PATCH by zero-mean NCC
+  — coarse 4×-pyramid search, fine refine with ±5% scale search (targets
+  shrink as they climb), parabolic sub-pixel peak, slow template update on
+  strong matches only, scale re-baking. The hotspot centroid tracker is the
+  wrong tool close-in: the plume outshines the airframe at ignition.
+- **Self-derived velocity feed-forward**: target rate = commanded boresight
+  rate + measured error growth, low-passed (τ 0.5 s) — a pure P correction
+  against an accelerating rocket carries rate/(P·360) of velocity lag
+  (measured: exactly 54 px in the first closed-loop run); with the FF the
+  same run tracks at **3.1 px max / 2.5 px final**.
+- **Synthetic close-range launch validation** (tests/controller.rs): a
+  structured rocket (nose/body/interstage/fins) on a sky+ground scene;
+  grab on the upper body at T−2.6 s; at T0 a 45 px/s² boost, a saturating
+  exhaust plume brighter than anything on the airframe, and shrink to 0.55×.
+  Result: max boresight error 3.1 px, final 2.5 px, and the tracked point
+  slips ≤1.4 px from the grabbed feature — it never slides onto the plume.
+  A second test pins static pre-launch hold. Tracker unit tests cover
+  sub-pixel translation recovery (<0.35 px) and false-lock rejection.
+- No PROGRAM transition needed: click-to-grab switches the loop to FEATURE
+  directly; loss (3× coast) zeroes and waits for a re-grab. Grab size,
+  tracked box, score and status render on the hotspot camera view.
+
+---
+
 ## 2026-08-26 — HOTSPOT bare star tracking fixed; sync home
 
 - **Root cause of the "bouncing" HOTSPOT**: the star filter's bare branch

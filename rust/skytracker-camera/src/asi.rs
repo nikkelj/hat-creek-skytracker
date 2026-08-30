@@ -9,7 +9,7 @@
 #![allow(non_snake_case, dead_code)]
 
 use libloading::{Library, Symbol};
-use std::ffi::c_int;
+use std::ffi::{c_int, c_long};
 
 pub const ASI_IMG_RAW8: c_int = 0;
 pub const ASI_IMG_RGB24: c_int = 1;
@@ -26,8 +26,11 @@ pub const ASI_HIGH_SPEED_MODE: c_int = 14;
 pub struct AsiCameraInfo {
     pub name: [u8; 64],
     pub camera_id: c_int,
-    pub max_height: i64,
-    pub max_width: i64,
+    // C `long` in the SDK header: 4 bytes on Windows, 8 on Linux. Declaring
+    // these i64 shifted every following field on Windows (max_width read as
+    // 2^32, open_asi failed, every camera fell back to the simulator).
+    pub max_height: c_long,
+    pub max_width: c_long,
     pub is_color_cam: c_int,
     pub bayer_pattern: c_int,
     pub supported_bins: [c_int; 16],
@@ -47,6 +50,12 @@ pub struct AsiCameraInfo {
 pub struct AsiSdk {
     lib: Library,
 }
+
+/// The SDK's enumeration and open calls (ASIGetNumOfConnectedCameras,
+/// ASIGetCameraProperty, ASIOpenCamera/ASIInitCamera) are not thread-safe:
+/// two slot workers enumerating concurrently can be handed the same camera.
+/// Hold this across the whole enumerate→open→configure sequence.
+pub static OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 pub struct AsiError(pub String);
@@ -142,9 +151,10 @@ impl AsiSdk {
 
     pub fn set_control(&self, camera_id: i32, control: c_int, value: i64, auto: bool) -> Result<(), AsiError> {
         unsafe {
-            let f: Symbol<unsafe extern "C" fn(c_int, c_int, i64, c_int) -> c_int> =
+            // lValue is C `long` (4 bytes on Windows).
+            let f: Symbol<unsafe extern "C" fn(c_int, c_int, c_long, c_int) -> c_int> =
                 self.sym(b"ASISetControlValue")?;
-            check(f(camera_id, control, value, auto as c_int), "ASISetControlValue")
+            check(f(camera_id, control, value as c_long, auto as c_int), "ASISetControlValue")
         }
     }
 
@@ -168,10 +178,11 @@ impl AsiSdk {
     /// used via ctypes): fills `buf`, waits up to `wait_ms`.
     pub fn get_video_data(&self, camera_id: i32, buf: &mut [u8], wait_ms: i32) -> Result<(), AsiError> {
         unsafe {
-            let f: Symbol<unsafe extern "C" fn(c_int, *mut u8, i64, c_int) -> c_int> =
+            // lBuffSize is C `long` (4 bytes on Windows).
+            let f: Symbol<unsafe extern "C" fn(c_int, *mut u8, c_long, c_int) -> c_int> =
                 self.sym(b"ASIGetVideoData")?;
             check(
-                f(camera_id, buf.as_mut_ptr(), buf.len() as i64, wait_ms),
+                f(camera_id, buf.as_mut_ptr(), buf.len() as c_long, wait_ms),
                 "ASIGetVideoData",
             )
         }
@@ -193,26 +204,33 @@ pub struct AsiSource {
 
 impl crate::pump::FrameSource for AsiSource {
     fn next_frame(&mut self) -> Option<(Vec<u8>, usize, usize, usize, f64)> {
-        if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = self.sdk.stop_video(self.camera_id);
-            let _ = self.sdk.close(self.camera_id);
-            return None;
-        }
-        let mut buf = vec![0u8; self.width * self.height * self.channels];
-        let t0 = std::time::Instant::now();
-        match self.sdk.get_video_data(self.camera_id, &mut buf, self.wait_ms) {
-            Ok(()) => Some((
-                buf,
-                self.width,
-                self.height,
-                self.channels,
-                t0.elapsed().as_secs_f64(),
-            )),
-            Err(_) => {
-                // Dropped/timed-out frame: keep pumping (matches the
-                // Python thread's tolerate-and-continue behavior).
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                self.next_frame()
+        // This thread is the SOLE owner of stop_video/close: the app side
+        // sets `stopped` (and may call stop_video to unblock a blocking
+        // ASIGetVideoData) but must never close the camera itself —
+        // closing under a concurrent ASIGetVideoData hangs/crashes the SDK.
+        loop {
+            if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = self.sdk.stop_video(self.camera_id);
+                let _ = self.sdk.close(self.camera_id);
+                return None;
+            }
+            let mut buf = vec![0u8; self.width * self.height * self.channels];
+            let t0 = std::time::Instant::now();
+            match self.sdk.get_video_data(self.camera_id, &mut buf, self.wait_ms) {
+                Ok(()) => {
+                    return Some((
+                        buf,
+                        self.width,
+                        self.height,
+                        self.channels,
+                        t0.elapsed().as_secs_f64(),
+                    ))
+                }
+                Err(_) => {
+                    // Dropped/timed-out frame: keep pumping (matches the
+                    // Python thread's tolerate-and-continue behavior).
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
             }
         }
     }

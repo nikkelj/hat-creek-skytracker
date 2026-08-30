@@ -10,6 +10,7 @@
 //! Inputs the loop cannot own (joystick axes, camera frames, skyfield setpoint)
 //! are pushed in by Python as plain Rust data; see `Inputs` / `Frame`.
 
+use crate::feature_track::FeatureTracker;
 use crate::hotspot::{self, Detection};
 use crate::pid::PidController;
 use crate::transforms::{self, MountMode};
@@ -22,6 +23,9 @@ pub enum Mode {
     Handoff,
     Hotspot,
     Mti,
+    /// Feature/template tracker: follow an operator-grabbed patch of an
+    /// extended target (close-range rocket) — no trajectory, pure optical.
+    Feature,
 }
 
 /// Sky-frame target pushed by Python (from skyfield). Feed-forward rates are
@@ -104,6 +108,11 @@ pub struct Inputs {
 
     // HOTSPOT
     pub hotspot: HotspotParams,
+
+    /// FEATURE-mode grab request: (frame x, frame y, template half-size px).
+    /// `feature_grab_seq` bumps once per request; the loop consumes it once.
+    pub feature_grab: Option<(f64, f64, usize)>,
+    pub feature_grab_seq: u64,
 }
 
 impl Default for Inputs {
@@ -145,6 +154,8 @@ impl Default for Inputs {
                 star_filter: false,
                 rate_gate_dps: 0.15,
             },
+            feature_grab: None,
+            feature_grab_seq: 0,
         }
     }
 }
@@ -173,6 +184,10 @@ pub struct StepOutput {
 
     pub azm_error: f64,
     pub alt_error: f64,
+
+    /// FEATURE mode: last match score and the tracked box (cx, cy, half px).
+    pub feature_score: f64,
+    pub feature_box: Option<(f64, f64, f64)>,
     pub azm_pid_output: f64,
     pub alt_pid_output: f64,
 
@@ -210,6 +225,75 @@ fn hotspot_discrete_step(total_rev_s: f64) -> i32 {
     sign * mag
 }
 
+
+/// True SKY elevation of the boresight for the configured mount geometry —
+/// the optical pixel->angle conversion compresses azimuth by cos(el) on the
+/// sky, so it must see the sky elevation, not the raw ALT axis angle (in
+/// AltAz that is 90 - el; in AltAz-Side / Eq it is a declination-like angle
+/// and using it raw mis-scales -- and can flip -- the azimuth correction).
+fn sky_el_of(inputs: &Inputs, azm: f64, alt: f64) -> f64 {
+    boresight_sky(inputs, azm, alt).1
+}
+
+/// Boresight SKY (az, el) for the mount's current axis angles, through the
+/// configured geometry. In AltAz this is (azm + alignment, 90 - alt); in
+/// AltAz-Side / Eq the axes are pole-referenced and the sky direction must
+/// come from the full transform.
+fn boresight_sky(inputs: &Inputs, azm: f64, alt: f64) -> (f64, f64) {
+    match inputs.mount_mode {
+        // Keep the historical exact form for AltAz (parity with the Python
+        // hotspot path, which ignores the alignment azimuth offset here).
+        MountMode::AltAz => (azm, 90.0 - alt),
+        _ => transforms::mount_to_sky(
+            inputs.mount_mode,
+            azm,
+            alt,
+            inputs.alignment_az,
+            inputs.alignment_el,
+            inputs.altaz_side_flip,
+        ),
+    }
+}
+
+/// A small SKY-frame offset (d_az, d_el in degrees, measured optically at
+/// the boresight) -> the MOUNT-axis offset (d_azm, d_alt) that realises it:
+/// sky_to_mount(boresight + d) - (azm, alt). For AltAz this is exactly
+/// (d_az, -d_el) -- the historical sign flip -- and for AltAz-Side / Eq it is
+/// the proper rotation into the pole-referenced axes, which the old
+/// `if AltAz { -d_el } else { d_el }` shortcut got wrong.
+fn sky_delta_to_axis(inputs: &Inputs, azm: f64, alt: f64, d_az: f64, d_el: f64) -> (f64, f64) {
+    match inputs.mount_mode {
+        MountMode::AltAz => (d_az, -d_el),
+        MountMode::Passthrough => (d_az, d_el),
+        _ => {
+            let (bs_az, bs_el) = boresight_sky(inputs, azm, alt);
+            let (t_azm, t_alt) = transforms::sky_to_mount(
+                inputs.mount_mode,
+                bs_az + d_az,
+                (bs_el + d_el).clamp(-89.999, 89.999),
+                inputs.alignment_az,
+                inputs.alignment_el,
+                inputs.altaz_side_flip,
+            );
+            (wrap180(t_azm - azm), wrap180(t_alt - alt))
+        }
+    }
+}
+
+/// Inverse of `sky_delta_to_axis`: a small MOUNT-axis offset -> the SKY
+/// offset it produces at the current pointing.
+fn axis_delta_to_sky(inputs: &Inputs, azm: f64, alt: f64, d_azm: f64, d_alt: f64) -> (f64, f64) {
+    match inputs.mount_mode {
+        MountMode::AltAz => (d_azm, -d_alt),
+        MountMode::Passthrough => (d_azm, d_alt),
+        _ => {
+            let (bs_az, bs_el) = boresight_sky(inputs, azm, alt);
+            let (n_az, n_el) = boresight_sky(inputs, azm + d_azm, alt + d_alt);
+            (wrap180(n_az - bs_az), n_el - bs_el)
+        }
+    }
+}
+
 /// Run hot-spot detection on a frame (gated or full-frame). Returns None when
 /// there is no frame or nothing qualifies. Pure; issues no commands.
 fn detect_in_frame(
@@ -234,6 +318,26 @@ pub struct LoopState {
     // STANDBY one-shot stop guard.
     standby_stopped: bool,
     prev_mode: Option<Mode>,
+
+    // Focus read-back (core_loop's low-cadence poll).
+    pub focus_poll_i: u32,
+    pub last_focus_frac: f64,
+
+    // FEATURE-mode tracker state.
+    feature: Option<FeatureTracker>,
+    feature_grab_seen: u64,
+    feature_miss: u32,
+    feature_last_det: Option<f64>,
+    feature_corr_dps: (f64, f64),
+    feature_last_seq: Option<u64>,
+    feature_interval: f64,
+    feature_last_fresh: f64,
+    // Self-derived velocity feed-forward: the target's angular rate estimated
+    // from our own commanded rate + the error's growth rate (a launch has no
+    // trajectory to ride, so the tracker supplies its own).
+    feature_prev_err: Option<(f64, f64, f64)>,
+    feature_ff_dps: (f64, f64),
+    feature_cmd_dps: (f64, f64),
 
     // HOTSPOT lock state (ported from JoystickModeState).
     hotspot_gate_center: Option<(f64, f64)>,
@@ -289,6 +393,19 @@ impl LoopState {
             pid_last_update: None,
             standby_stopped: false,
             prev_mode: None,
+            focus_poll_i: 0,
+            last_focus_frac: 0.0,
+            feature: None,
+            feature_grab_seen: 0,
+            feature_miss: 0,
+            feature_last_det: None,
+            feature_corr_dps: (0.0, 0.0),
+            feature_last_seq: None,
+            feature_interval: 0.2,
+            feature_last_fresh: 0.0,
+            feature_prev_err: None,
+            feature_ff_dps: (0.0, 0.0),
+            feature_cmd_dps: (0.0, 0.0),
             hotspot_gate_center: None,
             hotspot_acquired: false,
             hotspot_miss_count: 0,
@@ -416,6 +533,7 @@ impl LoopState {
             }
             // MTI: stub, as in Python.
             Mode::Mti => {}
+            Mode::Feature => self.step_feature(inputs, frame, current_azm, current_alt, now, &mut out),
         }
 
         out
@@ -564,8 +682,21 @@ impl LoopState {
         if flipped {
             alt_sign = -alt_sign;
         }
-        let alt_ff = alt_sign * sp.ff_el_dps;
-        self.azm_pid.set_feed_forward_rate(sp.ff_az_dps);
+        let (az_ff, alt_ff) = match inputs.mount_mode {
+            MountMode::AltAz | MountMode::Passthrough => (sp.ff_az_dps, alt_sign * sp.ff_el_dps),
+            // AltAz-Side / Eq: sky rates -> axis rates through the geometry.
+            _ => {
+                let (a, e) = sky_delta_to_axis(
+                    inputs,
+                    current_azm,
+                    current_alt,
+                    sp.ff_az_dps * 0.1,
+                    sp.ff_el_dps * 0.1,
+                );
+                (a * 10.0, e * 10.0)
+            }
+        };
+        self.azm_pid.set_feed_forward_rate(az_ff);
         self.alt_pid.set_feed_forward_rate(alt_ff);
 
         let dt = self.dt(now);
@@ -614,11 +745,7 @@ impl LoopState {
         const RATE_FILTER_REL_FRACTION: f64 = 0.35;
 
         let hp = &inputs.hotspot;
-        let (bs_az, bs_el) = if inputs.mount_mode == MountMode::AltAz {
-            (current_azm, 90.0 - current_alt)
-        } else {
-            (current_azm, current_alt)
-        };
+        let (bs_az, bs_el) = boresight_sky(inputs, current_azm, current_alt);
         self.track_candidates
             .retain(|c| now - c.0 <= RATE_FILTER_MAX_AGE_S);
         let base = self
@@ -712,11 +839,7 @@ impl LoopState {
             Some(d) => {
                 out.hotspot_snr = d.snr;
                 out.hotspot_centroid = Some((d.cx, d.cy));
-                let el_sky = if inputs.mount_mode == MountMode::AltAz {
-                    90.0 - current_alt
-                } else {
-                    current_alt
-                };
+                let el_sky = sky_el_of(inputs, current_azm, current_alt);
                 match self.detection_rate_verdict(
                     &d, inputs, current_azm, current_alt, el_sky, frame_time,
                 ) {
@@ -755,6 +878,185 @@ impl LoopState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// FEATURE: follow an operator-grabbed template of an extended target
+    /// (close-range rocket) purely optically — grab pre-launch, the PID nulls
+    /// the patch's pixel error through ignition and ascent. No trajectory,
+    /// no handoff; on loss it zeroes and waits for a re-grab.
+    fn step_feature(
+        &mut self,
+        inputs: &Inputs,
+        frame: Option<&Frame>,
+        current_azm: f64,
+        current_alt: f64,
+        now: f64,
+        out: &mut StepOutput,
+    ) {
+        let hp = inputs.hotspot; // shared optics geometry + rate caps
+
+        // Safety limits, same stance as HOTSPOT.
+        let (azm_min, azm_max) = inputs.azm_limit;
+        let (alt_min, alt_max) = inputs.alt_limit;
+        if !(azm_min <= current_azm && current_azm <= azm_max && alt_min <= current_alt && current_alt <= alt_max) {
+            out.azm_rate_cmd = Some(0);
+            out.alt_rate_cmd = Some(0);
+            out.requested_mode = Some(Mode::Standby);
+            out.hotspot_status = "limit";
+            out.status_msg = Some("FEATURE: mount at safety limit - switched to STANDBY".to_string());
+            self.feature = None;
+            return;
+        }
+
+        // One-shot grab request.
+        if inputs.feature_grab_seq != self.feature_grab_seen {
+            self.feature_grab_seen = inputs.feature_grab_seq;
+            if let (Some(f), Some((cx, cy, half))) = (frame, inputs.feature_grab) {
+                self.feature = FeatureTracker::init(&f.data, f.w, f.h, cx, cy, half);
+                self.feature_miss = 0;
+                self.feature_corr_dps = (0.0, 0.0);
+                self.feature_ff_dps = (0.0, 0.0);
+                self.feature_cmd_dps = (0.0, 0.0);
+                self.feature_prev_err = None;
+                self.feature_last_det = Some(now);
+                out.status_msg = Some(match &self.feature {
+                    Some(t) => format!("FEATURE: template grabbed at ({cx:.0},{cy:.0}) ±{} px", t.half()),
+                    None => "FEATURE: grab failed (box off-frame or textureless)".to_string(),
+                });
+            }
+        }
+        if self.feature.is_none() {
+            out.azm_rate_cmd = Some(0);
+            out.alt_rate_cmd = Some(0);
+            out.hotspot_status = "no template";
+            return;
+        }
+
+        // Stale-frame gate (same reasoning as HOTSPOT).
+        let frame_is_stale = matches!((frame, self.feature_last_seq), (Some(f), Some(last)) if f.seq == last);
+        if let Some(f) = frame {
+            if !frame_is_stale {
+                self.feature_last_seq = Some(f.seq);
+            }
+        }
+        let frame = if frame_is_stale { None } else { frame };
+        let frame_time = frame.map(|f| f.time).unwrap_or(now);
+        if frame.is_some() {
+            if self.feature_last_fresh > 0.0 {
+                let iv = frame_time - self.feature_last_fresh;
+                if iv > 0.0 {
+                    self.feature_interval = iv.clamp(0.05, 2.0);
+                }
+            }
+            self.feature_last_fresh = frame_time;
+        }
+
+        let el_sky = sky_el_of(inputs, current_azm, current_alt);
+        // Search widens on misses (launch jerk / brief plume washout).
+        let search = (32.0 * 1.5f64.powi(self.feature_miss.min(6) as i32)).min(120.0) as usize;
+        let m = {
+            let tr = self.feature.as_mut().unwrap();
+            frame.and_then(|f| tr.track(&f.data, f.w, f.h, search, 0.45))
+        };
+        let half = self.feature.as_ref().map(|t| t.half() as f64).unwrap_or(0.0);
+
+        if let Some(mm) = m {
+            let (h, w) = frame.map(|f| (f.h, f.w)).unwrap_or((0, 0));
+            let dx = mm.cx - (w as f64 / 2.0);
+            let dy = mm.cy - (h as f64 / 2.0);
+            let (az_error, el_error) = hotspot::pixel_offset_to_angles(
+                dx, dy, hp.pixel_size_um, hp.focal_length_mm, hp.rotation_deg, el_sky, hp.x_sign, hp.y_sign, true,
+            );
+            let (az_error, el_error) = sky_delta_to_axis(inputs, current_azm, current_alt, az_error, el_error);
+
+            // Velocity feed-forward: target rate = our commanded boresight
+            // rate + the measured error growth, low-passed (τ 0.5 s). A pure
+            // P correction against an accelerating rocket carries a velocity
+            // lag of rate/(P·360) — the FF absorbs the velocity so the PID
+            // only handles the residual.
+            if let Some((t_prev, az_prev, el_prev)) = self.feature_prev_err {
+                let dt_m = (frame_time - t_prev).clamp(1e-3, 2.0);
+                let tgt = (
+                    self.feature_cmd_dps.0 + (az_error - az_prev) / dt_m,
+                    self.feature_cmd_dps.1 + (el_error - el_prev) / dt_m,
+                );
+                let a = (dt_m / 0.5).min(1.0);
+                let lim = 2.0 * hp.max_rate_dps;
+                self.feature_ff_dps.0 = (self.feature_ff_dps.0 + a * (tgt.0 - self.feature_ff_dps.0)).clamp(-lim, lim);
+                self.feature_ff_dps.1 = (self.feature_ff_dps.1 + a * (tgt.1 - self.feature_ff_dps.1)).clamp(-lim, lim);
+            }
+            self.feature_prev_err = Some((frame_time, az_error, el_error));
+
+            self.azm_pid.update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);
+            self.alt_pid.update_gains(inputs.alt_gains.0, inputs.alt_gains.1, inputs.alt_gains.2);
+            self.azm_pid.set_output_filter_tau(inputs.output_filter_tau);
+            self.alt_pid.set_output_filter_tau(inputs.output_filter_tau);
+            self.azm_pid.set_feed_forward_rate(0.0);
+            self.alt_pid.set_feed_forward_rate(0.0);
+            let dt = self.dt(now);
+            let (az_out, _) = self.azm_pid.compute_pid_output(az_error, dt, Some(current_azm));
+            let (al_out, _) = self.alt_pid.compute_pid_output(el_error, dt, Some(current_alt));
+            // Same correction cap as HOTSPOT: never outrun the measurements.
+            let interval = self.feature_interval.max(0.05);
+            let cap_az = (hp.max_rate_dps / 360.0).min(0.9 * az_error.abs() / interval / 360.0);
+            let cap_al = (hp.max_rate_dps / 360.0).min(0.9 * el_error.abs() / interval / 360.0);
+            let az_corr = az_out.clamp(-cap_az, cap_az);
+            let al_corr = al_out.clamp(-cap_al, cap_al);
+            let az_total = self.feature_ff_dps.0 / 360.0 + az_corr;
+            let al_total = self.feature_ff_dps.1 / 360.0 + al_corr;
+            self.feature_corr_dps = (az_corr * 360.0, al_corr * 360.0);
+            self.feature_cmd_dps = (az_total * 360.0, al_total * 360.0);
+            self.feature_miss = 0;
+            self.feature_last_det = Some(now);
+
+            out.azm_error = az_error;
+            out.alt_error = el_error;
+            out.azm_pid_output = az_total;
+            out.alt_pid_output = al_total;
+            out.hotspot_acquired = true;
+            out.hotspot_status = "locked";
+            out.hotspot_snr = mm.score * 10.0; // score 0..1 on the SNR readout scale
+            out.hotspot_centroid = Some((mm.cx, mm.cy));
+            out.feature_score = mm.score;
+            out.feature_box = Some((mm.cx, mm.cy, half));
+            out.azm_rate_cmd = Some(hotspot_discrete_step(az_total));
+            out.alt_rate_cmd = Some(hotspot_discrete_step(al_total));
+            return;
+        }
+
+        // Miss: bleed the correction, keep looking; loss (3× coast) zeroes and
+        // waits for a re-grab — near the ground there is nothing to fall back to.
+        if !frame_is_stale && frame.is_some() {
+            self.feature_miss += 1;
+            let (mut a, mut e) = self.feature_corr_dps;
+            a *= 0.5;
+            e *= 0.5;
+            if a.abs() < 0.02 {
+                a = 0.0;
+            }
+            if e.abs() < 0.02 {
+                e = 0.0;
+            }
+            self.feature_corr_dps = (a, e);
+        }
+        let lost = self.feature_last_det.map_or(true, |t| now - t > (3.0 * hp.coast_time_s).max(2.0));
+        if lost {
+            self.feature_corr_dps = (0.0, 0.0);
+            self.feature_ff_dps = (0.0, 0.0);
+            self.feature_cmd_dps = (0.0, 0.0);
+            out.hotspot_status = "lost — re-grab";
+        } else {
+            out.hotspot_status = "searching";
+        }
+        // Coast on the velocity estimate while the correction bleeds off —
+        // a brief plume washout must not stop a fast-climbing target.
+        let (a, e) = (self.feature_ff_dps.0 + self.feature_corr_dps.0, self.feature_ff_dps.1 + self.feature_corr_dps.1);
+        self.feature_cmd_dps = (a, e);
+        out.azm_pid_output = a / 360.0;
+        out.alt_pid_output = e / 360.0;
+        out.feature_box = self.feature.as_ref().map(|t| (t.cx, t.cy, half));
+        out.azm_rate_cmd = Some(hotspot_discrete_step(a / 360.0));
+        out.alt_rate_cmd = Some(hotspot_discrete_step(e / 360.0));
+    }
+
     fn step_hotspot(
         &mut self,
         inputs: &Inputs,
@@ -822,11 +1124,7 @@ impl LoopState {
         // cos(el) on the sky); in AltAz the mount ALT axis is 90 - el, and
         // passing it raw overstates the azimuth error by cos(el)/cos(ALT) --
         // a divergent overshoot at moderate elevations.
-        let el_sky = if inputs.mount_mode == MountMode::AltAz {
-            90.0 - current_alt
-        } else {
-            current_alt
-        };
+        let el_sky = sky_el_of(inputs, current_azm, current_alt);
 
         // Detect on this cycle's frame, gated to the last lock once acquired.
         // The gate is PREDICTED forward by the boresight motion we ourselves
@@ -834,6 +1132,17 @@ impl LoopState {
         // legitimate correction sweeps a large pixel distance between frames),
         // and GROWS on consecutive misses so residual prediction error or
         // target motion can't strand it while the target is still in frame.
+        let acq_gate = if self.hotspot_gate_center.is_none() {
+            // Unacquired: search near the boresight first ("lock the nearest
+            // star", and a HANDOFF-verified target is center-steered anyway),
+            // widening on misses until the whole frame is in play.
+            frame.map(|f| {
+                let growth = 1.4f64.powi(self.hotspot_miss_count.min(10) as i32).min(4.0);
+                (f.w as f64 / 2.0, f.h as f64 / 2.0, 0.18 * f.w.min(f.h) as f64 * growth)
+            })
+        } else {
+            None
+        };
         let gate = self.hotspot_gate_center.map(|(cx, cy)| {
             // Predict with the CORRECTION rates, not the total command: the
             // trajectory feed-forward moves the boresight WITH the target
@@ -846,14 +1155,12 @@ impl LoopState {
             let gate_dt = (frame_time - self.hotspot_gate_time).max(0.0);
             let (mut gx, mut gy) = (cx, cy);
             if gate_dt > 0.0 && (az_dps != 0.0 || alt_dps != 0.0) {
-                let el_sky_dps = if inputs.mount_mode == MountMode::AltAz {
-                    -alt_dps
-                } else {
-                    alt_dps
-                };
+                // Axis motion over the gate span -> sky motion (mode-general).
+                let (d_sky_az, d_sky_el) =
+                    axis_delta_to_sky(inputs, current_azm, current_alt, az_dps * gate_dt, alt_dps * gate_dt);
                 let (pdx, pdy) = hotspot::angles_to_pixel_offset(
-                    -az_dps * gate_dt,
-                    -el_sky_dps * gate_dt,
+                    -d_sky_az,
+                    -d_sky_el,
                     hp.pixel_size_um,
                     hp.focal_length_mm,
                     hp.rotation_deg,
@@ -866,8 +1173,15 @@ impl LoopState {
                 gy += pdy;
             }
             let growth = 1.5f64.powi(self.hotspot_miss_count.min(8) as i32).min(4.0);
-            (gx, gy, hp.gate_radius * growth)
+            // Bare targets are sidereal-slow: a tight gate keeps a rival star
+            // of similar brightness from stealing the lock (brightest-in-gate
+            // flip-flops between two ~equal stars inside a wide gate). Misses
+            // still grow it for recovery; trajectory targets keep the full
+            // configured gate — they genuinely sweep pixels between frames.
+            let base_r = if inputs.setpoint.is_none() { hp.gate_radius.min(45.0) } else { hp.gate_radius };
+            (gx, gy, base_r * growth)
         });
+        let gate = gate.or(acq_gate);
         let detection = detect_in_frame(frame, &hp, gate);
 
         // Star-rejection rate gate: a detection whose implied sky rate doesn't
@@ -881,9 +1195,17 @@ impl LoopState {
             Some(d) => {
                 // Candidates are stamped with the frame midpoint so the
                 // filter's implied rates measure image-to-image motion.
-                if self
-                    .detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, frame_time)
-                    == Some(false)
+                // Tracking BARE (no trajectory), a star IS the target —
+                // manual HOTSPOT with nothing selected means "lock the
+                // nearest star" — so the star-like rate reject only runs
+                // against a setpoint. (The old bare branch rejected anything
+                // slower than the rate gate: every star got locked during the
+                // baseline warm-up, then rejected, decayed and re-locked — a
+                // limit cycle that looked like bouncing.)
+                if inputs.setpoint.is_some()
+                    && self
+                        .detection_rate_verdict(&d, inputs, current_azm, current_alt, el_sky, frame_time)
+                        == Some(false)
                 {
                     out.hotspot_status = "star-reject";
                     None
@@ -899,18 +1221,21 @@ impl LoopState {
         // the capped correction to supply ALL of the tracking rate. Honors the
         // same per-axis FF toggles as PROGRAM; zero when tracking bare.
         let (ff_az, ff_el) = match inputs.setpoint {
-            Some(sp) => (
-                if inputs.ff_azm_enabled { sp.ff_az_dps } else { 0.0 },
-                if inputs.ff_alt_enabled {
-                    if inputs.mount_mode == MountMode::AltAz {
-                        -sp.ff_el_dps
-                    } else {
-                        sp.ff_el_dps
-                    }
-                } else {
-                    0.0
-                },
-            ),
+            Some(sp) => {
+                // Sky rates -> axis rates through the mount geometry (a 0.1 s
+                // finite step keeps the non-linear modes local).
+                let (a, e) = sky_delta_to_axis(
+                    inputs,
+                    current_azm,
+                    current_alt,
+                    sp.ff_az_dps * 0.1,
+                    sp.ff_el_dps * 0.1,
+                );
+                (
+                    if inputs.ff_azm_enabled { a * 10.0 } else { 0.0 },
+                    if inputs.ff_alt_enabled { e * 10.0 } else { 0.0 },
+                )
+            }
             None => (0.0, 0.0),
         };
 
@@ -935,11 +1260,8 @@ impl LoopState {
             // negate the elevation term to command the mount the right way --
             // matching the mount-frame error PROGRAM track feeds the same PID.
             // Mirrors joystick_controller.hotspot_track.
-            let el_error = if inputs.mount_mode == MountMode::AltAz {
-                -el_error
-            } else {
-                el_error
-            };
+            let (az_error, el_error) =
+                sky_delta_to_axis(inputs, current_azm, current_alt, az_error, el_error);
 
             self.azm_pid
                 .update_gains(inputs.azm_gains.0, inputs.azm_gains.1, inputs.azm_gains.2);

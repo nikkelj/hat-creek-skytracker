@@ -58,7 +58,21 @@ impl Observer {
 /// A parsed TLE ready for propagation.
 pub struct Satellite {
     pub name: String,
+    /// NORAD catalog field (line-1 cols 3-7), alpha-5 safe.
+    pub satnum: String,
+    /// International designator (line-1 cols 10-17, e.g. "98067A").
+    pub intl_desg: String,
+    pub inclination_deg: f64,
+    pub raan_deg: f64,
+    pub arg_perigee_deg: f64,
+    pub mean_anomaly_deg: f64,
+    pub rev_number: u32,
     pub epoch_jd_utc: f64,
+    /// TLE mean motion, revolutions per day (line-2 cols 53-63). python-sgp4's
+    /// `no_kozai` (rad/min) is `mean_motion_rev_per_day * TAU / 1440`.
+    pub mean_motion_rev_per_day: f64,
+    /// TLE eccentricity (python-sgp4 `ecco`).
+    pub eccentricity: f64,
     constants: sgp4::Constants,
 }
 
@@ -112,9 +126,19 @@ impl Satellite {
         // diverges from python-sgp4 by ~0.5 km over two weeks.
         let constants = sgp4::Constants::from_elements_afspc_compatibility_mode(&elements)
             .map_err(|e| SatError::Tle(e.to_string()))?;
+        let l2num = |a: usize, b: usize| line2.get(a..b).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(0.0);
         Ok(Satellite {
             name: name.to_string(),
+            satnum: line1.get(2..7).unwrap_or("").trim().to_string(),
+            intl_desg: line1.get(9..17).unwrap_or("").trim().to_string(),
+            inclination_deg: l2num(8, 16),
+            raan_deg: l2num(17, 25),
+            arg_perigee_deg: l2num(34, 42),
+            mean_anomaly_deg: l2num(43, 51),
+            rev_number: line2.get(63..68).and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0),
             epoch_jd_utc,
+            mean_motion_rev_per_day: elements.mean_motion,
+            eccentricity: elements.eccentricity,
             constants,
         })
     }

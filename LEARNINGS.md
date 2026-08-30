@@ -6,6 +6,49 @@ Newest entries first.
 
 ---
 
+## 2026-08-29 — First hardware session: every "rig-ready, untested" seam had a bug
+
+Phase 8 bring-up on the rig found five, all invisible in sim:
+
+1. **Serial silent (mount ignores every command).** pyserial asserts DTR and
+   RTS on open — `dsrdtr=False`/`rtscts=False` only disable flow *control*,
+   not the line states. Rust `serialport` leaves both low on Windows and the
+   mount's adapter never listened. Fix: `write_data_terminal_ready(true)` +
+   `write_request_to_send(true)` after open (`skytracker-core/src/serial.rs`).
+   `SKYTRACKER_SERIAL_TRACE=<file>` now hex-dumps the wire for next time.
+2. **LOOP DEAD after using the CONNECTION panel.** `CoreLoop::stop()` latches
+   a stop flag on the *shared* state; the replacement loop spawns on the same
+   Shared, and the old handle — dropped *after* the new spawn (`core = c2`
+   drops the old value last) — re-latched stop in its Drop and killed the new
+   thread before its first cycle. Fix: spawn clears stop/loop_dead; Drop only
+   latches when it still owns a live thread.
+3. **Guide feed duplicated into the main view.** The ZWO enumeration calls
+   (`ASIGetNumOfConnectedCameras`/`ASIGetCameraProperty`) are not thread-safe;
+   parallel slot workers were handed the same camera. Opening an already-open
+   camera "succeeds", so both pumps pulled guide frames. Fix: global
+   `OPEN_LOCK` across enumerate→open→configure.
+4. **Camera disconnect hung then crashed.** Teardown closed the camera from
+   the command thread while the pump thread sat inside a blocking
+   `ASIGetVideoData` — and the pump's own stop path closed it a second time.
+   Fix: the pump thread is the sole owner of stop/close; teardown signals,
+   nudges with `stop_video`, and joins.
+5. **ASI struct layout: C `long` is 4 bytes on Windows** (8 on Linux).
+   `ASI_CAMERA_INFO.MaxHeight/MaxWidth` declared `i64` shifted every following
+   field — max_width read as 2^32, open failed, silent sim fallback. Same fix
+   in `ASISetControlValue`/`ASIGetVideoData` signatures (`c_long`).
+
+Plus one port shortcut that bit: the Rust `mount3d` `eq_params` mirrored the
+Python "with alignment az/el = 0" — with `alignment_azimuth` 274.8° the
+rendered tube pointed ~85° from the true boresight (moon on the mount,
+"Pluto" in the view). The pose chain now takes alignment az/el + side flip
+like `mount3d._eq_params`.
+
+Lesson: sim parity proves the math, not the boundary. Every FFI struct,
+serial line state, and SDK threading assumption is only true once a real
+device has said so.
+
+---
+
 ## 2026-08-23 — "HOTSPOT loses lock ~10 s after handoff" was the capture dump, not the tracker
 
 In the sim autotest the optical loop locked at t≈5 s and reliably went

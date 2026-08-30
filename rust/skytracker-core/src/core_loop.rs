@@ -317,6 +317,16 @@ impl CoreLoop {
         let mut mount = mount;
         let mut state = LoopState::new();
 
+        // A Shared is reused across reconnects (MountCmd::Connect stops the
+        // old loop, then spawns a new one on the same Shared). The previous
+        // loop's stop latch and dead flag must be cleared here or the new
+        // thread exits before its first cycle and the UI shows LOOP DEAD
+        // until the app restarts.
+        shared.stop.store(false, Ordering::Relaxed);
+        if let Ok(mut o) = shared.outputs.lock() {
+            o.loop_dead = false;
+        }
+
         let handle = std::thread::Builder::new()
             .name("CoreLoop".into())
             .spawn(move || {
@@ -363,18 +373,22 @@ impl CoreLoop {
                                 }
                             }
                         }
-                        Err(_) => {
+                        Err(p) => {
                             // A cycle panicked. Stop the mount, mark the loop
                             // dead so the adapter's watchdog surfaces it, and
                             // halt — the loop's state can no longer be trusted.
                             apply_command(&mut mount, &mut state, &Command::Stop);
+                            let msg = p
+                                .downcast_ref::<String>()
+                                .map(|s| s.as_str())
+                                .or_else(|| p.downcast_ref::<&str>().copied())
+                                .unwrap_or("<non-string panic payload>");
                             if let Ok(mut o) = thread_shared.outputs.lock() {
                                 o.fresh = false;
                                 o.loop_dead = true;
-                                o.status_msgs.push(
-                                    "CoreLoop: cycle panicked - motion stopped, loop halted"
-                                        .to_string(),
-                                );
+                                o.status_msgs.push(format!(
+                                    "CoreLoop: cycle panicked ({msg}) - motion stopped, loop halted"
+                                ));
                             }
                             return;
                         }
@@ -434,6 +448,13 @@ impl Drop for CoreLoop {
         // mount bridge, the loop thread needs the GIL to finish its cycle;
         // joining while the GIL is held (e.g. during GC) would deadlock.
         // Explicit `stop()` joins with the GIL released (see the PyO3 wrapper).
-        self.shared.stop.store(true, Ordering::Relaxed);
+        //
+        // Only latch stop while this handle still owns a live thread. An
+        // already-stopped CoreLoop is dropped AFTER its replacement spawns on
+        // the same Shared (`core = new_core` drops the old value last), and an
+        // unconditional store here would kill the replacement's loop thread.
+        if self.handle.is_some() {
+            self.shared.stop.store(true, Ordering::Relaxed);
+        }
     }
 }

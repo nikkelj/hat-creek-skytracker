@@ -8,8 +8,8 @@ members = [
     "skytracker-imaging",
     "skytracker-adsb",
     "skytracker-camera",
-    "skytracker-ffi",
     "skytracker-app",
+    "skytracker-ffi",
 ]
 
 [workspace.package]

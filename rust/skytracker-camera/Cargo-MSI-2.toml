@@ -1,0 +1,17 @@
+[package]
+name = "skytracker-camera"
+description = "Camera capture pipeline for the Hat Creek Skytracker (Phase 4 of the Rust port): full-rate frame pump, ring buffer with exposure-midpoint timestamps, armed capture with parallel BMP dump, and the ZWO ASI SDK binding — the whole per-frame path off the GIL (Python capped at 4-10 FPS; cameras do 50-100)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_camera"
+crate-type = ["rlib"]
+
+[dependencies]
+# Runtime loading of ASICamera2.dll: builds and tests fine without the
+# DLL or hardware present (sim/push sources need neither).
+libloading = "0.8"
+# Parallel BMP dump workers for armed-capture flushes.
+rayon = "1"

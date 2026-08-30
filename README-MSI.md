@@ -211,26 +211,6 @@ a regression test).
 - **pyserial** — NexStar AUX serial protocol
 - **zwoasi** — ZWO ASI camera SDK bindings
 - **plotly** — post-processing/plots
-- **Rust** (`rust/` Cargo workspace) — the real-time core (control loop, PID,
-  hotspot detection, transforms, NexStar protocol) as the `skytracker_core`
-  extension module, flag-gated via `use_rust_core_loop`
-
-### Rust port (branch `rust-port`)
-
-The project is being ported to Rust in phases — engines first, an egui+wgpu
-UI last — with the pygame app staying fully functional after every phase.
-`rust/` is a Cargo workspace: `skytracker-core` (control loop and friends),
-`skytracker-astro` (the skyfield replacement: SGP4 passes, DE421 bodies,
-star apparent places — sub-arcsec parity, bulk precompute 76× faster), and
-`skytracker-ffi` (the only PyO3 crate; the Python module name stays
-`skytracker_core`). The astro engine is flag-gated via `use_rust_astro`
-(or `SKYTRACKER_RUST_ASTRO=1`), with skyfield as the automatic fallback.
-Every phase is gated on golden-vector parity tests recorded from the
-current Python implementations (`tools/record_golden.py` →
-`tests/golden/`, committed), live A/B suites (`test_rust_astro_parity.py`),
-the full pytest suite, and a closed-loop sim-tracking baseline
-(`tests/golden/loop_baseline.json`). See `rust/README.md` for crate layout
-and `VALIDATION.md` for the parity record.
 
 ## Hardware Simulator
 
@@ -283,7 +263,7 @@ pytest                                 # ~250 tests, headless, < 1 minute
 
 Suites with missing prerequisites are skipped automatically with a reason
 (see `conftest.py`): the Rust parity tests need the `skytracker_core` wheel
-(`maturin build rust/skytracker-ffi`), the star-catalog tests need
+(`maturin build rust/skytracker_core`), the star-catalog tests need
 `hip_main.dat` (CDS I/239) in the repo root, and plate-solve tests need
 `tetra3`. `de421.bsp` is auto-provisioned from the `skyfield-data` package.
 Individual files still run standalone, e.g. `python test_simulator.py`.

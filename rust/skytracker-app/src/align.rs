@@ -23,14 +23,24 @@ pub fn spawn(shared: Arc<Shared>, rx: crossbeam_channel::Receiver<AlignCmd>, mou
 fn find_db(shared: &Shared) -> Result<(String, std::path::PathBuf), String> {
     let cfg = &shared.config;
     let cam = &cfg.cam[shared.solve_slot()];
-    let name = cam.tetra3_db.clone().unwrap_or_else(|| "db_cam1_tyc".into());
-    for dir in cfg.tetra3_search_dirs() {
-        let p = dir.join(format!("{name}.npz"));
-        if p.exists() {
-            return Ok((name, p));
+    let base = cam.tetra3_db.clone().unwrap_or_else(|| "db_cam1_tyc".into());
+    // Sim frames are a centred crop (~1.28° for the guide cam), well below
+    // the hardware full-frame FOV the main DB indexes — prefer a matching
+    // "<name>_sim" DB when the cameras are simulated, fall back otherwise.
+    let mut names = Vec::new();
+    if cfg.camera_source.eq_ignore_ascii_case("sim") {
+        names.push(format!("{base}_sim"));
+    }
+    names.push(base.clone());
+    for name in &names {
+        for dir in cfg.tetra3_search_dirs() {
+            let p = dir.join(format!("{name}.npz"));
+            if p.exists() {
+                return Ok((name.clone(), p));
+            }
         }
     }
-    Err(format!("{name}.npz not found (set tetra3_db_dir or SKYTRACKER_TETRA3_DIR)"))
+    Err(format!("{base}.npz not found (set tetra3_db_dir or SKYTRACKER_TETRA3_DIR)"))
 }
 
 pub struct Solved {

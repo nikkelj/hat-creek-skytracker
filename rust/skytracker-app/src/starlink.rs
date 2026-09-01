@@ -31,42 +31,49 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
     let cache_dir = root.join(&shared.config.captures_dir).join("ephemerides");
 
-    // Manifest once at startup (retry a few times: the app often starts
-    // before the network is up in the field).
-    let mut manifest_tries = 0;
-    loop {
-        manifest_tries += 1;
-        let fetched: Result<String, String> = agent
-            .get(&format!("{base}/MANIFEST.txt"))
-            .call()
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.into_string().map_err(|e| e.to_string()));
-        match fetched {
-            Ok(text) => {
-                let man = parse_manifest(&text);
-                shared.ephem_status.store(Arc::new(format!("manifest: {} satellites", man.len())));
-                shared.starlink_manifest.store(Arc::new(Some(Arc::new(man))));
-                break;
-            }
-            Err(e) => {
-                shared.ephem_status.store(Arc::new(format!("manifest fetch failed: {e}")));
-                if manifest_tries >= 5 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(30));
-            }
-        }
-    }
+    // Manifest: keep retrying until it lands (the app often starts before
+    // the network is up in the field — giving up after a few tries left the
+    // whole feature dead until an app restart). Quick retries at first,
+    // then once a minute, without blocking the request loop below.
+    let mut next_manifest = std::time::Instant::now();
+    let mut manifest_tries = 0u32;
 
     // Request loop: fetch + parse one ephemeris per request.
     loop {
+        if shared.starlink_manifest.load().as_ref().is_none() && std::time::Instant::now() >= next_manifest {
+            manifest_tries += 1;
+            let fetched: Result<String, String> = agent
+                .get(&format!("{base}/MANIFEST.txt"))
+                .call()
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.into_string().map_err(|e| e.to_string()));
+            match fetched {
+                Ok(text) => {
+                    let man = parse_manifest(&text);
+                    shared.ephem_status.store(Arc::new(format!("manifest: {} satellites", man.len())));
+                    shared.starlink_manifest.store(Arc::new(Some(Arc::new(man))));
+                }
+                Err(e) => {
+                    shared.ephem_status.store(Arc::new(format!("manifest fetch failed (retrying): {e}")));
+                    next_manifest = std::time::Instant::now()
+                        + if manifest_tries < 5 { Duration::from_secs(30) } else { Duration::from_secs(60) };
+                }
+            }
+        }
         let req = (**shared.ephem_request.load()).clone();
         let Some(satnum) = req else {
             std::thread::sleep(Duration::from_millis(300));
             continue;
         };
-        shared.ephem_request.store(Arc::new(None));
         let man = shared.starlink_manifest.load();
+        if man.as_ref().is_none() {
+            // Keep the request pending; the manifest retry above will land
+            // and the next pass serves it.
+            shared.ephem_status.store(Arc::new("waiting for the Starlink manifest (network?)…".into()));
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        shared.ephem_request.store(Arc::new(None));
         let Some((file, name)) = man.as_ref().as_ref().and_then(|m| m.get(&satnum)).cloned() else {
             shared.ephem_status.store(Arc::new(format!("{satnum}: not in the Starlink manifest")));
             continue;

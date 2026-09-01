@@ -1587,6 +1587,8 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
                     if ui.small_button("use ephemeris").on_hover_text("download this satellite's Starlink public ephemeris (~2 MB) and track from it instead of the TLE — survives maneuvers").clicked() {
                         shared.ephem_request.store(Arc::new(Some(sn.clone())));
                     }
+                } else if man.as_ref().as_ref().is_none() {
+                    ui.label(egui::RichText::new("TLE (Starlink manifest not loaded yet — network?)").font(theme::mono(9.5)).color(DIM));
                 } else {
                     ui.label(egui::RichText::new("TLE (not in the Starlink manifest)").font(theme::mono(9.5)).color(DIM));
                 }

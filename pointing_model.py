@@ -174,6 +174,15 @@ class PointingModel:
         """
         samples = list(samples)
 
+        # Rust fast path (Phase 2b): coefficient parity 1e-6, numpy fallback.
+        import rust_pointing_adapter
+        if rust_pointing_adapter.enabled():
+            stats = rust_pointing_adapter.fit_altaz(
+                samples, remove_refraction, seed_terms, free_terms,
+                robust, robust_sigma, robust_floor_deg)
+            if stats is not None:
+                return cls(stats["terms"]), stats
+
         def sky_rms(pairs):
             sq = 0.0
             for az_cmd, el_cmd, d_az, d_el in pairs:

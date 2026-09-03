@@ -5,6 +5,744 @@ references. Newest entries first.
 
 ---
 
+## 2026-08-26 — FEATURE mode: template tracker for close-range launches
+
+- New **FEATURE** loop mode (skytracker-core::feature_track): click the
+  camera feed to grab a template patch of the vehicle pre-launch (±12–96 px,
+  textureless grabs rejected); the loop follows that PATCH by zero-mean NCC
+  — coarse 4×-pyramid search, fine refine with ±5% scale search (targets
+  shrink as they climb), parabolic sub-pixel peak, slow template update on
+  strong matches only, scale re-baking. The hotspot centroid tracker is the
+  wrong tool close-in: the plume outshines the airframe at ignition.
+- **Self-derived velocity feed-forward**: target rate = commanded boresight
+  rate + measured error growth, low-passed (τ 0.5 s) — a pure P correction
+  against an accelerating rocket carries rate/(P·360) of velocity lag
+  (measured: exactly 54 px in the first closed-loop run); with the FF the
+  same run tracks at **3.1 px max / 2.5 px final**.
+- **Synthetic close-range launch validation** (tests/controller.rs): a
+  structured rocket (nose/body/interstage/fins) on a sky+ground scene;
+  grab on the upper body at T−2.6 s; at T0 a 45 px/s² boost, a saturating
+  exhaust plume brighter than anything on the airframe, and shrink to 0.55×.
+  Result: max boresight error 3.1 px, final 2.5 px, and the tracked point
+  slips ≤1.4 px from the grabbed feature — it never slides onto the plume.
+  A second test pins static pre-launch hold. Tracker unit tests cover
+  sub-pixel translation recovery (<0.35 px) and false-lock rejection.
+- No PROGRAM transition needed: click-to-grab switches the loop to FEATURE
+  directly; loss (3× coast) zeroes and waits for a re-grab. Grab size,
+  tracked box, score and status render on the hotspot camera view.
+
+---
+
+## 2026-08-26 — HOTSPOT bare star tracking fixed; sync home
+
+- **Root cause of the "bouncing" HOTSPOT**: the star filter's bare branch
+  (no trajectory) rejected any detection slower than the 0.15°/s rate gate
+  — i.e. every star. Each star got locked during the 0.35 s rate-baseline
+  warm-up (jerking the mount toward it), then rejected, correction decayed,
+  gate grew, re-locked… a limit cycle. With a satellite selected but not in
+  frame, the trajectory feed-forward additionally kept sweeping the sky.
+- **Fixes**: (1) the star-like rate reject now only runs against a setpoint
+  — tracking bare, a star IS the target; (2) initial acquisition hunts near
+  the reticle first (18% of frame, growing on misses) instead of taking the
+  globally brightest corner blob — "lock the NEAREST star"; (3) bare-target
+  lock uses a tight gate (≤45 px) so a rival star of similar brightness
+  can't steal the lock (the brightest-in-gate flip-flop seen in soak).
+- **Verified**: new SKYTRACKER_AUTOTEST_BARE=1 mode engages HOTSPOT with no
+  target parked on the star field — 20 s soak holds one star continuously
+  (errors 0.002–0.01°, boresight creeping at sidereal rate); two new core
+  tests (nearest-to-center acquisition, star lock with filter ON); the
+  satellite HANDOFF→HOTSPOT autotest is unchanged (err 0.02°, solid lock).
+- **Sync home** button (mount panel): with the mount physically on its
+  index marks, tares az/alt — offsets := current raw encoders (persisted),
+  so the indices read 0/0 and PARK returns to them.
+- The ISS pass test's 3-min lower duration bound tripped on a real 122 s
+  grazing pass — loosened to 45 s (the test runs against the live clock).
+
+---
+
+## 2026-08-26 — Capture spool, blob stabilization, Starlink ephemerides
+
+- **Capture** streams to disk as it records (bounded queue → writer thread):
+  5+ minute collections are disk-bound, not RAM-bound. Disk-behind drops the
+  newest frame and counts it (REC tag + run_cameraN.json `dropped`) — never
+  ring-drops buffered frames. Mono → 8-bit palette BMP (3× smaller,
+  pixel-exact round trip). Measured on this machine: **774 frames/s,
+  905 MB/s** sustained at 1248×936 — 8× headroom over the 98 fps sim.
+- **Replay stabilization**: default mode is now **blob** — lock the most
+  blobby bright object (smoothed peak + background-subtracted sub-pixel
+  centroid) to its reference position; the flow tracker latched onto stars
+  and let the target slide. Falls back to flow when no blob exists. New
+  "track via cam N" measures the target's motion on another camera and
+  applies it through the plate-scale ratio. blob_lock test pins the warp
+  sign convention.
+- **Starlink public ephemerides**: MANIFEST.txt (11k satellites) fetched at
+  startup; a "use ephemeris" button on a selected Starlink satellite
+  downloads its ~2 MB MEME file (cached, old versions swept) and the mount
+  setpoint, skyplot mark and arc all switch to cubic-Hermite interpolation
+  of the J2000 state vectors (MEME→TOD→ITRS→ENU via FrameContext) —
+  surviving maneuvers that make TLEs useless. Expires back to TLE after the
+  ~72 h span (tag shows hours left). **Cross-check**: ephemeris vs TLE for
+  STARLINK-30814 agreed 0.19–0.93° over 5.5 h — the expected TLE-staleness
+  envelope (worst at closest range), confirming the frame chain.
+
+---
+
+## 2026-08-24 — Parity scrub (4-agent audit) + tiers 0–3
+
+A four-agent audit compared every Python subsystem against the native app
+(control/joystick, skyplot/visuals, config keys, camera/align/replay/sim).
+~60 gaps found and worked through in priority tiers:
+
+- **Tier 0 (correctness):** the shared config key `exposure` is
+  **microseconds** in Python but was read/saved as ms by the native app — a
+  1000× corruption in both directions; fixed to µs + a one-time migration of
+  the ms-era values in config.json/config.example.json. RATE mode now gates
+  per-axis against the hardware limits (blocks outward slew, allows return).
+  STOP is a latch (Circle toggles, any mode-select releases) enforced through
+  Inputs.stopped every cycle. Capture runs write trajectory.csv (pass arc +
+  per-frame interpolated rows — native replays now get track overlays),
+  a config snapshot, auto-named folders (NAME_NORAD), and the armed ring is
+  capped by `buffer_size`. Solar-safety warning on selecting the Sun.
+  Defaults aligned to Python (axis limits, FF off, mask 0), string-typed
+  saves for Python's config editor.
+- **Tier 1a (rig controls):** focus motor (L2/R2 analog drive → ±9 rate,
+  ~1 Hz encoder read-back, UI bar), LAUNCH override (T0 re-based to the
+  button press, forces PROGRAM, pre-empts targets, T+ readout), 4-state bias
+  mode (coarse/fine × az-el/along-cross-track with velocity projection,
+  persisted), per-mode gain-profile save-back + seeding, live tunables
+  (lead time, star filter, per-axis FF, ADS-B fit points), Eq pointing model
+  applied in the HA/Dec frame, wrap-aware park servicing, MTI reachable.
+- **Tier 1b (alignment):** polar-align routine (RA sweep + fit_polar_axis →
+  base/tilt knob corrections), asymptotic settle (tol × cycles), retry
+  failed, quick refit (IA/IE), skip + MANUAL banner, continuous plate solve
+  (plate_solve_enabled), one-star "apply align" into alignment_azimuth,
+  prerequisite checklist.
+- **Tier 2 (tracking UX):** visualization-clock pause + ±60 min scrub (mount
+  stays live), sunlit/eclipsed arc coloring (skyplot + navball), celestial
+  ±45 min trajectory polylines, solved-boresight marker, below-horizon
+  bodies pinned to the rim, Pluto, GEO-triangle/MEO-hexagon markers,
+  rotated-rect camera FOV + 10× dashed copy, global tooltips toggle,
+  persisted display toggles, table name/altitude filters + clear, launch
+  selector list, passes TCA time + shift-click secondary sort, info-pane
+  RA/Dec + rates + below-horizon status, lim-mag readout.
+- **Tier 3a/3b:** camera frame timestamps, ROI 1/32, 0° rotation reset, PNG
+  capture option, 300-line status scrollback + Exit button; HW-sim master
+  switch, save-to-config, seed, cam2 co-boresight offset injection, serial
+  latency/garbage fault injection.
+
+**Deferred with intent (documented, not dropped):** ORB stabilizer method +
+alignment-point local warping in Replay (flow stabilizer covers the need),
+injected sim pointing-model/refraction, Eq-mode alignment *fitting* (the Eq
+residual model is applied but fits still run alt-az; Python-era eq fits are
+honored from config), local-timezone clock (needs a tz database).
+
+Autotest after each tier: HOTSPOT lock holds (err 0.007–0.02°), workspace
+tests green throughout.
+
+---
+
+## 2026-08-23 — UI round 5: KSP navball, virtual controller, live PID, pixel zoom
+
+- **KSP-style navball** (port of joystick_panels.render_navball): true
+  orthographic ball — sky/ground hemisphere fill (texture cached on
+  quantized elevation; the fill depends only on el since world-up in the
+  camera frame is (0, cos e, sin e)), 30° meridians + 10° parallels, bright
+  horizon, cardinal letters, green pitch-numeral chips, bezel with ticks +
+  heading index, fixed yellow "waterline" boresight reticle, the selected
+  target's arc (grey past / yellow future) + purple KSP crosshair at the
+  setpoint, ADS-B diamonds, and the green HDG/PITCH instrument box with
+  past-pole normalization. Verified in the fresh-state tour.
+- **Virtual controller panel** (port of render_joystick_status): stylized
+  DualShock drawn per frame from live gamepad state now published in
+  MountSnapshot (buttons bitmask, both sticks, L2/R2 analog) — pressed
+  buttons light green, stick crosshairs move live, the RATE stick is
+  amber-tagged with the tare point marked, L2/R2 fill bars, the
+  adaptive-rate gear ladder (green base / orange boost / grey outside RATE),
+  and a function legend that highlights while a control is held.
+- **Inline live PID tuning**: the gains… popup became a PID GAINS section in
+  the mount panel — dragging P/I/D applies to the loop immediately
+  (SetGains); "sync from loop" re-reads after a mode-profile switch.
+- **Camera pixel zoom**: mousewheel over any camera view zooms about the
+  cursor (1–16×), drag pans, reset button appears — a pure display
+  transform, independent of the hardware ROI; all overlays (reticle, ROI
+  box, hotspot, solve marks) ride the same transform.
+- **Track camera controls** are now a single always-visible row
+  (gain / exposure / γ / rotation / ROI) instead of a collapsible.
+- Note: egui persistence keeps collapse state per user — screenshot tours
+  need a fresh app.ron to show the default-open panels.
+
+---
+
+## 2026-08-23 — UI round 4: skyplot zoom + info panes, deterministic splitters
+
+- **Skyplot zoom/pan**: mousewheel zooms about the cursor (1–60×), drag pans
+  when zoomed, and a `N.N× · reset` overlay button (bottom-right of the plot)
+  restores the whole dome. All hit-testing (hover cards, click-select) works
+  through the transform; content clips to the plot rect.
+- **Selected-object info pane** (top-right, like the old UI): satellites show
+  NORAD, intl designator, epoch, inclination, RAAN, arg perigee, mean anomaly,
+  mean motion, eccentricity, rev #, apogee/perigee, live az/el, slant range
+  and rates — the classical elements are parsed from TLE line 2 in
+  `skytracker-astro` and carried on `SatMark`. Bodies / stars / DSOs /
+  aircraft / launches get type-appropriate cards.
+- **Camera FOV cards + footprints**: per-camera color-matched cards (az/el,
+  FOV w×h, rotation, spot size ″/px) under the info pane; the skyplot draws
+  each connected camera's FOV circle in its color (fisheye bubble =
+  zenith-centred coverage circle). At 1× the pinhole FOVs are a few px —
+  zooming shows them at true scale.
+- **Deterministic splitters** (`vdrag_handle`): the egui bottom-panel resize
+  memory kept sliding back after a drag, so quad's camera row and the scope
+  right-bar sections (skyplot / controls / bubble) now use stored heights
+  with explicit drag bars. Verified across the four layout tours.
+- **Visible-satellites rollup** available in every layout: bottom panel
+  (tabs), right-bar rollup (stack, scope), top-left rollup (quad).
+- **Track-screen camera controls**: each camera view carries a `controls`
+  rollup (gain / exposure / gamma / rotation / ROI) in all layouts.
+- **Exposure floor** dropped 32 µs → **1 µs** (slider + ASI clamp; the
+  driver enforces its own hardware minimum).
+- Workspace tests green after the `Satellite` element additions; screenshot
+  tours of all four layouts inspected (tabs/stack/quad/scope).
+
+---
+
+## 2026-08-23 — UI round 3: track layouts, µs exposure, weighted combined view
+
+- **Exposure** is now microseconds internally (`exposure_us`, config keeps the
+  ms `exposure` for Python compat): log slider 32 µs – 2 s with µs/ms/s
+  formatting and typed entry ("570us", "5.7ms", "0.5s"); ASI gets the value
+  directly, the sim scales its signal by exposure × gain.
+- **Track layouts** (`track_layout`, live selector, persisted): tabs / stack
+  (three cameras in a full column) / quad (controls | skyplot, 2-or-3-camera
+  bottom row) / scope (guide+main split or weighted-combined dominate;
+  compact skyplot + essentials peripheral). Screenshots:
+  rust_app_track_{quad,stack,scope}.png. The skyplot drops its readouts,
+  legend and auto-labels below 240 px radius so the mini form stays clean.
+- **Combined view** re-verified in the tour (it existed but was unexercised)
+  and upgraded from a single opacity to **per-camera dominance weights** —
+  painting layer k with alpha w_k/Σw gives the exact weighted mean; shared
+  `weighted_overlay` also powers the scope layout. Plate-scale matching shows
+  the Main FOV correctly inset within the Guide field.
+- Quad camera row initially collapsed to a sliver: `default_height` computed
+  from `screen_rect()` on the first frame (window not yet sized) — fixed with
+  a fixed default; noted for future panels.
+
+---
+
+## 2026-08-23 — Parity round: pointing model applied, gamepad map complete, runtime connect, diagnostics, sim noise
+
+- **Pointing model in the loop**: PROGRAM/HANDOFF setpoints are pre-corrected
+  `command = desired − error(desired)` with the 7-term alt-az model
+  (`pointing_model_terms`, `pointing_model_enabled`, persisted; APPLY MODEL on
+  the Align screen stores + saves a fresh fit). With the existing config terms
+  the panel shows `corr +0.51′ / +1.49′` being applied live.
+- **Gamepad**: Options cycles AltAz → AltAz-Side → Eq → Passthrough (live,
+  persisted), Square tares the stick, RATE now reads the **right** stick like
+  the Python app (`joystick_rate_stick`), gearbox base step / wind-up from
+  config.
+- **Runtime connection**: serial port enumeration + connect/disconnect
+  re-spawns the core loop; ADS-B source switchable live (rtlsdr / dump1090 /
+  sim / off).
+- **Diagnostics**: az/el error + rate-command strip charts (30 s) and a
+  navball in the mount panel.
+- **Sim**: encoder read noise (1σ 0.0007°), rate noise, reversal backlash
+  (0.006°) injected into the byte-level responder (`SimNoise`), live from the
+  Sim screen; closed loop still locks and holds with them on.
+- **Capture dump made asynchronous** — see LEARNINGS (it was starving the
+  HOTSPOT camera).
+- Workspace tests 146/146.
+
+---
+
+## 2026-08-23 — Native RTL-SDR ADS-B: real Mode S frames on the first run
+
+`skytracker-adsb::demod` ports pyModeS' RtlReader (100 µs-window noise
+floor, 10 dB minimum amplitude, 16-sample preamble match with the 0.8
+amplitude tolerance, PPM bit decision per half-chip pair, DF/CRC acceptance)
+— unit-tested on synthesized frames (round-trip, streaming in noise,
+corrupted frame rejected: 4/4). The app binds `rtlsdr.dll` (repo root) with
+libloading: 2 MS/s, 1090 MHz, auto/manual gain, synchronous reads, then
+`modes::decode_message` → the same aircraft table as the SBS path.
+
+First run with the Nooelec dongle attached to this PC (config
+`adsb_source_mode: "rtlsdr"`), 20 s into the screenshot tour:
+**"rtlsdr: receiving 1090 MHz · 17 Mode S frames · noise 0.066 · 1 aircraft
+· 3 msgs"** — a real aircraft decoded and plotted. The last Python-only
+ADS-B piece is gone; `adsb_receiver.py` is now fully superseded natively.
+
+---
+
+## 2026-08-23 — Native app: three cameras, sensor-calibration view, filter wheels, HOTSPOT feed-forward fix
+
+- **Camera model**: logical slots with role / projection / hardware index /
+  sensor geometry / bin; one worker thread per slot (sim or ASI by hardware
+  index), live gain / exposure / gamma / rotation / ROI (hardware ROI via
+  `ASISetStartPos`, sim ROI by cropping), swap = exchange hardware indices and
+  reconnect (settings stay with the slot), captures arm every connected
+  camera into one run directory as `CameraN_` files. Sim: guide 50 mm
+  (1248×936 crop at 2.9 µm, FOV 1.28° — the tetra3 DB camera), ASI432MM main
+  (9 µm / 2000 mm, FOV 0.32°), ASI462MM bubble (equidistant fisheye fixed at
+  the zenith, whole-sky Hipparcos + satellites). All three run at 97–98 FPS.
+- **Cameras screen** (doc/screenshots/rust_app_cameras.png): three feeds +
+  per-camera controls, combined opacity overlay (optionally plate-scale
+  matched), reset / save to config, filter-wheel cards (EFW offline here —
+  no `EFW_filter.dll` on this machine; the manual wheel marks positions and
+  persists assignments to config.json).
+- **Closed loop through the multi-camera path** (`SKYTRACKER_AUTOTEST=45`,
+  AltAz-Side): HANDOFF → HOTSPOT at t=5 s, locked through the run with the
+  error converging 0.08° → 0.006° — the mount worker now keeps the
+  trajectory setpoint alive in HOTSPOT (feed-forward + star-filter rate
+  reference), which it had been clearing before. A second run lost lock at
+  t≈12 s and fell back to PROGRAM cleanly — lock robustness against bright
+  stars crossing the gate remains a tuning item for the rig.
+- App crate tests 20/20, camera crate tests 2/2.
+
+---
+
+## 2026-08-23 — Native app 7g: replay proxies, skyplot layers, ADS-B, gamepad, celestial tracking
+
+- **Replay** (`SKYTRACKER_REPLAY_TEST`): on a local 196-frame run the
+  worker displays ~43 fps at 1x and stays within 5 frames of the playhead;
+  the earlier "sluggish Yaogan playback" was OneDrive online-only
+  placeholders (12.4 s first read per 18 MB frame) — now detected and
+  labelled, playback buffers instead of racing (LEARNINGS 2026-08-23).
+- **Skyplot layers**: IAU-CSN names (HIP→name, Sirius/Achernar checked),
+  OpenNGC Messier (110 + the M45 patch) and NGC (mag-limited), mount keepout
+  wash (same reachability scan as rendering_threads, incl. the AltAz flip),
+  ADS-B aircraft with linear-fit prediction — all click-selectable.
+- **Celestial / aircraft PROGRAM tracking**: the sky worker publishes the
+  selection's live az/el + rates (bodies via DE421, stars via apparent
+  places, DSOs via ICRS→ENU); `SKYTRACKER_AUTOTEST_TARGET=body:sun` →
+  PROGRAM follows the Sun's azimuth with 0.003–0.006° error (Sun below the
+  horizon at test time, so the setpoint correctly parked at the mask).
+- **Gamepad** (DualShock via gilrs): Circle STOP, R3/L3 mode cycle, L1
+  feed-forward toggle, Cross capture arm/save — mirrors joystick_controller.
+- App crate tests: 20/20 (catalogs, replay, mount3d, alignment adapter).
+
+---
+
+## 2026-08-22 — Native app Phase 7b–7f: every screen, closed-loop in the sim
+
+**What landed** (`rust/skytracker-app`, one session after first light):
+Track (skyplot with the selected satellite's ±10 min track, de-conflicted
+labels, hover cards, boresight/FOV/setpoint, camera with HOTSPOT overlay,
+mount instrument panel, capture arm/save, sortable table), **Passes**
+(`skytracker-astro::passes`), **Align** (tetra3 plate solve + the
+alignment runner), **Replay** (port of post_process incl. H.264 export),
+**Mount 3D**, **Sim**, **Config**; native serial transport + ASI source
+wired behind config; the in-process camera→core-loop frame feed for
+HANDOFF/HOTSPOT; a Tycho deep catalogue for the sim camera (590,804 stars
+≤ mag 10.5, 2 s load); headless `SKYTRACKER_AUTOTEST` and
+`SKYTRACKER_SCREENSHOT_DIR` modes. Screenshots: doc/screenshots/rust_app_*.png.
+
+**Pass prediction vs skyfield** (`rust/skytracker-astro/tests/passes.rs`,
+reference generated by `tests/gen_passes_ref.py` with skyfield 1.46 +
+`trajectory._estimate_pass_magnitude`; ISS, HST, CALSPHERE 1 + two GEOs,
+24 h from the ISS TLE epoch, mask 10°): 12/12 passes matched — AOS/LOS
+**0.00 s**, TCA time 0.012 s, peak elevation 0.0001°, range at TCA 0.000 km,
+magnitude **0.0003 mag**, apogee/perigee 0.000 km, eclipse verdicts identical.
+The two GEOs produce zero / one truncated 86,400 s pass on both sides.
+Live: 16,080 TLEs → 16,436 passes over 6 h in ~1.0–1.4 s on the sky worker.
+
+**Alignment runner** (`rust/skytracker-pointing/src/alignment.rs`, 23
+tests): Fibonacci grid + holdout split bit-identical to the Python golden
+values (including Python's banker's rounding in the holdout index), spiral
+grid-search, running fit with early stop, backtest pass, supervised
+confirm, retry-failed; a synthetic 7-term truth is recovered within 0.05°
+with 8″ noise.
+
+**Closed loop in the simulator** (`SKYTRACKER_AUTOTEST=70`: injected
+misalignment +0.040°/−0.030° between the reported pose and the true
+boresight, a LEO target selected, HANDOFF armed at t=4 s; config mount
+mode **AltAz-Side** with azm/alt offsets 90/90, alignment az 274.8°, el
+−0.6°):
+
+| t | mode | note |
+|---|---|---|
+| 4.0 s | HANDOFF | GOTO to the setpoint (180/45 → 356/55 in < 1 s on the sim), PID takes over |
+| 5.0 s | **HOTSPOT** | promoted after `handoff_min_frames` consecutive verified detections; `locked`, SNR 67 |
+| 5–67 s | HOTSPOT | **locked for the entire run**; mount-frame error 0.29° → 0.02° by t=30 s and held; centroid parked at (482, 382) of 960×720 — the ~22 px floor of the discrete MC_MOVE steps; camera 97–98 FPS, loop 15.0 Hz |
+
+Same test in **AltAz** mode: HANDOFF → HOTSPOT lock at t=5 s, locked
+through the run (error 0.16° → 0.05° by t=22 s). Before the geometry fix
+described in LEARNINGS (2026-08-22) the AltAz-Side run locked for one
+frame and fell back to PROGRAM; the fix leaves the Python A/B loop parity
+suite unchanged (`test_loop_ab_parity.py` + core-loop/hotspot suites: 30
+passed).
+
+**Plate solve on simulated frames** (tetra3 port, `db_cam1_tyc`, FOV 0.98°):
+`solved: 7 matches, rmse 2.4″, 18 ms` on a Tycho-rendered 960×720 frame
+during the AltAz run — the first end-to-end solve of the Rust sim camera
+by the Rust solver. Sparse fields (2–6 centroids) correctly return no
+solution; the Align screen retries on the next frame.
+
+**Alignment run in the simulator** (`SKYTRACKER_AUTOTEST=150`, AltAz-Side,
+6 fit + 2 holdout points, sim camera 1248×936 = FOV 1.28° — inside
+`db_cam1_tyc`'s 0.85–1.30° range; a 0.98° frame averaged only ~6 mag ≤ 10
+stars and both the Rust and the reference Python tetra3 declined to solve
+it): the runner slews through the Rust GOTO path (sky → `sky_to_mount` →
+encoder + offsets), settles, solves, and on sparse fields spiral-searches —
+sample 1 after 40 grid cells near the zenith (`mount 137.508/71.556 true
+137.557/71.524 Δ 129″`), sample 2 after 9 (`Δ 131″`), i.e. it *measures* the
+injected +0.040°/−0.030° misalignment (0.04 cos 71.5° + 0.03 → ~120″). Two
+samples in 150 s — a full 6-point fit needs ~5 min on this sparse sim and
+is the next autotest extension. Solve on a mid-density field during the
+screenshot tour (no misalignment injected): `6 matches, rmse 8.3″, 21 ms`,
+pointing error +4″ cross / +6″ el — the sim's own aberration/proper-motion
+omission, not the solver.
+
+**Rig items this surfaced:** HOTSPOT on AltAz-Side/Eq now rotates the
+optical correction into the pole-referenced axes through `sky_to_mount`
+(AltAz behaviour unchanged) — verify on hardware together with the x/y
+signs; serial transport and ASI source are wired but untested; the mount
+snapshot now reports sky az/el (axes separately), so the Python app's
+raw-axis readouts and the native app's readouts differ by design.
+
+---
+
+## 2026-08-22 — Native egui+wgpu app: first light (Phase 7a)
+
+**What it is.** `rust/skytracker-app` — the native application over the
+Rust engines, the plan's Phase 7 architecture realized: three
+single-owner worker threads (sky: astro engine + TLE catalog + DE421 +
+Hipparcos; mount: the core loop over the byte-level wall-clock sim mount
+with gamepad → adaptive rate gearbox → RATE, or live satellite setpoints
+→ PROGRAM; camera: a Rust star-field simulator — catalog stars projected
+through camera 1's pinhole at the mount's live pointing — pumped through
+the real skytracker-camera pipeline at ~100 FPS) publish immutable
+`ArcSwap` snapshots; the UI renders snapshots and sends `MountCmd`s over
+a channel, never mutating shared state. eframe on wgpu, requesting
+repaint at 120 Hz (display-refresh bound: 60 Hz on this desktop).
+
+**First light** (doc/screenshots/rust_app_phase7.png, launched from the
+repo root on the live catalog): polar skyplot with 1,025 stars and 763
+visible satellites from 16,080 TLEs (GEO belt, planets, mask ring), sky
+compute 3.4 ms/s on the worker; camera panel at **97 FPS**; mount panel
+with the sim loop at 15.0 Hz and STANDBY/RATE/PROGRAM/STOP; elevation-
+sorted live satellite table with click-to-select driving PROGRAM
+setpoints; hover tooltips; 9 s soak clean. Run:
+`cargo run --release -p skytracker-app` from the repo root.
+
+Remaining Phase 7: pass table + trajectory arcs, HANDOFF/HOTSPOT UI over
+the in-process camera→hotspot path, alignment/plate-solve screens, post-
+process replay, mount3d, config editing, native open_asi/serial
+transports, AlignmentRunner, then pygame deletion.
+
+---
+
+## 2026-08-18 — Rust PID auto-tuner identical to Python (Phase 6b)
+
+**What it is.** `autotune.rs` in skytracker-core ports PIDAutoTuner: the
+shared-schedule P/D/I twiddle in log-gain space (settle/eval windows,
+>3% acceptance margin, step expand/shrink, live divergence gate,
+pause/resume on tracking loss, sweep convergence). Exposed as
+RustPIDAutoTuner; the PIDAutoTuner-compatible Python wrapper mirrors the
+applied gains into the live config fields both loops read, so
+joystick_controller / joystick_panels are untouched. Selected by
+`make_autotuner` behind `use_rust_autotune` / SKYTRACKER_RUST_AUTOTUNE=1.
+
+**Validation** (test_rust_autotune_parity.py, in CI): both tuners drive
+identical synthetic plants (error depends on the gains each applied, so
+decision divergence cascades) at 15 Hz — **5,230 cycles identical**
+through full convergence (9 sweeps; phase, stage, every applied gain to
+1e-9, every status message); 3,600 cycles identical through a 6 s
+tracking dropout + divergence spike; stop(revert=True) identical and
+restores initial gains.
+
+Alignment-run sequencing (AlignmentRunner) is thread/hardware-coupled
+and moves with the Phase 7 app's state redesign; its pure math
+(Fibonacci grid, fits) is already ported.
+
+---
+
+## 2026-08-18 — Rust-loop gaps closed: mask-exit + rate gearbox (Phase 6a)
+
+**Mask-exit pre-positioning**: the flag-on Rust loop's documented gap
+(below-horizon satellite → safe stop) is closed: the adapter now holds
+the setpoint at the mask-exit point (target azimuth at the elevation
+mask, zero rates), mirroring the Python program_track drive and the
+launch path's mask hold. Loop/adapter/A-B suites green (32 tests).
+
+**Adaptive rate gearbox**: `axis_to_rate` + `AdaptiveRateMapper` ported
+to skytracker-core (rate.rs) with the exact constants and absolute-
+deadline semantics; exposed as RustAdaptiveRateMapper.
+test_rust_rate_parity.py (in CI): 16,004 axis samples identical, and 20
+random deterministic stick timelines (pins, releases, reversals, stale
+gaps at 15 Hz service) match the Python gearbox on EVERY step and
+ceiling. One porting catch: a guessed JOY_RELEASE_DEFLECTION (0.5 vs
+the real 0.70) was flushed out immediately by the timeline A/B.
+
+MTI remains a stub on both sides by design; alignment-run sequencing +
+autotune port in Phase 6b; Rust-loop promotion to default awaits the rig.
+
+---
+
+## 2026-08-18 — Rust camera pipeline sustains camera-native rates (Phase 4a)
+
+**What it is.** `skytracker-camera`: the capture pipeline rebuilt in
+Rust — frame pump thread, ring buffer with exposure-midpoint stamping
+(camera_buffer semantics), armed-capture retention + rayon-parallel BMP
+dump, and the ZWO ASI SDK binding (ASICamera2.dll via libloading,
+rig-ready but timing-truth pending hardware). Python touches frames only
+on display pull. Motivation: the Python capture path (CameraThread +
+pygame conversion + CircularBuffer, all under the GIL) capped at
+**4-10 FPS** against cameras capable of 50-100.
+
+**Validation** (test_rust_camera_pipeline.py, in CI; frames rendered by
+the real HardwareSimulator per the sim-first directive, replayed
+metered):
+
+- **100.2 FPS sustained** at the 100 FPS target and **50.3** at 50, zero
+  dropped frames, while a concurrent 30 Hz display consumer pulls.
+- Unthrottled pipeline headroom **2,244 FPS** (VGA mono) vs 992 FPS for
+  the isolated Python per-frame path (2.3×) — and the Rust path holds
+  under load since no stage touches the GIL, where the Python 992
+  degrades to the observed 4-10 in the live app.
+- Armed capture: 40 sim frames dumped as byte-correct BMPs with
+  monotonic stamps; midpoint backdating measured at exactly 250 ms for
+  a 0.5 s exposure (parity with exposure_midpoint_utc).
+
+**Phase 4b (wiring)**: `RustCameraThread` (rust_camera_adapter.py)
+subclasses CameraThread and reroutes the per-frame path: raw frames go to
+the Rust ring, the display Surface is built lazily at UI-pull rate
+instead of per frame, and armed capture keeps the exact frame-dict
+contract capture_manager consumes. Selected in
+camera_manager._start_camera_thread behind `use_rust_camera` /
+SKYTRACKER_RUST_CAMERA=1 (Python CameraThread on any failure). Verified:
+camera_manager sim connect runs the Rust thread at the paced sim target
+(15.4 FPS actual vs 15 target), display + detection + capture round-trip
+correct, and the full-wiring closed-loop tracking gate holds on the Rust
+camera (**PROGRAM rms 74.4″** vs the 67-73″ Python baseline band).
+Remaining: rig-session timing truth + native open_asi promotion.
+
+---
+
+## 2026-08-18 — Rust ADS-B decode identical to pyModeS (Phase 5)
+
+**What it is.** `skytracker-adsb` ports the Mode-S DF17/18 decode subset
+the app uses (CRC-24, ICAO, typecode, TC 1-4 callsign, TC 9-18/20-22
+CPR position-with-reference + altitude, TC 19 velocity — faithful to
+pyModeS's algorithms including its integer-truncation quirks) plus the
+WGS84 geodetic→ECEF→ENU→az/el chain. `decode_adsb_message` routes
+through it behind `use_rust_adsb` / SKYTRACKER_RUST_ADSB=1 with pyModeS
+as fallback. Deliberate divergence: Gillham (Q=0) altitudes above
+50,187 ft decode to None. SBS source + tracker orchestration stay
+Python; native RTL demod arrives with the Phase 7 app.
+
+**Validation** (test_rust_adsb_parity.py, in CI): a generated corpus of
+242 CRC-valid DF17 frames (random ident/position/velocity payloads,
+CRCs from pyModeS's own encoder) decodes **identically** in every field
+(ident 81, position 81, velocity 80); geometry matches numpy to 7e-15;
+the classic pyModeS reference messages decode to the documented values
+in pure-Rust unit tests. Existing test_adsb.py suite green.
+
+---
+
+## 2026-08-17 — Rust imaging kernels live in the pipelines (Phase 3b)
+
+**What it is.** The stacking/stabilizer/sharpen numeric kernels now route
+through `skytracker-imaging` behind `use_rust_imaging` /
+SKYTRACKER_RUST_IMAGING=1 (cv2/numpy fallback): sharpness grading
+(laplacian/tenengrad incl. INTER_AREA downscale with uint8 rounding
+semantics), brightness centroid, patchwise local shifts + dense grid
+warp, the flow-method stabilizer estimate (detect + LK + RANSAC +
+plausibility bounds in one Rust call), and the mono finish()
+(multi-scale unsharp + auto-stretch). Orchestration and color paths stay
+Python.
+
+**Validation** (test_rust_imaging_parity.py, in CI, real entry points on
+a synthetic jittered burst): end-to-end LuckyStacker master (flow align
++ local grid + accumulate) **51.2 dB PSNR** flag-off vs flag-on (gate
+40); finish() **identical**; sharpness <1e-3 rel; centroid exact;
+stabilizer transforms 0.0055 px / 0.0012°; grid-warp 51.1 dB, shift-field
+42.2 dB. Per-node local shifts on noisy rotated patches differ at the
+estimators' shared noise floor (median 0.37 px) — the clean-signal
+phase-correlation case is golden-gated at 0.01 px in cargo.
+
+**Phase 3c (MP4 export)**: post_process's Mp4Exporter can now write
+H.264 via openh264 + a pure-Rust MP4 muxer behind the same flag
+(cv2.VideoWriter mp4v fallback; odd dimensions fall back). Round-trip
+gate is comparative: the H.264 output must decode no worse than the
+mp4v writer it replaces — measured **37.2 dB vs mp4v's 35.1 dB** on the
+noisy synthetic burst, all frames cv2-decodable. (Two traps documented
+in LEARNINGS: limited-range YUV, and openh264's per-GOP QP startup.)
+
+---
+
+## 2026-08-17 — Rust imaging primitives vs cv2 goldens (Phase 3a)
+
+**What it is.** `skytracker-imaging`: the OpenCV numeric cluster the
+stacking/stabilization pipeline composes — filters (Gaussian/Laplacian/
+Sobel, reflect-101 borders), warpAffine/remap (incl. cv2's 1/32-px
+fixed-point coordinate quantization), rustfft phase correlation with
+OpenCV's fftShift/minMaxLoc/weighted-centroid subpixel chain, Shi-Tomasi
+corners + pyramidal Lucas-Kanade (win 21, 3 levels, Scharr gradients),
+and RANSAC similarity with exact-LSQ refine.
+
+**Validation** (cargo test -p skytracker-imaging vs regenerated
+cv2_ops.npz): filters ≤ 9e-5; warp 4.6e-5; LK 0.0055 px; RANSAC
+**identical** to cv2 (rotation/translation/scale 0.000, same 54 inliers);
+phase correlation 0.01 px with a mirror-tolerant gate at exact
+half-pixel shifts (cv2's f32 pipeline and our f64 pipeline break the
+two-row peak tie oppositely; the test also asserts we are never less
+accurate than cv2 against truth).
+
+**Golden integrity bug found and fixed**: cv2.phaseCorrelate mutates its
+inputs in place; the original cv2_ops.npz was internally inconsistent
+(see LEARNINGS 2026-08-17). Recorder fixed, goldens regenerated, and a
+defensive copy added to stacking.py's live phase-correlate call.
+
+---
+
+## 2026-08-16 — Rust pointing-model fits at machine precision
+
+**What it is.** Phase 2b: `skytracker-pointing` ports the 7-term TPOINT
+fits (alt-az IA/IE/AN/AW/NPAE/CA/TF and equatorial IH/ID/NP/CH/ME/MA/TF
+with parallactic-angle flexure), including the partial (seeded) nightly
+refit, MAD-robust outlier rejection, Bennett refraction stripping, and
+the polar-axis SVD plane fit. Least squares uses numpy's
+`lstsq(rcond=None)` semantics (SVD minimum-norm with the same cutoff).
+Fit classmethods route via `use_rust_pointing` / SKYTRACKER_RUST_POINTING
+with the numpy implementations as fallback.
+
+**Validation** (test_rust_pointing_parity.py, in CI; synthesized truth
+models + noisy samples + planted outliers through the real classmethod
+entry points): worst coefficient difference **4.4e-16 deg** (gate 1e-6),
+identical robust rejection counts (3/3), identical n_samples/design_cond/
+RMS stats, polar-axis fit exact to 2.8e-14 deg.
+
+---
+
+## 2026-08-16 — Rust plate solver: numerically identical to tetra3
+
+**What it is.** Phase 2a of the Rust port: `skytracker-platesolve` is a
+pure-Rust line-by-line port of ESA tetra3's lost-in-space solver
+(centroider + edge-ratio pattern hash + Kabsch verify), reading the app's
+existing `.npz` pattern databases unchanged. Wired into
+`plate_solver.PlateSolver` behind `use_rust_platesolve` /
+`SKYTRACKER_RUST_PLATESOLVE=1` with tetra3 as the automatic fallback.
+
+**Validation:**
+
+- **Pattern hash**: 1,000 golden keys **bit-exact** on the live
+  db_cam1_tyc geometry (bins=50, catalog=2,351,182) and an alternate
+  geometry — the existing databases work as-is (numpy uint64 wraparound
+  reproduced with Rust wrapping arithmetic).
+- **Centroids**: within **0.0000 px** of Python tetra3 on golden frames
+  and freshly rendered fields (gate 0.3 px).
+- **End-to-end** (test_rust_platesolve_parity.py, in CI): 12/12 synthetic
+  star fields (stars projected from the DB's own catalog at random
+  pointings) solved by both solvers with **0.00 arcsec** centre
+  difference, **0.0000°** roll difference, and identical match counts —
+  the same accepted pattern, the same refined rotation, to f64 precision.
+- Wrapper flag-on path verified (identical SolveResult); solve speed
+  comparable (~260 ms first-call, dominated by DB load on both sides).
+- Existing test_plate_solve.py / test_alignment.py suites green.
+
+---
+
+## 2026-08-16 — Rust astro engine wired into the app (flag-gated) at 76×
+
+**What it is.** Phase 1 integration: the `AstroEngine` PyO3 class exposes
+the Rust astro engine, and `trajectory.py` / `celestial.py` route through
+it behind `use_rust_astro` (or env `SKYTRACKER_RUST_ASTRO=1`), skyfield
+remaining the automatic fallback on any error.
+
+**Live A/B parity** (test_rust_astro_parity.py, real tle_cache + app entry
+points, both implementations side by side):
+
+- `_compute_one_trajectory` rows: 40 sats × 31 samples, worst **0.041″**
+  (gate 20″); px/py sub-pixel; rates within 2e-3 °/s.
+- Visibility gate: 250 sats, **zero** disagreements (boundary cases
+  verified within 0.2° of the threshold when they occur).
+- `solar_system_altaz` + `build_trajectory` (moon, planet:Jupiter, star
+  anchor): worst **0.03″** — with an explicit guard that the Rust path
+  actually engaged (see LEARNINGS: silent fallback made an early version
+  of this test compare skyfield to itself).
+
+**Measured speedup** (bench_rust_vs_python.py, 16,085-sat catalog,
+31 samples): visibility gate 176.6 → 57.3 ms (**3.1×**); bulk trajectory
+rows for the 970 visible satellites 285.7 → **3.8 ms (75.9×)** — one FFI
+call, rayon-parallel, GIL released. TLE catalog parse: 16,085 sats in
+40 ms.
+
+---
+
+## 2026-08-15 — Rust astro engine: bodies, stars, and a pure-Rust SPK reader
+
+**What it is.** Completion of the Phase 1 engine math: `skytracker-astro`
+now covers solar-system bodies (sun/moon/planets from `de421.bsp`) and
+Hipparcos star apparent places, replacing skyfield's observe/apparent chain.
+
+- **SPK reader** (`spk.rs`): minimal pure-Rust DAF/Type-2 Chebyshev reader
+  (~250 LOC, no external deps) instead of a heavy ephemeris crate.
+  Validated against jplephem on all 15 de421 segments × 25 epochs:
+  worst position diff **1 cm**, velocity 1e-11 km/s.
+- **Bodies** (`ephemeris.rs` + `apparent.rs`): light-time iteration +
+  NOVAS aberration (ported from skyfield.relativity) + IAU2000A frame
+  chain. Worst alt/az and RA/Dec separation vs skyfield: **0.79 arcsec**
+  (gate 60"); the omitted relativistic light deflection is the residual.
+- **Stars** (`stars.rs`): hip_main.dat parser (117,955 rows) + the
+  starlib position/proper-motion/parallax model. Worst separation
+  **0.17 arcsec** across 50 stars (incl. high-proper-motion set) × 10
+  epochs over 2024–2027.
+
+---
+
+## 2026-08-15 — Rust astro engine: satellite/time parity vs skyfield
+
+**What it is.** Phase 1 of the Rust port: `rust/skytracker-astro` replaces
+the skyfield satellite pipeline. Validated against the Phase 0 golden
+vectors (pure-Rust `cargo test -p skytracker-astro`):
+
+- **Satellite topocentric alt/az/range**: worst sky separation
+  **0.03 arcsec** over 6 TLEs (ISS→polar→Molniya-class) × 200 epochs;
+  relative range error ≤ 1.1e-7 (gate: 20 arcsec).
+- **GAST/GMST/ΔT**: worst 1.9 ms of time (gate: 5 ms), using the full
+  IAU2000A nutation series generated verbatim from skyfield's tables.
+- **Az/el rates**: worst sky-projected difference 8.5e-8 deg/s against the
+  golden finite-difference scheme.
+
+Two convention traps found and documented in LEARNINGS.md: the Rust sgp4
+crate defaults to WGS84 (skyfield uses WGS72 — use the AFSPC-compat
+constructor), and skyfield runs SGP4 on UTC while rotating TEME→PEF with
+UT1.
+
+---
+
+## 2026-08-15 — Rust port Phase 0: golden vectors + closed-loop baseline
+
+**What it is.** The full-Rust port (branch `rust-port`) validates every
+future phase against frozen reference outputs of the *current* Python
+implementations, recorded before any port work touches them.
+
+**What was recorded** (`tools/record_golden.py` → `tests/golden/`, committed):
+
+- **skyfield**: 6 TLEs spanning inclinations (ISS 51.6° → polar) × 200
+  epochs → topocentric alt/az/range/rates; sun/moon/5 planets and 50
+  Hipparcos stars (40 brightest + 10 highest-PM) at 2024–2027 epochs;
+  GAST/GMST/ΔT series. Tolerances for the Rust astro engine: sats 20″,
+  bodies/stars 60″, GAST 5 ms.
+- **tetra3**: 1,000 pattern-hash keys → `_key_to_index` outputs against the
+  live `db_cam1_tyc` geometry (bins=50, catalog=2,351,182) plus an alternate
+  geometry — the Rust solver must match **bit-exact** or the existing
+  database is unusable. Centroids on 5 synthetic star fields (0.3 px gate).
+- **OpenCV**: phase-correlate on known sub-pixel shifts, Gaussian/Laplacian/
+  Sobel kernels, RANSAC similarity estimation with planted outliers, and
+  pyramidal LK on a known shift — the numeric contract for the Phase 3
+  imaging port.
+- **Closed-loop baseline** (`tools/record_loop_baseline.py` →
+  `tests/golden/loop_baseline.json`): full-wiring sim rig
+  (test_tracking_quality.py). PROGRAM rms ≈ 67–73″, HOTSPOT hold
+  rms ≈ 138″, HANDOFF latency ≈ 1.0 s, zero false rejects/losses.
+  Phases 1/4/6/7 must not regress these.
+
+**Structural change validated:** `rust/` is now a Cargo workspace —
+`skytracker-core` (pure Rust) + `skytracker-ffi` (the only pyo3 crate;
+Python module name unchanged). All 49 cross-language parity tests pass
+against the relocated wheel; `cargo test --workspace` links no libpython.
+
+---
+
 ## 2026-07-28 — Pass-table visual magnitude: model basis and validity bounds
 
 **What it is.** The pass table's **Mag** column is an *estimate* of apparent

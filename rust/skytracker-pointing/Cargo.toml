@@ -1,0 +1,14 @@
+[package]
+name = "skytracker-pointing"
+description = "TPOINT-style pointing models (alt-az + equatorial), polar-axis fit — Phase 2b of the Rust port, ports pointing_model.py / eq_pointing_model.py / polar_align.py math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_pointing"
+crate-type = ["rlib"]
+
+[dependencies]
+# SVD least squares (numpy lstsq semantics) + plane fits.
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }

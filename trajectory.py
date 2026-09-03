@@ -4,6 +4,10 @@ import os
 from datetime import datetime, timedelta, timezone
 from skyfield.api import wgs84, load
 
+# Rust astro engine bridge (Phase 1 strangler seam). Every call returns
+# None on failure, so the skyfield paths below remain the safety net.
+import rust_astro_adapter
+
 # ==============================================================================
 # CONSTANTS
 # ==============================================================================
@@ -323,6 +327,21 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
 
     min_visible_alt = max(elevation_mask_deg, FRUSTUM_UNCERTAINTY_MARGIN_DEGREES)
 
+    # Rust gate: parallel propagation of the whole catalog off the GIL. The
+    # engine matches skyfield's full pipeline (0.03 arcsec), tighter than the
+    # Python coarse gate below, and the 15 deg margin dwarfs both.
+    if satellites and rust_astro_adapter.enabled():
+        vis = rust_astro_adapter.visible_satnums(
+            satellites, visibility_times, observer, min_visible_alt)
+        if vis is not None:
+            visible_satellites = [
+                sat for sat in satellites
+                if getattr(getattr(sat, 'model', None), 'satnum_str', None) in vis]
+            if update_status_callback:
+                update_status_callback(
+                    f"Visibility filtering (rust): {len(visible_satellites)}/{len(satellites)} satellites potentially visible")
+            return visible_satellites
+
     # Fast path: propagate all satellites in one batched SGP4 call. Falls back to
     # the per-satellite loop if anything about the vectorized path goes wrong.
     visible_satellites = None
@@ -357,6 +376,15 @@ def _filter_satellites_by_visibility(satellites, observer, ts, center_time, dura
 
     return visible_satellites
 
+def _rows_to_trajectory(rows):
+    """(n, 8) ndarray -> the (trajectory_list, times_array, segments) triple
+    _compute_one_trajectory returns; shared by the Rust fast paths."""
+    times_array = rows[:, 0].copy()
+    trajectory = rows.tolist()
+    segments = _create_arc_segments_simple(rows, times_array[0])
+    return trajectory, times_array, segments
+
+
 def _compute_one_trajectory(sat, observer, times, cx, cy, radius):
     """Compute a single satellite's trajectory + arc segments over `times`.
 
@@ -364,6 +392,12 @@ def _compute_one_trajectory(sat, observer, times, cx, cy, radius):
     selected-satellite recompute (tight spacing, one sat). Returns
     (trajectory_list, times_array, segments) in the standard 8-column format:
     [time_tt, alt_deg, az_deg, dist_km, px, py, az_rate_dps, el_rate_dps]."""
+    # Rust fast path: same rows (0.03 arcsec parity), same segment builder.
+    if rust_astro_adapter.enabled():
+        rows = rust_astro_adapter.satellite_rows(sat, times, observer, cx, cy, radius)
+        if rows is not None:
+            return _rows_to_trajectory(rows)
+
     topocentrics = (sat - observer).at(times)
     alts, azs, distances = topocentrics.altaz()
 
@@ -530,11 +564,26 @@ def precompute_trajectories(state, observer, ts, display, update_status_callback
     if update_status_callback:
         update_status_callback(f"Computing optimized trajectories for {total_sats}/{satellites_in_label_dict} satellites...")
 
+    # Rust bulk fast path: one FFI call computes every satellite's rows in
+    # parallel (rayon) with the GIL released; falls back per-sat below for
+    # any satellite the engine skipped (or entirely, when the flag is off).
+    rust_bulk = None
+    if satellites_to_compute and rust_astro_adapter.enabled():
+        rust_bulk = rust_astro_adapter.bulk_rows(
+            [sat for sat, _ in satellites_to_compute], times, observer, cx, cy, radius)
+
     processed_count = 0
     for sat, cache_key in satellites_to_compute:
         processed_count += 1
 
-        trajectory, times_array, segments = _compute_one_trajectory(sat, observer, times, cx, cy, radius)
+        rows = None
+        if rust_bulk is not None:
+            model = getattr(sat, 'model', None)
+            rows = rust_bulk.get(getattr(model, 'satnum_str', None)) if model else None
+        if rows is not None and rows.shape[0] == len(times.tt):
+            trajectory, times_array, segments = _rows_to_trajectory(rows)
+        else:
+            trajectory, times_array, segments = _compute_one_trajectory(sat, observer, times, cx, cy, radius)
 
         # Cache the computed trajectory
         TRAJECTORY_CACHE[cache_key] = (trajectory, times_array, segments)

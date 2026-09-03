@@ -1,0 +1,38 @@
+[package]
+name = "skytracker-ffi"
+description = "PyO3 bindings for the skytracker engine crates. Python module name stays `skytracker_core`. Strangler seam: deleted when the Rust app replaces Python."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+skytracker-core = { workspace = true }
+skytracker-astro = { path = "../skytracker-astro" }
+skytracker-platesolve = { path = "../skytracker-platesolve" }
+skytracker-pointing = { path = "../skytracker-pointing" }
+skytracker-imaging = { path = "../skytracker-imaging" }
+skytracker-adsb = { path = "../skytracker-adsb" }
+skytracker-camera = { path = "../skytracker-camera" }
+# bindings.rs builds ArrayView2 over incoming numpy frames.
+ndarray = { workspace = true }
+# pyo3 + numpy + the serial transport are OPTIONAL and only pulled in for the
+# extension-module build (maturin enables the feature; see pyproject.toml).
+# This keeps `cargo test --workspace` pure Rust with zero libpython linkage.
+pyo3 = { workspace = true, optional = true }
+numpy = { workspace = true, optional = true }
+
+[features]
+default = []
+extension-module = [
+    "dep:pyo3",
+    "dep:numpy",
+    "pyo3/extension-module",
+    "skytracker-core/serial",
+    # MP4 export (openh264 C++ build) rides only with the extension build,
+    # keeping plain `cargo test --workspace` C-free.
+    "skytracker-imaging/mp4-export",
+]

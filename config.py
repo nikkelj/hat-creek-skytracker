@@ -249,6 +249,21 @@ class ConfigState:
         # the Hardware Simulator screen. Takes effect on restart.
         self.use_rust_core_loop = False
         self.rust_core_loop_hz = 15
+        # Phase 1 of the Rust port: route trajectory/celestial math through
+        # the skytracker-astro engine (skyfield stays as the fallback).
+        self.use_rust_astro = False
+        # Phase 2: plate-solve with skytracker-platesolve (tetra3 fallback).
+        self.use_rust_platesolve = False
+        # Phase 2b: pointing-model fits via skytracker-pointing (numpy fallback).
+        self.use_rust_pointing = False
+        # Phase 3b: stacking/stabilizer/sharpen kernels via skytracker-imaging.
+        self.use_rust_imaging = False
+        # Phase 5: ADS-B Mode-S decode via skytracker-adsb (pyModeS fallback).
+        self.use_rust_adsb = False
+        # Phase 4b: camera capture via skytracker-camera (CameraThread fallback).
+        self.use_rust_camera = False
+        # Phase 6b: PID auto-tuner via skytracker-core (Python tuner fallback).
+        self.use_rust_autotune = False
 
         # Hardware safety limits configuration (degrees)
         self.azm_limit_min_str = "-180.0"
@@ -395,6 +410,13 @@ class ConfigState:
             "altaz_side_flip": self.altaz_side_flip,
             "use_rust_core_loop": self.use_rust_core_loop,
             "rust_core_loop_hz": self.rust_core_loop_hz,
+            "use_rust_astro": self.use_rust_astro,
+            "use_rust_platesolve": self.use_rust_platesolve,
+            "use_rust_pointing": self.use_rust_pointing,
+            "use_rust_imaging": self.use_rust_imaging,
+            "use_rust_adsb": self.use_rust_adsb,
+            "use_rust_camera": self.use_rust_camera,
+            "use_rust_autotune": self.use_rust_autotune,
             "continuous_rate_tracking": self.continuous_rate_tracking,
             "guide_rate_max_dps": self.guide_rate_max_dps
         }
@@ -519,6 +541,13 @@ class ConfigState:
         # Load experimental Rust core loop toggle
         self.use_rust_core_loop = config_dict.get("use_rust_core_loop", self.use_rust_core_loop)
         self.rust_core_loop_hz = config_dict.get("rust_core_loop_hz", self.rust_core_loop_hz)
+        self.use_rust_astro = config_dict.get("use_rust_astro", self.use_rust_astro)
+        self.use_rust_platesolve = config_dict.get("use_rust_platesolve", self.use_rust_platesolve)
+        self.use_rust_pointing = config_dict.get("use_rust_pointing", self.use_rust_pointing)
+        self.use_rust_imaging = config_dict.get("use_rust_imaging", self.use_rust_imaging)
+        self.use_rust_adsb = config_dict.get("use_rust_adsb", self.use_rust_adsb)
+        self.use_rust_camera = config_dict.get("use_rust_camera", self.use_rust_camera)
+        self.use_rust_autotune = config_dict.get("use_rust_autotune", self.use_rust_autotune)
 
         # Continuous variable-rate tracking
         self.continuous_rate_tracking = config_dict.get("continuous_rate_tracking", self.continuous_rate_tracking)

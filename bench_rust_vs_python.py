@@ -13,7 +13,7 @@ PROGRAM control-cycle comparison. Honest about where the win is:
     and NO GIL, so the per-call overhead disappears.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python bench_rust_vs_python.py
 """
 
@@ -110,6 +110,58 @@ def main():
     print("Note: the PID per-call row reflects FFI overhead, not compute; the")
     print("loop runs cycles inside a Rust thread with no per-cycle FFI, so the")
     print("'PROGRAM cycle' row is the figure that matters for the live loop.")
+
+    bench_astro()
+
+
+def bench_astro():
+    """Phase 1: trajectory precompute + visibility gate, skyfield vs the
+    Rust astro engine (bulk FFI, rayon-parallel, GIL released)."""
+    import os
+
+    if not os.path.exists("tle_cache.tle"):
+        print("\n(astro bench skipped: no tle_cache.tle)")
+        return
+    if not getattr(rc, "ASTRO_ENGINE_AVAILABLE", False):
+        print("\n(astro bench skipped: wheel lacks AstroEngine)")
+        return
+
+    from skyfield.api import load, wgs84
+
+    import rust_astro_adapter
+    import trajectory as tj
+
+    ts = load.timescale()
+    observer = wgs84.latlon(34.8740289, -120.4461237, elevation_m=100.0)
+    sats = load.tle_file("tle_cache.tle")
+    t0 = ts.now()
+    times = ts.linspace(t0, ts.tt_jd(t0.tt + 15.0 / 1440.0), 31)
+
+    print(f"\nPhase 1 astro engine ({len(sats)} sats, 31 samples)")
+    print("-" * 70)
+
+    # Visibility gate over the full catalog.
+    t = time.perf_counter()
+    mask = tj._batched_visibility_mask(sats, observer, times, 15.0)
+    py_vis = time.perf_counter() - t
+    t = time.perf_counter()
+    vis = rust_astro_adapter.visible_satnums(sats, times, observer, 15.0)
+    rs_vis = time.perf_counter() - t
+    n_vis = int(np.sum(mask))
+    print(f"visibility gate      py {py_vis*1e3:8.1f} ms   rust {rs_vis*1e3:8.1f} ms"
+          f"   x{py_vis/rs_vis:5.1f}   ({n_vis} visible / rust {len(vis)})")
+
+    # Bulk trajectory rows for the visible set (the precompute hot path).
+    visible = [s for s, v in zip(sats, mask) if v]
+    t = time.perf_counter()
+    for sat in visible:
+        tj._compute_one_trajectory(sat, observer, times, 500, 400, 300)
+    py_rows = time.perf_counter() - t
+    t = time.perf_counter()
+    bulk = rust_astro_adapter.bulk_rows(visible, times, observer, 500, 400, 300)
+    rs_rows = time.perf_counter() - t
+    print(f"trajectory rows      py {py_rows*1e3:8.1f} ms   rust {rs_rows*1e3:8.1f} ms"
+          f"   x{py_rows/rs_rows:5.1f}   ({len(visible)} sats -> {len(bulk)} computed)")
 
 
 if __name__ == "__main__":

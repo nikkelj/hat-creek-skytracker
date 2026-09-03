@@ -627,31 +627,37 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         let cyan = Color32::from_rgb(90, 220, 230);
         let now_u = crate::sky::now_unix();
         for a in &adsb.aircraft {
-            let age = (now_u - a.fit_t_unix).clamp(0.0, 120.0);
-            let (az, el) = (a.fit_az + a.az_rate * age, a.fit_el + a.el_rate * age);
+            let (az, el) = a.azel_at(now_u);
             if el < -1.0 {
                 continue;
             }
             let p = polar(center, radius, az, el);
             let key = format!("adsb:{}", a.icao);
             let selected = st.selected.as_deref() == Some(key.as_str());
-            // Heading chevron along the track direction on the plot.
-            let p2 = polar(center, radius, az + a.az_rate * 20.0, el + a.el_rate * 20.0);
+            // Heading chevron along the predicted curve on the plot.
+            let (az20, el20) = a.azel_at(now_u + 20.0);
+            let p2 = polar(center, radius, az20, el20);
             let dir = (p2 - p).normalized();
             let dir = if dir.x.is_nan() { Vec2::new(0.0, -1.0) } else { dir };
             let side = Vec2::new(-dir.y, dir.x);
             let tri = vec![p + dir * 6.0, p - dir * 4.0 + side * 4.0, p - dir * 4.0 - side * 4.0];
             painter.add(egui::Shape::convex_polygon(tri, theme::with_alpha(cyan, 220), Stroke::new(0.8, cyan)));
+            // Predicted trajectory for every aircraft (faint), bright when
+            // selected — the biasing/feed-forward path the mount will ride.
+            let pred_a = if selected { 170 } else { 60 };
+            let mut prev: Option<Pos2> = None;
+            for (pt, paz, pel) in &a.predicted {
+                if *pt < now_u {
+                    continue;
+                }
+                let q = polar(center, radius, *paz, *pel);
+                if let Some(pp) = prev {
+                    painter.line_segment([pp, q], Stroke::new(1.2, theme::with_alpha(cyan, pred_a)));
+                }
+                prev = Some(q);
+            }
             if selected {
                 sel_ring(p);
-                let mut prev: Option<Pos2> = None;
-                for (_, paz, pel) in &a.predicted {
-                    let q = polar(center, radius, *paz, *pel);
-                    if let Some(pp) = prev {
-                        painter.line_segment([pp, q], Stroke::new(1.2, theme::with_alpha(cyan, 170)));
-                    }
-                    prev = Some(q);
-                }
                 let mut prev: Option<Pos2> = None;
                 for (_, haz, hel) in &a.history {
                     let q = polar(center, radius, *haz, *hel);
@@ -2387,8 +2393,7 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
         let info_map = shared.aircraft_info.load();
         let now_u = crate::sky::now_unix();
         for a in &adsb.aircraft {
-            let age = (now_u - a.fit_t_unix).clamp(0.0, 120.0);
-            let (az, el) = ((a.fit_az + a.az_rate * age).rem_euclid(360.0), a.fit_el + a.el_rate * age);
+            let (az, el) = a.azel_at(now_u);
             if !(st.show_below_mask || el >= mask) {
                 continue;
             }

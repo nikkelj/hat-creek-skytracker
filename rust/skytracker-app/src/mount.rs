@@ -810,13 +810,18 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 if let Some(icao) = sn.strip_prefix("adsb:") {
                     let adsb = shared.adsb.load();
                     let a = adsb.aircraft.iter().find(|a| a.icao == icao)?;
-                    let age = crate::sky::now_unix() - a.fit_t_unix;
-                    let el = a.fit_el + a.el_rate * age;
+                    // Ride the ENU-propagated prediction curve: position AND
+                    // feed-forward rates track the angular acceleration of a
+                    // straight flight path (a linear az/el extrapolation lags
+                    // hard through closest approach).
+                    let now_u = crate::sky::now_unix();
+                    let (az, el) = a.azel_at(now_u);
+                    let (ar, er) = a.rates_at(now_u);
                     return Some(Setpoint {
-                        az_deg: (a.fit_az + a.az_rate * age).rem_euclid(360.0),
+                        az_deg: az,
                         el_deg: if el <= 0.0 { cfg.elevation_mask_deg } else { el },
-                        ff_az_dps: if el <= 0.0 { 0.0 } else { a.az_rate },
-                        ff_el_dps: if el <= 0.0 { 0.0 } else { a.el_rate },
+                        ff_az_dps: if el <= 0.0 { 0.0 } else { ar },
+                        ff_el_dps: if el <= 0.0 { 0.0 } else { er },
                     });
                 }
                 // Ephemeris override (Starlink public ephemerides): maneuvering

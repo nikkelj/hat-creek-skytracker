@@ -858,6 +858,36 @@ pub struct AdsbSnapshot {
     pub aircraft: Vec<AircraftMark>,
 }
 
+impl AircraftMark {
+    /// Az/el at unix `t`, riding the ENU-propagated prediction while it
+    /// covers `t` — the curve carries the angular acceleration of a straight
+    /// 3-D flight path (largest near closest approach), which a linear
+    /// az/el extrapolation misses. Falls back to the linear fit outside the
+    /// prediction span.
+    pub fn azel_at(&self, t: f64) -> (f64, f64) {
+        let mut prev = (self.fit_t_unix, self.fit_az, self.fit_el);
+        if t > prev.0 {
+            for &(pt, paz, pel) in &self.predicted {
+                if t <= pt {
+                    let f = if pt > prev.0 { (t - prev.0) / (pt - prev.0) } else { 0.0 };
+                    let daz = (paz - prev.1 + 540.0).rem_euclid(360.0) - 180.0;
+                    return ((prev.1 + daz * f).rem_euclid(360.0), prev.2 + (pel - prev.2) * f);
+                }
+                prev = (pt, paz, pel);
+            }
+        }
+        let age = t - prev.0;
+        ((prev.1 + self.az_rate * age).rem_euclid(360.0), prev.2 + self.el_rate * age)
+    }
+
+    /// Instantaneous az/el rates (deg/s) on the same curve at unix `t`.
+    pub fn rates_at(&self, t: f64) -> (f64, f64) {
+        let (a0, e0) = self.azel_at(t - 0.5);
+        let (a1, e1) = self.azel_at(t + 0.5);
+        ((a1 - a0 + 540.0).rem_euclid(360.0) - 180.0, e1 - e0)
+    }
+}
+
 /// Public-registry details for one airframe (adsbdb.com lookup, disk-cached).
 /// `known: false` is a negative cache: the registry had nothing for this hex.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

@@ -667,14 +667,31 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                     painter.text(lp, Align2::LEFT_CENTER, &a.label, theme::sans(10.5), theme::with_alpha(cyan, 220));
                 }
             }
+            // Registry line (adsbdb, cached) when the lookup has landed.
+            let reg_line = shared
+                .aircraft_info
+                .load()
+                .get(&a.icao.to_ascii_lowercase())
+                .filter(|i| i.known)
+                .map(|i| {
+                    format!(
+                        "\n{} · {} {}{}",
+                        i.registration,
+                        i.manufacturer,
+                        i.type_name,
+                        if i.owner.is_empty() { String::new() } else { format!(" · {}", i.owner) }
+                    )
+                })
+                .unwrap_or_default();
             consider(
                 &mut best,
                 p,
                 key,
                 format!(
-                    "{}  ({})\nalt {:.0} m  range {:.0} km  {}\naz {:.1}°  el {:.1}°   fix {:.0} s ago",
+                    "{}  ({}){}\nalt {:.0} m  range {:.0} km  {}\naz {:.1}°  el {:.1}°   fix {:.0} s ago",
                     a.label,
                     a.icao.to_uppercase(),
+                    reg_line,
                     a.alt_m,
                     a.range_km,
                     a.speed_kt.map(|v| format!("{v:.0} kt")).unwrap_or_default(),
@@ -1071,6 +1088,21 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 title = a.label.clone();
                 kv(&mut lines, "type", "aircraft".into(), TEXT_2);
                 kv(&mut lines, "icao", a.icao.clone(), TEXT_2);
+                // Public-registry enrichment (adsbdb, cached on disk).
+                if let Some(i) = shared.aircraft_info.load().get(&a.icao.to_ascii_lowercase()).filter(|i| i.known) {
+                    if !i.registration.is_empty() {
+                        kv(&mut lines, "reg", i.registration.clone(), TEXT_2);
+                    }
+                    if !i.type_name.is_empty() || !i.manufacturer.is_empty() {
+                        kv(&mut lines, "airframe", format!("{} {}", i.manufacturer, i.type_name).trim().to_string(), TEXT_2);
+                    }
+                    if !i.owner.is_empty() {
+                        kv(&mut lines, "owner", i.owner.clone(), TEXT_2);
+                    }
+                    if !i.country.is_empty() {
+                        kv(&mut lines, "country", i.country.clone(), TEXT_2);
+                    }
+                }
                 kv(&mut lines, "azimuth", format!("{:.2}°", a.az), lb);
                 kv(&mut lines, "elevation", format!("{:.2}°", a.el), lg);
                 kv(&mut lines, "range", format!("{:.1} km", a.range_km), TEXT_2);
@@ -2312,7 +2344,19 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
     let filt = st.table_filter.to_ascii_lowercase();
     let alt_min = st.alt_min_km.trim().parse::<f64>().ok();
     let alt_max = st.alt_max_km.trim().parse::<f64>().ok();
-    let mut rows: Vec<_> = sky
+    // Unified row shape so ADS-B aircraft ride in the satellite table.
+    struct VisRow {
+        key: String,
+        name: String,
+        id: String,
+        el: f64,
+        az: f64,
+        range_km: f64,
+        az_rate: f64,
+        aircraft: bool,
+        hover: Option<String>,
+    }
+    let mut rows: Vec<VisRow> = sky
         .sats
         .iter()
         .filter(|s| s.el > 0.0 && (st.show_below_mask || s.el >= mask))
@@ -2322,12 +2366,73 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
             let mean_alt = (s.apogee_km + s.perigee_km) / 2.0;
             alt_min.map_or(true, |v| mean_alt >= v) && alt_max.map_or(true, |v| mean_alt <= v)
         })
+        .map(|s| VisRow {
+            key: s.satnum.clone(),
+            name: s.name.clone(),
+            id: s.satnum.clone(),
+            el: s.el,
+            az: s.az,
+            range_km: s.range_km,
+            az_rate: s.az_rate,
+            aircraft: false,
+            hover: None,
+        })
         .collect();
+    // Aircraft (ADS-B): included when the layer is on. "below mask" also
+    // admits below-horizon tracks — they climb into view fast. The alt-km
+    // filter applies with the aircraft's geometric altitude.
+    let mut n_aircraft = 0usize;
+    if st.show_aircraft {
+        let adsb = shared.adsb.load();
+        let info_map = shared.aircraft_info.load();
+        let now_u = crate::sky::now_unix();
+        for a in &adsb.aircraft {
+            let age = (now_u - a.fit_t_unix).clamp(0.0, 120.0);
+            let (az, el) = ((a.fit_az + a.az_rate * age).rem_euclid(360.0), a.fit_el + a.el_rate * age);
+            if !(st.show_below_mask || el >= mask) {
+                continue;
+            }
+            let alt_km = a.alt_m / 1000.0;
+            if !(alt_min.map_or(true, |v| alt_km >= v) && alt_max.map_or(true, |v| alt_km <= v)) {
+                continue;
+            }
+            let info = info_map.get(&a.icao.to_ascii_lowercase()).filter(|i| i.known);
+            let name = match &info {
+                Some(i) if !i.icao_type.is_empty() => format!("✈ {} · {}", a.label, i.icao_type),
+                _ => format!("✈ {}", a.label),
+            };
+            if !(filt.is_empty() || name.to_ascii_lowercase().contains(&filt) || a.icao.to_ascii_lowercase().contains(&filt)) {
+                continue;
+            }
+            n_aircraft += 1;
+            rows.push(VisRow {
+                key: format!("adsb:{}", a.icao),
+                name,
+                id: a.icao.to_ascii_uppercase(),
+                el,
+                az,
+                range_km: a.range_km,
+                az_rate: a.az_rate,
+                aircraft: true,
+                hover: info.map(|i| {
+                    format!(
+                        "{} — {} {}\nowner: {}{}",
+                        i.registration,
+                        i.manufacturer,
+                        i.type_name,
+                        if i.owner.is_empty() { "?" } else { &i.owner },
+                        if i.country.is_empty() { String::new() } else { format!("  ({})", i.country) },
+                    )
+                }),
+            });
+        }
+    }
+    let _ = n_aircraft;
     let (col, asc) = st.table_sort;
     rows.sort_by(|a, b| {
         let o = match col {
             0 => a.name.cmp(&b.name),
-            1 => a.satnum.cmp(&b.satnum),
+            1 => a.id.cmp(&b.id),
             2 => a.el.partial_cmp(&b.el).unwrap(),
             3 => a.az.partial_cmp(&b.az).unwrap(),
             4 => a.range_km.partial_cmp(&b.range_km).unwrap(),
@@ -2367,22 +2472,31 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
         })
         .body(|body| {
             body.rows(18.0, rows.len(), |mut row| {
-                let s = rows[row.index()];
-                let sel = st.selected.as_deref() == Some(s.satnum.as_str());
+                let s = &rows[row.index()];
+                let sel = st.selected.as_deref() == Some(s.key.as_str());
                 row.set_selected(sel);
                 let dim = s.el < mask;
-                let c = if dim { DIM } else { TEXT };
+                let cyan = Color32::from_rgb(90, 220, 230);
+                let c = match (s.aircraft, dim) {
+                    (true, false) => cyan,
+                    (true, true) => theme::with_alpha(cyan, 120),
+                    (false, false) => TEXT,
+                    (false, true) => DIM,
+                };
                 row.col(|ui| {
-                    ui.label(egui::RichText::new(&s.name).color(if sel { ACCENT } else { c }));
+                    let l = ui.label(egui::RichText::new(&s.name).color(if sel { ACCENT } else { c }));
+                    if let Some(h) = &s.hover {
+                        l.on_hover_text(h.clone());
+                    }
                 });
-                row.col(|ui| { ui.label(egui::RichText::new(&s.satnum).font(theme::mono(11.0)).color(c)); });
+                row.col(|ui| { ui.label(egui::RichText::new(&s.id).font(theme::mono(11.0)).color(c)); });
                 row.col(|ui| { ui.label(egui::RichText::new(format!("{:.1}", s.el)).font(theme::mono(11.0)).color(c)); });
                 row.col(|ui| { ui.label(egui::RichText::new(format!("{:.1}", s.az)).font(theme::mono(11.0)).color(c)); });
                 row.col(|ui| { ui.label(egui::RichText::new(format!("{:.0}", s.range_km)).font(theme::mono(11.0)).color(c)); });
                 row.col(|ui| { ui.label(egui::RichText::new(format!("{:+.3}", s.az_rate)).font(theme::mono(11.0)).color(c)); });
                 if row.response().clicked() {
-                    st.selected = Some(s.satnum.clone());
-                    let _ = tx.send(MountCmd::SelectTarget(Some(s.satnum.clone())));
+                    st.selected = Some(s.key.clone());
+                    let _ = tx.send(MountCmd::SelectTarget(Some(s.key.clone())));
                 }
             });
         });

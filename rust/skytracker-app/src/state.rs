@@ -858,6 +858,20 @@ pub struct AdsbSnapshot {
     pub aircraft: Vec<AircraftMark>,
 }
 
+/// Public-registry details for one airframe (adsbdb.com lookup, disk-cached).
+/// `known: false` is a negative cache: the registry had nothing for this hex.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct AircraftInfo {
+    pub registration: String,
+    pub icao_type: String,
+    pub type_name: String,
+    pub manufacturer: String,
+    pub owner: String,
+    pub country: String,
+    pub known: bool,
+    pub fetched_unix: f64,
+}
+
 /// Published by the mount worker every control cycle.
 #[derive(Clone, Debug, Default)]
 pub struct MountSnapshot {
@@ -1176,6 +1190,8 @@ pub struct Shared {
     /// Launch override: LAUNCH button re-bases the selected trajectory's T0
     /// to "now" and pre-empts every other target until aborted.
     pub launch_armed: ArcSwap<Option<(String, f64)>>,
+    /// Airframe registry details keyed by lowercase ICAO hex (aircraft_db worker).
+    pub aircraft_info: ArcSwap<std::collections::HashMap<String, Arc<AircraftInfo>>>,
     /// Live mount mode name (Options button cycles it).
     pub mount_mode: ArcSwap<String>,
     /// Serial ports enumerated on request (MountCmd::ListPorts).
@@ -1227,6 +1243,7 @@ impl Shared {
             eq_pointing: ArcSwap::from_pointee(eq0),
             adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
             launch_armed: ArcSwap::from_pointee(None),
+            aircraft_info: ArcSwap::from_pointee(std::collections::HashMap::new()),
             feature_grab_request: ArcSwap::from_pointee(None),
             starlink_manifest: ArcSwap::from_pointee(None),
             ephemerides: ArcSwap::from_pointee(std::collections::HashMap::new()),

@@ -11,6 +11,7 @@
 //! SKYTRACKER_SCREENSHOT_DIR=<dir> cycles every screen and saves PNGs.
 
 mod adsb;
+mod aircraft_db;
 mod align;
 mod align_runner;
 mod camera;
@@ -804,6 +805,7 @@ fn main() -> eframe::Result<()> {
     mount::spawn(shared.clone(), rx, root.clone(), tx_cam.clone());
     camera::spawn(shared.clone(), rx_cam, root.clone());
     adsb::spawn(shared.clone());
+    aircraft_db::spawn(shared.clone(), root.clone());
     align::spawn(shared.clone(), rx_align, tx.clone());
     filterwheel::spawn(shared.clone(), rx_fw, root.clone());
 

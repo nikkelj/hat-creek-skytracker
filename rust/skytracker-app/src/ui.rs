@@ -576,7 +576,15 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     // Rocket launches: the trajectory arc + the rocket's current position.
     {
         let now_u = crate::sky::now_unix();
+        let armed = (**shared.launch_armed.load()).clone();
         for l in sky.launches.iter() {
+            // While the LAUNCH button is armed for this trajectory, the file's
+            // clock is re-based to the button press — query it at the shifted
+            // time so the marker flies the arc from T+0.
+            let q_now = match &armed {
+                Some((k, t0)) if k == &l.key => l.rows.first().map(|r| r.0 + (now_u - t0)).unwrap_or(now_u),
+                _ => now_u,
+            };
             let col = Color32::from_rgb(0, 220, 230);
             let mut prev: Option<Pos2> = None;
             for &(t, az, el, _) in l.rows.iter().step_by(5) {
@@ -586,12 +594,12 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
                 let p = polar(center, radius, az, el);
                 if let Some(pp) = prev {
-                    let a = if t < now_u { 70 } else { 170 };
+                    let a = if t < q_now { 70 } else { 170 };
                     painter.line_segment([pp, p], Stroke::new(1.2, theme::with_alpha(col, a)));
                 }
                 prev = Some(p);
             }
-            if let Some((az, el, _)) = crate::launches::interp(l, now_u) {
+            if let Some((az, el, _)) = crate::launches::interp(l, q_now) {
                 if el > -1.0 {
                     let p = polar(center, radius, az, el);
                     painter.circle_filled(p, 4.0, col);
@@ -604,11 +612,11 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
             } else if let Some(&(t0, az, el, _)) = l.rows.first() {
                 // Before T0: mark the pad / first point with a countdown.
-                if el > -1.0 && t0 > now_u {
+                if el > -1.0 && t0 > q_now {
                     let p = polar(center, radius, az, el);
                     painter.circle_stroke(p, 4.0, Stroke::new(1.0, theme::with_alpha(col, 150)));
-                    painter.text(p + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, format!("{} T-{:.0}s", l.name, t0 - now_u), theme::sans(10.0), theme::with_alpha(col, 180));
-                    consider(&mut best, p, l.key.clone(), format!("launch {} in {:.0} s", l.name, t0 - now_u), 9.0);
+                    painter.text(p + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, format!("{} T-{:.0}s", l.name, t0 - q_now), theme::sans(10.0), theme::with_alpha(col, 180));
+                    consider(&mut best, p, l.key.clone(), format!("launch {} in {:.0} s", l.name, t0 - q_now), 9.0);
                 }
             }
         }

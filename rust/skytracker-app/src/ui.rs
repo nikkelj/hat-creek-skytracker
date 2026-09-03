@@ -441,7 +441,7 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
     // Sun keep-out cone (sensor + eye safety, config sun_keepout_*): the
     // exclusion the mount worker enforces, washed in orange around the sun.
     {
-        let sun_r = cfg.sun_keepout_deg();
+        let sun_r = if shared.solar_mode.load(std::sync::atomic::Ordering::Relaxed) { 0.0 } else { cfg.sun_keepout_deg() };
         if sun_r > 0.0 {
             let sky_now = shared.sky.load();
             if let Some(sun) = sky_now.bodies.iter().find(|b| b.name == "sun") {

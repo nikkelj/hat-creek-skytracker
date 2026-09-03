@@ -922,7 +922,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
             // holds the last rate and the mount would coast on in — so entry
             // also latches a Stop.
             let mut sp = sp;
-            let sun_r = cfg.sun_keepout_deg();
+            let sun_r = if shared.solar_mode.load(std::sync::atomic::Ordering::Relaxed) { 0.0 } else { cfg.sun_keepout_deg() };
             if sun_r > 0.0 {
                 if let Some(s) = sp.as_ref() {
                     let sun = shared.sky.load().bodies.iter().find(|b| b.name == "sun").map(|b| (b.az, b.el));

@@ -194,6 +194,9 @@ impl App {
                     if m.loop_dead {
                         theme::tag(ui, "LOOP DEAD", RED);
                     }
+                    if self.shared.solar_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                        theme::tag(ui, "☀ KEEPOUT OFF", RED);
+                    }
                     let sky = self.shared.sky.load();
                     ui.label(egui::RichText::new(&sky.utc_iso).font(theme::mono(11.5)).color(theme::TEXT));
                 });
@@ -729,6 +732,27 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
                 ("tooltips_enabled", st.show_tips),
             ] {
                 crate::mount::persist_config_key(&shared.config.path, key, serde_json::json!(v));
+            }
+        }
+        // Solar-filter mode: live sun keep-out override. Loud while active —
+        // the top bar carries a red tag, and the skyplot wash disappears.
+        {
+            use std::sync::atomic::Ordering;
+            let solar = shared.solar_mode.load(Ordering::Relaxed);
+            let txt = if solar { egui::RichText::new("☀ KEEPOUT OFF").color(egui::Color32::BLACK) } else { egui::RichText::new("☀ solar").color(theme::TEXT_2) };
+            let btn = egui::Button::new(txt).fill(if solar { theme::RED } else { egui::Color32::TRANSPARENT });
+            if ui
+                .add(btn)
+                .on_hover_text(if solar {
+                    "solar-filter mode ACTIVE: the sun keep-out is disabled. Click to re-enable the exclusion cone."
+                } else {
+                    "solar-filter mode: disable the sun keep-out cone for filtered solar imaging. Only with the filter fitted — this removes the sensor/eye safety interlock."
+                })
+                .clicked()
+            {
+                let now_solar = !solar;
+                shared.solar_mode.store(now_solar, Ordering::Relaxed);
+                crate::mount::persist_config_key(&shared.config.path, "sun_keepout_enabled", serde_json::json!(!now_solar));
             }
         }
         // LAUNCH: arm the selected launch trajectory at T0 = now (Python's

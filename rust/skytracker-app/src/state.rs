@@ -1257,6 +1257,9 @@ pub struct Shared {
     pub launch_armed: ArcSwap<Option<(String, f64)>>,
     /// Airframe registry details keyed by lowercase ICAO hex (aircraft_db worker).
     pub aircraft_info: ArcSwap<std::collections::HashMap<String, Arc<AircraftInfo>>>,
+    /// Solar-filter mode: true = sun keep-out DISABLED (live override of
+    /// sun_keepout_enabled; the toggle persists the config key too).
+    pub solar_mode: std::sync::atomic::AtomicBool,
     /// Live mount mode name (Options button cycles it).
     pub mount_mode: ArcSwap<String>,
     /// Serial ports enumerated on request (MountCmd::ListPorts).
@@ -1285,6 +1288,7 @@ impl Shared {
         let mount_mode0 = config.mount_mode.clone();
         let eq0 = (config.eq_pointing_model_enabled, config.eq_pointing_model_terms);
         let fit0 = config.adsb_fit_points.max(2);
+        let solar0 = !config.sun_keepout_enabled;
         Arc::new(Shared {
             adsb: ArcSwap::from_pointee(AdsbSnapshot::default()),
             sky: ArcSwap::from_pointee(SkySnapshot::default()),
@@ -1309,6 +1313,7 @@ impl Shared {
             adsb_fit_points: std::sync::atomic::AtomicUsize::new(fit0),
             launch_armed: ArcSwap::from_pointee(None),
             aircraft_info: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            solar_mode: std::sync::atomic::AtomicBool::new(solar0),
             feature_grab_request: ArcSwap::from_pointee(None),
             starlink_manifest: ArcSwap::from_pointee(None),
             ephemerides: ArcSwap::from_pointee(std::collections::HashMap::new()),

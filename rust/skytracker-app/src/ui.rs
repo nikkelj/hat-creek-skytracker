@@ -79,6 +79,9 @@ pub struct UiState {
     pub stack_cams_w: f32,
     /// FEATURE-mode template half-size (px) for click-to-grab.
     pub feature_half: usize,
+    /// Launch-trajectory layer on the skyplot (persisted; an armed LAUNCH
+    /// clock still draws its own trajectory when hidden).
+    pub show_launches: bool,
     /// Fullscreen camera view (slot), cycled by the gamepad center pad and
     /// per-view buttons; Esc exits.
     pub fullscreen_cam: Option<usize>,
@@ -142,6 +145,7 @@ impl Default for UiState {
             stack_ctl_w: 400.0,
             stack_cams_w: 360.0,
             feature_half: 32,
+            show_launches: true,
             fullscreen_cam: None,
             fs_seen: 0,
         }
@@ -404,6 +408,7 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         st.show_stars = cfg.raw["starfield_enabled"].as_bool().unwrap_or(true);
         st.show_sats = cfg.raw["satellites_enabled"].as_bool().unwrap_or(true);
         st.show_aircraft = cfg.raw["aircraft_enabled"].as_bool().unwrap_or(st.show_aircraft);
+        st.show_launches = cfg.raw["launch_trajectories_enabled"].as_bool().unwrap_or(st.show_launches);
         st.track_layout = std::env::var("SKYTRACKER_LAYOUT").unwrap_or_else(|_| cfg.raw["track_layout"].as_str().unwrap_or("tabs").to_string());
         st.quad_cams = cfg.raw["track_quad_cams"].as_u64().unwrap_or(3).clamp(2, 3) as usize;
         st.scope_combined = cfg.raw["track_scope_combined"].as_bool().unwrap_or(false);
@@ -611,10 +616,17 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
         }
     }
     // Rocket launches: the trajectory arc + the rocket's current position.
+    // The layer toggle hides them (all trajectories all the time is noisy);
+    // an armed LAUNCH clock or the selected trajectory still draws.
     {
         let now_u = crate::sky::now_unix();
         let armed = (**shared.launch_armed.load()).clone();
         for l in sky.launches.iter() {
+            let selected = st.selected.as_deref() == Some(l.key.as_str());
+            let is_armed = matches!(&armed, Some((k, _)) if k == &l.key);
+            if !st.show_launches && !selected && !is_armed {
+                continue;
+            }
             // While the LAUNCH button is armed for this trajectory, the file's
             // clock is re-based to the button press — query it at the shifted
             // time so the marker flies the arc from T+0.
@@ -623,6 +635,8 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 _ => now_u,
             };
             let col = Color32::from_rgb(0, 220, 230);
+            // Embossed when selected: a dark under-stroke below a heavier,
+            // brighter line so it stands proud of the other trajectories.
             let mut prev: Option<Pos2> = None;
             for &(t, az, el, _) in l.rows.iter().step_by(5) {
                 if el < -1.0 {
@@ -631,8 +645,14 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 }
                 let p = polar(center, radius, az, el);
                 if let Some(pp) = prev {
-                    let a = if t < q_now { 70 } else { 170 };
-                    painter.line_segment([pp, p], Stroke::new(1.2, theme::with_alpha(col, a)));
+                    if selected {
+                        let a = if t < q_now { 130 } else { 255 };
+                        painter.line_segment([pp, p], Stroke::new(4.0, theme::with_alpha(Color32::BLACK, 160)));
+                        painter.line_segment([pp, p], Stroke::new(2.2, theme::with_alpha(col, a)));
+                    } else {
+                        let a = if t < q_now { 55 } else { 120 };
+                        painter.line_segment([pp, p], Stroke::new(1.2, theme::with_alpha(col, a)));
+                    }
                 }
                 prev = Some(p);
             }
@@ -1604,6 +1624,83 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             );
         });
     });
+    // Connection + log at the very top: ADS-B state and the status stream
+    // need prominence. Collapsible; the header itself carries the live
+    // ADS-B summary so it reads even when closed.
+    if !st.conn_init {
+        st.conn_init = true;
+        st.conn_transport = shared.config.mount_transport.clone();
+        st.conn_port = shared.config.serial_port.clone();
+        st.conn_baud = shared.config.serial_baud;
+        st.adsb_mode = shared.config.adsb_source_mode.clone();
+        let _ = tx.send(MountCmd::ListPorts);
+    }
+    {
+        let a = shared.adsb.load();
+        let hdr = format!("CONNECTION · adsb {} · {} ac · {} msgs", a.mode, a.n_aircraft, a.n_msgs);
+        egui::CollapsingHeader::new(egui::RichText::new(hdr).font(theme::sans(10.5)).color(TEXT_2)).id_salt("conn").default_open(true).show(ui, |ui| {
+            ui.columns(2, |cols| {
+                {
+                    let ui = &mut cols[0];
+                    ui.horizontal_wrapped(|ui| {
+                        egui::ComboBox::from_id_salt("conn_tr").selected_text(st.conn_transport.clone()).width(70.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut st.conn_transport, "sim".into(), "sim");
+                            ui.selectable_value(&mut st.conn_transport, "serial".into(), "serial");
+                        });
+                        if st.conn_transport == "serial" {
+                            let ports = shared.serial_ports.load();
+                            egui::ComboBox::from_id_salt("conn_port").selected_text(if st.conn_port.is_empty() { "port".to_string() } else { st.conn_port.clone() }).width(90.0).show_ui(ui, |ui| {
+                                for p in ports.iter() {
+                                    ui.selectable_value(&mut st.conn_port, p.clone(), p);
+                                }
+                            });
+                            if ui.small_button("⟳").on_hover_text("rescan serial ports").clicked() {
+                                let _ = tx.send(MountCmd::ListPorts);
+                            }
+                            ui.add(egui::DragValue::new(&mut st.conn_baud).speed(100.0).range(1200..=115200));
+                        }
+                        let connected = !m.loop_dead && m.connected;
+                        if theme::mode_button(ui, "CONNECT", connected && !m.transport.contains("disconnected"), GREEN) {
+                            let _ = tx.send(MountCmd::Connect { transport: st.conn_transport.clone(), port: st.conn_port.clone(), baud: st.conn_baud });
+                        }
+                        if ui.small_button("disconnect").clicked() {
+                            let _ = tx.send(MountCmd::Disconnect);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("ADS-B").color(TEXT_2));
+                        egui::ComboBox::from_id_salt("adsb_src").selected_text(st.adsb_mode.clone()).width(90.0).show_ui(ui, |ui| {
+                            for md in ["off", "rtlsdr", "dump1090", "sim"] {
+                                ui.selectable_value(&mut st.adsb_mode, md.into(), md);
+                            }
+                        });
+                        if ui.small_button("connect").clicked() {
+                            shared.adsb_request.store(Arc::new(Some(st.adsb_mode.clone())));
+                        }
+                        if ui.small_button("disconnect").clicked() {
+                            shared.adsb_request.store(Arc::new(Some("off".into())));
+                        }
+                    });
+                    ui.label(egui::RichText::new(format!("{} · {} aircraft", a.status, a.n_aircraft)).font(theme::mono(10.0)).color(TEXT));
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("fit points").font(theme::sans(10.0)).color(DIM));
+                        let mut n = shared.adsb_fit_points.load(std::sync::atomic::Ordering::Relaxed) as i64;
+                        if ui.add(egui::Slider::new(&mut n, 2..=20)).on_hover_text("ADS-B linear-fit depth: recent fixes used for the trajectory prediction").changed() {
+                            shared.adsb_fit_points.store(n as usize, std::sync::atomic::Ordering::Relaxed);
+                            crate::mount::persist_config_key(&shared.config.path, "adsb_fit_points", serde_json::json!(n));
+                        }
+                    });
+                }
+                let ui = &mut cols[1];
+                ui.label(egui::RichText::new(format!("log · {}", m.status.len())).font(theme::sans(10.0)).color(DIM));
+                egui::ScrollArea::vertical().id_salt("statuslog_scroll").max_height(118.0).stick_to_bottom(true).show(ui, |ui| {
+                    for s in m.status.iter() {
+                        ui.label(egui::RichText::new(s).font(theme::mono(9.5)).color(TEXT_2));
+                    }
+                });
+            });
+        });
+    }
     ui.horizontal(|ui| {
         for mode in ["STANDBY", "RATE", "PROGRAM", "HANDOFF", "HOTSPOT", "FEATURE", "MTI"] {
             if theme::mode_button(ui, mode, m.mode == mode, mode_color(mode)) {
@@ -1624,6 +1721,9 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         theme::readout(ui, "error az / el", &format!("{:+.3} / {:+.3}", m.az_error, m.el_error), "°", ec);
     });
     ui.add_space(4.0);
+    // Readout text left, navball riding the whitespace to its right.
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
     egui::Grid::new("mount_grid").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
         theme::kv(ui, "rate cmd", format!("{:+} / {:+}   gear {}", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling));
         if m.bias != (0.0, 0.0) || m.parking {
@@ -1700,6 +1800,14 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             "gains el",
             format!("{:.5} {:.5} {:.5}", m.gains[1][0], m.gains[1][1], m.gains[1][2]),
         );
+    });
+        });
+        if st.show_navball {
+            ui.vertical(|ui| {
+                ui.set_max_width(ui.available_width().min(160.0));
+                navball(ui, shared, st, &m);
+            });
+        }
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
@@ -1830,85 +1938,9 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         strip_chart(ui, &st.history, |h| (h.1, h.2), "error az / el  (°)", tracking, true);
         strip_chart(ui, &st.history, |h| (h.3, h.4), "rate cmd az / el  (steps)", tracking, false);
     });
-    egui::CollapsingHeader::new(egui::RichText::new("NAVBALL").font(theme::sans(10.5)).color(DIM)).id_salt("navball").default_open(true).show(ui, |ui| {
-        navball(ui, shared, st, &m);
-    });
     egui::CollapsingHeader::new(egui::RichText::new("JOYSTICK").font(theme::sans(10.5)).color(DIM)).id_salt("joypanel").default_open(true).show(ui, |ui| {
         joystick_panel(ui, &m, shared.config.joystick_rate_stick.eq_ignore_ascii_case("left"));
     });
-    ui.add_space(4.0);
-    // Connection controls (mirrors render_connection_controls / ADS-B controls).
-    if !st.conn_init {
-        st.conn_init = true;
-        st.conn_transport = shared.config.mount_transport.clone();
-        st.conn_port = shared.config.serial_port.clone();
-        st.conn_baud = shared.config.serial_baud;
-        st.adsb_mode = shared.config.adsb_source_mode.clone();
-        let _ = tx.send(MountCmd::ListPorts);
-    }
-    egui::CollapsingHeader::new(egui::RichText::new("CONNECTION").font(theme::sans(10.5)).color(DIM)).id_salt("conn").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("conn_tr").selected_text(st.conn_transport.clone()).width(70.0).show_ui(ui, |ui| {
-                ui.selectable_value(&mut st.conn_transport, "sim".into(), "sim");
-                ui.selectable_value(&mut st.conn_transport, "serial".into(), "serial");
-            });
-            if st.conn_transport == "serial" {
-                let ports = shared.serial_ports.load();
-                egui::ComboBox::from_id_salt("conn_port").selected_text(if st.conn_port.is_empty() { "port".to_string() } else { st.conn_port.clone() }).width(90.0).show_ui(ui, |ui| {
-                    for p in ports.iter() {
-                        ui.selectable_value(&mut st.conn_port, p.clone(), p);
-                    }
-                });
-                if ui.small_button("⟳").on_hover_text("rescan serial ports").clicked() {
-                    let _ = tx.send(MountCmd::ListPorts);
-                }
-                ui.add(egui::DragValue::new(&mut st.conn_baud).speed(100.0).range(1200..=115200));
-            }
-            let connected = !m.loop_dead && m.connected;
-            if theme::mode_button(ui, "CONNECT", connected && !m.transport.contains("disconnected"), GREEN) {
-                let _ = tx.send(MountCmd::Connect { transport: st.conn_transport.clone(), port: st.conn_port.clone(), baud: st.conn_baud });
-            }
-            if ui.small_button("disconnect").clicked() {
-                let _ = tx.send(MountCmd::Disconnect);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("ADS-B").color(TEXT_2));
-            egui::ComboBox::from_id_salt("adsb_src").selected_text(st.adsb_mode.clone()).width(90.0).show_ui(ui, |ui| {
-                for m in ["off", "rtlsdr", "dump1090", "sim"] {
-                    ui.selectable_value(&mut st.adsb_mode, m.into(), m);
-                }
-            });
-            if ui.small_button("connect").clicked() {
-                shared.adsb_request.store(Arc::new(Some(st.adsb_mode.clone())));
-            }
-            if ui.small_button("disconnect").clicked() {
-                shared.adsb_request.store(Arc::new(Some("off".into())));
-            }
-            let a = shared.adsb.load();
-            ui.label(egui::RichText::new(format!("{} · {} ac", a.status, a.n_aircraft)).font(theme::mono(10.0)).color(DIM));
-        });
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("fit points").font(theme::sans(10.0)).color(DIM));
-            let mut n = shared.adsb_fit_points.load(std::sync::atomic::Ordering::Relaxed) as i64;
-            if ui.add(egui::Slider::new(&mut n, 2..=20)).on_hover_text("ADS-B linear-fit depth: recent fixes used for the trajectory prediction").changed() {
-                shared.adsb_fit_points.store(n as usize, std::sync::atomic::Ordering::Relaxed);
-                crate::mount::persist_config_key(&shared.config.path, "adsb_fit_points", serde_json::json!(n));
-            }
-        });
-    });
-    ui.add_space(4.0);
-    theme::section(ui, "log");
-    egui::CollapsingHeader::new(egui::RichText::new(format!("history · {}", m.status.len())).font(theme::sans(10.0)).color(DIM)).id_salt("statuslog").default_open(false).show(ui, |ui| {
-        egui::ScrollArea::vertical().id_salt("statuslog_scroll").max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
-            for s in m.status.iter() {
-                ui.label(egui::RichText::new(s).font(theme::mono(9.5)).color(TEXT_2));
-            }
-        });
-    });
-    for s in m.status.iter().rev().take(6) {
-        ui.label(egui::RichText::new(s).font(theme::mono(10.5)).color(TEXT_2));
-    }
 }
 
 /// Compact mount readouts for camera-first layouts: mode buttons, az/el,
@@ -2215,14 +2247,19 @@ fn navball(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, m: &crate:
 /// that highlights while a control is held.
 pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_stick_left: bool) {
     let connected = m.joystick.is_some();
+    let btn = |bit: u32| connected && (m.joy_buttons >> bit) & 1 == 1;
     ui.label(egui::RichText::new(format!("joystick: {}", m.joystick.clone().unwrap_or_else(|| "none".into()))).font(theme::mono(10.5)).color(if connected { TEXT_2 } else { RED }));
+    // Pad graphic left, function legend right — the legend used to hang
+    // below the pad with a column of dead space beside both.
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() * 0.55).min(230.0));
     let w = ui.available_width().min(340.0);
     let pad_h = w * 0.55;
     let (r, p) = ui.allocate_painter(Vec2::new(ui.available_width(), pad_h), Sense::hover());
     let body = Rect::from_center_size(Pos2::new(r.rect.center().x, r.rect.top() + pad_h * 0.60), Vec2::new(w * 0.94, pad_h * 0.70));
     let alpha: u8 = if connected { 255 } else { 90 };
     let wa = |col: Color32| theme::with_alpha(col, alpha);
-    let btn = |bit: u32| connected && (m.joy_buttons >> bit) & 1 == 1;
     let off_fill = theme::with_alpha(theme::BG, alpha);
     p.rect(body, 26.0, theme::with_alpha(theme::RAISED, alpha.saturating_sub(55)), Stroke::new(1.0, wa(HAIRLINE)));
     let at = |fx: f32, fy: f32| Pos2::new(body.left() + body.width() * fx, body.top() + body.height() * fy);
@@ -2334,7 +2371,9 @@ pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_s
         gp.rect(seg, 2.0, col, Stroke::new(1.0, HAIRLINE));
     }
     ui.label(egui::RichText::new("hold the stick pinned to wind up the boost gears").font(theme::sans(9.0)).color(DIM));
-    // Function legend, live-highlighted while a control is held.
+        });
+        // Function legend, live-highlighted while a control is held.
+        ui.vertical(|ui| {
     egui::Grid::new("joy_legend").num_columns(2).spacing([10.0, 1.0]).show(ui, |ui| {
         let rows: [(&str, String, bool); 11] = [
             ("✕", "capture arm / save run".into(), btn(0)),
@@ -2362,6 +2401,8 @@ pub fn joystick_panel(ui: &mut egui::Ui, m: &crate::state::MountSnapshot, rate_s
             ui.label(egui::RichText::new(v).font(theme::sans(9.5)).color(if active { GREEN } else { TEXT_2 }));
             ui.end_row();
         }
+    });
+        });
     });
 }
 

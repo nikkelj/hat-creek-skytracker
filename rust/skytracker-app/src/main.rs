@@ -686,6 +686,9 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
             }
         }
         ui.separator();
+        // Capture BEFORE any checkbox mutates the state, or changes to the
+        // earlier toggles never persist.
+        let toggles_before = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips, st.show_launches);
         ui.checkbox(&mut st.show_stars, "stars");
         ui.checkbox(&mut st.show_sats, "satellites");
         ui.checkbox(&mut st.show_labels, "labels");
@@ -694,8 +697,8 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
         ui.checkbox(&mut st.show_messier, "Messier");
         ui.checkbox(&mut st.show_ngc, "NGC");
         ui.checkbox(&mut st.show_aircraft, "aircraft");
+        ui.checkbox(&mut st.show_launches, "launches");
         ui.checkbox(&mut st.show_keepout, "keepout");
-        let toggles_before = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips);
         ui.checkbox(&mut st.show_meo, "MEO");
         ui.checkbox(&mut st.show_geo, "GEO");
         ui.checkbox(&mut st.show_tips, "tips");
@@ -718,7 +721,7 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
             }
         }
         // Persist the display toggles (Python config keys) on change.
-        let after = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips);
+        let after = (st.show_stars, st.show_sats, st.show_aircraft, st.show_labels, st.show_messier, st.show_ngc, st.show_meo, st.show_geo, st.show_tips, st.show_launches);
         if after != toggles_before {
             for (key, v) in [
                 ("starfield_enabled", st.show_stars),
@@ -730,6 +733,7 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
                 ("meo_enabled", st.show_meo),
                 ("geo_enabled", st.show_geo),
                 ("tooltips_enabled", st.show_tips),
+                ("launch_trajectories_enabled", st.show_launches),
             ] {
                 crate::mount::persist_config_key(&shared.config.path, key, serde_json::json!(v));
             }

@@ -1721,9 +1721,15 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         theme::readout(ui, "error az / el", &format!("{:+.3} / {:+.3}", m.az_error, m.el_error), "°", ec);
     });
     ui.add_space(4.0);
-    // Readout text left, navball riding the whitespace to its right.
+    // Readout text left, navball riding the whitespace to its right — the
+    // navball's width is budgeted FIRST or the grid starves it to nothing.
+    // Panels too narrow for both stack the navball underneath instead.
+    let nav_w: f32 = 160.0;
+    let side_by_side = st.show_navball && ui.available_width() >= 560.0;
+    let left_w = if side_by_side { ui.available_width() - nav_w - 12.0 } else { ui.available_width() };
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
+            ui.set_width(left_w);
     egui::Grid::new("mount_grid").num_columns(2).spacing([14.0, 3.0]).show(ui, |ui| {
         theme::kv(ui, "rate cmd", format!("{:+} / {:+}   gear {}", m.rate_cmd.0, m.rate_cmd.1, m.gear_ceiling));
         if m.bias != (0.0, 0.0) || m.parking {
@@ -1802,13 +1808,16 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         );
     });
         });
-        if st.show_navball {
+        if side_by_side {
             ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width().min(160.0));
+                ui.set_width(nav_w);
                 navball(ui, shared, st, &m);
             });
         }
     });
+    if st.show_navball && !side_by_side {
+        navball(ui, shared, st, &m);
+    }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         let tuning = m.autotune.is_some();

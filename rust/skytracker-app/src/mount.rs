@@ -151,6 +151,13 @@ pub(crate) fn persist_config_key(path: &std::path::Path, key: &str, value: serde
     }
 }
 
+/// Great-circle separation between two az/el directions (deg).
+fn angular_sep_deg(az1: f64, el1: f64, az2: f64, el2: f64) -> f64 {
+    let (e1, e2) = (el1.to_radians(), el2.to_radians());
+    let da = (az1 - az2).to_radians();
+    (e1.sin() * e2.sin() + e1.cos() * e2.cos() * da.cos()).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
 fn spawn_loop(cfg: &Config, loop_shared: &Arc<LoopShared>) -> (CoreLoop, String, Vec<String>, Option<Arc<std::sync::Mutex<skytracker_core::sim::SimNoise>>>) {
     let mut notes = Vec::new();
     let hz = if cfg.loop_hz > 0.0 { cfg.loop_hz } else { 15.0 };
@@ -241,6 +248,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     let mut parking = false;
     let mut stopped = false;
     let mut rate_limit_warned = false;
+    let mut sun_keepout_warned = false;
     let mut pm_corr_last = (0.0f64, 0.0f64);
     // Per-mode PID gain profiles (service_gain_profiles): the departing
     // mode's live gains are SAVED into its profile (and persisted), the
@@ -909,6 +917,31 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 s
             });
             pm_corr_last = pm_corr;
+            // Sun keep-out: never command the boresight inside the exclusion
+            // cone. Dropping the setpoint alone is NOT enough — the firmware
+            // holds the last rate and the mount would coast on in — so entry
+            // also latches a Stop.
+            let mut sp = sp;
+            let sun_r = cfg.sun_keepout_deg();
+            if sun_r > 0.0 {
+                if let Some(s) = sp.as_ref() {
+                    let sun = shared.sky.load().bodies.iter().find(|b| b.name == "sun").map(|b| (b.az, b.el));
+                    if let Some((sun_az, sun_el)) = sun {
+                        let sep = angular_sep_deg(s.az_deg, s.el_deg, sun_az, sun_el);
+                        if sep < sun_r {
+                            if !sun_keepout_warned {
+                                sun_keepout_warned = true;
+                                loop_shared.commands.lock().unwrap().push_back(Command::Stop);
+                                push_status(&mut status, format!("☀ SUN KEEPOUT: target {sep:.1}° from the sun (< {sun_r:.1}°) — motion stopped, setpoint blocked"));
+                            }
+                            sp = None;
+                        } else if sun_keepout_warned && sep > sun_r + 1.0 {
+                            sun_keepout_warned = false;
+                            push_status(&mut status, "sun keepout cleared — tracking resumes".into());
+                        }
+                    }
+                }
+            }
             last_setpoint = sp.as_ref().map(|s| (s.az_deg, s.el_deg));
             if prev_target != target {
                 prev_target = target.clone();

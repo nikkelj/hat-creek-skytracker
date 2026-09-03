@@ -438,6 +438,43 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             );
         }
     }
+    // Sun keep-out cone (sensor + eye safety, config sun_keepout_*): the
+    // exclusion the mount worker enforces, washed in orange around the sun.
+    {
+        let sun_r = cfg.sun_keepout_deg();
+        if sun_r > 0.0 {
+            let sky_now = shared.sky.load();
+            if let Some(sun) = sky_now.bodies.iter().find(|b| b.name == "sun") {
+                if sun.el > -sun_r {
+                    let (saz, sel_r) = (sun.az.to_radians(), sun.el.to_radians());
+                    let rr = sun_r.to_radians();
+                    let mut pts: Vec<Pos2> = Vec::with_capacity(72);
+                    for i in 0..72 {
+                        let b = i as f64 * std::f64::consts::TAU / 72.0;
+                        // Great-circle destination at angular distance rr, bearing b.
+                        let el2 = (sel_r.sin() * rr.cos() + sel_r.cos() * rr.sin() * b.cos()).asin();
+                        let az2 = saz + (b.sin() * rr.sin() * sel_r.cos()).atan2(rr.cos() - sel_r.sin() * el2.sin());
+                        pts.push(polar(center, radius, az2.to_degrees().rem_euclid(360.0), el2.to_degrees().max(-0.4)));
+                    }
+                    let orange = Color32::from_rgb(255, 130, 40);
+                    painter.add(egui::Shape::convex_polygon(pts.clone(), theme::with_alpha(orange, 34), Stroke::NONE));
+                    for i in 0..pts.len() {
+                        painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(1.2, theme::with_alpha(orange, 140)));
+                    }
+                    if sun.el > -2.0 {
+                        let lp = polar(center, radius, sun.az, sun.el.max(0.0));
+                        painter.text(
+                            lp + Vec2::new(0.0, -12.0),
+                            Align2::CENTER_BOTTOM,
+                            format!("☀ keepout {sun_r:.0}°"),
+                            theme::sans(9.5),
+                            theme::with_alpha(orange, 210),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Rings + spokes.
     for el in [0.0, 30.0, 60.0] {
         let r = radius * ((90.0 - el) / 90.0) as f32;

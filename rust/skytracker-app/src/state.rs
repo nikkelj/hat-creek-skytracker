@@ -215,6 +215,13 @@ pub struct Config {
     pub serial_baud: u32,
     pub camera_source: String, // "sim" | "asi"
     pub asi_dll: String,
+    /// Sun keep-out: block tracking setpoints (and wash the skyplot) within
+    /// this cone of the sun. Radius = max(safety_factor × (half-diagonal FOV
+    /// + solar radius) over the enabled pinhole cameras, min_deg — the eye-
+    /// safety floor for the spotting scope; airglow is strong inside ~10°).
+    pub sun_keepout_enabled: bool,
+    pub sun_keepout_factor: f64,
+    pub sun_keepout_min_deg: f64,
     pub captures_dir: String,
     /// Armed-capture ring depth in frames (Python `buffer_size`).
     pub capture_buffer_frames: usize,
@@ -441,6 +448,9 @@ impl Config {
             serial_baud: f("mount_serial_baud", 9600.0) as u32,
             camera_source: s("camera_source", "sim"),
             asi_dll: s("asi_dll", "ASICamera2.dll"),
+            sun_keepout_enabled: b("sun_keepout_enabled", true),
+            sun_keepout_factor: f("sun_keepout_safety_factor", 3.0),
+            sun_keepout_min_deg: f("sun_keepout_min_deg", 25.0),
             captures_dir: s("captures_dir", "data"),
             capture_buffer_frames: f("buffer_size", 1000.0).max(1.0) as usize,
             image_format: s("image_format", "bmp").to_lowercase(),
@@ -584,6 +594,9 @@ impl Config {
         set("mount_serial_baud", json!(self.serial_baud));
         set("camera_source", json!(self.camera_source));
         set("asi_dll", json!(self.asi_dll));
+        set("sun_keepout_enabled", json!(self.sun_keepout_enabled));
+        set("sun_keepout_safety_factor", json!(self.sun_keepout_factor));
+        set("sun_keepout_min_deg", json!(self.sun_keepout_min_deg));
         set("captures_dir", json!(self.captures_dir));
         set("tetra3_db_dir", json!(self.tetra3_db_dir));
         set("alignment_points", json!(self.alignment_points));
@@ -663,6 +676,28 @@ impl Config {
 
     pub fn repo_root(&self) -> PathBuf {
         self.path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+    }
+
+    /// Effective sun keep-out radius (deg): safety_factor × (half-diagonal
+    /// FOV + solar radius) of the widest enabled pinhole camera, floored at
+    /// `sun_keepout_min_deg` (eye safety through the spotting scope — the
+    /// bubble fisheye is excluded: no focused energy). 0 when disabled.
+    pub fn sun_keepout_deg(&self) -> f64 {
+        if !self.sun_keepout_enabled {
+            return 0.0;
+        }
+        const SUN_RADIUS_DEG: f64 = 0.27;
+        let sensor = self
+            .cam
+            .iter()
+            .filter(|c| c.enabled && c.projection == Projection::Pinhole && c.focal_mm > 0.0)
+            .map(|c| {
+                let diag_mm = (((c.sensor_w * c.sensor_w + c.sensor_h * c.sensor_h) as f64).sqrt()) * c.pixel_um * 1e-3;
+                (diag_mm / (2.0 * c.focal_mm)).atan().to_degrees() + SUN_RADIUS_DEG
+            })
+            .fold(0.0, f64::max)
+            * self.sun_keepout_factor;
+        sensor.max(self.sun_keepout_min_deg)
     }
 
     /// Directories searched for tetra3 `.npz` databases.

@@ -351,12 +351,22 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
     let observer = skytracker_astro::sgp4_pass::Observer { lat_deg: cfg.lat_deg, lon_deg: cfg.lon_deg, elevation_m: cfg.alt_m };
     let geom = observer.geometry();
     let recorder = Arc::new(CaptureRecorder::new());
-    // Sweep stale spool dirs left by a crashed/killed previous run.
+    // Sweep stale spool dirs left by a crashed/killed previous run. An
+    // orphan that holds frames is a capture someone wanted: rename it to a
+    // visible ORPHAN_ dir rather than destroy it; only empty spools go.
     if let Ok(rd) = std::fs::read_dir(root.join(&cfg.captures_dir)) {
         let prefix = format!(".spool_cam{}_", slot + 1);
         for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(&prefix) {
-                let _ = std::fs::remove_dir_all(e.path());
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) {
+                let n_files = std::fs::read_dir(e.path()).map(|d| d.flatten().count()).unwrap_or(0);
+                if n_files == 0 {
+                    let _ = std::fs::remove_dir_all(e.path());
+                } else {
+                    let keep = e.path().with_file_name(format!("ORPHAN_{}", name.trim_start_matches('.')));
+                    eprintln!("skytracker capture: keeping orphaned spool {name} ({n_files} frames) as {}", keep.display());
+                    let _ = std::fs::rename(e.path(), keep);
+                }
             }
         }
     }
@@ -376,6 +386,9 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
     let mut fps = 0.0;
     let mut last_seq = u64::MAX;
     let mut armed_frames = 0usize;
+    // Spool dir of the current capture, so a failed dump can park it under
+    // a visible name instead of leaving it for the startup sweep.
+    let mut armed_spool: Option<std::path::PathBuf> = None;
     let mut last_dump: Option<String> = None;
     let mut deep_n = 0usize;
     let mut dump_result: Option<Arc<Mutex<Option<String>>>> = None;
@@ -391,8 +404,14 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                     if connected {
                         let spool = root.join(&cfg.captures_dir).join(format!(".spool_cam{}_{}", slot + 1, crate::sky::utc_stamp_compact()));
                         match recorder.arm_spool(&spool, cfg.capture_buffer_frames) {
-                            Ok(()) => armed_frames = 0,
-                            Err(e) => last_dump = Some(format!("arm failed: {e}")),
+                            Ok(()) => {
+                                armed_frames = 0;
+                                armed_spool = Some(spool);
+                            }
+                            Err(e) => {
+                                eprintln!("skytracker capture: arm failed — {e}");
+                                last_dump = Some(format!("arm FAILED: {e}"));
+                            }
                         }
                     }
                 }
@@ -444,6 +463,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         let rec = recorder.clone();
                         let (w2, h2, src2, fov2, cname, crole, cn) = (w, h, source_name.clone(), cam_cfg.fov_deg(w as f64), cam_cfg.name.clone(), cam_cfg.role.clone(), name.clone());
                         let slot2 = slot;
+                        let spool_path2 = armed_spool.take();
                         let done = Arc::new(Mutex::new(None::<String>));
                         dump_result = Some(done.clone());
                         let png = cfg.image_format == "png";
@@ -495,13 +515,27 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                                     if dir.read_dir().map(|mut d| !d.any(|e| e.as_ref().map(|e| e.file_name().to_string_lossy().starts_with("config_")).unwrap_or(false))).unwrap_or(false) {
                                         let _ = std::fs::copy(&config_path, cfg_copy);
                                     }
+                                    let fail_note = rec.failed().map(|f| format!(" — WRITE FAILURES: {f}")).unwrap_or_default();
                                     if dropped > 0 {
-                                        format!("{n} frames -> {} ({dropped} dropped: disk slower than capture)", dir.display())
+                                        format!("{n} frames -> {} ({dropped} dropped: disk slower than capture){fail_note}", dir.display())
                                     } else {
-                                        format!("{n} frames -> {}", dir.display())
+                                        format!("{n} frames -> {}{fail_note}", dir.display())
                                     }
                                 }
-                                Err(e) => format!("dump failed: {e}"),
+                                Err(e) => {
+                                    // Keep whatever landed: park the spool under a
+                                    // visible name so the startup sweep can't erase
+                                    // the evidence (it deletes `.spool_*`).
+                                    let mut moved = String::new();
+                                    if let Some(sp) = &spool_path2 {
+                                        let keep = dir.with_file_name(format!("FAILED_{cn}_cam{}_{}", slot2 + 1, crate::sky::utc_stamp_compact()));
+                                        if sp.exists() && std::fs::rename(sp, &keep).is_ok() {
+                                            moved = format!(" (spool kept as {})", keep.display());
+                                        }
+                                    }
+                                    eprintln!("skytracker capture: dump failed — {e}{moved}");
+                                    format!("dump FAILED: {e}{moved}")
+                                }
                             };
                             *done.lock().unwrap() = Some(res);
                         }).ok();
@@ -625,6 +659,8 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                     connected: false,
                     armed: false,
                     armed_frames: 0,
+                    armed_written: 0,
+                    armed_failed: None,
                     armed_dropped: 0,
                     last_dump: last_dump.clone(),
                     deep_stars: 0,
@@ -708,6 +744,8 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                         connected: true,
                         armed: recorder.is_armed(),
                         armed_frames,
+                        armed_written: recorder.written(),
+                        armed_failed: recorder.failed(),
                         armed_dropped: recorder.dropped(),
                         last_dump: last_dump.clone(),
                         deep_stars: deep_n,

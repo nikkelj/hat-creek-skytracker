@@ -14,6 +14,17 @@ use std::path::Path;
 /// 24-bit BGR.
 pub fn write_bmp(path: &Path, frame: &Frame) -> std::io::Result<()> {
     let (w, h, c) = (frame.width, frame.height, frame.channels);
+    // Guard against a frame whose buffer is shorter than its declared
+    // geometry: index math below would otherwise PANIC the writer thread,
+    // which historically vanished silently (the channel just disconnected)
+    // and lost the whole capture. Fail loud with an Err instead.
+    let need = w * h * c.max(1);
+    if frame.data.len() < need {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame buffer {} bytes < {w}x{h}x{c} = {need}", frame.data.len()),
+        ));
+    }
     if c == 1 {
         return write_bmp_gray8(path, frame);
     }
@@ -103,6 +114,10 @@ pub struct CaptureRecorder {
     armed: std::sync::atomic::AtomicBool,
     dropped: std::sync::atomic::AtomicUsize,
     written: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by the writer thread the moment a frame fails to write (I/O error
+    /// or bad geometry). Surfaced live so a capture that is silently going
+    /// nowhere is visible immediately, not only when the run is saved.
+    failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     inner: std::sync::Mutex<Option<Spool>>,
 }
 
@@ -126,6 +141,7 @@ impl CaptureRecorder {
             armed: std::sync::atomic::AtomicBool::new(false),
             dropped: std::sync::atomic::AtomicUsize::new(0),
             written: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failed: std::sync::Arc::new(std::sync::Mutex::new(None)),
             inner: std::sync::Mutex::new(None),
         }
     }
@@ -138,18 +154,39 @@ impl CaptureRecorder {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(capacity.max(2));
         let wdir = dir.to_path_buf();
         let written = self.written.clone();
+        let failed = self.failed.clone();
         written.store(0, Ordering::SeqCst);
         self.dropped.store(0, Ordering::SeqCst);
+        *failed.lock().unwrap() = None;
         let writer = std::thread::Builder::new().name("capture-spool".into()).spawn(move || {
             let mut times = Vec::new();
             let mut i = 0usize;
+            let mut first_err: Option<std::io::Error> = None;
             while let Ok(f) = rx.recv() {
-                write_bmp(&wdir.join(format!("frame_{i:05}.bmp")), &f)?;
-                times.push(f.utc_midpoint_s);
-                written.fetch_add(1, Ordering::Relaxed);
+                match write_bmp(&wdir.join(format!("frame_{i:05}.bmp")), &f) {
+                    Ok(()) => {
+                        times.push(f.utc_midpoint_s);
+                        written.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // Record the first failure and keep draining so the
+                        // capture pump never blocks and a single bad frame
+                        // does not silently abort the whole run. A persistent
+                        // fault (disk full, bad geometry) keeps `failed` set.
+                        if first_err.is_none() {
+                            let msg = format!("frame {i}: {e}");
+                            eprintln!("skytracker capture: write failed — {msg}");
+                            *failed.lock().unwrap() = Some(msg);
+                            first_err = Some(e);
+                        }
+                    }
+                }
                 i += 1;
             }
-            Ok(times)
+            match first_err {
+                Some(e) if times.is_empty() => Err(e),
+                _ => Ok(times),
+            }
         })?;
         *self.inner.lock().unwrap() = Some(Spool { dir: dir.to_path_buf(), tx: Some(tx), writer: Some(writer) });
         self.armed.store(true, Ordering::SeqCst);
@@ -183,9 +220,23 @@ impl CaptureRecorder {
                 Err(TrySendError::Full(_)) => {
                     self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Disconnected(_)) => {
+                    // The writer thread is gone: every frame from here on is
+                    // lost. Count it AND flag it — this branch used to be
+                    // empty, so a dead writer looked like a healthy capture.
+                    self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut f = self.failed.lock().unwrap();
+                    if f.is_none() {
+                        *f = Some("spool writer thread exited".into());
+                    }
+                }
             }
         }
+    }
+
+    /// First write failure of the current capture, if any (live).
+    pub fn failed(&self) -> Option<String> {
+        self.failed.lock().unwrap().clone()
     }
 
     /// Stop accepting frames immediately; the writer keeps draining what is

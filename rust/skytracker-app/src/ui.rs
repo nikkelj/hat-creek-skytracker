@@ -1546,9 +1546,20 @@ pub fn camera_view(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
         }
     }
     if cam.armed {
-        p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, RED);
-        let rec_txt = if cam.armed_dropped > 0 { format!("REC {}  drop {}", cam.armed_frames, cam.armed_dropped) } else { format!("REC {}", cam.armed_frames) };
-        p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, rec_txt, theme::mono(10.5), RED);
+        // REC reports frames ON DISK. Offered-but-unwritten frames used to
+        // count as recorded, so a dead spool writer looked like a healthy
+        // capture right up until the empty run dir.
+        let (rec_txt, col) = if let Some(err) = &cam.armed_failed {
+            (format!("REC FAILED · {} on disk · {err}", cam.armed_written), RED)
+        } else if cam.armed_dropped > 0 {
+            (format!("REC {}  drop {}", cam.armed_written, cam.armed_dropped), AMBER)
+        } else if cam.armed_frames > cam.armed_written + 8 {
+            (format!("REC {}  (queued {})", cam.armed_written, cam.armed_frames - cam.armed_written), AMBER)
+        } else {
+            (format!("REC {}", cam.armed_written), RED)
+        };
+        p.circle_filled(r.rect.right_top() + Vec2::new(-10.0, 10.0), 4.0, col);
+        p.text(r.rect.right_top() + Vec2::new(-18.0, 10.0), Align2::RIGHT_CENTER, rec_txt, theme::mono(10.5), col);
     }
     p.text(
         r.rect.left_top() + Vec2::new(6.0, 6.0),

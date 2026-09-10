@@ -1027,6 +1027,10 @@ pub struct CamSnapshot {
     pub connected: bool,
     pub armed: bool,
     pub armed_frames: usize,
+    /// Frames the spool writer has actually committed to disk (vs offered).
+    pub armed_written: usize,
+    /// First write failure of the current capture — a capture going nowhere.
+    pub armed_failed: Option<String>,
     /// Frames skipped because the spool queue was full (disk behind).
     pub armed_dropped: usize,
     pub last_dump: Option<String>,

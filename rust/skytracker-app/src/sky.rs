@@ -303,21 +303,21 @@ fn run(shared: Arc<Shared>, root: std::path::PathBuf) {
 
         // DSOs every 5 s (fixed ICRS directions; Messier always, NGC to the limit).
         if last_stars.elapsed() > Duration::from_secs(5) {
+            // Always computed (cheap): the skyplot filters by the LIVE
+            // Messier/NGC toggles. Gating on the startup config meant a
+            // toggle that had persisted as off could never be switched back
+            // on without restarting the app.
             let mut marks = Vec::new();
-            if cfg.messier_enabled {
-                for d in &messier {
-                    let (az, el) = dso_altaz(d, jd_tt);
-                    if el > -2.0 {
-                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: true, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
-                    }
+            for d in &messier {
+                let (az, el) = dso_altaz(d, jd_tt);
+                if el > -2.0 {
+                    marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: true, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
                 }
             }
-            if cfg.ngc_enabled {
-                for d in ngc.iter().filter(|d| d.mag <= cfg.ngc_limit_mag) {
-                    let (az, el) = dso_altaz(d, jd_tt);
-                    if el > 0.0 {
-                        marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: false, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
-                    }
+            for d in ngc.iter().filter(|d| d.mag <= cfg.ngc_limit_mag) {
+                let (az, el) = dso_altaz(d, jd_tt);
+                if el > 0.0 {
+                    marks.push(DsoMark { key: d.key.clone(), name: d.name.clone(), az, el, mag: d.mag, messier: false, ra_deg: d.ra_deg, dec_deg: d.dec_deg });
                 }
             }
             dso_marks = marks;

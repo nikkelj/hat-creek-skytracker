@@ -453,18 +453,52 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
                 if sun.el > -sun_r {
                     let (saz, sel_r) = (sun.az.to_radians(), sun.el.to_radians());
                     let rr = sun_r.to_radians();
-                    let mut pts: Vec<Pos2> = Vec::with_capacity(72);
-                    for i in 0..72 {
-                        let b = i as f64 * std::f64::consts::TAU / 72.0;
-                        // Great-circle destination at angular distance rr, bearing b.
-                        let el2 = (sel_r.sin() * rr.cos() + sel_r.cos() * rr.sin() * b.cos()).asin();
-                        let az2 = saz + (b.sin() * rr.sin() * sel_r.cos()).atan2(rr.cos() - sel_r.sin() * el2.sin());
-                        pts.push(polar(center, radius, az2.to_degrees().rem_euclid(360.0), el2.to_degrees().max(-0.4)));
-                    }
                     let orange = Color32::from_rgb(255, 130, 40);
-                    painter.add(egui::Shape::convex_polygon(pts.clone(), theme::with_alpha(orange, 34), Stroke::NONE));
-                    for i in 0..pts.len() {
-                        painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(1.2, theme::with_alpha(orange, 140)));
+                    let n = 72usize;
+                    let ring: Vec<(f64, f64)> = (0..n)
+                        .map(|i| {
+                            let b = i as f64 * std::f64::consts::TAU / n as f64;
+                            // Great-circle destination at angular distance rr, bearing b.
+                            let el2 = (sel_r.sin() * rr.cos() + sel_r.cos() * rr.sin() * b.cos()).asin();
+                            let az2 = saz + (b.sin() * rr.sin() * sel_r.cos()).atan2(rr.cos() - sel_r.sin() * el2.sin());
+                            (az2.to_degrees().rem_euclid(360.0), el2.to_degrees())
+                        })
+                        .collect();
+                    // Clip at the horizon: keep the above-horizon cap and close it
+                    // along the rim. Clamping the sunken vertices onto the rim made
+                    // the outline fold back on itself, and egui's fill feathering
+                    // flings vertices to the screen edge at such a cusp (the big
+                    // orange wedges when the sun was just below the horizon).
+                    let mut pts: Vec<Pos2> = Vec::with_capacity(n + 16);
+                    if ring.iter().all(|p| p.1 >= 0.0) {
+                        pts.extend(ring.iter().map(|&(a, e)| polar(center, radius, a, e)));
+                    } else if let Some(start) = ring.iter().position(|p| p.1 < 0.0) {
+                        let mut cap: Vec<(f64, f64)> = Vec::new();
+                        for k in 1..=n {
+                            let p = ring[(start + k) % n];
+                            if p.1 >= 0.0 {
+                                cap.push(p);
+                            } else if !cap.is_empty() {
+                                break;
+                            }
+                        }
+                        if cap.len() >= 2 {
+                            let (a0, a1) = (cap[0].0, cap[cap.len() - 1].0);
+                            pts.extend(cap.iter().map(|&(a, e)| polar(center, radius, a, e)));
+                            // Rim arc back from a1 to a0, retracing the cap's azimuth span.
+                            let d = (a1 - a0 + 540.0).rem_euclid(360.0) - 180.0;
+                            let steps = 16;
+                            for k in 1..steps {
+                                let a = (a1 - d * k as f64 / steps as f64).rem_euclid(360.0);
+                                pts.push(polar(center, radius, a, 0.0));
+                            }
+                        }
+                    }
+                    if pts.len() >= 3 {
+                        painter.add(egui::Shape::convex_polygon(pts.clone(), theme::with_alpha(orange, 34), Stroke::NONE));
+                        for i in 0..pts.len() {
+                            painter.line_segment([pts[i], pts[(i + 1) % pts.len()]], Stroke::new(1.2, theme::with_alpha(orange, 140)));
+                        }
                     }
                     if sun.el > -2.0 {
                         let lp = polar(center, radius, sun.az, sun.el.max(0.0));
@@ -1205,6 +1239,37 @@ pub fn skyplot(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: &c
             kv(&mut lines, "status", "below horizon / hidden".into(), DIM);
         }
         py += info_pane(&painter, Pos2::new(px, py), pane_w, &title, ACCENT, &lines) + 6.0;
+        // Starlink ephemeris switch on the card itself — the mount panel has
+        // the same control, but the eye lands here when a satellite is picked.
+        if sel.chars().all(|c| c.is_ascii_digit()) {
+            let man = shared.starlink_manifest.load();
+            let ephs = shared.ephemerides.load();
+            let now = crate::sky::now_unix();
+            let in_manifest = man.as_ref().as_ref().map_or(false, |m| m.contains_key(sel));
+            if in_manifest || ephs.contains_key(sel) {
+                let (label, col) = match ephs.get(sel) {
+                    Some(e) if now >= e.start_unix && e.stop_unix > now => (format!("EPHEMERIS · {:.0} h left  ↻ refresh", (e.stop_unix - now) / 3600.0), GREEN),
+                    Some(_) => ("EPHEMERIS EXPIRED · on TLE  ↻ refresh".to_string(), AMBER),
+                    None => ("▶ use Starlink ephemeris".to_string(), ACCENT),
+                };
+                let r = Rect::from_min_size(Pos2::new(px, py - 4.0), Vec2::new(pane_w, 18.0));
+                let resp = ui
+                    .interact(r, ui.id().with(("card_ephem", sel.clone())), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("download this satellite's Starlink public ephemeris (~2 MB) and track from it instead of the TLE — survives maneuvers");
+                painter.rect(r, 3.0, theme::with_alpha(theme::RAISED, if resp.hovered() { 240 } else { 200 }), Stroke::new(1.0, if resp.hovered() { col } else { HAIRLINE }));
+                painter.text(r.center(), Align2::CENTER_CENTER, label, theme::sans(10.0), col);
+                if resp.clicked() {
+                    shared.ephem_request.store(Arc::new(Some(sel.clone())));
+                }
+                py += 20.0;
+                let status = shared.ephem_status.load();
+                if !status.is_empty() {
+                    painter.text(Pos2::new(px, py), Align2::LEFT_TOP, status.as_str(), theme::mono(8.5), DIM);
+                    py += 14.0;
+                }
+            }
+        }
     }
     // ---- Camera parameter / FOV cards, color-matched to the footprints ----
     for (i, c) in shared.cams.iter().enumerate() {

@@ -399,6 +399,9 @@ pub struct Sidecar {
     pub tags: Vec<String>,
     pub notes: String,
     pub annotations: Vec<Annotation>,
+    /// Per camera slot (horizontal, vertical) mirror applied to display,
+    /// MP4 export and stacks — a property of how that run's cameras sat.
+    pub flip: Vec<(bool, bool)>,
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -423,8 +426,20 @@ impl Sidecar {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(Annotation::from_json).collect())
                 .unwrap_or_default();
+            sc.flip = map
+                .get("flip")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|p| {
+                            let b = |i: usize| p.get(i).and_then(|x| x.as_bool()).unwrap_or(false);
+                            (b(0), b(1))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             for (k, v) in map {
-                if !matches!(k.as_str(), "display_name" | "favorite" | "tags" | "notes" | "annotations") {
+                if !matches!(k.as_str(), "display_name" | "favorite" | "tags" | "notes" | "annotations" | "flip") {
                     sc.extra.insert(k, v);
                 }
             }
@@ -439,6 +454,7 @@ impl Sidecar {
         map.insert("tags".into(), serde_json::json!(self.tags));
         map.insert("notes".into(), serde_json::Value::String(self.notes.clone()));
         map.insert("annotations".into(), serde_json::Value::Array(self.annotations.iter().map(|a| a.to_json()).collect()));
+        map.insert("flip".into(), serde_json::json!(self.flip.iter().map(|f| [f.0, f.1]).collect::<Vec<_>>()));
         let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".into());
         std::fs::write(path, text)
     }
@@ -698,6 +714,43 @@ impl Gray {
             rgb.extend_from_slice(&[v, v, v]);
         }
         rgb
+    }
+}
+
+/// Mirror a w×h single-channel buffer in place (horizontal and/or vertical).
+pub fn flip_in_place<T: Copy>(data: &mut [T], w: usize, h: usize, fh: bool, fv: bool) {
+    if fh {
+        for y in 0..h {
+            data[y * w..(y + 1) * w].reverse();
+        }
+    }
+    if fv {
+        for y in 0..h / 2 {
+            let (a, b) = data.split_at_mut((h - 1 - y) * w);
+            a[y * w..(y + 1) * w].swap_with_slice(&mut b[..w]);
+        }
+    }
+}
+
+/// Same for packed RGB (3 bytes per pixel).
+pub fn flip_rgb_in_place(rgb: &mut [u8], w: usize, h: usize, fh: bool, fv: bool) {
+    if fh {
+        for y in 0..h {
+            let row = &mut rgb[y * w * 3..(y + 1) * w * 3];
+            for x in 0..w / 2 {
+                let (i, j) = (x * 3, (w - 1 - x) * 3);
+                for c in 0..3 {
+                    row.swap(i + c, j + c);
+                }
+            }
+        }
+    }
+    if fv {
+        let rw = w * 3;
+        for y in 0..h / 2 {
+            let (a, b) = rgb.split_at_mut((h - 1 - y) * rw);
+            a[y * rw..(y + 1) * rw].swap_with_slice(&mut b[..rw]);
+        }
     }
 }
 
@@ -1224,11 +1277,13 @@ pub struct ProcParams {
     pub stab_link: Option<usize>,
     pub reference_idx: usize,
     pub sharpen: SharpenSettings,
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 impl Default for ProcParams {
     fn default() -> Self {
-        ProcParams { gamma: 1.0, brightness: 0.0, contrast: 1.0, stabilize: false, stab: StabSettings::default(), stab_link: None, reference_idx: 0, sharpen: SharpenSettings::default() }
+        ProcParams { gamma: 1.0, brightness: 0.0, contrast: 1.0, stabilize: false, stab: StabSettings::default(), stab_link: None, reference_idx: 0, sharpen: SharpenSettings::default(), flip_h: false, flip_v: false }
     }
 }
 
@@ -1806,9 +1861,16 @@ pub fn run_export(spec: &ExportSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &
                 }
             }
             if spec.overlays {
+                // Track vectors live in capture pixel space: bake before the
+                // flip. Meta text and annotations (authored on the displayed,
+                // flipped image) bake after it so they read correctly.
                 let vectors = compute_track_vectors(&run.trajectory, f.t, w as f64, h as f64);
+                bake_overlays(&mut rgb, w, h, vectors.as_ref(), &[], &[], spec.slot);
+                flip_rgb_in_place(&mut rgb, w, h, p.flip_h, p.flip_v);
                 let meta = build_meta_lines(run, cam_index, f.t, *orig_idx, run.cams[spec.slot].frames.len(), p.gamma, p.stabilize);
-                bake_overlays(&mut rgb, w, h, vectors.as_ref(), &meta, &annots, spec.slot);
+                bake_overlays(&mut rgb, w, h, None, &meta, &annots, spec.slot);
+            } else {
+                flip_rgb_in_place(&mut rgb, w, h, p.flip_h, p.flip_v);
             }
             enc.write_rgb(&rgb).map_err(|e| e.to_string())?;
             written += 1;
@@ -1838,6 +1900,8 @@ pub struct StackSpec {
     /// frame on the track target / brightest blob, crop to center_size².
     pub centered: bool,
     pub center_size: usize,
+    /// (horizontal, vertical) mirror applied to the finished masters.
+    pub flip: (bool, bool),
 }
 
 /// Lucky-imaging stack (stacking.stack_run, gray): grade frames in range by
@@ -1910,8 +1974,9 @@ pub fn run_stack(spec: &StackSpec, status: &Arc<ArcSwap<JobStatus>>, cancel: &At
         s.progress = 0.6;
         s.message = format!("Aligning + stacking {}…", imgs.len());
     });
-    let (mean, n_stacked, n_rejected) = stack_gray(&imgs, 0, true, spec.stab).ok_or("nothing to stack")?;
+    let (mut mean, n_stacked, n_rejected) = stack_gray(&imgs, 0, true, spec.stab).ok_or("nothing to stack")?;
     let (w, h) = (imgs[0].w, imgs[0].h);
+    flip_in_place(&mut mean, w, h, spec.flip.0, spec.flip.1);
     if let Some(dir) = spec.out_base.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1974,6 +2039,8 @@ struct LoadedRun {
     pane_w: Vec<usize>,
     reference_idx: Vec<usize>,
     adjust: Vec<CamAdjust>,
+    flip: Vec<(bool, bool)>,
+    tex_flip: Vec<(bool, bool)>,
     annotations: Vec<Annotation>,
     sidecar: Sidecar,
     t0: f64,
@@ -2009,6 +2076,8 @@ fn make_params(stabilize: bool, stab: StabSettings, stab_link: Option<usize>, sh
         stab_link: stab_link.filter(|s| *s != slot),
         reference_idx: l.reference_idx.get(slot).copied().unwrap_or(0),
         sharpen,
+        flip_h: l.flip.get(slot).map_or(false, |f| f.0),
+        flip_v: l.flip.get(slot).map_or(false, |f| f.1),
     }
 }
 
@@ -2210,6 +2279,12 @@ impl ReplayState {
         self.loaded = Some(LoadedRun {
             annotations: run.sidecar.annotations.clone(),
             sidecar: run.sidecar.clone(),
+            flip: {
+                let mut f = run.sidecar.flip.clone();
+                f.resize(n, (false, false));
+                f
+            },
+            tex_flip: vec![(false, false); n],
             run,
             lib_index,
             workers,
@@ -2383,7 +2458,7 @@ impl ReplayState {
         let cam_no = l.run.cams[slot].cam_index + 1;
         let base = Self::export_dir(captures_dir).join(format!("{}_cam{cam_no}_stack{}", l.run.folder, self.stack_n));
         let out_base = Self::unique_base(&base, "png");
-        let spec = StackSpec { run: l.run.clone(), slot, t_start: self.in_marker, t_end: self.out_marker, keep_n: self.stack_n.max(1), stab: self.stab, out_base, centered: self.stack_centered, center_size: self.stack_center_size };
+        let spec = StackSpec { run: l.run.clone(), slot, t_start: self.in_marker, t_end: self.out_marker, keep_n: self.stack_n.max(1), stab: self.stab, out_base, centered: self.stack_centered, center_size: self.stack_center_size, flip: l.flip.get(slot).copied().unwrap_or((false, false)) };
         let handle = JobHandle::new("stack");
         let status = handle.status.clone();
         let cancel = handle.cancel.clone();
@@ -2640,10 +2715,18 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
     // Pull fresh frames -> textures.
     for slot in 0..l.workers.len() {
         if let Some(f) = l.workers[slot].out.load_full() {
-            if f.seq != l.tex_seq[slot] {
+            let flip = l.flip.get(slot).copied().unwrap_or((false, false));
+            if f.seq != l.tex_seq[slot] || l.tex_flip[slot] != flip {
                 l.tex_seq[slot] = f.seq;
+                l.tex_flip[slot] = flip;
                 if f.error.is_none() && f.w > 0 && f.h > 0 {
-                    let img = egui::ColorImage::from_gray([f.w, f.h], &f.gray);
+                    let img = if flip.0 || flip.1 {
+                        let mut g = f.gray.clone();
+                        flip_in_place(&mut g, f.w, f.h, flip.0, flip.1);
+                        egui::ColorImage::from_gray([f.w, f.h], &g)
+                    } else {
+                        egui::ColorImage::from_gray([f.w, f.h], &f.gray)
+                    };
                     match l.textures[slot].as_mut() {
                         Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                         None => l.textures[slot] = Some(ui.ctx().load_texture(format!("replay_cam{slot}"), img, egui::TextureOptions::LINEAR)),
@@ -2702,7 +2785,9 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
         let img_rect = Rect::from_center_size(rect.center() + st.pane_pan[slot], size * zoom);
         // Decode target follows the zoom so a paused zoomed view sharpens up.
         l.pane_w[slot] = (size.x * zoom).round() as usize;
-        // Visible source-pixel rect (crop export) while zoomed.
+        let flip = l.flip.get(slot).copied().unwrap_or((false, false));
+        // Visible source-pixel rect (crop export) while zoomed — in capture
+        // pixel space, so mirror it back when the pane is flipped.
         st.pane_view[slot] = if zoom > 1.001 {
             l.last_frame[slot]
                 .as_ref()
@@ -2715,7 +2800,10 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
                     let y0 = (((vis.min.y - img_rect.min.y) * fy).floor().max(0.0)) as usize;
                     let x1 = (((vis.max.x - img_rect.min.x) * fx).ceil().max(0.0) as usize).min(f.full_w);
                     let y1 = (((vis.max.y - img_rect.min.y) * fy).ceil().max(0.0) as usize).min(f.full_h);
-                    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
+                    let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+                    let x0 = if flip.0 { f.full_w.saturating_sub(x0 + cw) } else { x0 };
+                    let y0 = if flip.1 { f.full_h.saturating_sub(y0 + ch) } else { y0 };
+                    [x0, y0, cw, ch]
                 })
                 .filter(|v| v[2] >= 2 && v[3] >= 2)
         } else {
@@ -2737,7 +2825,12 @@ fn panes(ui: &mut egui::Ui, st: &mut ReplayState) {
             if st.overlays && f.error.is_none() {
                 let (pw, ph) = (img_rect.width() as f64, img_rect.height() as f64);
                 if let Some(v) = compute_track_vectors(&l.run.trajectory, f.t, pw, ph) {
-                    let p = |q: [f64; 2]| Pos2::new(img_rect.min.x + q[0] as f32, img_rect.min.y + q[1] as f32);
+                    // Vectors are in capture pixel space; mirror onto the flipped pane.
+                    let p = |q: [f64; 2]| {
+                        let x = if flip.0 { pw - q[0] } else { q[0] };
+                        let y = if flip.1 { ph - q[1] } else { q[1] };
+                        Pos2::new(img_rect.min.x + x as f32, img_rect.min.y + y as f32)
+                    };
                     let (a, it) = (p(v.anchor), p(v.intrack));
                     painter.arrow(a, it - a, Stroke::new(1.5, theme::GREEN));
                     painter.line_segment([p(v.cross_p), p(v.cross_n)], Stroke::new(1.5, theme::ACCENT));
@@ -3079,12 +3172,25 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
     let slot = st.active_cam;
     if let Some(l) = st.loaded.as_mut() {
         let mut copy_to_others = false;
+        let mut flip_changed = false;
         {
             let a = &mut l.adjust[slot];
             ui.spacing_mut().slider_width = 150.0;
             ui.add(egui::Slider::new(&mut a.gamma, 0.2..=5.0).text("gamma").fixed_decimals(2));
             ui.add(egui::Slider::new(&mut a.brightness, -128.0..=128.0).text("brightness").fixed_decimals(0));
             ui.add(egui::Slider::new(&mut a.contrast, 0.2..=3.0).text("contrast").fixed_decimals(2));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("flip").font(theme::sans(10.0)).color(theme::DIM));
+                let fl = &mut l.flip[slot];
+                if ui.selectable_label(fl.0, "↔ horizontal").on_hover_text("mirror this camera left-right in the display, MP4 export and stacks (saved with the run)").clicked() {
+                    fl.0 = !fl.0;
+                    flip_changed = true;
+                }
+                if ui.selectable_label(fl.1, "↕ vertical").on_hover_text("mirror this camera top-bottom in the display, MP4 export and stacks (saved with the run)").clicked() {
+                    fl.1 = !fl.1;
+                    flip_changed = true;
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("reset").clicked() {
                     *a = CamAdjust::default();
@@ -3093,6 +3199,17 @@ fn controls_panel(ui: &mut egui::Ui, st: &mut ReplayState, captures_dir: &Path) 
                     copy_to_others = true;
                 }
             });
+        }
+        if flip_changed {
+            l.sidecar.flip = l.flip.clone();
+            let _ = l.sidecar.save(&l.run.sidecar_path());
+            if let Some(lib) = &st.library {
+                let mut v = (**lib).clone();
+                if let Some(r) = v.get_mut(l.lib_index) {
+                    r.sidecar = l.sidecar.clone();
+                }
+                st.library = Some(Arc::new(v));
+            }
         }
         if copy_to_others {
             let v = l.adjust[slot];
@@ -3569,7 +3686,7 @@ mod tests {
         let out_dir = root.join("exports");
         let status = Arc::new(ArcSwap::from_pointee(JobStatus::default()));
         let cancel = AtomicBool::new(false);
-        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 3, stab: StabSettings::default(), out_base: out_dir.join("stack_ctr"), centered: true, center_size: 48 };
+        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 3, stab: StabSettings::default(), out_base: out_dir.join("stack_ctr"), centered: true, center_size: 48, flip: (false, false) };
         let final_path = run_stack(&spec, &status, &cancel).unwrap();
         let img = image::open(&final_path).unwrap();
         assert_eq!((img.width(), img.height()), (48, 48));
@@ -3608,7 +3725,7 @@ mod tests {
         let status = Arc::new(ArcSwap::from_pointee(JobStatus::default()));
         let cancel = AtomicBool::new(false);
         // Stack best 4 of cam 1 over the whole run.
-        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 4, stab: StabSettings::default(), out_base: out_dir.join("stack_test"), centered: false, center_size: 512 };
+        let spec = StackSpec { run: sat.clone(), slot: 0, t_start: sat.t0().unwrap(), t_end: sat.t1().unwrap(), keep_n: 4, stab: StabSettings::default(), out_base: out_dir.join("stack_test"), centered: false, center_size: 512, flip: (false, false) };
         let final_path = run_stack(&spec, &status, &cancel).unwrap();
         assert!(final_path.exists() && out_dir.join("stack_test.png").exists());
         let master = image::open(out_dir.join("stack_test.png")).unwrap();

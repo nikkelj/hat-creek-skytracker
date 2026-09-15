@@ -50,6 +50,13 @@ def fit_polar_axis(samples_azel, toward_az_deg=0.0, toward_alt_deg=45.0):
     pts = np.array([cartesian_from_az_el(az, el) for az, el in samples_azel])
     if len(pts) < MIN_SAMPLES:
         raise ValueError("need at least 3 samples to fit the polar axis")
+    # Rust fast path (Phase 2b): same SVD plane fit, numpy fallback.
+    import rust_pointing_adapter
+    if rust_pointing_adapter.enabled():
+        res = rust_pointing_adapter.fit_polar_axis(
+            samples_azel, toward_az_deg, toward_alt_deg)
+        if res is not None:
+            return res
     centroid = pts.mean(axis=0)
     # Smallest right-singular vector of the centered points = best-fit plane normal.
     _, _, vt = np.linalg.svd(pts - centroid)

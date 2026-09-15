@@ -16,8 +16,8 @@ everything, including an in-flight Park**.
 
 - [ ] `pytest` green locally; CI green on the branch you're about to run.
 - [ ] **If using the Rust loop: rebuild the wheel after every pull** —
-      `maturin build --release -m rust/skytracker_core/Cargo.toml && pip
-      install --force-reinstall rust/skytracker_core/target/wheels/skytracker_core-*.whl`.
+      `maturin build --release -m rust/skytracker-ffi/Cargo.toml && pip
+      install --force-reinstall rust/target/wheels/skytracker_core-*.whl`.
       A stale wheel runs but silently lacks new APIs (a pre-2026-07 wheel has
       no liveness counter; the adapter now detects this and tells you to
       rebuild instead of misreading it as a stalled loop).

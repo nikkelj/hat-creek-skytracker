@@ -7,7 +7,7 @@ norecursedirs = [
 ]
 addopts = "-ra"
 markers = [
-    "rust: needs the skytracker_core wheel (maturin build rust/skytracker_core)",
+    "rust: needs the skytracker_core wheel (maturin build rust/skytracker-ffi)",
     "ephemeris: needs de421.bsp in the repo root (auto-copied from the skyfield-data package when installed)",
     "starcatalog: needs the Hipparcos catalogue hip_main.dat (CDS I/239) in the repo root",
 ]

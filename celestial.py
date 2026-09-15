@@ -34,6 +34,9 @@ from skyfield.api import Star, load, wgs84
 
 from trajectory import _unwrap_az_diff, live_tt
 
+# Rust astro engine bridge (returns None on failure -> skyfield fallback).
+import rust_astro_adapter
+
 OPENNGC_PATH = "catalogs/openngc.csv"
 
 # Sliding tracking-trajectory window: rebuild when live time is within
@@ -234,6 +237,18 @@ class CelestialCatalog:
     def solar_system_altaz(self, lat_deg, lon_deg, elev_m, ts, t_tt):
         """[(key, name, az, el, dist_km, color, radius_px)] for all bodies.
         Full Skyfield apparent topocentric positions (11 observes, ~ms)."""
+        if rust_astro_adapter.enabled():
+            out = []
+            for key, (name, _body, color, rad) in self._bodies.items():
+                r = rust_astro_adapter.body_altaz_dist(key, t_tt, lat_deg, lon_deg, elev_m)
+                if r is None:
+                    out = None
+                    break
+                alt_deg, az_deg, dist_km = r
+                out.append((key, name, az_deg, alt_deg, dist_km, color, rad))
+            if out is not None:
+                return out
+
         observer = self._observer(lat_deg, lon_deg, elev_m).at(ts.tt_jd(t_tt))
         out = []
         for key, (name, body, color, rad) in self._bodies.items():
@@ -331,6 +346,20 @@ class CelestialCatalog:
         n = max(3, int(round(duration_min * 60.0 / step_sec)) + 1)
         offsets = np.linspace(-half, half, n)
         times = ts.tt_jd(center_tt + offsets / 86400.0)
+
+        # Rust fast path: same 8-column contract, same rate scheme.
+        if rust_astro_adapter.enabled():
+            times_tt = np.asarray(times.tt)
+            if key in self._bodies:
+                rows = rust_astro_adapter.body_rows(
+                    key, times_tt, lat_deg, lon_deg, elev_m)
+            else:
+                radec = self._fixed_radec(key)
+                rows = None if radec is None else rust_astro_adapter.fixed_rows(
+                    radec[0], radec[1], times_tt, lat_deg, lon_deg, elev_m)
+            if rows is not None and rows.shape[0] == n:
+                return rows.tolist(), rows[:, 0].copy()
+
         observer = self._observer(lat_deg, lon_deg, elev_m)
         alt, az, dist = observer.at(times).observe(target).apparent().altaz()
 

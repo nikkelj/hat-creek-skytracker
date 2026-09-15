@@ -1,0 +1,20 @@
+[package]
+name = "skytracker-platesolve"
+description = "Pure-Rust port of the ESA tetra3 lost-in-space plate solver (Phase 2 of the Rust port): reads the existing tetra3 .npz pattern databases bit-compatibly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_platesolve"
+crate-type = ["rlib"]
+
+[dependencies]
+# .npz databases are zip archives of .npy members (stored, not deflated,
+# for np.savez — but tetra3 uses savez_compressed, so enable deflate).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 3x3 SVD for the Kabsch rotation solve.
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+npyz = { version = "0.8", features = ["npz"] }

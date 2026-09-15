@@ -1,0 +1,33 @@
+{
+  "loop": "rust (RustCoreLoopAdapter, use_rust_core_loop flag-on config)",
+  "metrics": {
+    "FAST target": {
+      "latency": 1.08,
+      "losses": 0.0,
+      "rejects": 0.0,
+      "rms": 456.9
+    },
+    "HANDOFF latency": {
+      "false_reject_episodes": 0.0,
+      "latency_s": 1.04
+    },
+    "HOTSPOT hold": {
+      "bias": 132.4,
+      "jitter(std)": 37.9,
+      "p95": 198.0,
+      "rms": 137.7
+    },
+    "PROGRAM": {
+      "bias": 65.4,
+      "jitter(std)": 32.4,
+      "p95": 126.7,
+      "peak": 163.5,
+      "rms": 73.0
+    }
+  },
+  "source": "test_tracking_quality.py full-wiring suite",
+  "units": {
+    "angles": "arcsec",
+    "times": "s"
+  }
+}

@@ -7,7 +7,7 @@ if a change makes the Rust core slower than the Python it replaces.
 
 For the actual numbers, run bench_rust_vs_python.py instead.
 
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_perf.py
 """
 

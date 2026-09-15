@@ -1,0 +1,24 @@
+[package]
+name = "skytracker-core"
+description = "Pure-Rust engine core for the Hat Creek Skytracker (control loop, PID, hotspot, transforms, NexStar protocol, sim mount)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# Underscore lib name so downstream code reads `use skytracker_core::...`,
+# matching the historical crate name. Pure rlib: the Python extension module
+# is built by the sibling `skytracker-ffi` crate.
+name = "skytracker_core"
+crate-type = ["rlib"]
+
+[dependencies]
+# ndarray backs the pure-Rust hotspot core.
+ndarray = { workspace = true }
+# serialport backs the real-hardware Transport; optional so `cargo test`
+# needs no system deps (libudev) unless the serial feature is requested.
+serialport = { workspace = true, optional = true }
+
+[features]
+default = []
+serial = ["dep:serialport"]

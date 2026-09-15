@@ -7,7 +7,7 @@
             "command": "C:\\Users\\nikke\\anaconda3\\envs\\track\\Scripts\\maturin.exe",
             "args": ["develop", "--release"],
             "options": {
-                "cwd": "${workspaceFolder}/rust/skytracker_core",
+                "cwd": "${workspaceFolder}/rust/skytracker-ffi",
                 "env": {
                     // maturin needs the conda env "active" to find the target
                     // interpreter; CARGO_TARGET_DIR must stay outside OneDrive
@@ -23,12 +23,12 @@
             "problemMatcher": ["$rustc"]
         },
         {
-            "label": "Rust: cargo test (skytracker_core)",
+            "label": "Rust: cargo test (workspace)",
             "type": "shell",
             "command": "cargo",
-            "args": ["test"],
+            "args": ["test", "--workspace"],
             "options": {
-                "cwd": "${workspaceFolder}/rust/skytracker_core",
+                "cwd": "${workspaceFolder}/rust",
                 "env": {
                     "CARGO_TARGET_DIR": "C:\\Users\\nikke\\rust-build"
                 }

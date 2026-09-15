@@ -31,6 +31,7 @@ satellite/star convention used everywhere else.
 """
 
 import math
+import os
 import socket
 import threading
 import time
@@ -371,6 +372,25 @@ class AdsbTracker:
 # MESSAGE DECODE (pyModeS)
 # ==============================================================================
 
+_RUST_ADSB_FLAG = False
+
+
+def configure_rust_adsb(config_state):
+    """Latch the config flag (called at startup from main.py)."""
+    global _RUST_ADSB_FLAG
+    _RUST_ADSB_FLAG = bool(getattr(config_state, "use_rust_adsb", False))
+
+
+def rust_adsb_enabled():
+    env = os.environ.get("SKYTRACKER_RUST_ADSB")
+    if env == "1":
+        return True
+    if env == "0":
+        return False
+    return _RUST_ADSB_FLAG
+
+
+
 def decode_adsb_message(msg, ref_lat, ref_lon):
     """Decode one raw Mode-S hex message into an update dict, or None if it is not
     a usable ADS-B (DF17/18) extended-squitter. Uses pyModeS' single-message
@@ -378,10 +398,20 @@ def decode_adsb_message(msg, ref_lat, ref_lon):
     a ground receiver), so no even/odd CPR frame pairing is needed.
 
     Returns dicts like {'icao', 'kind': 'position'|'velocity'|'ident', ...}."""
-    import pyModeS as pms
-
     if msg is None or len(msg) != 28:
         return None
+
+    # Rust fast path (Phase 5 of the Rust port): same decode, pyModeS
+    # fallback. Enabled by env SKYTRACKER_RUST_ADSB=1 or config
+    # use_rust_adsb (latched via rust_adsb_enabled below).
+    if rust_adsb_enabled():
+        try:
+            import skytracker_core as _sc
+            return _sc.adsb_decode_message(msg, ref_lat, ref_lon)
+        except Exception:
+            pass  # fall through to pyModeS
+
+    import pyModeS as pms
     try:
         df = pms.df(msg)
         if df not in (17, 18):

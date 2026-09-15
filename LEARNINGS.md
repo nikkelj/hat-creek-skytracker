@@ -6,6 +6,238 @@ Newest entries first.
 
 ---
 
+## 2026-08-29 — First hardware session: every "rig-ready, untested" seam had a bug
+
+Phase 8 bring-up on the rig found five, all invisible in sim:
+
+1. **Serial silent (mount ignores every command).** pyserial asserts DTR and
+   RTS on open — `dsrdtr=False`/`rtscts=False` only disable flow *control*,
+   not the line states. Rust `serialport` leaves both low on Windows and the
+   mount's adapter never listened. Fix: `write_data_terminal_ready(true)` +
+   `write_request_to_send(true)` after open (`skytracker-core/src/serial.rs`).
+   `SKYTRACKER_SERIAL_TRACE=<file>` now hex-dumps the wire for next time.
+2. **LOOP DEAD after using the CONNECTION panel.** `CoreLoop::stop()` latches
+   a stop flag on the *shared* state; the replacement loop spawns on the same
+   Shared, and the old handle — dropped *after* the new spawn (`core = c2`
+   drops the old value last) — re-latched stop in its Drop and killed the new
+   thread before its first cycle. Fix: spawn clears stop/loop_dead; Drop only
+   latches when it still owns a live thread.
+3. **Guide feed duplicated into the main view.** The ZWO enumeration calls
+   (`ASIGetNumOfConnectedCameras`/`ASIGetCameraProperty`) are not thread-safe;
+   parallel slot workers were handed the same camera. Opening an already-open
+   camera "succeeds", so both pumps pulled guide frames. Fix: global
+   `OPEN_LOCK` across enumerate→open→configure.
+4. **Camera disconnect hung then crashed.** Teardown closed the camera from
+   the command thread while the pump thread sat inside a blocking
+   `ASIGetVideoData` — and the pump's own stop path closed it a second time.
+   Fix: the pump thread is the sole owner of stop/close; teardown signals,
+   nudges with `stop_video`, and joins.
+5. **ASI struct layout: C `long` is 4 bytes on Windows** (8 on Linux).
+   `ASI_CAMERA_INFO.MaxHeight/MaxWidth` declared `i64` shifted every following
+   field — max_width read as 2^32, open failed, silent sim fallback. Same fix
+   in `ASISetControlValue`/`ASIGetVideoData` signatures (`c_long`).
+
+Plus one port shortcut that bit: the Rust `mount3d` `eq_params` mirrored the
+Python "with alignment az/el = 0" — with `alignment_azimuth` 274.8° the
+rendered tube pointed ~85° from the true boresight (moon on the mount,
+"Pluto" in the view). The pose chain now takes alignment az/el + side flip
+like `mount3d._eq_params`.
+
+Lesson: sim parity proves the math, not the boundary. Every FFI struct,
+serial line state, and SDK threading assumption is only true once a real
+device has said so.
+
+---
+
+## 2026-08-23 — "HOTSPOT loses lock ~10 s after handoff" was the capture dump, not the tracker
+
+In the sim autotest the optical loop locked at t≈5 s and reliably went
+`coasting → lost → PROGRAM` around t≈12 s. Everything pointed at tracker
+tuning (gate, star filter, feed-forward) — and one real fix did come out of
+that (the worker was clearing the trajectory setpoint in HOTSPOT). But the
+1 Hz log also showed the camera at **36 fps** on the loss line: the autotest
+saves its capture at t=11 s and `CaptureRecorder::disarm_and_dump` (≈200 BMP
+writes + renames) ran *inside the camera worker*, so the HOTSPOT frame feed
+starved for ~1 s — exactly the coast time — and the loop gave up. Moved the
+dump onto its own thread (the recorder is an Arc); lock now holds straight
+through the save with encoder noise + backlash injected, error 0.003–0.02°.
+Lesson: when a control loop drops out at a repeatable time, look for what
+else the test does at that time before touching gains.
+
+---
+
+## 2026-08-23 — "Sluggish replay" was OneDrive Files-On-Demand, not the decoder
+
+Replaying the YAOGAN-11 run in the native app: the playhead raced along,
+the frames barely changed. A headless benchmark (`SKYTRACKER_REPLAY_TEST`)
+showed the decode worker blocked for **24.9 s on one frame** and the
+background proxy cache filling at ~2 s/frame. `Get-Item` on the frames:
+attributes `4199968` = `RecallOnDataAccess | Offline | ReparsePoint` —
+the run synced from the MSI machine as **online-only placeholders**; the
+first `ReadAllBytes` of one 18 MB BMP took 12.4 s (cloud download), the
+re-read 15 ms. A 625-frame run is ~11 GB of first-touch downloads. On a
+local run (196 frames) the same code displays ~43 fps at 1x with the
+worker within 5 frames of the playhead.
+
+Fixes that are the app's business: a whole-run reduced-resolution proxy
+cache built in the background (rayon; ≤ 1024 px wide, ≤ 160 MB per
+camera) so playback never waits on a 6 MP BMP decode; playback rides the
+proxies while playing and re-requests full resolution on pause; the
+playhead **holds ("buffering")** while the decoders are behind instead of
+skipping; the transport shows "downloading from OneDrive n/m" when the
+frames carry the placeholder attributes, with the remedy (right-click the
+folder → Always keep on this device). Lesson: when a pipeline that is
+fast on local files crawls on a synced folder, check the file attributes
+before the profiler.
+
+---
+
+## 2026-08-22 — HOTSPOT geometry was alt-az only; AltAz-Side needs the axis rotation
+
+Running the native app's headless closed-loop check (`SKYTRACKER_AUTOTEST`)
+on the configured **AltAz-Side** mount: HANDOFF promoted to HOTSPOT, locked
+for one frame, then coasted out and fell back to PROGRAM. Root cause was
+not the detector — it was five `if mount_mode == AltAz { 90 - alt } else
+{ alt }` shortcuts in the core controller (boresight sky position, `el_sky`
+for the cos(el) azimuth compression, the elevation-error sign, the
+HOTSPOT feed-forward sign, the gate prediction). They are exact for AltAz
+and *meaningless* for AltAz-Side / Eq, whose axes are pole-referenced: the
+optical correction measured on the sky (cross-el, el) has to be rotated
+into (axis-1, axis-2) — and near the pole the old code scaled the azimuth
+term by 1/cos(ALT) with ALT ≈ 100°, i.e. flipped its sign.
+
+Fix: two tiny helpers, `sky_delta_to_axis` = `sky_to_mount(boresight + d)
+- (azm, alt)` and its inverse, used everywhere the controller crosses the
+sky/axis boundary (errors, feed-forward in both HOTSPOT and PROGRAM, gate
+prediction, star-filter boresight). For AltAz they reduce to the historical
+`(d_az, -d_el)` exactly, so the Python A/B loop parity suite (30 tests) is
+unchanged; for AltAz-Side the sim now locks and holds for the whole run.
+Lesson: anything that says "ALT" when it means "sky elevation" is a latent
+bug on every mount geometry except the one it was written on — push the
+frame conversion through the one transform that already knows the mode.
+
+Second trap from the same session: `transformations.py`'s `AzAlt2AzEl_AltAz`
+(forward) drops `alignment_elevation` while its inverse keeps it, so the
+pair is not a round trip when the alignment elevation is non-zero (-0.6° in
+config). The native app's `mount_to_sky` is the exact inverse of
+`sky_to_mount` (unit-tested round-trip in all four modes); the Python
+forward form is kept only where parity with the Python display matters.
+
+Third: a hot-spot tracker keys on the *brightest* compact object. A sim
+that renders catalogue stars brighter than the target teaches you nothing
+about the tracker — the star filter correctly rejects them all and HANDOFF
+never promotes. The Rust sim caps star peaks at 55% of the target; the
+real-world equivalent is "track bright passes or gate the search".
+
+---
+
+## 2026-08-17 — Unflagged H.264 is decoded as limited-range YUV
+
+The Rust MP4 exporter (Phase 3c) hit a hard ~24 dB round-trip PSNR
+ceiling that no bitrate or rate-control setting moved — because the
+problem wasn't compression at all: the RGB→YUV conversion used
+full-range BT.601, but decoders assume **limited range (Y 16–235)** for
+unflagged H.264 streams, producing a systematic contrast error. The
+tell: PSNR identical to three decimals across wildly different encoder
+settings (a systematic error is bitrate-independent). Studio-swing
+conversion fixed it instantly: 37.2 dB, beating the cv2 mp4v writer it
+replaces (35.1 dB) on the same frames.
+
+Also: openh264's bitrate controller holds its startup QP for a whole
+GOP, so short clips see no effect from the bitrate target at all —
+another way "changing the knob does nothing" pointed at the real bug.
+
+---
+
+## 2026-08-17 — cv2.phaseCorrelate mutates its input arrays
+
+Discovered porting the imaging primitives (Rust port Phase 3a): OpenCV
+4.8's `cv2.phaseCorrelate(a, b, window)` **multiplies the window into the
+caller's arrays in place** when they arrive as contiguous float numpy
+buffers. In tools/record_golden.py this silently corrupted `base` a
+little more on each loop iteration, producing a golden file whose
+`shifted` images came from progressively-windowed bases — caught only
+because the Rust warp port refused to match at 100 intensity units. The
+filters *did* match, because they were computed after the corruption and
+stored alongside the corrupted base: an internally-inconsistent golden
+that partially validates. Fix: pass `.copy()`s.
+
+stacking.py survived by accident: its phase-correlate windows are
+non-contiguous slices, which the numpy bridge copies before OpenCV sees
+them — but a full-width window would be contiguous and corrupt the live
+frame. Defensive copies added there too.
+
+Bonus findings from the same port: cv2.warpAffine quantizes source
+coordinates to 1/32 px (INTER_TAB_SIZE) even for float images — a 0.3 px
+shift silently becomes 0.3125; and at exact half-pixel shifts,
+phaseCorrelate's weighted-centroid estimate carries a ±0.32 px bias whose
+sign depends on which of the two tied peak rows float dust selects.
+
+---
+
+## 2026-08-15 — Adapter fallbacks make A/B parity tests lie
+
+The Rust-astro adapter returns None on any failure so callers fall back
+to skyfield — safe for the app, treacherous for tests: the celestial A/B
+parity test initially "passed" at 0.00″ because the engine couldn't
+resolve celestial.py's `planet:Jupiter` selection keys, the adapter fell
+back, and the test compared **skyfield to skyfield**. The tell was a
+missing per-key print, not a failure.
+
+Rule now baked into test_rust_astro_parity.py: before any A/B assert,
+prove the fast path actually engages (probe the adapter directly and
+assert non-None). Any strangler-pattern port with graceful fallback needs
+this guard, or green parity means nothing.
+
+---
+
+## 2026-08-15 — Satellite parity: two conventions that cost 20″ each
+
+Porting the skyfield satellite pipeline to `skytracker-astro` (Rust port
+Phase 1) hit two silent convention mismatches, each worth ~20 arcsec —
+found only because the golden gate is 20″:
+
+* **The Rust `sgp4` crate's `Constants::from_elements` uses WGS84 gravity;
+  python-sgp4/skyfield use WGS72.** Positions diverge ~0.5 km over a
+  two-week propagation. Use `from_elements_afspc_compatibility_mode`
+  (that's the WGS72 path) for parity.
+* **Skyfield runs SGP4 on the UTC timescale, not UT1** (`sgp4lib._at`:
+  "we assume the TLE epoch to be a UTC date"), while the TEME→PEF
+  rotation uses UT1 and GAST uses TT. Feeding UT1 minutes into SGP4 costs
+  ~0.2 s of along-track motion (≈1.5 km for the ISS).
+
+Also worth keeping: the full skyfield satellite alt/az chain
+(TEME→GCRS→observer-relative→ENU) **algebraically collapses** to
+`ENU(rot_z(−θ_GMST1982(UT1))·r_TEME(UTC) − r_obs_ECEF)` because the
+precession-nutation matrix and GAST cancel in the observer-relative
+projection — verified to 0.03″ against golden vectors. And the IAU2000A
+nutation/EE tables were code-generated verbatim from skyfield's own
+bundled arrays (tools/gen_astro_tables.py) rather than typed from papers.
+
+---
+
+## 2026-08-15 — PyO3 #[pymodule] shadows an extern crate of the same name
+
+Splitting the bindings out of `skytracker_core` into the new
+`skytracker-ffi` workspace crate (Rust-port Phase 0) hit a wall of
+`E0659: skytracker_core is ambiguous` plus bogus "no `hotspot` in ..."
+errors. Cause: `#[pymodule] fn skytracker_core(...)` expands to a *module*
+named `skytracker_core` inside the bindings file, which shadows the extern
+engine crate of the same name — every `skytracker_core::` path then resolves
+into the macro-generated module. Fix: name the function something else and
+pin the Python-visible name via the attribute:
+`#[pymodule(name = "skytracker_core")] fn ffi_module(...)`. The wheel import
+name is unchanged, so `rust_loop_adapter.py` and all parity tests run as-is.
+
+Two adjacent gotchas from the same split: `tle_cache.tle` has `\r\r\n` line
+endings, so Python's universal newlines yields an empty line after every
+real one (filter blanks before pairing TLE lines); and a bare
+`cargo build -p skytracker-ffi --features extension-module` fails in
+`pyo3-build-config` unless `PYO3_PYTHON` points at the conda `track`
+interpreter (conda isn't on PATH; maturin sets this up itself).
+
+---
+
 ## 2026-07-27 — Perf scrub: the "memory leak" was the camera ring; the FPS was the GIL
 
 Field report: ~4 FPS on cam1, ~9 on cam2, and memory growing until the app

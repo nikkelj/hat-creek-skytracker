@@ -1,14 +1,30 @@
-# Rust core (experiment)
+# Rust workspace (full-port program)
 
-Exploration of a **Rust-core / Python-shell** split for the skytracker. The goal
-is to move the real-time, hardware-touching parts (mount serial protocol, the
-fixed-rate control loop, PID, hotspot detection) into a Rust extension module
-while keeping skyfield trajectories, the pygame UI, and capture-to-disk in
-Python. See branch `rust-core-experiment`.
+This directory is a **Cargo workspace** and the home of the full Rust port
+(branch `rust-port`). The original Rust-core / Python-shell experiment
+(branch `rust-core-experiment`) proved the pattern; the port now proceeds
+in phases — engines first, egui UI last, Python retired at the end. The
+master plan lives with the phase gates in the repo plan file and
+`doc/BENCH_CHECKLIST.md`; golden validation vectors live in
+`../tests/golden/` (recorded by `../tools/record_golden.py`).
 
-## Status — Step 1: Mount protocol port
+Crates:
 
-`skytracker_core/` ports the **used subset** of `lib/auxstar.py` (the NexStar 'P'
+| Crate | Role |
+|-------|------|
+| `skytracker-core` | Pure-Rust engine: protocol, sim, PID, hotspot, transforms, controller, core loop (no pyo3) |
+| `skytracker-astro` | Phase 1 astro engine replacing skyfield: timescales/GAST (IAU2000A tables generated from skyfield), SGP4 passes, pure-Rust SPK reader for de421.bsp, body/star apparent places, TLE catalog, pass prediction (`passes.rs`: AOS/TCA/LOS, peak rate, est. magnitude + cylindrical shadow, apogee — 0.00 s / 0.012 s / 0.0003 mag vs skyfield). Parity: sats 0.03″, GAST 1.9 ms, bodies 0.79″, stars 0.17″; bulk precompute 76× |
+| `skytracker-ffi` | The ONLY pyo3 crate; builds the Python module `skytracker_core` (strangler seam, deleted at the end). Exposes the core-loop classes + `AstroEngine` |
+| `skytracker-platesolve` | Phase 2 tetra3 port: pattern hash bit-exact vs the existing .npz databases, centroids 0.0 px, solutions numerically identical to Python tetra3 (12/12 A/B fields) |
+| `skytracker-pointing` | Phase 2b TPOINT fits (alt-az + equatorial incl. partial/robust modes, polar-axis fit): coefficients at machine precision vs numpy (4e-16 deg); `alignment.rs` = the alignment runner (Fibonacci grid + holdout, spiral grid search, running fit/early stop, backtest, supervised) as a pure state machine, 23 tests incl. Python-golden grid parity |
+| `skytracker-imaging` | Phase 3a imaging primitives (filters/warps/phase-correlate/Shi-Tomasi/LK/RANSAC) at cv2 parity: filters ≤9e-5, LK 0.006 px, RANSAC identical. Phase 3b composes them into the stacking/stabilizer/sharpen pipelines |
+| `skytracker-adsb` | Phase 5 Mode-S DF17/18 decode (pyModeS subset, 242-frame corpus decodes identically) + WGS84 topocentric geometry |
+| `skytracker-camera` | Phase 4a capture pipeline: pump/ring/exposure-midpoint stamps/armed BMP dump + ASI DLL binding (libloading, rig-ready). Sim-proven 100 FPS sustained, 2,244 FPS headroom vs Python's GIL-bound 4-10 |
+| `skytracker-app` | Phase 7 native app (eframe/egui on wgpu, 120 Hz repaint target): ArcSwap snapshot bus + command channels; workers sky (astro engine, passes, arcs) / mount (core loop over sim or serial, gamepad, autotune) / camera (Tycho star-field sim or ASI, in-process HANDOFF/HOTSPOT frame feed, capture) / align (tetra3 plate solve + alignment runner). Screens: Track, Passes, Align, Replay, Mount 3D, Sim, Config. `cargo run --release -p skytracker-app` (finds the repo root from cwd, SKYTRACKER_ROOT, or the build checkout); `SKYTRACKER_AUTOTEST=<s>` headless closed-loop check, `SKYTRACKER_SCREENSHOT_DIR=<dir>` screenshot tour |
+
+## Ported so far
+
+`skytracker-core/` ports the **used subset** of `lib/auxstar.py` (the NexStar 'P'
 pass-through path) to Rust, plus a **byte-level** simulated mount the existing
 Python `SimMount` lacks (it duck-types at the method level and never speaks
 bytes). This lets a full `encode -> transact -> parse` round-trip run with no
@@ -16,15 +32,15 @@ hardware.
 
 | Piece | File |
 |-------|------|
-| Protocol encoding (byte-faithful port) | `skytracker_core/src/protocol.rs` |
-| `Mount<Transport>` + byte-level `SimResponder` + loopback | `skytracker_core/src/sim.rs` |
-| `PidController` (port of `control.py`) | `skytracker_core/src/pid.rs` |
-| Hotspot detect + geometry (port of `hotspot.py`) | `skytracker_core/src/hotspot.rs` |
-| Coordinate transforms (port of `transformations.py`) | `skytracker_core/src/transforms.rs` |
-| Control-loop decision logic (pure) | `skytracker_core/src/controller.rs` |
-| Threaded fixed-rate loop (port of `mount_control.py`) | `skytracker_core/src/core_loop.rs` |
-| PyO3 bindings (`extension-module` feature) | `skytracker_core/src/python_bindings.rs` |
-| Rust unit + integration tests | `skytracker_core/tests/*.rs` |
+| Protocol encoding (byte-faithful port) | `skytracker-core/src/protocol.rs` |
+| `Mount<Transport>` + byte-level `SimResponder` + loopback | `skytracker-core/src/sim.rs` |
+| `PidController` (port of `control.py`) | `skytracker-core/src/pid.rs` |
+| Hotspot detect + geometry (port of `hotspot.py`) | `skytracker-core/src/hotspot.rs` |
+| Coordinate transforms (port of `transformations.py`) | `skytracker-core/src/transforms.rs` |
+| Control-loop decision logic (pure) | `skytracker-core/src/controller.rs` |
+| Threaded fixed-rate loop (port of `mount_control.py`) | `skytracker-core/src/core_loop.rs` |
+| PyO3 bindings (`extension-module` feature) | `skytracker-ffi/src/bindings.rs` |
+| Rust unit + integration tests | `skytracker-core/tests/*.rs` |
 | Cross-language parity tests | `../test_rust_*.py` |
 
 ## Build & test
@@ -34,11 +50,13 @@ Prerequisites: Rust (MSVC toolchain) + `maturin` in the `track` conda env.
 ```sh
 # Pure-Rust tests (no Python needed): protocol, pid, hotspot, transforms,
 # controller, and closed-loop integration against the byte-level sim.
-cd rust/skytracker_core
-cargo test
+cd rust
+cargo test --workspace
 
-# Build the extension into the active env, then run cross-language parity +
+# Build the extension (skytracker-ffi crate; Python module name stays
+# `skytracker_core`) into the active env, then run cross-language parity +
 # the Python-driven control loop.
+cd skytracker-ffi
 maturin develop --release
 cd ../..
 python test_rust_mount_parity.py

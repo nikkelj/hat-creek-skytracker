@@ -7,7 +7,7 @@ the real `lib.auxstar.NexstarHandController` writes to the wire, and that the
 Rust byte-level SimMount closes a tracking loop (slew -> position advances).
 
 Build the extension first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_mount_parity.py
 
 Skips cleanly (does not fail) if skytracker_core isn't built yet, so the rest of

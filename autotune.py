@@ -328,3 +328,105 @@ class PIDAutoTuner:
         if self.phase == 'measure':
             left = f" {max(0.0, EVAL_SEC - (time.time() - self._phase_t0)):.0f}s"
         return f"autotune S{self.sweep + 1} {what}{left} | {self.summary()}"
+
+
+# ---------------------------------------------------------------------------
+# Rust-port seam (Phase 6b): the same tuner in skytracker-core, behind the
+# PIDAutoTuner interface joystick_controller / joystick_panels consume.
+# ---------------------------------------------------------------------------
+
+_RUST_AUTOTUNE_FLAG = False
+
+
+def configure_rust_autotune(config_state):
+    """Latch the config flag (called at startup from main.py)."""
+    global _RUST_AUTOTUNE_FLAG
+    _RUST_AUTOTUNE_FLAG = bool(getattr(config_state, "use_rust_autotune", False))
+
+
+def rust_autotune_enabled():
+    import os
+    env = os.environ.get("SKYTRACKER_RUST_AUTOTUNE")
+    if env == "1":
+        return True
+    if env == "0":
+        return False
+    return _RUST_AUTOTUNE_FLAG
+
+
+class RustPIDAutoTuner:
+    """PIDAutoTuner-compatible wrapper over skytracker_core.RustPIDAutoTuner.
+
+    The Rust tuner owns gain decisions; after every call the applied gains
+    are mirrored into config_state (the live fields both control loops read),
+    exactly where the Python tuner wrote them."""
+
+    _FIELDS = {'azm': ('pid_azm_p_gain', 'pid_azm_d_gain', 'pid_azm_i_gain'),
+               'alt': ('pid_alt_p_gain', 'pid_alt_d_gain', 'pid_alt_i_gain')}
+
+    def __init__(self, config_state, mode=None):
+        import skytracker_core as sc
+        self.cfg = config_state
+        self.armed_mode = mode
+        self.target_label = None
+        self._label_stamped = False
+        initial = {ax: tuple(float(getattr(config_state, f, 0.0) or 0.0) for f in fields)
+                   for ax, fields in self._FIELDS.items()}
+        self._rs = sc.RustPIDAutoTuner(initial['azm'], initial['alt'])
+        self._messages = []
+
+    # -- gains sync ---------------------------------------------------------
+    def _sync(self):
+        azm, alt = self._rs.applied_gains()
+        for ax, vals in (('azm', azm), ('alt', alt)):
+            for f, v in zip(self._FIELDS[ax], vals):
+                setattr(self.cfg, f, v)
+        for m in self._rs.take_messages():
+            print(f"AUTOTUNE: {m}")
+            self._messages.append(m)
+
+    # -- PIDAutoTuner surface --------------------------------------------------
+    @property
+    def active(self):
+        return self._rs.active
+
+    @property
+    def phase(self):
+        return self._rs.phase
+
+    @property
+    def sweep(self):
+        return self._rs.sweep
+
+    def start(self, now=None):
+        self._rs.start(time.time() if now is None else now)
+        self._sync()
+
+    def stop(self, revert=False):
+        self._rs.stop(revert)
+        self._sync()
+
+    def update(self, now, tracking_active, azm_error_deg, alt_error_deg):
+        self._rs.update(float(now), bool(tracking_active),
+                        float(azm_error_deg), float(alt_error_deg))
+        self._sync()
+
+    def take_messages(self):
+        msgs, self._messages = self._messages, []
+        return msgs
+
+    def summary(self):
+        return self._rs.summary()
+
+    def status_text(self):
+        return self._rs.status_text(time.time())
+
+
+def make_autotuner(config_state, mode=None):
+    """PIDAutoTuner (Python) or RustPIDAutoTuner per the Rust-port flag."""
+    if rust_autotune_enabled():
+        try:
+            return RustPIDAutoTuner(config_state, mode=mode)
+        except Exception as e:
+            print(f"Rust auto-tuner unavailable ({e}); using Python tuner.")
+    return PIDAutoTuner(config_state, mode=mode)

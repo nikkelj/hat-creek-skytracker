@@ -4,7 +4,7 @@ Cross-language parity for the Rust transforms port (skytracker_core) against
 transformations.py, including the scipy-backed AzAlt2AzEl path.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_transforms_parity.py
 """
 

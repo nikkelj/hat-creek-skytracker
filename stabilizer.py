@@ -149,10 +149,22 @@ class Stabilizer:
         if self.method == "orb":
             self._ref_kp, self._ref_des = self._orb.detectAndCompute(gray, mask)
         else:  # flow
-            self._ref_pts = cv2.goodFeaturesToTrack(
-                gray, maxCorners=self.max_features, qualityLevel=0.01,
-                minDistance=8, mask=mask,
-            )
+            # Rust fast path (Phase 3b): same detector parameters; cv2
+            # keeps the ROI-masked path (mask unsupported in Rust).
+            pts = None
+            if mask is None:
+                import rust_imaging_adapter
+                if rust_imaging_adapter.enabled():
+                    got = rust_imaging_adapter.detect_flow_reference(
+                        gray.astype(np.float32), self.max_features)
+                    if got is not None and len(got):
+                        pts = got.reshape(-1, 1, 2).astype(np.float32)
+            if pts is None:
+                pts = cv2.goodFeaturesToTrack(
+                    gray, maxCorners=self.max_features, qualityLevel=0.01,
+                    minDistance=8, mask=mask,
+                )
+            self._ref_pts = pts
 
     @property
     def has_reference(self):
@@ -197,6 +209,21 @@ class Stabilizer:
     def _estimate_flow(self, gray):
         if self._ref_pts is None or len(self._ref_pts) < 3:
             return None, 0
+        # Rust fast path (Phase 3b): LK + RANSAC + plausibility bounds in
+        # one call (similarity model, no ROI); cv2 fallback otherwise.
+        if not self.full_affine and self.roi is None:
+            import rust_imaging_adapter
+            if rust_imaging_adapter.enabled():
+                res = rust_imaging_adapter.estimate_flow(
+                    self._ref_gray.astype(np.float32), self._ref_pts,
+                    gray.astype(np.float32), self.min_inliers,
+                    self.min_inlier_ratio, self.scale_tol,
+                    self.max_rotation_deg, self.max_translation_frac)
+                if res is not None:
+                    M, n, reason = res
+                    if reason:
+                        self.last_reject_reason = reason
+                    return M, n
         # Track reference points forward into the new frame.
         nxt, status, _ = cv2.calcOpticalFlowPyrLK(
             self._ref_gray, gray, self._ref_pts, None,

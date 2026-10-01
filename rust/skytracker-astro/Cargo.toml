@@ -1,0 +1,29 @@
+[package]
+name = "skytracker-astro"
+description = "Astro engine for the Hat Creek Skytracker: timescales/GAST, SGP4 passes, DE421 ephemeris, star apparent places (Phase 1 of the Rust port; replaces skyfield)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "skytracker_astro"
+crate-type = ["rlib"]
+
+[dependencies]
+# SGP4 propagation (Vallado test-vector validated) — replaces sgp4.api.SatrecArray.
+sgp4 = "2"
+# Parallel bulk trajectory precompute.
+rayon = "1"
+# TLE download (Celestrak gp.php) -- port of satellite_data.download_tle_data.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+# NOTE: timescales are implemented in src/time.rs as a direct port of the
+# skyfield formulas (leap table + sampled delta-T + ERA/GMST/GAST) rather
+# than via hifitime — golden-vector parity requires skyfield's exact
+# conventions. The JPL SPK reader (anise) arrives with the ephemeris module.
+
+[dev-dependencies]
+# Golden-vector tests read ../../tests/golden/*.npz recorded from skyfield.
+npyz = { version = "0.8", features = ["npz"] }
+
+[features]
+default = []

@@ -16,7 +16,7 @@ algorithm. Small float32-vs-f64 reduction differences are absorbed by tolerance;
 n_pixels is allowed to differ by at most 1 borderline pixel.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_hotspot_parity.py
 """
 

@@ -1087,8 +1087,18 @@ class Mp4Exporter:
         processor = FrameProcessor()
         stab = Stabilizer(method=self.stab_method) if self.stabilize else None
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(self.out_path, fourcc, fps, (out_w, out_h))
+        # Rust fast path (Phase 3c): H.264 via openh264 + pure-Rust muxing
+        # (better codec than cv2's mp4v); cv2.VideoWriter fallback. I420
+        # needs even dimensions -- odd sizes use the fallback.
+        writer = None
+        if out_w % 2 == 0 and out_h % 2 == 0:
+            import rust_imaging_adapter
+            if rust_imaging_adapter.enabled():
+                writer = rust_imaging_adapter.make_video_writer(
+                    self.out_path, out_w, out_h, fps)
+        if writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(self.out_path, fourcc, fps, (out_w, out_h))
         if not writer.isOpened():
             raise RuntimeError(f"Could not open VideoWriter for {self.out_path}")
 

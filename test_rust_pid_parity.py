@@ -9,7 +9,7 @@ step. This is the strong check: identical dynamics over hundreds of cycles, not
 just a handful of named scenarios.
 
 Build first, then run:
-    cd rust/skytracker_core && maturin develop --release
+    cd rust/skytracker-ffi && maturin develop --release
     python test_rust_pid_parity.py
 """
 

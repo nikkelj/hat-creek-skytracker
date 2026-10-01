@@ -202,6 +202,40 @@ global mount_control_thread
 # RustCoreLoopAdapter, behind a flag (default off). Enable with
 # config_state.use_rust_core_loop = True or env SKYTRACKER_RUST_LOOP=1.
 import os as _os
+
+# Phase 1 of the Rust port: route trajectory/celestial math through the
+# skytracker-astro engine when flagged (config use_rust_astro or env
+# SKYTRACKER_RUST_ASTRO=1). The adapter falls back to skyfield on any error.
+import rust_astro_adapter
+rust_astro_adapter.configure(config_state)
+if rust_astro_adapter.enabled():
+    print("Using RUST astro engine for trajectories/celestial (skyfield fallback).")
+# Phase 2b: pointing-model fits (use_rust_pointing / SKYTRACKER_RUST_POINTING=1).
+import rust_pointing_adapter
+rust_pointing_adapter.configure(config_state)
+if rust_pointing_adapter.enabled():
+    print("Using RUST pointing-model fits (numpy fallback).")
+# Phase 3b: imaging kernels (use_rust_imaging / SKYTRACKER_RUST_IMAGING=1).
+import rust_imaging_adapter
+rust_imaging_adapter.configure(config_state)
+if rust_imaging_adapter.enabled():
+    print("Using RUST imaging kernels for stacking/stabilize/sharpen (cv2 fallback).")
+# Phase 5: ADS-B decode (use_rust_adsb / SKYTRACKER_RUST_ADSB=1).
+import adsb_receiver as _adsb
+_adsb.configure_rust_adsb(config_state)
+if _adsb.rust_adsb_enabled():
+    print("Using RUST ADS-B Mode-S decode (pyModeS fallback).")
+# Phase 4b: camera capture (use_rust_camera / SKYTRACKER_RUST_CAMERA=1).
+import rust_camera_adapter
+rust_camera_adapter.configure(config_state)
+if rust_camera_adapter.enabled():
+    print("Using RUST camera capture pipeline (CameraThread fallback).")
+# Phase 6b: PID auto-tuner (use_rust_autotune / SKYTRACKER_RUST_AUTOTUNE=1).
+import autotune as _autotune
+_autotune.configure_rust_autotune(config_state)
+if _autotune.rust_autotune_enabled():
+    print("Using RUST PID auto-tuner (Python tuner fallback).")
+
 _use_rust_loop = bool(getattr(config_state, "use_rust_core_loop", False)) or (
     _os.environ.get("SKYTRACKER_RUST_LOOP", "") in ("1", "true", "True")
 )

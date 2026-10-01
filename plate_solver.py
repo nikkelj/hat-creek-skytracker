@@ -106,6 +106,34 @@ class PlateSolver:
         self.db_name = _resolve_db_name(config_state, cam_name, self.fov_deg)
         self._t3 = None
 
+    def _use_rust(self):
+        """Phase 2 of the Rust port: solve with skytracker-platesolve when
+        flagged (config use_rust_platesolve or env SKYTRACKER_RUST_PLATESOLVE=1).
+        Python tetra3 remains the fallback on any error."""
+        env = os.environ.get("SKYTRACKER_RUST_PLATESOLVE")
+        if env == "1":
+            return True
+        if env == "0":
+            return False
+        return bool(getattr(self.config_state, "use_rust_platesolve", False))
+
+    def _ensure_rust_loaded(self):
+        """Load (and cache) the Rust solver for this database, or None."""
+        with _SOLVER_LOCK:
+            rs = _SOLVER_CACHE.get("rust:" + self.db_name)
+            if rs is None:
+                try:
+                    import skytracker_core
+                    if not getattr(skytracker_core, "PLATESOLVE_AVAILABLE", False):
+                        raise ImportError("wheel predates PlateSolver")
+                    rs = skytracker_core.PlateSolver(
+                        os.path.join(_tetra3_data_dir(), self.db_name + ".npz"))
+                except Exception as e:
+                    print(f"Rust plate solver unavailable ({e}); using tetra3.")
+                    rs = False  # cache the failure, don't retry per frame
+                _SOLVER_CACHE["rust:" + self.db_name] = rs
+        return rs or None
+
     def ensure_loaded(self):
         """Load (and cache) the tetra3 database. Raises if tetra3 is missing."""
         if self._t3 is not None:
@@ -127,7 +155,6 @@ class PlateSolver:
         """
         if image is None:
             return None
-        t3 = self.ensure_loaded()
         if fov_estimate is None:
             fov_estimate = self.fov_deg
         img = np.asarray(image)
@@ -135,6 +162,34 @@ class PlateSolver:
             img = img[..., 0]
         if img.dtype != np.uint8:
             img = np.clip(img, 0, 255).astype(np.uint8)
+
+        # Rust fast path (identical solutions: see test_rust_platesolve_parity).
+        if self._use_rust():
+            rs = self._ensure_rust_loaded()
+            if rs is not None:
+                try:
+                    res = rs.solve_from_image(
+                        img, fov_estimate=fov_estimate,
+                        fov_max_error=fov_estimate * 0.6,
+                        pattern_checking_stars=12, match_radius=0.02,
+                        match_threshold=1e-2)
+                except Exception as e:
+                    print(f"Rust plate solve error ({e}); falling back to tetra3.")
+                    res = None
+                    rs = None
+                if rs is not None:
+                    if res is None:
+                        return SolveResult(float('nan'), float('nan'), float('nan'),
+                                           float('nan'), float('nan'), 0, 1.0)
+                    return SolveResult(
+                        ra_deg=float(res['RA']), dec_deg=float(res['Dec']),
+                        roll_deg=float(res['Roll']), fov_deg=float(res['FOV']),
+                        rmse=float(res['RMSE']), n_matches=int(res['Matches']),
+                        prob=float(res['Prob']),
+                        matched_centroids=np.asarray(res['matched_centroids']),
+                    )
+
+        t3 = self.ensure_loaded()
         # tetra3 expects a PIL Image (it reads image.size), so wrap the array.
         from PIL import Image
         pil_img = Image.fromarray(img)

@@ -11,7 +11,7 @@ import time
 from lib.auxstar import RATES
 
 # Sanity bounds on the measured control-cycle dt. Mirrored in
-# rust/skytracker_core/src/pid.rs (DT_MAX_SECONDS) -- keep in sync.
+# rust/skytracker-core/src/pid.rs (DT_MAX_SECONDS) -- keep in sync.
 # Upper bound: after a stall or a mode sitting idle (STANDBY -> PROGRAM with
 # the same target), the first cycle would otherwise integrate the whole gap in
 # one step -- `integral_error += error * dt` pins the integrator at its clip

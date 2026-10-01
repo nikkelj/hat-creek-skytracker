@@ -21,9 +21,17 @@ though, climbed linearly to **4.7 GB** and system free memory fell to
 1000 (6.4 GB) if the disk ever lagged — on a 16 GB laptop with the app's
 own textures and catalogs on top, Windows was paging. That is the freeze.
 
-Fix: both bounded by **bytes** (ring 128 MB, spool queue 256 MB per
+Fix: both bounded by **bytes** (ring 128 MB, spool queue 768 MB per
 camera; nothing reads deep history since the spool streams to disk). Same
 run after: RSS flat at **384 MB**, free memory steady, identical throughput.
+
+The full 10-minute soak then found the *second* limit: at ~41 GB written
+the laptop SSD's SLC write cache is exhausted and the drive stalls 5–8 s
+every ~28 s (1–30 MB/s). A 256 MB queue was only 3.7 s of 6.4 MB guide
+frames, so the guide cam dropped 250 frames (3.9%) in the last 2.5 min —
+bounded and counted, but lost. 768 MB ≈ 11 s rides the stalls out (worst
+case ~2.7 GB if all three cameras stall at once). The SLC cache also
+shrinks as the drive fills: keep the capture volume well under ~80 %.
 Plus a 2× display downsample for frames ≥ 1800 px wide (a full-res guide
 frame was a 26 MB RGBA convert + GPU upload per frame on the UI thread) and
 a disk-space guard at ARM (refuse under 2 GB, report minutes of headroom).

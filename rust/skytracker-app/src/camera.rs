@@ -29,7 +29,10 @@ pub const CAM_FPS: f64 = 100.0;
 /// pinned ~5 GB (ring) + up to 6.4 GB (spool queue) with the hardware
 /// cameras and paged the machine mid-capture.
 pub const RING_BYTES: usize = 128 * 1024 * 1024;
-pub const SPOOL_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+// 768 MB: the laptop SSD stalls 5-8 s every ~28 s once its SLC cache is
+// exhausted (~40 GB in at 93 MB/s); 256 MB was only 3.7 s of guide-cam
+// frames and dropped 3.9% of them in the last minutes of a 10-minute soak.
+pub const SPOOL_QUEUE_BYTES: usize = 768 * 1024 * 1024;
 /// Refuse to arm below this much free disk: the writer cannot recover from
 /// a full volume mid-capture.
 pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;

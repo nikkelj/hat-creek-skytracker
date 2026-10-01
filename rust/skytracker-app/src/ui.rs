@@ -1366,12 +1366,32 @@ pub fn cam_texture(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, sl
     // Re-upload on a new frame or when the gamma settings changed.
     let key = cam.seq ^ ((settings.gamma * 1000.0) as u64) << 40 ^ (settings.gamma_enabled as u64) << 63;
     if key != st.cam_seq[slot] {
+        // Display-only 2x box downsample for wide frames: a full-res 3096x2080
+        // upload is a 26 MB RGBA conversion + GPU transfer per frame per camera
+        // on the UI thread (~280 MB/s at 11 fps). Overlays map through
+        // cam.width/height, not the texture, so geometry is unaffected.
+        let full = cam.width * cam.height;
+        let (tw, th, src): (usize, usize, std::borrow::Cow<[u8]>) = if cam.width >= 1800 && cam.height >= 2 && cam.data.len() >= full {
+            let (w2, h2) = (cam.width / 2, cam.height / 2);
+            let mut d = vec![0u8; w2 * h2];
+            for y in 0..h2 {
+                let r0 = &cam.data[(2 * y) * cam.width..(2 * y) * cam.width + 2 * w2];
+                let r1 = &cam.data[(2 * y + 1) * cam.width..(2 * y + 1) * cam.width + 2 * w2];
+                let row = &mut d[y * w2..(y + 1) * w2];
+                for x in 0..w2 {
+                    row[x] = ((r0[2 * x] as u16 + r0[2 * x + 1] as u16 + r1[2 * x] as u16 + r1[2 * x + 1] as u16) >> 2) as u8;
+                }
+            }
+            (w2, h2, std::borrow::Cow::Owned(d))
+        } else {
+            (cam.width, cam.height, std::borrow::Cow::Borrowed(&cam.data[..]))
+        };
         let img = if settings.gamma_enabled {
             let lut = gamma_lut(settings.gamma);
-            let mapped: Vec<u8> = cam.data.iter().map(|&v| lut[v as usize]).collect();
-            egui::ColorImage::from_gray([cam.width, cam.height], &mapped)
+            let mapped: Vec<u8> = src.iter().map(|&v| lut[v as usize]).collect();
+            egui::ColorImage::from_gray([tw, th], &mapped)
         } else {
-            egui::ColorImage::from_gray([cam.width, cam.height], &cam.data)
+            egui::ColorImage::from_gray([tw, th], &src)
         };
         match st.cam_tex[slot].as_mut() {
             Some(t) => t.set(img, egui::TextureOptions::LINEAR),

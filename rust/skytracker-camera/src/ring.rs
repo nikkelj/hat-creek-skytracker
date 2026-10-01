@@ -40,22 +40,45 @@ pub fn exposure_midpoint(capture_time_s: f64, now_s: f64) -> f64 {
 pub struct Ring {
     inner: Mutex<VecDeque<Frame>>,
     capacity: usize,
+    /// Resident pixel bytes across the queue, and the budget they must stay
+    /// under. A frame-count cap alone let three hardware cameras pin ~5 GB
+    /// (600 x 6.4 MB guide frames) — the long-capture "freeze" was the
+    /// machine paging. Nothing reads deep history (the spool streams to
+    /// disk as frames arrive), so the ring only needs a short tail.
+    bytes: std::sync::atomic::AtomicUsize,
+    byte_budget: usize,
 }
 
 impl Ring {
     pub fn new(capacity: usize) -> Self {
+        Self::with_byte_budget(capacity, usize::MAX)
+    }
+
+    pub fn with_byte_budget(capacity: usize, byte_budget: usize) -> Self {
         Ring {
-            inner: Mutex::new(VecDeque::with_capacity(capacity)),
+            inner: Mutex::new(VecDeque::with_capacity(capacity.min(64))),
             capacity,
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            byte_budget: byte_budget.max(1),
         }
     }
 
     pub fn push(&self, frame: Frame) {
+        use std::sync::atomic::Ordering;
         let mut q = self.inner.lock().unwrap();
-        if q.len() == self.capacity {
-            q.pop_front();
-        }
+        let mut bytes = self.bytes.load(Ordering::Relaxed) + frame.data.len();
         q.push_back(frame);
+        while q.len() > 1 && (q.len() > self.capacity || bytes > self.byte_budget) {
+            if let Some(old) = q.pop_front() {
+                bytes -= old.data.len();
+            }
+        }
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Resident pixel bytes currently held.
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn latest(&self) -> Option<Frame> {

@@ -6,6 +6,34 @@ Newest entries first.
 
 ---
 
+## 2026-10-01 — The long-capture "freeze" was memory, not the disk
+
+Stress harness (`skytracker-camera/examples/capture_stress.rs`): three
+synthetic cameras at the rig's real frame sizes and rates (3096×2080 @ 11,
+1608×1104 @ 6.7, 968×548 @ 20 — 93 MB/s, 55 GB per 10 min) through the real
+Pump → Ring → CaptureRecorder path, with RSS sampled from outside.
+
+The SSD was never the problem: 93 MB/s sustained, zero drops, the writer
+never more than one frame behind, `finish()` in 10 ms. The process RSS,
+though, climbed linearly to **4.7 GB** and system free memory fell to
+**700 MB** in one minute. The frame ring held 600 full-res frames per camera
+(3.9 GB for the guide cam alone) and the spool queue could pin another
+1000 (6.4 GB) if the disk ever lagged — on a 16 GB laptop with the app's
+own textures and catalogs on top, Windows was paging. That is the freeze.
+
+Fix: both bounded by **bytes** (ring 128 MB, spool queue 256 MB per
+camera; nothing reads deep history since the spool streams to disk). Same
+run after: RSS flat at **384 MB**, free memory steady, identical throughput.
+Plus a 2× display downsample for frames ≥ 1800 px wide (a full-res guide
+frame was a 26 MB RGBA convert + GPU upload per frame on the UI thread) and
+a disk-space guard at ARM (refuse under 2 GB, report minutes of headroom).
+
+Lesson: a bounded *count* is not a bounded *size*. When frame dimensions
+can change by 12× between sim and hardware, every buffer cap must be in
+bytes.
+
+---
+
 ## 2026-08-29 — First hardware session: every "rig-ready, untested" seam had a bug
 
 Phase 8 bring-up on the rig found five, all invisible in sim:

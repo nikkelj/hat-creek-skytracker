@@ -23,6 +23,40 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const CAM_FPS: f64 = 100.0;
+/// Resident-memory budgets. The frame ring only feeds the display and the
+/// hotspot loop (latest frame); the armed-capture spool streams to disk as
+/// frames arrive, so neither needs deep history. Unbounded-by-bytes they
+/// pinned ~5 GB (ring) + up to 6.4 GB (spool queue) with the hardware
+/// cameras and paged the machine mid-capture.
+pub const RING_BYTES: usize = 128 * 1024 * 1024;
+pub const SPOOL_QUEUE_BYTES: usize = 256 * 1024 * 1024;
+/// Refuse to arm below this much free disk: the writer cannot recover from
+/// a full volume mid-capture.
+pub const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Free bytes on the volume holding `path` (Windows: GetDiskFreeSpaceExW
+/// through libloading, no extra crate; None elsewhere or on failure).
+pub fn free_space_bytes(path: &std::path::Path) -> Option<u64> {
+    #[cfg(windows)]
+    unsafe {
+        use std::os::windows::ffi::OsStrExt;
+        let lib = libloading::Library::new("kernel32.dll").ok()?;
+        let f: libloading::Symbol<unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32> =
+            lib.get(b"GetDiskFreeSpaceExW\0").ok()?;
+        let dir = if path.is_dir() { path.to_path_buf() } else { path.parent()?.to_path_buf() };
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+        if f(wide.as_ptr(), &mut avail, &mut total, &mut free) != 0 {
+            return Some(avail);
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
 /// Sim frames are a centred crop of the (binned) sensor so the plate scale
 /// stays that of the real camera while the per-frame cost stays bounded.
 pub const SIM_MAX_W: usize = 1248;
@@ -342,7 +376,7 @@ fn open_asi(cfg: &crate::state::Config, cam: &CameraConfig, hw_index: usize, set
     // AsiSource owns an SDK handle too; load a second binding for it.
     let sdk2 = AsiSdk::load(&dll).map_err(|e| e.0)?;
     let source = AsiSource { sdk: sdk2, camera_id: id, width: w, height: h, channels: 1, wait_ms: 1000, stopped: stop.clone() };
-    Ok((Pump::spawn(source, 600), w, h, sdk, id, stop))
+    Ok((Pump::spawn_with_budget(source, 600, RING_BYTES), w, h, sdk, id, stop))
 }
 
 fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<CamCmd>, root: std::path::PathBuf, deep: Arc<Mutex<Option<DeepCatalog>>>) {
@@ -401,9 +435,30 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 CamCmd::Arm => {
+                    // Disk guard: refuse below MIN_FREE_BYTES, otherwise report
+                    // how long this camera's stream fits so a 10-minute launch
+                    // is a known quantity before the clock starts.
+                    let captures = root.join(&cfg.captures_dir);
+                    let _ = std::fs::create_dir_all(&captures);
+                    let free = free_space_bytes(&captures);
+                    if let Some(fb) = free {
+                        if fb < MIN_FREE_BYTES {
+                            last_dump = Some(format!("ARM REFUSED: only {:.1} GB free on the capture volume", fb as f64 / 1e9));
+                            continue;
+                        }
+                    }
                     if connected {
+                        if let Some(fb) = free {
+                            let per_s = (w * h) as f64 * (fps as f64).max(1.0);
+                            let mins = fb as f64 / per_s / 60.0;
+                            last_dump = Some(format!("armed · {:.0} GB free ≈ {:.0} min of this camera at {:.1} fps", fb as f64 / 1e9, mins, fps));
+                        }
                         let spool = root.join(&cfg.captures_dir).join(format!(".spool_cam{}_{}", slot + 1, crate::sky::utc_stamp_compact()));
-                        match recorder.arm_spool(&spool, cfg.capture_buffer_frames) {
+                        // Queue depth in frames from the byte budget: a disk
+                        // stall then drops frames (counted) instead of eating RAM.
+                        let frame_bytes = (w * h).max(1);
+                        let queue = (SPOOL_QUEUE_BYTES / frame_bytes).clamp(2, cfg.capture_buffer_frames.max(2));
+                        match recorder.arm_spool(&spool, queue) {
                             Ok(()) => {
                                 armed_frames = 0;
                                 armed_spool = Some(spool);
@@ -606,7 +661,7 @@ fn run_slot(shared: Arc<Shared>, slot: usize, rx: crossbeam_channel::Receiver<Ca
                     w = sw;
                     h = sh;
                     let (s, push) = PushSource::new();
-                    pump = Some(Pump::spawn(s, 600));
+                    pump = Some(Pump::spawn_with_budget(s, 600, RING_BYTES));
                     let renderer = SimRenderer {
                         proj: Projector {
                             w: w as f64,

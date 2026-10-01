@@ -91,9 +91,14 @@ pub struct Pump {
 }
 
 impl Pump {
-    /// Spawn the pump thread over any source.
-    pub fn spawn(mut source: impl FrameSource, ring_capacity: usize) -> Pump {
-        let ring = Arc::new(Ring::new(ring_capacity));
+    /// Spawn the pump thread over any source (frame-count ring cap only).
+    pub fn spawn(source: impl FrameSource, ring_capacity: usize) -> Pump {
+        Self::spawn_with_budget(source, ring_capacity, usize::MAX)
+    }
+
+    /// Spawn with the ring bounded by BOTH frame count and resident bytes.
+    pub fn spawn_with_budget(mut source: impl FrameSource, ring_capacity: usize, ring_bytes: usize) -> Pump {
+        let ring = Arc::new(Ring::with_byte_budget(ring_capacity, ring_bytes));
         let recorder = Arc::new(CaptureRecorder::new());
         let frames_pumped = Arc::new(AtomicU64::new(0));
 

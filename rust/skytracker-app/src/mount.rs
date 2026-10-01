@@ -234,13 +234,16 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
     // Operator bias (on-sky cross-el / el, deg) and its D-pad step;
     // persisted across runs (bias_azm_deg / bias_alt_deg / bias_control_mode).
     let mut bias = (
-        raw_f64(&cfg.raw["bias_azm_deg"]).unwrap_or(0.0).clamp(-3.0, 3.0),
-        raw_f64(&cfg.raw["bias_alt_deg"]).unwrap_or(0.0).clamp(-3.0, 3.0),
+        raw_f64(&cfg.raw["bias_azm_deg"]).unwrap_or(0.0),
+        raw_f64(&cfg.raw["bias_alt_deg"]).unwrap_or(0.0),
     );
     let mut bias_fine = cfg.raw["bias_control_mode"].as_str().map_or(false, |s| s == "fine");
     // Bias frame: "azel" nudges cross-el/el; "alongcross" projects onto the
     // target's sky-velocity direction (in-track / cross-track).
     let mut bias_frame_ac = false;
+    // The (az, el) nudge actually applied to the last setpoint — the bias
+    // projected into the sky frame — for FoldBiasIntoAlignment.
+    let mut last_bias_nudge = (0.0f64, 0.0f64);
     let mut bias_it = 0.0f64;
     let mut bias_ct = 0.0f64;
     let mut focus_last_rate = 0i32;
@@ -384,12 +387,40 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 }
                 MountCmd::Bias { daz, del } => {
                     if bias_frame_ac {
-                        bias_it = (bias_it + daz).clamp(-3.0, 3.0);
-                        bias_ct = (bias_ct + del).clamp(-3.0, 3.0);
+                        bias_it = (bias_it + daz);
+                        bias_ct = (bias_ct + del);
                     } else {
-                        bias.0 = (bias.0 + daz).clamp(-3.0, 3.0);
-                        bias.1 = (bias.1 + del).clamp(-3.0, 3.0);
+                        bias.0 = (bias.0 + daz);
+                        bias.1 = (bias.1 + del);
                         persist_bias(&cfg.path, bias, bias_fine);
+                    }
+                }
+                MountCmd::BiasSet { az, el, it, ct } => {
+                    bias = (az, el);
+                    bias_it = it;
+                    bias_ct = ct;
+                    persist_bias(&cfg.path, bias, bias_fine);
+                }
+                MountCmd::FoldBiasIntoAlignment => {
+                    // Same semantics as the Align screen's "apply align" (az only):
+                    // the boresight is physically on the target while the model
+                    // reports target + nudge, so true - reported = -nudge.
+                    let daz = last_bias_nudge.0;
+                    if daz.abs() < 1e-6 {
+                        push_status(&mut status, "fold: no azimuth bias applied to the current setpoint".into());
+                    } else {
+                        let az = (cfg.alignment_az - daz).rem_euclid(360.0);
+                        let el = cfg.alignment_el;
+                        cfg.alignment_az = az;
+                        let mut i = loop_shared.inputs.lock().unwrap();
+                        i.alignment_az = az;
+                        drop(i);
+                        persist_config_key(&cfg.path, "alignment_azimuth", serde_json::json!(format!("{az}")));
+                        bias.0 = 0.0;
+                        bias_it = 0.0;
+                        bias_ct = 0.0;
+                        persist_bias(&cfg.path, bias, bias_fine);
+                        push_status(&mut status, format!("bias folded into alignment: az {:+.3}° -> alignment_azimuth {az:.4}° (el {el:.4}°); el bias {:+.2}° kept", -daz, bias.1));
                     }
                 }
                 MountCmd::BiasReset => {
@@ -683,12 +714,12 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                                 _ => (0.0, -step),
                             };
                             if bias_frame_ac {
-                                bias_it = (bias_it + dx).clamp(-3.0, 3.0);
-                                bias_ct = (bias_ct + dy).clamp(-3.0, 3.0);
+                                bias_it = (bias_it + dx);
+                                bias_ct = (bias_ct + dy);
                                 push_status(&mut status, format!("bias in-track {:+.2}° / cross {:+.2}°", bias_it, bias_ct));
                             } else {
-                                bias.0 = (bias.0 + dx).clamp(-3.0, 3.0);
-                                bias.1 = (bias.1 + dy).clamp(-3.0, 3.0);
+                                bias.0 = (bias.0 + dx);
+                                bias.1 = (bias.1 + dy);
                                 persist_bias(&cfg.path, bias, bias_fine);
                                 push_status(&mut status, format!("bias {:+.2}° / {:+.2}°", bias.0, bias.1));
                             }
@@ -873,6 +904,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 })
             });
             let mut pm_corr = (0.0, 0.0);
+            let mut bias_nudge = (0.0f64, 0.0f64);
             let sp = sp.map(|mut s| {
                 if bias != (0.0, 0.0) || bias_it != 0.0 || bias_ct != 0.0 {
                     // _apply_bias_to_target: az/el bias is a cross-el/el nudge;
@@ -892,6 +924,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                     }
                     s.az_deg = (s.az_deg + crossel / cos_el).rem_euclid(360.0);
                     s.el_deg += elb;
+                    bias_nudge = (crossel / cos_el, elb);
                 }
                 // Pointing-model pre-correction (control.apply_pointing_model):
                 // command = desired - error(desired), first-order inverse.
@@ -917,6 +950,7 @@ fn run(shared: Arc<Shared>, rx: Receiver<MountCmd>, root: std::path::PathBuf, tx
                 s
             });
             pm_corr_last = pm_corr;
+            last_bias_nudge = bias_nudge;
             // Sun keep-out: never command the boresight inside the exclusion
             // cone. Dropping the setpoint alone is NOT enough — the firmware
             // holds the last rate and the mount would coast on in — so entry

@@ -1140,6 +1140,12 @@ pub enum MountCmd {
     ToggleFeedForward,
     /// Operator bias on the setpoint: on-sky cross-elevation / elevation (deg).
     Bias { daz: f64, del: f64 },
+    /// Absolute operator bias (deg): cross-el (az), el, in-track, cross-track.
+    BiasSet { az: f64, el: f64, it: f64, ct: f64 },
+    /// Daytime sync: the operator has biased the boresight ONTO the target, so
+    /// the model's pointing error at this direction is the applied nudge —
+    /// fold its azimuth part into alignment_azimuth and clear the az biases.
+    FoldBiasIntoAlignment,
     BiasReset,
     BiasFine(bool),
     /// Cycle the bias mode: coarse/azel → fine/azel → coarse/alongcross → fine/alongcross.

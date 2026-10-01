@@ -82,6 +82,10 @@ pub struct UiState {
     /// Launch-trajectory layer on the skyplot (persisted; an armed LAUNCH
     /// clock still draws its own trajectory when hidden).
     pub show_launches: bool,
+    /// Bias panel nudge step (deg) and the in-flight edit (so a typed/dragged
+    /// value doesn't snap back to the one-cycle-stale snapshot).
+    pub bias_step: f64,
+    pub bias_edit: Option<[f64; 4]>,
     /// Fullscreen camera view (slot), cycled by the gamepad center pad and
     /// per-view buttons; Esc exits.
     pub fullscreen_cam: Option<usize>,
@@ -146,6 +150,8 @@ impl Default for UiState {
             stack_cams_w: 360.0,
             feature_half: 32,
             show_launches: true,
+            bias_step: 0.1,
+            bias_edit: None,
             fullscreen_cam: None,
             fs_seen: 0,
         }
@@ -1915,22 +1921,6 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
         if ui.small_button("sync home").on_hover_text("place the mount on its physical index marks FIRST, then click: tares az/alt so the indices read 0/0 (sets azm/alt offsets to the current raw encoders, persisted; PARK returns here)").clicked() {
             let _ = tx.send(MountCmd::SyncHome);
         }
-        let step = if m.bias_fine { 0.01 } else { 0.1 };
-        let ac = m.bias_frame == "alongcross";
-        let (hn, vn) = if ac { ("InTk", "XTk") } else { ("Az", "El") };
-        for (l, dx, dy) in [("◀", -step, 0.0), ("▶", step, 0.0), ("▲", 0.0, step), ("▼", 0.0, -step)] {
-            let axis = if dx != 0.0 { hn } else { vn };
-            if ui.small_button(l).on_hover_text(format!("operator bias {axis} {:+.2}° (gamepad D-pad; Share cycles the mode)", if dx != 0.0 { dx } else { dy })).clicked() {
-                let _ = tx.send(MountCmd::Bias { daz: dx, del: dy });
-            }
-        }
-        let mode_lbl = format!("{}·{}", if m.bias_fine { "fine" } else { "coarse" }, if ac { "trk" } else { "azel" });
-        if ui.small_button(mode_lbl).on_hover_text("bias mode: coarse/azel → fine/azel → coarse/along-cross-track → fine/along-cross-track (gamepad: Share)").clicked() {
-            let _ = tx.send(MountCmd::CycleBiasMode);
-        }
-        if (m.bias != (0.0, 0.0) || m.bias_it != 0.0 || m.bias_ct != 0.0) && ui.small_button("bias 0").clicked() {
-            let _ = tx.send(MountCmd::BiasReset);
-        }
         // Per-axis feed-forward (render_pid_diagnostics FF buttons).
         ui.separator();
         if theme::mode_button(ui, "FFaz", m.ff_azm, GREEN) {
@@ -1940,8 +1930,68 @@ pub fn mount_panel(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx
             let _ = tx.send(MountCmd::SetFeedForward { az: m.ff_azm, el: !m.ff_alt });
         }
     });
-    if m.bias_it != 0.0 || m.bias_ct != 0.0 {
-        theme::kv_colored(ui, "bias trk", format!("in {:+.2}° / cross {:+.2}°", m.bias_it, m.bias_ct), AMBER);
+    // Operator bias: four explicit channels — cross-el / el in the sky frame,
+    // in-track / cross-track along the target's motion — UNCAPPED (a mount
+    // set up by compass can be many degrees off). Type a value, drag it, or
+    // nudge by the selected step. "fold az → align" absorbs the azimuth part
+    // into alignment_azimuth: the daytime sync when plate solving is
+    // impossible. The gamepad D-pad (Share cycles fine/coarse, az-el/track)
+    // drives the same channels.
+    {
+        let snap = [m.bias.0, m.bias.1, m.bias_it, m.bias_ct];
+        if let Some(e) = st.bias_edit {
+            if e.iter().zip(snap.iter()).all(|(a, b)| (a - b).abs() < 1e-6) {
+                st.bias_edit = None;
+            }
+        }
+        let dirty = snap.iter().any(|v| *v != 0.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("BIAS").font(theme::sans(10.5)).color(if dirty { AMBER } else { DIM }));
+            ui.label(egui::RichText::new("step").font(theme::sans(10.0)).color(DIM));
+            for s in [0.01f64, 0.1, 1.0] {
+                if ui.selectable_label((st.bias_step - s).abs() < 1e-9, format!("{s}°")).clicked() {
+                    st.bias_step = s;
+                }
+            }
+            if dirty && ui.small_button("bias 0").on_hover_text("clear all four bias channels").clicked() {
+                st.bias_edit = None;
+                let _ = tx.send(MountCmd::BiasReset);
+            }
+            if (m.bias.0 != 0.0 || m.bias_it != 0.0 || m.bias_ct != 0.0)
+                && ui
+                    .small_button("fold az → align")
+                    .on_hover_text("the target is centred, so the azimuth bias IS the alignment error: fold it into alignment_azimuth (persisted) and clear the az/track biases. Same math as Align → apply align, no plate solve needed — use it in daylight.")
+                    .clicked()
+            {
+                st.bias_edit = None;
+                let _ = tx.send(MountCmd::FoldBiasIntoAlignment);
+            }
+        });
+        let mut v = st.bias_edit.unwrap_or(snap);
+        let before = v;
+        egui::Grid::new("bias_grid").num_columns(4).spacing([6.0, 2.0]).show(ui, |ui| {
+            let rows = [
+                ("cross-el (az)", "sky-frame azimuth nudge, scaled by cos(el) so it moves the boresight by this many degrees across the sky"),
+                ("el", "sky-frame elevation nudge"),
+                ("in-track", "along the target's direction of motion (lead / lag)"),
+                ("cross-track", "perpendicular to the target's motion"),
+            ];
+            for (i, (name, tip)) in rows.iter().enumerate() {
+                ui.label(egui::RichText::new(*name).font(theme::sans(10.5)).color(if v[i] != 0.0 { AMBER } else { TEXT_2 })).on_hover_text(*tip);
+                if ui.small_button("−").clicked() {
+                    v[i] -= st.bias_step;
+                }
+                ui.add(egui::DragValue::new(&mut v[i]).speed(0.01).fixed_decimals(2).suffix("°"));
+                if ui.small_button("+").clicked() {
+                    v[i] += st.bias_step;
+                }
+                ui.end_row();
+            }
+        });
+        if v != before {
+            st.bias_edit = Some(v);
+            let _ = tx.send(MountCmd::BiasSet { az: v[0], el: v[1], it: v[2], ct: v[3] });
+        }
     }
     if m.mode == "FEATURE" {
         ui.horizontal(|ui| {

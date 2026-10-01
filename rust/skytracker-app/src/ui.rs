@@ -132,7 +132,7 @@ impl Default for UiState {
             sky_pan: Vec2::ZERO,
             quad_cam_h: 470.0,
             scope_sky_h: 320.0,
-            scope_ctl_h: 150.0,
+            scope_ctl_h: 360.0,
             navball_tex: None,
             cam_zoom: Vec::new(),
             cam_pan: Vec::new(),
@@ -2613,7 +2613,28 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
     // scrolls inside a fixed box, so this function's content never exceeds
     // its container (a growing panel would feed back into its own height).
     let launch_h: f32 = if sky.launches.is_empty() { 0.0 } else { 92.0 };
-    let table_h = (ui.available_height() - launch_h).max(80.0);
+    // Launch-trajectory selector (tracking_visuals "Launch Trajectories" box).
+    if !sky.launches.is_empty() {
+        theme::section(ui, &format!("launch trajectories · {}", sky.launches.len()));
+        egui::ScrollArea::vertical().id_salt("launch_sel").max_height(launch_h - 26.0).show(ui, |ui| {
+        for l in sky.launches.iter() {
+            let sel = st.selected.as_deref() == Some(l.key.as_str());
+            let dur = l.rows.last().map(|r| r.0 - l.rows.first().map(|f| f.0).unwrap_or(r.0)).unwrap_or(0.0);
+            let max_el = l.rows.iter().map(|r| r.2).fold(f64::MIN, f64::max);
+            if ui
+                .selectable_label(sel, egui::RichText::new(format!("{} · max el {:.0}° · {:.0} s", l.name, max_el, dur)).font(theme::mono(10.5)))
+                .clicked()
+            {
+                let key = if sel { None } else { Some(l.key.clone()) };
+                st.selected = key.clone();
+                let _ = tx.send(MountCmd::SelectTarget(key));
+            }
+        }
+        });
+    }    // The table takes whatever height is left (the selector is drawn first
+    // so a fixed-height pane, like the tabs layout's bottom panel, can never
+    // clip it off the bottom).
+    let table_h = ui.available_height().max(80.0);
     let table_w = ui.available_width();
     ui.allocate_ui(Vec2::new(table_w, table_h), |ui| {
         ui.set_min_size(Vec2::new(table_w, table_h));
@@ -2670,23 +2691,4 @@ pub fn sky_table(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut UiState, tx: 
         });
 
     });
-    // Launch-trajectory selector (tracking_visuals "Launch Trajectories" box).
-    if !sky.launches.is_empty() {
-        theme::section(ui, &format!("launch trajectories · {}", sky.launches.len()));
-        egui::ScrollArea::vertical().id_salt("launch_sel").max_height(launch_h - 26.0).show(ui, |ui| {
-        for l in sky.launches.iter() {
-            let sel = st.selected.as_deref() == Some(l.key.as_str());
-            let dur = l.rows.last().map(|r| r.0 - l.rows.first().map(|f| f.0).unwrap_or(r.0)).unwrap_or(0.0);
-            let max_el = l.rows.iter().map(|r| r.2).fold(f64::MIN, f64::max);
-            if ui
-                .selectable_label(sel, egui::RichText::new(format!("{} · max el {:.0}° · {:.0} s", l.name, max_el, dur)).font(theme::mono(10.5)))
-                .clicked()
-            {
-                let key = if sel { None } else { Some(l.key.clone()) };
-                st.selected = key.clone();
-                let _ = tx.send(MountCmd::SelectTarget(key));
-            }
-        }
-        });
-    }
 }

@@ -445,7 +445,15 @@ impl eframe::App for App {
 
         match self.screen {
             Screen::Track => {
-                // Layout selector rides in the toggles row; the choice persists.
+                // Layout selector + layer toggles + LAUNCH live in one strip
+                // pinned under the top bar: the same upper-left spot in every
+                // layout (quad used to park it over the skyplot column), and
+                // the row wraps so nothing rolls off a narrow pane.
+                egui::TopBottomPanel::top("track_toggles")
+                    .frame(egui::Frame::none().fill(theme::BG).inner_margin(egui::Margin::symmetric(0.0, 3.0)))
+                    .show(ctx, |ui| {
+                        track_toggles(ui, &mut self.ui, &self.shared);
+                    });
                 let layout = self.ui.track_layout.clone();
                 match layout.as_str() {
                     // ---- stacked: controls column + a full camera column ----
@@ -479,7 +487,6 @@ impl eframe::App for App {
                             }
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-                            track_toggles(ui, &mut self.ui, &self.shared);
                             ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                         });
                     }
@@ -511,7 +518,6 @@ impl eframe::App for App {
                                     });
                                 }
                                 let ui = &mut cols[1];
-                                track_toggles(ui, &mut self.ui, &self.shared);
                                 ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                             });
                         });
@@ -532,18 +538,20 @@ impl eframe::App for App {
                             let ctl_h = self.ui.scope_ctl_h;
                             ui.allocate_ui(egui::Vec2::new(w, ctl_h), |ui| {
                                 ui.set_min_size(egui::Vec2::new(w, ctl_h));
+                                // The full mount panel (offsets, bias, pointing
+                                // model, joystick...) — the compact readout was too
+                                // sparse to run a launch from.
                                 egui::ScrollArea::vertical().id_salt("scope_ctl").max_height(ctl_h).show(ui, |ui| {
-                                    ui::compact_mount(ui, &self.shared, &self.tx);
+                                    ui::mount_panel(ui, &self.shared, &mut self.ui, &self.tx);
                                 });
                             });
-                            ui::vdrag_handle(ui, "scope_ctl", &mut self.ui.scope_ctl_h, 80.0, 500.0, false);
+                            ui::vdrag_handle(ui, "scope_ctl", &mut self.ui.scope_ctl_h, 80.0, 900.0, false);
                             sats_rollup(ui, &self.shared, &mut self.ui, &self.tx, false);
                             let h = (ui.available_height() - 40.0).max(120.0);
                             ui::camera_view(ui, &self.shared, &mut self.ui, 2, false, Some(h));
                             ui::camera_quick_controls(ui, &self.shared, 2, &self.tx_cam);
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-                            track_toggles(ui, &mut self.ui, &self.shared);
                             let h = ui.available_height() - 4.0;
                             if self.ui.scope_combined {
                                 let (r, _) = ui.allocate_painter(egui::Vec2::new(ui.available_width(), h), egui::Sense::hover());
@@ -580,7 +588,6 @@ impl eframe::App for App {
                             ui::sky_table(ui, &self.shared, &mut self.ui, &self.tx);
                         });
                         egui::CentralPanel::default().frame(egui::Frame::none().fill(theme::BG)).show(ctx, |ui| {
-                            track_toggles(ui, &mut self.ui, &self.shared);
                             ui::skyplot(ui, &self.shared, &mut self.ui, &self.tx);
                         });
                     }
@@ -647,7 +654,7 @@ fn sats_rollup(ui: &mut egui::Ui, shared: &Arc<Shared>, st: &mut ui::UiState, tx
 
 /// The Track screen's toggle strip: skyplot layers + the layout selector.
 fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add_space(6.0);
         let before = (st.track_layout.clone(), st.quad_cams, st.scope_combined);
         egui::ComboBox::from_id_salt("track_layout").selected_text(st.track_layout.clone()).width(70.0).show_ui(ui, |ui| {
@@ -655,6 +662,20 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
                 ui.selectable_value(&mut st.track_layout, l.to_string(), l);
             }
         });
+        // LAUNCH first, next to the layout selector: always reachable.
+        // Arm the selected launch trajectory at T0 = now (Python's
+        // launch button); shows T+ while armed, click again to abort.
+        let armed = (**shared.launch_armed.load()).clone();
+        if let Some((key, t0)) = &armed {
+            let t_plus = crate::sky::now_unix() - t0;
+            if ui.add(egui::Button::new(egui::RichText::new(format!("■ T{}{:.0}s", if t_plus >= 0.0 { "+" } else { "-" }, t_plus.abs())).color(egui::Color32::BLACK)).fill(theme::RED)).on_hover_text(format!("{key} armed — click to abort the launch override")).clicked() {
+                shared.launch_armed.store(Arc::new(None));
+            }
+        } else if st.selected.as_deref().map_or(false, |s| s.starts_with("launch:")) {
+            if ui.add(egui::Button::new(egui::RichText::new("LAUNCH").color(egui::Color32::BLACK)).fill(theme::AMBER)).on_hover_text("re-base this trajectory's T0 to now and track it (forces PROGRAM)").clicked() {
+                shared.launch_armed.store(Arc::new(Some((st.selected.clone().unwrap(), crate::sky::now_unix()))));
+            }
+        }
         if st.track_layout == "quad" {
             for k in [2usize, 3] {
                 if ui.selectable_label(st.quad_cams == k, format!("{k} cams")).clicked() {
@@ -757,19 +778,6 @@ fn track_toggles(ui: &mut egui::Ui, st: &mut ui::UiState, shared: &Arc<Shared>) 
                 let now_solar = !solar;
                 shared.solar_mode.store(now_solar, Ordering::Relaxed);
                 crate::mount::persist_config_key(&shared.config.path, "sun_keepout_enabled", serde_json::json!(!now_solar));
-            }
-        }
-        // LAUNCH: arm the selected launch trajectory at T0 = now (Python's
-        // launch button); shows T+ while armed, click again to abort.
-        let armed = (**shared.launch_armed.load()).clone();
-        if let Some((key, t0)) = &armed {
-            let t_plus = crate::sky::now_unix() - t0;
-            if ui.add(egui::Button::new(egui::RichText::new(format!("■ T{}{:.0}s", if t_plus >= 0.0 { "+" } else { "-" }, t_plus.abs())).color(egui::Color32::BLACK)).fill(theme::RED)).on_hover_text(format!("{key} armed — click to abort the launch override")).clicked() {
-                shared.launch_armed.store(Arc::new(None));
-            }
-        } else if st.selected.as_deref().map_or(false, |s| s.starts_with("launch:")) {
-            if ui.add(egui::Button::new(egui::RichText::new("LAUNCH").color(egui::Color32::BLACK)).fill(theme::AMBER)).on_hover_text("re-base this trajectory's T0 to now and track it (forces PROGRAM)").clicked() {
-                shared.launch_armed.store(Arc::new(Some((st.selected.clone().unwrap(), crate::sky::now_unix()))));
             }
         }
     });
